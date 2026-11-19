@@ -126,14 +126,32 @@ export function runMythrilSymbolicAnalysis(req: MythrilAnalysisRequest): Mythril
       maxBuffer: 16 * 1024 * 1024,
     });
 
-    const facts = parseMythrilJsonOutput(proc.stdout || "", req.file);
-    if (facts.length === 0 && proc.status !== 0 && !(proc.stdout || "").includes('"issues"')) {
+    const rawOut = proc.stdout || "";
+    const jsonIdx = rawOut.indexOf("{");
+    if (jsonIdx >= 0) {
+      try {
+        const parsedRaw = JSON.parse(rawOut.slice(jsonIdx));
+        if (parsedRaw && parsedRaw.success === false && parsedRaw.error) {
+          return {
+            adapter: "mythril",
+            status: "error",
+            issuesCount: 0,
+            facts: [],
+            error: String(parsedRaw.error).slice(0, 600),
+          };
+        }
+      } catch {
+        // handled below
+      }
+    }
+    const facts = parseMythrilJsonOutput(rawOut, req.file);
+    if (facts.length === 0 && proc.status !== 0 && !rawOut.includes('"issues"')) {
       return {
         adapter: "mythril",
         status: "error",
         issuesCount: 0,
         facts: [],
-        error: (proc.stderr || proc.stdout || `myth exited ${proc.status}`).slice(0, 600),
+        error: (proc.stderr || rawOut || `myth exited ${proc.status}`).slice(0, 600),
       };
     }
 

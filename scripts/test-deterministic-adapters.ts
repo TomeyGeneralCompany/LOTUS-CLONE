@@ -315,7 +315,7 @@ contract LotusProbeTest {
 
   if (isMythrilAvailable()) {
     const mythSol = `// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.19;
 contract KillableVault {
     function destroy(address payable to) public {
         selfdestruct(to);
@@ -325,10 +325,12 @@ contract KillableVault {
     const mythRes = runMythrilSymbolicAnalysis({
       file: "contracts/KillableVault.sol",
       contractSource: mythSol,
-      executionTimeoutSec: 25,
+      solv: "0.8.19",
+      executionTimeoutSec: 30,
       maxDepth: 12,
     });
     assert.equal(mythRes.status, "completed", `Mythril failed: ${mythRes.error}`);
+    console.log("Mythril live facts:", mythRes.facts.map((f) => f.detail).join(" | "));
     assert.ok(mythRes.issuesCount >= 1, "Mythril must detect unprotected selfdestruct");
     assert.ok(mythRes.facts.some((f) => f.kind === "symbolic_finding"));
     executedLive.push("mythril");
