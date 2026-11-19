@@ -1,10 +1,9 @@
 // Joern (Apache-2.0) CPG dataflow & sink query script for LOTUS ProgramFacts IR.
 // Usage: joern --script scripts/adapters/joern_cpg_facts.sc --param cpgFile=/tmp/cpg.bin --param outFile=/tmp/out.json
 
-import io.shiftleft.semanticcpg.language._
-import io.joern.dataflowengineoss.language._
 import java.nio.file.{Files, Paths}
 import java.nio.charset.StandardCharsets
+import scala.util.Try
 
 @main def exec(cpgFile: String, outFile: String) = {
   importCpg(cpgFile)
@@ -21,7 +20,7 @@ import java.nio.charset.StandardCharsets
   val sinks = cpg.call.name(sinkRegex).l.take(200)
   val sources = cpg.method.internal.parameter.l.take(200)
 
-  val flows = sinks.reachableByFlows(sources).l.take(100)
+  val flows = Try(sinks.reachableByFlows(sources).l.take(100)).getOrElse(List.empty)
 
   val symJson = methods.map { m =>
     val line = m.lineNumber.getOrElse(1)

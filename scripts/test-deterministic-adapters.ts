@@ -365,6 +365,7 @@ contract KillableVault {
       sources: [{ path: "src/AdminController.java", sha256: "c".repeat(64), content: javaSource }],
     });
     assert.equal(joernRes.status, "completed", `Joern failed: ${joernRes.error}`);
+    console.log("Joern live results:", { symbols: joernRes.symbols.length, facts: joernRes.facts.map((f) => f.detail), edges: joernRes.edges.length });
     assert.ok(joernRes.symbols.length >= 1, "Joern must extract CPG methods");
     assert.ok(
       joernRes.facts.some((f) => f.kind === "taint_flow" || f.kind === "sink_command"),

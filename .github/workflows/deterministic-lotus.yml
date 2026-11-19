@@ -63,11 +63,16 @@ jobs:
         with:
           python-version: "3.10"
       - run: npm ci
-      - name: Install Mythril (MIT) in isolated virtualenv
+      - name: Install Mythril (MIT) + solc 0.8.19 in isolated virtualenv
         run: |
           python3 -m venv /tmp/mythril-venv
           /tmp/mythril-venv/bin/pip install --upgrade pip "setuptools<70" wheel
           /tmp/mythril-venv/bin/pip install mythril
+          mkdir -p "$HOME/.solcx"
+          curl -fsSL https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.19+commit.7dd6d404 -o "$HOME/.solcx/solc-v0.8.19"
+          chmod +x "$HOME/.solcx/solc-v0.8.19"
+          ln -sf "$HOME/.solcx/solc-v0.8.19" /tmp/mythril-venv/bin/solc
+          /tmp/mythril-venv/bin/solc --version
           /tmp/mythril-venv/bin/myth version
       - name: Install Joern CLI (Apache-2.0)
         run: |
