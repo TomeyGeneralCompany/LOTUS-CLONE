@@ -420,14 +420,66 @@ export function evaluateAnalysisLead(
   graph: ProgramFactsGraph,
   lead: LeadAnalysisInput,
 ): LeadAnalysisDecision {
-  const allHypotheses = generateHypotheses(graph);
-  const directMatches = allHypotheses.filter(
-    (h) => h.file === lead.path && (h.selector === lead.selector || h.selector.endsWith("." + lead.selector) || lead.selector.endsWith("." + h.selector)),
-  );
   const fileFacts = graph.byFile.get(lead.path)?.facts || [];
   const symbolFacts = fileFacts.filter(
-    (f) => !f.symbol || f.symbol === lead.selector || f.symbol.endsWith("." + lead.selector) || lead.selector.endsWith("." + f.symbol),
+    (f) =>
+      !f.symbol ||
+      f.symbol === lead.selector ||
+      f.symbol.endsWith("." + lead.selector) ||
+      lead.selector.endsWith("." + f.symbol),
   );
+
+  // 1. Z3 SMT UNSAT refutation takes precedence: if a guard on this lead is proved
+  //    unsatisfiable (unreachable), immediately defer the lead rather than wasting verification.
+  const unsatFacts = symbolFacts.filter((f) => f.kind === "smt_unsat_guard");
+  if (unsatFacts.length > 0) {
+    const primary = unsatFacts[0];
+    return {
+      action: "defer_lead",
+      leadId: lead.leadId,
+      path: lead.path,
+      query: lead.selector,
+      hypothesis: "Guard constraints proved unsatisfiable (unreachable) by Z3 SMT analysis",
+      answer: `Deterministic Z3 SMT analysis refuted reachability for ${lead.selector} at ${primary.file}:${primary.line}: ${primary.detail}`.slice(0, 680),
+      matchedHypotheses: [],
+    };
+  }
+
+  const allHypotheses = generateHypotheses(graph);
+  const directMatches = allHypotheses.filter(
+    (h) =>
+      h.file === lead.path &&
+      (h.selector === lead.selector ||
+        h.selector.endsWith("." + lead.selector) ||
+        lead.selector.endsWith("." + h.selector)),
+  );
+
+  // 2. Specialized analyzer findings (Joern taint_flow, Mythril symbolic_finding,
+  //    Foundry foundry_invariant_violated, isolated fast-check property_counterexample)
+  //    promote a lead directly to assess_lead for isolated verification.
+  const specializedFindings = symbolFacts.filter(
+    (f) =>
+      f.kind === "taint_flow" ||
+      f.kind === "symbolic_finding" ||
+      f.kind === "foundry_invariant_violated" ||
+      f.kind === "property_counterexample",
+  );
+  if (specializedFindings.length > 0) {
+    const primary = specializedFindings[0];
+    const witnessSummary = specializedFindings
+      .slice(0, 3)
+      .map((f) => `${f.file}:${f.line} [${f.adapter}:${f.kind}] ${f.detail}`)
+      .join("; ");
+    return {
+      action: "assess_lead",
+      leadId: lead.leadId,
+      path: lead.path,
+      query: lead.selector,
+      hypothesis: `Specialized ${primary.adapter} analysis identified ${primary.kind} in ${lead.selector} at ${primary.file}:${primary.line}; verify exploitability and security impact in isolated replay.`,
+      answer: `Specialized escalation (${primary.adapter}) returned actionable evidence for ${lead.selector}: ${witnessSummary}`.slice(0, 680),
+      matchedHypotheses: directMatches,
+    };
+  }
 
   if (directMatches.length > 0) {
     const top = directMatches[0];

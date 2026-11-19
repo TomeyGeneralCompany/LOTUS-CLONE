@@ -38,6 +38,19 @@ export {
 } from "./hypothesis-engine";
 
 export {
+  extractNumericGuardConstraints,
+  mergeFactsIntoGraph,
+  runClosedLoopLeadAnalysis,
+  type ClosedLoopLeadInput,
+  type ClosedLoopLeadResult,
+  type EscalationAdapterName,
+  type EscalationCache,
+  type EscalationCacheEntry,
+  type EscalationStepRecord,
+  type SpecializedEscalationHooks,
+} from "./specialized-escalation";
+
+export {
   resolveLocalModelAdapter,
   isDeterministicMode,
   driveDeterministicAuditTurn,
@@ -47,11 +60,15 @@ export {
   type DeterministicAuditTurnInput,
   type DeterministicObservedCase,
   type DeterministicOutcomeCounts,
+  type DeterministicReplayRecord,
+  type DeterministicReviewEvidence,
+  type DeterministicSecurityImpactEvidence,
   type DeterministicEvidenceReviewResult,
 } from "./analysis-review-driver";
 
 export {
   babelAstFactsAdapter,
+  isIsolatedJsSandboxAvailable,
   runFastCheckJsProbe,
   libCstFactsAdapter,
   isLibCstAvailable,
@@ -75,6 +92,9 @@ export {
   type FastCheckProbeRequest,
   type FastCheckProbeResult,
   type FastCheckSecurityProperty,
+  type IsolatedJsBatchEvaluator,
+  type IsolatedJsBatchObservation,
+  type IsolatedJsBatchResponse,
   type Z3FeasibilityQuery,
   type Z3FeasibilityResult,
   type FoundryProbeRequest,

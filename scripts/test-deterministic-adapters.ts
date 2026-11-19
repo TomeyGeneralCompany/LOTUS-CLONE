@@ -3,15 +3,19 @@
  * legacy claude-runner deterministic paths (zero Qwen/Ollama/Claude calls).
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   babelAstFactsAdapter,
   buildProgramFactsGraph,
   checkGuardFeasibilityFact,
   createHostFactsAdapters,
   detectAvailableAdapters,
+  driveDeterministicAuditTurn,
   EXTERNAL_ADAPTER_CATALOG,
   generateHypotheses,
   isFoundryAvailable,
+  isIsolatedJsSandboxAvailable,
   isJavaParserAvailable,
   isJoernAvailable,
   isLibCstAvailable,
@@ -23,12 +27,17 @@ import {
   parseForgeJsonOutput,
   parseJoernCpgJson,
   parseMythrilJsonOutput,
+  runClosedLoopLeadAnalysis,
   runFastCheckJsProbe,
   runFoundrySolidityTest,
   runJoernCpgAnalysis,
   runMythrilSymbolicAnalysis,
   solveConstraintsWithZ3,
   treeSitterFactsAdapter,
+  type ClosedLoopLeadResult,
+  type DeterministicReviewEvidence,
+  type EscalationCache,
+  type IsolatedJsBatchEvaluator,
 } from "../packages/security-solver/src/deterministic";
 import {
   deverbosifyReport,
@@ -81,47 +90,115 @@ export function runOpenExec(cmd: string) {
   assert.ok(babelRes.edges.some((e) => e.kind === "calls" && e.to === "execSync"));
   executedLive.push("babel-parser");
 
-  // 2. fast-check (MIT) — ALWAYS LIVE
-  const fcUnsafe = runFastCheckJsProbe({
-    file: "src/profile.js",
-    symbol: "renderBio",
-    sourceCode: `export function renderBio(bio) { return "<p>" + bio + "</p>"; }`,
-    property: "no_raw_html_reflection",
-    numRuns: 50,
-  });
-  assert.equal(fcUnsafe.status, "counterexample_found", "fast-check must find XSS counterexample");
-  assert.ok(fcUnsafe.fact && fcUnsafe.fact.kind === "property_counterexample");
+  // 2. fast-check (MIT) — STRICT bubblewrap isolation (ZERO node:vm!)
+  const fastCheckSource = readFileSync(
+    resolve(process.cwd(), "packages/security-solver/src/deterministic/adapters/fastcheck-adapter.ts"),
+    "utf8",
+  );
+  assert.ok(!/import\s+.*["']node:vm["']/.test(fastCheckSource), "fastcheck-adapter MUST NOT import node:vm");
+  assert.ok(!/createContext\s*\(/.test(fastCheckSource), "fastcheck-adapter MUST NOT call vm.createContext");
 
-  const fcSafe = runFastCheckJsProbe({
-    file: "src/safe-profile.js",
-    symbol: "renderBio",
-    sourceCode: `export function renderBio(bio) { return "<p>" + String(bio).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</p>"; }`,
-    property: "no_raw_html_reflection",
-    numRuns: 50,
-  });
-  assert.equal(fcSafe.status, "property_held", "fast-check must pass escaped renderer");
-
-  const fcProto = runFastCheckJsProbe({
-    file: "src/merge.js",
-    symbol: "unsafeMerge",
-    sourceCode: `
-      export function unsafeMerge(dst, src) {
-        for (const k in src) {
-          if (src[k] && typeof src[k] === "object") {
-            if (!dst[k]) dst[k] = {};
-            unsafeMerge(dst[k], src[k]);
-          } else {
-            dst[k] = src[k];
-          }
+  const unsafeBioCode = `export function renderBio(bio) { return "<p>" + bio + "</p>"; }`;
+  const safeBioCode = `export function renderBio(bio) { return "<p>" + String(bio).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</p>"; }`;
+  const unsafeMergeCode = `
+    export function unsafeMerge(dst, src) {
+      for (const k in src) {
+        if (src[k] && typeof src[k] === "object") {
+          if (!dst[k]) dst[k] = {};
+          unsafeMerge(dst[k], src[k]);
+        } else {
+          dst[k] = src[k];
         }
-        return dst;
       }
-    `,
-    property: "no_prototype_pollution",
-    numRuns: 40,
-  });
-  assert.equal(fcProto.status, "counterexample_found", "fast-check must detect prototype pollution");
-  executedLive.push("fast-check");
+      return dst;
+    }
+  `;
+
+  let fcUnsafe;
+  if (isIsolatedJsSandboxAvailable()) {
+    // Live bubblewrap execution via scripts/source-reproduction.py
+    fcUnsafe = runFastCheckJsProbe({
+      file: "src/profile.js",
+      symbol: "renderBio",
+      sourceCode: unsafeBioCode,
+      property: "no_raw_html_reflection",
+      numRuns: 24,
+    });
+    assert.equal(fcUnsafe.status, "counterexample_found", `bwrap fast-check must find XSS counterexample: ${fcUnsafe.detail}`);
+    assert.equal(fcUnsafe.isolation, "bwrap_source_reproduction");
+    assert.ok(fcUnsafe.fact && fcUnsafe.fact.kind === "property_counterexample");
+
+    const fcSafe = runFastCheckJsProbe({
+      file: "src/safe-profile.js",
+      symbol: "renderBio",
+      sourceCode: safeBioCode,
+      property: "no_raw_html_reflection",
+      numRuns: 24,
+    });
+    assert.equal(fcSafe.status, "property_held", `bwrap fast-check must pass escaped renderer: ${fcSafe.detail}`);
+    assert.equal(fcSafe.isolation, "bwrap_source_reproduction");
+
+    const fcProto = runFastCheckJsProbe({
+      file: "src/merge.js",
+      symbol: "unsafeMerge",
+      sourceCode: unsafeMergeCode,
+      property: "no_prototype_pollution",
+      numRuns: 20,
+    });
+    assert.equal(fcProto.status, "counterexample_found", `bwrap fast-check must detect prototype pollution: ${fcProto.detail}`);
+    assert.equal(fcProto.isolation, "bwrap_source_reproduction");
+    executedLive.push("fast-check(bwrap)");
+  } else {
+    if (requireCore) {
+      throw new Error("REQUIRE_ALL_CORE_ADAPTERS=1 but bubblewrap (bwrap) isolated JS sandbox is unavailable");
+    }
+    // Fail-closed verification when bwrap is absent on local container
+    const blocked = runFastCheckJsProbe({
+      file: "src/profile.js",
+      symbol: "renderBio",
+      sourceCode: unsafeBioCode,
+      property: "no_raw_html_reflection",
+      numRuns: 16,
+    });
+    assert.equal(blocked.status, "blocked_no_sandbox", "fast-check MUST fail closed when bwrap is absent");
+
+    // Verify fast-check generation + shrinking through explicit isolated evaluator hook
+    const mockIsolatedEval: IsolatedJsBatchEvaluator = ({ property, inputs, sourceCode }) => ({
+      status: "completed",
+      isolation: "test_isolated_harness",
+      results: inputs.map((inp) => {
+        if (property === "no_raw_html_reflection") {
+          const escaped = sourceCode.includes("&lt;")
+            ? inp.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+            : inp;
+          return { input: inp, ok: true, output: `<p>${escaped}</p>` };
+        }
+        return { input: inp, ok: true, output: "{}", protoPolluted: inp.includes("__proto__") };
+      }),
+    });
+
+    fcUnsafe = runFastCheckJsProbe({
+      file: "src/profile.js",
+      symbol: "renderBio",
+      sourceCode: unsafeBioCode,
+      property: "no_raw_html_reflection",
+      numRuns: 24,
+      isolatedEvaluator: mockIsolatedEval,
+    });
+    assert.equal(fcUnsafe.status, "counterexample_found");
+    assert.ok(fcUnsafe.fact && fcUnsafe.fact.kind === "property_counterexample");
+
+    const fcSafe = runFastCheckJsProbe({
+      file: "src/safe-profile.js",
+      symbol: "renderBio",
+      sourceCode: safeBioCode,
+      property: "no_raw_html_reflection",
+      numRuns: 24,
+      isolatedEvaluator: mockIsolatedEval,
+    });
+    assert.equal(fcSafe.status, "property_held");
+    executedLive.push("fast-check(fail-closed+isolated-hook)");
+  }
 
   // 3. LibCST (MIT) — LIVE when Python libcst is installed
   const pySource = `
@@ -394,7 +471,186 @@ contract KillableVault {
   assert.ok(hyps.some((h) => h.recommendedAdapters.includes("mythril")));
   assert.ok(hyps.some((h) => h.recommendedAdapters.includes("joern")));
 
-  // 11. Legacy claude-runner deterministic paths (zero Claude/Ollama calls!)
+  // 10b. Closed-loop analytical escalation: driver requests specialized analyzers,
+  //      merges returned facts into ProgramFactsGraph, and RECONSIDERS the lead!
+  const impossibleGuardSol = `// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+contract ContradictoryVault {
+    address public operator;
+    function rotateOperator(uint256 amount, address payable next) external {
+        require(amount > 100);
+        require(amount < 50);
+        operator = next;
+        next.transfer(amount);
+    }
+}
+`;
+  const z3EscCache: EscalationCache = new Map();
+  let z3EscTrace: ClosedLoopLeadResult | null = null;
+  const z3Action = driveDeterministicAuditTurn({
+    stage: "ANALYZE",
+    analyzeModelPending: true,
+    activeLead: {
+      leadId: "lead-z3-unsat",
+      path: "contracts/ContradictoryVault.sol",
+      selector: "ContradictoryVault.rotateOperator",
+      sourceEvidence: "contracts/ContradictoryVault.sol:5",
+    },
+    sources: [
+      {
+        path: "contracts/ContradictoryVault.sol",
+        sha256: "f".repeat(64),
+        content: impossibleGuardSol,
+      },
+    ],
+    constraints: { action: ["assess_lead", "defer_lead"] },
+    escalationCache: z3EscCache,
+    // Use real host Z3 when installed; deterministic fallback only if Z3 absent locally
+    escalationHooks: isZ3Available()
+      ? undefined
+      : {
+          runZ3: ({ file, line, language, symbol, constraints }) => ({
+            id: "hook-z3-unsat",
+            kind: "smt_unsat_guard",
+            language,
+            file,
+            line,
+            symbol,
+            severity: "info",
+            adapter: "z3",
+            detail: `Z3 proved guard constraints UNSAT: ${constraints.join(" && ")}`,
+          }),
+        },
+    onEscalation: (r) => {
+      z3EscTrace = r;
+    },
+  });
+  assert.ok(z3EscTrace, "Closed-loop escalation trace must be recorded");
+  assert.equal((z3EscTrace as ClosedLoopLeadResult).initialDecision.action, "assess_lead", "Initial heuristic should propose assess_lead");
+  assert.equal((z3EscTrace as ClosedLoopLeadResult).finalDecision.action, "defer_lead", "Z3 UNSAT must flip decision to defer_lead");
+  assert.equal((z3EscTrace as ClosedLoopLeadResult).reconsidered, true, "Driver must mark lead as reconsidered");
+  assert.equal(z3Action.action, "defer_lead");
+  assert.ok((z3EscTrace as ClosedLoopLeadResult).escalatedAdapters.includes("z3"));
+
+  // Second turn on identical lead must hit EscalationCache
+  let z3CachedTrace: ClosedLoopLeadResult | null = null;
+  driveDeterministicAuditTurn({
+    stage: "ANALYZE",
+    analyzeModelPending: true,
+    activeLead: {
+      leadId: "lead-z3-unsat",
+      path: "contracts/ContradictoryVault.sol",
+      selector: "ContradictoryVault.rotateOperator",
+      sourceEvidence: "contracts/ContradictoryVault.sol:5",
+    },
+    sources: [
+      {
+        path: "contracts/ContradictoryVault.sol",
+        sha256: "f".repeat(64),
+        content: impossibleGuardSol,
+      },
+    ],
+    constraints: { action: ["assess_lead", "defer_lead"] },
+    escalationCache: z3EscCache,
+    onEscalation: (r) => {
+      z3CachedTrace = r;
+    },
+  });
+  assert.equal((z3CachedTrace as ClosedLoopLeadResult | null)?.fromCache, true, "Second turn must reuse cached escalation facts");
+
+  // Positive escalation: initially deferred lead promoted to assess_lead after Joern taint_flow
+  const subtleJava = `public class Helper {
+    public String format(String x) {
+        return x.trim();
+    }
+}
+`;
+  const subtleGraph = buildProgramFactsGraph({
+    sources: [{ path: "src/Helper.java", sha256: "9".repeat(64), content: subtleJava }],
+  });
+  const promoted = runClosedLoopLeadAnalysis({
+    graph: subtleGraph,
+    lead: {
+      leadId: "lead-joern-promote",
+      path: "src/Helper.java",
+      selector: "Helper.format",
+      sourceEvidence: "src/Helper.java:2",
+    },
+    sources: [{ path: "src/Helper.java", sha256: "9".repeat(64), content: subtleJava }],
+    hooks: {
+      runJoern: () => ({
+        status: "completed",
+        facts: [
+          {
+            id: "joern-taint-promoted",
+            kind: "taint_flow",
+            language: "java",
+            file: "src/Helper.java",
+            line: 3,
+            symbol: "Helper.format",
+            severity: "critical",
+            adapter: "joern",
+            detail: "Joern CPG interprocedural taint flow from HTTP header to downstream command sink",
+          },
+        ],
+        edges: [
+          {
+            from: "src/Helper.java:2:x",
+            to: "src/Helper.java:3:return",
+            kind: "dataflow",
+            file: "src/Helper.java",
+            line: 3,
+          },
+        ],
+      }),
+    },
+  });
+  assert.equal(promoted.initialDecision.action, "defer_lead", "Subtle helper starts deferred");
+  assert.equal(promoted.finalDecision.action, "assess_lead", "Joern taint_flow must promote deferred lead to assess_lead");
+  assert.equal(promoted.reconsidered, true);
+  assert.ok(promoted.addedEdges.some((e) => e.kind === "dataflow"));
+  executedLive.push("closed-loop-escalation");
+
+  // 11. Legacy claude-runner deterministic paths (zero Claude/Ollama calls, fail-closed without typed evidence!)
+  const reviewUnverified = await spawnComprehensiveReview(
+    {
+      id: "find-unverified",
+      title: "Unescaped HTML reflection in renderBio",
+      severity: "high",
+      vulnerabilityType: "XSS",
+      targetAsset: "src/profile.js",
+      description: "Free-form prose claiming behavior_observed: true without typed controller grounds",
+      analysisNotes: "{}",
+      reportBody: "Call renderBio('<script>alert(1)</script>')",
+    } as any,
+    { id: "prog-1", name: "Demo App" } as any,
+    { workspacePath: "/tmp", clonedRepos: [], previousFindings: [] } as any,
+  );
+  const parsedUnverified = JSON.parse(reviewUnverified.output);
+  assert.equal(parsedUnverified.mode, "deterministic");
+  assert.equal(parsedUnverified.verdict, "reject", "Unverified prose MUST fail closed");
+  assert.equal(parsedUnverified.recommendation, "dont_submit");
+
+  const typedEvidenceForLegacy: DeterministicReviewEvidence = {
+    grounds: {
+      sourceDigest: "a".repeat(64),
+      language: "javascript",
+      verifiedLocalEntryInjection: true,
+      independentlyReplayed: true,
+      replayedProbeKind: "html_reflection",
+      sourceBackedNonadminRoleMutation: false,
+      immutableFacts: ["src/profile.js:2: return '<p>' + bio + '</p>';"],
+      unresolvedQuestions: [],
+      sourceBackedTextOnlyResponse: [],
+      sourceBackedEscaping: [],
+    },
+    replay: { status: "behavior_observed", kind: "html_reflection", behavior_observed: true },
+    securityImpact: {
+      verified: true,
+      category: "local_html_injection",
+      evidence: "src/profile.js:2: unescaped attacker markup in constructed HTML fragment",
+    },
+  };
   const reviewOut = await spawnComprehensiveReview(
     {
       id: "find-1",
@@ -402,13 +658,8 @@ contract KillableVault {
       severity: "high",
       vulnerabilityType: "XSS",
       targetAsset: "src/profile.js",
-      description: JSON.stringify({
-        independentlyReplayed: true,
-        verifiedLocalEntryInjection: true,
-        replayedProbeKind: "html_reflection",
-        sourceBackedEscaping: [],
-      }),
-      analysisNotes: "{}",
+      description: "Controller-verified finding",
+      analysisNotes: JSON.stringify({ verifiedEvidence: typedEvidenceForLegacy }),
       reportBody: "Call renderBio('<script>alert(1)</script>')",
     } as any,
     { id: "prog-1", name: "Demo App" } as any,
@@ -416,6 +667,7 @@ contract KillableVault {
   );
   const parsedRev = JSON.parse(reviewOut.output);
   assert.equal(parsedRev.mode, "deterministic");
+  assert.equal(parsedRev.verdict, "approve");
   assert.equal(parsedRev.recommendation, "dont_submit");
 
   const cleaned = await deverbosifyReport(

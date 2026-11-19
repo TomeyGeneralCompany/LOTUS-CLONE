@@ -2,7 +2,7 @@ import type { StaticLeadFocus } from "./local-program-flow";
 import { activeLocalJobCount, requestLocalJobCancellation } from "./local-job";
 import { spawn } from "node:child_process";
 import { activeLocalAuditCount, abortLocalAudits } from "./local-ollama-runner";
-import { isDeterministicMode, evaluateDeterministicEvidenceReview } from "./deterministic";
+import { isDeterministicMode, evaluateDeterministicEvidenceReview, type DeterministicReviewEvidence } from "./deterministic";
 import { authorizedSourceUrls, cloneAuthorizedSource } from "./authorized-source";
 import { writeFile, mkdir, appendFile, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -1868,19 +1868,16 @@ export async function spawnComprehensiveReview(
   context: ReviewContext,
 ): Promise<{ output: string }> {
   if (isDeterministicMode()) {
-    const verdict = evaluateDeterministicEvidenceReview(
-      JSON.stringify({
-        findingId: finding.id,
-        title: finding.title,
-        severity: finding.severity,
-        vulnerabilityType: finding.vulnerabilityType,
-        targetAsset: finding.targetAsset,
-        description: finding.description,
-        analysisNotes: finding.analysisNotes,
-        reportBody: finding.reportBody,
-        programName: program.name,
-      }),
-    );
+    let typedEvidence: DeterministicReviewEvidence | null = null;
+    try {
+      const parsedNotes = JSON.parse(finding.analysisNotes || "{}") as Record<string, unknown>;
+      if (parsedNotes && typeof parsedNotes.verifiedEvidence === "object" && parsedNotes.verifiedEvidence !== null) {
+        typedEvidence = parsedNotes.verifiedEvidence as DeterministicReviewEvidence;
+      }
+    } catch {
+      typedEvidence = null;
+    }
+    const verdict = evaluateDeterministicEvidenceReview(typedEvidence);
     return {
       output: JSON.stringify({
         verdict: verdict.verdict,

@@ -409,7 +409,7 @@ def run_probe(repository: Path, specification: dict, _dependency_round: int = 0)
     target=(repository/file).resolve(strict=True)
     if not target.is_relative_to(repository) or not target.is_file() or target.stat().st_size>256000: raise ValueError('Source outside repository or too large')
     if not isinstance(function,str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}(?:\.[A-Za-z][A-Za-z0-9_]{0,79})?',function): raise ValueError('Public top-level function name required')
-    if kind not in ('html_reflection','entry_html_reflection','path_construction','solidity_sequence','java_sequence','python_sequence','javascript_sequence'): raise ValueError('Unsupported probe kind')
+    if kind not in ('html_reflection','entry_html_reflection','path_construction','solidity_sequence','java_sequence','python_sequence','javascript_sequence','javascript_property_batch'): raise ValueError('Unsupported probe kind')
     if not isinstance(nonce,str) or not re.fullmatch(r'[a-f0-9]{32}',nonce): raise ValueError('Invalid probe nonce')
     language = 'python' if file.endswith('.py') else 'solidity' if file.endswith('.sol') else 'java' if file.endswith('.java') else 'javascript'
     if kind == 'entry_html_reflection' and (language not in ('python','javascript','java') or
@@ -429,6 +429,15 @@ def run_probe(repository: Path, specification: dict, _dependency_round: int = 0)
         if not isinstance(steps,list) or not 1 <= len(steps) <= 12 or not any(
             isinstance(step,dict) and step.get('method') == function.split('.')[1] for step in steps):
             raise ValueError('Java sequence must invoke selected method')
+    elif kind == 'javascript_property_batch':
+        if language != 'javascript' or '.' in function:
+            raise ValueError('JavaScript top-level function required for property batch')
+        prop = specification.get('property')
+        if prop not in ('no_raw_html_reflection','no_path_traversal','no_prototype_pollution','no_unhandled_exception'):
+            raise ValueError('Unsupported property batch mode')
+        inputs = specification.get('inputs')
+        if not isinstance(inputs, list) or not (1 <= len(inputs) <= 64) or any(not isinstance(x, str) or len(x) > 2048 for x in inputs):
+            raise ValueError('Invalid property batch inputs')
     elif kind in ('python_sequence','javascript_sequence'):
         if language != kind.split('_')[0] or '.' in function:
             raise ValueError('Polyglot sequence source language mismatch')
@@ -646,6 +655,13 @@ def run_probe(repository: Path, specification: dict, _dependency_round: int = 0)
                     'classification':classification,
                     'source_sha256':source_hash,'kind':kind,'observations':data,
                     'limitation':limitation}
+        if kind == 'javascript_property_batch':
+            results = data.get('results')
+            if not isinstance(results, list):
+                raise ValueError('Invalid property batch observations')
+            return {'status':'observation_only','behavior_observed':False,
+                    'source_sha256':source_hash,'kind':kind,'observations':data,
+                    'limitation':'Isolated JavaScript property batch executed inside bubblewrap. Counterexamples are observations and require independent security review.'}
         if kind in ('python_sequence','javascript_sequence'):
             steps=data.get('steps')
             if not isinstance(steps,list) or len(steps)<2 or not all(

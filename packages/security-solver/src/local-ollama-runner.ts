@@ -23,7 +23,7 @@ import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequi
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { postOllamaChat } from "../../core/src/ollama-chat";
-import { driveDeterministicAuditTurn, resolveLocalModelAdapter } from "./deterministic";
+import { driveDeterministicAuditTurn, resolveLocalModelAdapter, type ClosedLoopLeadResult, type EscalationCache } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { readFile, realpath, appendFile, writeFile, rename, mkdtemp } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
@@ -279,6 +279,7 @@ export async function runLocalAudit(
   const analyzeApprovedIds=new Set<string>();
   type AnalysisPacket={id:string;path:string;selector:string;sourceEvidence:string;sourceSha256:string;sourceCommit:string;sourceExcerpt:string;excerptStart:number;truncated:boolean};
   const analysisPackets=new Map<string,AnalysisPacket>();
+  const deterministicEscalationCache:EscalationCache=new Map();
   const nextAnalysisPacket=()=>stageLock?.analysisLeads.find(x=>x.state.kind==='pending');
   // Current controller instruction is reconstructed from stage-owned state for
   // every inference, not carried as disposable conversational history.
@@ -1815,6 +1816,7 @@ export async function runLocalAudit(
           const recoveredFinalJson=(stageLock?.currentStage==='REVIEW' || stageLock?.currentStage==='REPORT' ||
             (constraints?.action?.length===1 && constraints.action[0]==='final')) && limits.recoverFinal
             ? await limits.recoverFinal() : null;
+          let lastEscalation:ClosedLoopLeadResult|null=null;
           const detAction=driveDeterministicAuditTurn({
             stage:stageLock?.currentStage,
             analyzeModelPending,
@@ -1835,7 +1837,19 @@ export async function runLocalAudit(
             outcomes:stageLock?.outcomeCounts,
             observedCases,
             recoveredFinalJson,
+            escalationCache:deterministicEscalationCache,
+            repositoryDir:cwd,
+            onEscalation:(res)=>{lastEscalation=res;},
           });
+          if(lastEscalation && ((lastEscalation as ClosedLoopLeadResult).escalatedAdapters.length>0 || (lastEscalation as ClosedLoopLeadResult).reconsidered)) {
+            const esc=lastEscalation as ClosedLoopLeadResult;
+            await appendFile(logFile,'[DETERMINISTIC_ESCALATION] '+JSON.stringify({
+              turn:turn+1,leadId:detAction.leadId,path:detAction.path,query:detAction.query,
+              initialAction:esc.initialDecision.action,finalAction:esc.finalDecision.action,
+              reconsidered:esc.reconsidered,adapters:esc.escalatedAdapters,
+              factsAdded:esc.addedFacts.length,edgesAdded:esc.addedEdges.length,
+              fromCache:esc.fromCache})+'\n');
+          }
           await appendFile(logFile,'[DETERMINISTIC_DRIVER_ACTION] '+JSON.stringify({
             turn:turn+1,stage:stageLock?.currentStage||'default',action:detAction.action,
             path:detAction.path,query:detAction.query,leadId:detAction.leadId})+'\n');

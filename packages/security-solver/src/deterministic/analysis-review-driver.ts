@@ -2,14 +2,27 @@
  * Deterministic Analysis & Review Driver.
  *
  * Replaces Ollama/Qwen across ANALYZE, REVIEW/REPORT, and evidence-only review
- * using the Program-Facts IR, Hypothesis Engine, and controller execution ledger.
+ * using the Program-Facts IR, Hypothesis Engine, closed-loop specialized
+ * analytical escalation (Z3, Joern, Mythril, Foundry, isolated fast-check),
+ * and typed controller-verified evidence records.
  * Zero LLM calls are made when LOCAL_MODEL_ADAPTER=deterministic (the default in
  * LOTUS-CLONE when AUTOHACK_OLLAMA_URL is not explicitly configured).
  */
-import { createHash } from "node:crypto";
 import type { SourceSnapshot, StaticLeadHint } from "../controller-solidity-experiment-planner";
-import { buildProgramFactsGraph, createHostFactsAdapters } from "./program-facts";
-import { evaluateAnalysisLead, type LeadAnalysisInput } from "./hypothesis-engine";
+import {
+  controllerVerifiedLocalHtmlReview,
+  type ControllerReviewGrounds,
+} from "../controller-review-boundary";
+import type { EntryReviewObservation } from "../entry-review-evidence";
+import type { ReviewEvidence } from "../review-evidence-chain";
+import { buildProgramFactsGraph, type ProgramFact } from "./program-facts";
+import type { LeadAnalysisInput } from "./hypothesis-engine";
+import {
+  runClosedLoopLeadAnalysis,
+  type ClosedLoopLeadResult,
+  type EscalationCache,
+  type SpecializedEscalationHooks,
+} from "./specialized-escalation";
 
 export type LocalModelAdapter = "deterministic" | "ollama" | "qwen-agent";
 
@@ -68,6 +81,18 @@ export interface DeterministicAuditTurnInput {
   outcomes?: DeterministicOutcomeCounts;
   observedCases?: readonly DeterministicObservedCase[];
   recoveredFinalJson?: string | null;
+  /** Optional cache shared across turns of the same audit to avoid repeating escalations. */
+  escalationCache?: EscalationCache;
+  /** Optional specialized analyzer hooks (defaults to host Z3/Joern/Mythril/Foundry/bwrap fast-check). */
+  escalationHooks?: SpecializedEscalationHooks;
+  /** Enable closed-loop analytical escalation during ANALYZE (default: true unless LOTUS_DISABLE_ESCALATION=1). */
+  enableSpecializedEscalation?: boolean;
+  /** Maximum specialized adapters invoked per lead (default: 3). */
+  maxEscalations?: number;
+  /** Optional repository root for isolated bubblewrap probes. */
+  repositoryDir?: string;
+  /** Optional observer called with closed-loop escalation telemetry (kept off the wire action JSON). */
+  onEscalation?: (result: ClosedLoopLeadResult) => void;
 }
 
 export interface DeterministicAuditAction {
@@ -161,14 +186,26 @@ export function driveDeterministicAuditTurn(
       (Array.isArray(input.requestSchema?.required) && input.requestSchema.required.includes("result")),
   );
 
-  // 1. ANALYZE stage: deterministically evaluate active pending lead using ProgramFactsGraph + HypothesisEngine
+  // 1. ANALYZE stage: closed-loop deterministic evaluation (ProgramFactsGraph ->
+  //    initial hypothesis -> specialized analytical escalation -> fact merge -> reconsider).
   if (input.stage === "ANALYZE" && input.analyzeModelPending) {
     if (input.activeLead && (can("assess_lead") || can("defer_lead"))) {
       const graph = buildProgramFactsGraph({
         sources: input.sources,
         staticLeads: input.staticLeads,
       });
-      const decision = evaluateAnalysisLead(graph, input.activeLead);
+      const closedLoop = runClosedLoopLeadAnalysis({
+        graph,
+        lead: input.activeLead,
+        sources: input.sources,
+        cache: input.escalationCache,
+        hooks: input.escalationHooks,
+        enableSpecializedEscalation: input.enableSpecializedEscalation,
+        maxEscalations: input.maxEscalations,
+        repositoryDir: input.repositoryDir,
+      });
+      input.onEscalation?.(closedLoop);
+      const decision = closedLoop.finalDecision;
       const chosenAction = can(decision.action)
         ? decision.action
         : can("assess_lead")
@@ -247,6 +284,52 @@ export function driveDeterministicAuditTurn(
   return { action: "final", path: "", query: "", answer: JSON.stringify(fallbackPayload) };
 }
 
+export interface DeterministicReplayRecord {
+  status?: string;
+  kind?: string;
+  behavior_observed?: boolean;
+  observations?: Record<string, unknown> | null;
+}
+
+export interface DeterministicSecurityImpactEvidence {
+  /** Must be explicitly true to confirm security impact beyond a raw local replay marker. */
+  verified: boolean;
+  /** Concrete impact class (e.g. "local_html_injection", "solidity_role_consumer_impact", "path_escape"). */
+  category: string;
+  /** Exact source file:line or verified replay observation establishing the security impact. */
+  evidence: string;
+  /** Optional proof that a privileged downstream consumer or security boundary was violated. */
+  downstreamConsumerVerified?: boolean;
+}
+
+export interface DeterministicReviewEvidence {
+  /** Controller-constructed immutable factual grounds (never parsed from prompt prose). */
+  grounds: ControllerReviewGrounds;
+  /** Independently replayed sandbox record from the controller. */
+  replay?: DeterministicReplayRecord | null;
+  /** Independently replayed controller entry handler record (for HTTP/HTML entry verification). */
+  entryReplay?: EntryReviewObservation | null;
+  /** Optional source-backed call/dataflow chain constructed by the controller. */
+  chainEvidence?: ReviewEvidence | null;
+  /** Optional target metadata. */
+  target?: {
+    caseId?: string;
+    file?: string;
+    selector?: string;
+    kind?: string;
+    reachability?: string;
+    callerFile?: string;
+    callerLine?: number;
+  };
+  /**
+   * Typed security-impact proof separate from raw replay observation.
+   * A positive replay marker alone NEVER establishes a security vulnerability.
+   */
+  securityImpact?: DeterministicSecurityImpactEvidence | null;
+  /** Optional specialized analyzer facts (Z3 UNSAT refutation, Joern taint, Mythril, Foundry). */
+  analyzerFacts?: readonly ProgramFact[];
+}
+
 export interface DeterministicEvidenceReviewResult {
   verdict: "approve" | "reject";
   recommendation: "submit" | "submit_cautiously" | "dont_submit";
@@ -265,136 +348,233 @@ export interface DeterministicEvidenceReviewResult {
   reasoning: string;
 }
 
-function extractJsonField(prompt: string, key: string): unknown {
-  const re = new RegExp(`"${key}"\\s*:\\s*(true|false|\\[[^\\]]*\\]|"[^"]*")`);
-  const m = re.exec(prompt);
-  if (!m) return undefined;
-  try {
-    return JSON.parse(m[1]);
-  } catch {
-    return undefined;
+function resolveTypedCitation(evidence: DeterministicReviewEvidence): string {
+  if (evidence.target?.callerFile && evidence.target?.callerLine) {
+    return `${evidence.target.callerFile}:${evidence.target.callerLine}`;
   }
+  const firstLink = evidence.chainEvidence?.links?.[0];
+  if (firstLink?.file && firstLink?.line) {
+    return `${firstLink.file}:${firstLink.line}`;
+  }
+  if (evidence.grounds.sourceBackedEscaping[0]) {
+    return evidence.grounds.sourceBackedEscaping[0];
+  }
+  if (evidence.grounds.sourceBackedTextOnlyResponse[0]) {
+    return evidence.grounds.sourceBackedTextOnlyResponse[0];
+  }
+  if (evidence.target?.file) {
+    return evidence.target.selector
+      ? `${evidence.target.file} (${evidence.target.selector})`
+      : evidence.target.file;
+  }
+  return "controller-verified evidence";
 }
 
-/**
- * Deterministic replacement for postOllamaChat in evidence-only-review.ts.
- * Evaluates the controller-prepared immutable evidence packet directly against
- * technical replay, differential control/attack checks, and mitigation facts.
- */
-export function evaluateDeterministicEvidenceReview(prompt: string): DeterministicEvidenceReviewResult {
-  const verifiedLocalEntry = extractJsonField(prompt, "verifiedLocalEntryInjection") === true;
-  const independentlyReplayed =
-    extractJsonField(prompt, "independentlyReplayed") === true ||
-    /"status"\s*:\s*"behavior_observed"/i.test(prompt) ||
-    /"behavior_observed"\s*:\s*true/i.test(prompt);
-  const notObserved =
-    /"status"\s*:\s*"behavior_not_observed"/i.test(prompt) ||
-    /"behavior_observed"\s*:\s*false/i.test(prompt);
-
-  const escapingArr = extractJsonField(prompt, "sourceBackedEscaping");
-  const hasSourceEscaping = Array.isArray(escapingArr) && escapingArr.length > 0;
-  const textOnlyArr = extractJsonField(prompt, "sourceBackedTextOnlyResponse");
-  const hasTextOnly = Array.isArray(textOnlyArr) && textOnlyArr.length > 0;
-
-  const isSolidity = /"replayedProbeKind"\s*:\s*"solidity_sequence"|"kind"\s*:\s*"solidity_sequence"/i.test(prompt);
-  const isPath = /"replayedProbeKind"\s*:\s*"path_construction"|"kind"\s*:\s*"path_construction"/i.test(prompt);
-  const isHtml = /"replayedProbeKind"\s*:\s*"html_reflection"|"kind"\s*:\s*"html_reflection"/i.test(prompt);
-
-  const digestMatch = /"sourceDigest"\s*:\s*"([a-f0-9]{16,64})"/i.exec(prompt);
-  const digestNote = digestMatch ? ` (digest ${digestMatch[1].slice(0, 16)})` : "";
-
-  const citationMatch = /([A-Za-z0-9_./-]+\.(?:sol|js|mjs|cjs|ts|py|java):\d+)/.exec(prompt);
-  const citation = citationMatch ? citationMatch[1] : "recorded controller evidence";
-
-  // Reject if a source-backed mitigation blocks the behavior or replay did not observe it
-  if (hasSourceEscaping || hasTextOnly || (!independentlyReplayed && notObserved)) {
-    const technicalReason = hasSourceEscaping
-      ? `Source-backed escaping/sanitization present in controller facts at ${citation}; unescaped injection is mitigated.`
-      : hasTextOnly
-        ? `Source-backed text/plain response declaration present at ${citation}; raw HTML execution is mitigated.`
-        : `Independent controller replay did not observe the claimed vulnerable behavior at ${citation}; technical evidence is insufficient.`;
-    return {
-      verdict: "reject",
-      recommendation: "dont_submit",
-      severity: "informational",
-      confidence: 0.8,
-      ratingReason: `Deterministic evidence review rejected the candidate${digestNote}: ${technicalReason}`,
-      bet100: false,
-      rubric: {
-        exploitability: 0,
-        impactSeverity: 0,
-        evidenceQuality: 2,
-        novelty: 0,
-        scopeAlignment: 1,
-      },
-      issues: [
-        {
-          category: hasSourceEscaping || hasTextOnly ? "mitigation_present" : "unreproduced_behavior",
-          severity: "fatal",
-          description: technicalReason,
-        },
-      ],
-      reasoning: `Deterministic controller evidence check${digestNote} evaluated immutable replay records and source-backed mitigations at ${citation}. ${technicalReason}`,
-    };
-  }
-
-  // Approve technically verified local replay, conservatively keeping recommendation = dont_submit
-  if (independentlyReplayed || verifiedLocalEntry) {
-    const behaviorType = isSolidity
-      ? "isolated EVM Solidity sequence violation"
-      : isPath
-        ? "unconfined path construction"
-        : isHtml
-          ? "unescaped HTML reflection"
-          : "replayed local security behavior";
-    return {
-      verdict: "approve",
-      recommendation: "dont_submit",
-      severity: "low",
-      confidence: isSolidity ? 0.78 : 0.72,
-      ratingReason: `Deterministic evidence review verified the independently replayed ${behaviorType}${digestNote} cited at ${citation}; external deployment exploitability remains unverified so submission is held.`,
-      bet100: false,
-      rubric: {
-        exploitability: isSolidity ? 2 : 1,
-        impactSeverity: 1,
-        evidenceQuality: 3,
-        novelty: 0,
-        scopeAlignment: 2,
-      },
-      issues: [
-        {
-          category: "evidence_limit",
-          severity: "warning",
-          description: `Local source-level ${behaviorType} is verified at ${citation}, but live deployment configuration, external reachability, and end-to-end exploit impact are not established.`,
-        },
-      ],
-      reasoning: `Deterministic review verified immutable controller replay evidence${digestNote} at ${citation} with no source-backed escaping or text-only mitigation recorded. Local technical behavior is confirmed; external submission remains disabled pending live deployment impact proof.`,
-    };
-  }
-
-  // Fallback when prompt lacks explicit replay markers
-  const promptHash = createHash("sha256").update(prompt).digest("hex").slice(0, 12);
+function rejectResult(params: {
+  category: string;
+  description: string;
+  ratingReason: string;
+  reasoning: string;
+  confidence?: number;
+  evidenceQuality?: number;
+}): DeterministicEvidenceReviewResult {
   return {
     verdict: "reject",
     recommendation: "dont_submit",
     severity: "informational",
-    confidence: 0.65,
-    ratingReason: `Deterministic evidence review could not confirm an independent positive replay record in evidence packet ${promptHash} (${citation}).`,
+    confidence: params.confidence ?? 0.82,
+    ratingReason: params.ratingReason,
     bet100: false,
     rubric: {
       exploitability: 0,
       impactSeverity: 0,
-      evidenceQuality: 1,
+      evidenceQuality: params.evidenceQuality ?? 2,
       novelty: 0,
       scopeAlignment: 1,
     },
     issues: [
       {
-        category: "missing_replay_proof",
+        category: params.category,
         severity: "fatal",
-        description: `Evidence packet ${promptHash} does not contain a confirmed behavior_observed replay record at ${citation}.`,
+        description: params.description,
       },
     ],
-    reasoning: `Deterministic review requires an independently replayed behavior_observed record with verifiable source citations; packet ${promptHash} lacks confirmed positive execution evidence.`,
+    reasoning: params.reasoning,
+  };
+}
+
+/**
+ * Deterministic evidence-only reviewer consuming LOTUS's typed, independently
+ * verified controller records directly (ZERO regex scraping of prompt text).
+ *
+ * Security Invariants:
+ *  1. Fail closed if typed `evidence` or `grounds` or valid `sourceDigest` is missing.
+ *  2. Reject immediately if Z3 proved the guard UNSAT (`smt_unsat_guard`) or if
+ *     source-backed escaping / text-only mitigations exist.
+ *  3. Reject if independent replay did not observe the claimed behavior.
+ *  4. A positive replay marker ALONE NEVER establishes a security vulnerability:
+ *     approval requires BOTH independent replay AND typed verified security impact
+ *     (`securityImpact.verified === true` or `controllerVerifiedLocalHtmlReview`).
+ *  5. External submission remains strictly disabled (`recommendation: "dont_submit"`,
+ *     `bet100: false`) unless external deployment impact is separately proven.
+ */
+export function evaluateDeterministicEvidenceReview(
+  evidence: DeterministicReviewEvidence | null | undefined,
+): DeterministicEvidenceReviewResult {
+  // 1. Fail closed when typed controller evidence is absent (never scrape prompt prose)
+  if (!evidence || !evidence.grounds) {
+    return rejectResult({
+      category: "missing_typed_evidence",
+      description:
+        "Deterministic review requires typed, independently verified controller evidence records (ControllerReviewGrounds); unverified or serialized prose cannot establish a vulnerability.",
+      ratingReason:
+        "Deterministic review rejected the candidate because no typed controller-verified evidence record was provided.",
+      reasoning:
+        "Fail-closed deterministic review does not parse free-form prompt text. Supply typed controller grounds, replay observations, and security-impact evidence.",
+      confidence: 0.9,
+      evidenceQuality: 0,
+    });
+  }
+
+  const { grounds } = evidence;
+  const digest = typeof grounds.sourceDigest === "string" ? grounds.sourceDigest.trim() : "";
+  if (!/^[a-f0-9]{16,64}$/i.test(digest)) {
+    return rejectResult({
+      category: "missing_source_digest",
+      description:
+        "Controller evidence record lacks a valid cryptographic sourceDigest tying findings to committed source.",
+      ratingReason:
+        "Deterministic review rejected the candidate because source provenance (sourceDigest) is missing or invalid.",
+      reasoning:
+        "Every deterministic security decision must be anchored to a valid controller-computed sourceDigest.",
+      confidence: 0.88,
+      evidenceQuality: 0,
+    });
+  }
+
+  const digestNote = ` (digest ${digest.slice(0, 16)})`;
+  const citation = resolveTypedCitation(evidence);
+
+  // 2. Z3 SMT UNSAT refutation
+  const unsatFact = (evidence.analyzerFacts || []).find((f) => f.kind === "smt_unsat_guard");
+  if (unsatFact) {
+    const desc = `Z3 SMT analysis proved the guard path unreachable at ${unsatFact.file}:${unsatFact.line}: ${unsatFact.detail}`;
+    return rejectResult({
+      category: "unreachable_guard_unsat",
+      description: desc,
+      ratingReason: `Deterministic review rejected the candidate${digestNote}: ${desc}`,
+      reasoning: `Typed analyzer evidence${digestNote} includes an smt_unsat_guard proof at ${unsatFact.file}:${unsatFact.line}, refuting reachability.`,
+      confidence: 0.92,
+      evidenceQuality: 3,
+    });
+  }
+
+  // 3. Source-backed mitigations (typed ControllerReviewGrounds arrays, exact file:line citations)
+  if (grounds.sourceBackedEscaping.length > 0) {
+    const escSites = grounds.sourceBackedEscaping.join(", ");
+    const desc = `Source-backed escaping/sanitization recorded by controller at ${escSites} mitigates unescaped injection.`;
+    return rejectResult({
+      category: "mitigation_present",
+      description: desc,
+      ratingReason: `Deterministic review rejected the candidate${digestNote}: ${desc}`,
+      reasoning: `Controller-verified source grounds${digestNote} cite escaping/sanitization at ${escSites}, blocking the claimed injection.`,
+      confidence: 0.86,
+      evidenceQuality: 3,
+    });
+  }
+
+  if (grounds.sourceBackedTextOnlyResponse.length > 0) {
+    const plainSites = grounds.sourceBackedTextOnlyResponse.join(", ");
+    const desc = `Source-backed text/plain response declaration recorded by controller at ${plainSites} mitigates raw HTML execution.`;
+    return rejectResult({
+      category: "mitigation_present",
+      description: desc,
+      ratingReason: `Deterministic review rejected the candidate${digestNote}: ${desc}`,
+      reasoning: `Controller-verified source grounds${digestNote} cite explicit text/plain response output at ${plainSites}.`,
+      confidence: 0.86,
+      evidenceQuality: 3,
+    });
+  }
+
+  // 4. Independent replay verification (typed replay object + grounds.independentlyReplayed)
+  const replayProvided = evidence.replay !== undefined && evidence.replay !== null;
+  const replayObserved = replayProvided
+    ? evidence.replay!.status === "behavior_observed" && evidence.replay!.behavior_observed === true
+    : grounds.independentlyReplayed;
+
+  if (!grounds.independentlyReplayed || !replayObserved) {
+    const statusLabel = evidence.replay?.status || (grounds.independentlyReplayed ? "observation_only" : "not_observed");
+    const desc = grounds.independentlyReplayed
+      ? `Independent controller replay completed at ${citation} with status "${statusLabel}", which did not establish a positive security behavior violation.`
+      : `Independent controller replay did not observe the claimed behavior at ${citation} (status: "${statusLabel}").`;
+    return rejectResult({
+      category: "unreproduced_behavior",
+      description: desc,
+      ratingReason: `Deterministic review rejected the candidate${digestNote}: ${desc}`,
+      reasoning: `Typed controller replay records${digestNote} at ${citation} show status="${statusLabel}" without a confirmed positive behavior violation.`,
+      confidence: 0.82,
+      evidenceQuality: 2,
+    });
+  }
+
+  // 5. Strict Security-Impact Gate:
+  //    A positive replay marker ALONE NEVER proves a security vulnerability!
+  const verifiedHtmlReview = evidence.entryReplay
+    ? controllerVerifiedLocalHtmlReview(grounds, evidence.entryReplay)
+    : null;
+  const explicitImpact =
+    evidence.securityImpact &&
+    evidence.securityImpact.verified === true &&
+    evidence.securityImpact.category.trim().length > 0 &&
+    evidence.securityImpact.evidence.trim().length > 0
+      ? evidence.securityImpact
+      : null;
+
+  if (!explicitImpact && !verifiedHtmlReview) {
+    const probeKind = grounds.replayedProbeKind || evidence.replay?.kind || evidence.target?.kind || "local_probe";
+    const desc = grounds.sourceBackedNonadminRoleMutation
+      ? `Independent controller replay at ${citation} confirmed the nonadministrator role mutation, but downstream privileged consumer impact is not established; positive replay alone does not establish a security vulnerability.`
+      : `Independent controller replay at ${citation} (${probeKind}) recorded local behavior, but typed security impact is not established; a positive replay marker alone does not prove a security vulnerability.`;
+    return rejectResult({
+      category: "missing_security_impact",
+      description: desc,
+      ratingReason: `Deterministic review rejected the candidate${digestNote}: ${desc}`,
+      reasoning: `Controller replay${digestNote} completed at ${citation} (${probeKind}), confirming local execution behavior. However, neither controller-verified entry-to-HTML injection nor typed security-impact evidence (such as downstream privileged consumer impact or security boundary breach) is established, so the candidate is rejected without denying the completed replay.`,
+      confidence: 0.84,
+      evidenceQuality: 2,
+    });
+  }
+
+  // 6. Both independent replay AND typed verified security impact are present ->
+  //    approve technically with recommendation strictly held at dont_submit.
+  const probeKind = grounds.replayedProbeKind || evidence.replay?.kind || evidence.target?.kind || "local_probe";
+  const isSolidity = probeKind === "solidity_sequence" || grounds.language === "solidity";
+  const impactLabel = explicitImpact
+    ? `${explicitImpact.category} (${explicitImpact.evidence})`
+    : "controller-verified local entry-to-HTML markup injection";
+  const confidence = explicitImpact?.downstreamConsumerVerified || isSolidity ? 0.78 : 0.72;
+
+  return {
+    verdict: "approve",
+    recommendation: "dont_submit",
+    severity: "low",
+    confidence,
+    ratingReason: `Deterministic evidence review verified both independent controller replay and typed security impact [${impactLabel}]${digestNote} at ${citation}; external deployment exploitability remains unverified so submission is held.`,
+    bet100: false,
+    rubric: {
+      exploitability: isSolidity ? 2 : 1,
+      impactSeverity: 1,
+      evidenceQuality: 3,
+      novelty: 0,
+      scopeAlignment: 2,
+    },
+    issues: [
+      {
+        category: "evidence_limit",
+        severity: "warning",
+        description: `Local source-level security impact [${impactLabel}] is verified at ${citation}, but live deployment configuration, external reachability, and end-to-end production impact are not established.`,
+      },
+    ],
+    reasoning: `Deterministic review consumed typed controller evidence${digestNote} at ${citation} with zero source-backed escaping or text-only mitigations. Both independent replay (${probeKind}) and typed security impact (${impactLabel}) are verified; external submission remains disabled pending live deployment impact proof.`,
   };
 }

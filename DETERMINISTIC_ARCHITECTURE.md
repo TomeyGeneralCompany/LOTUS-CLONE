@@ -32,3 +32,12 @@
 
 - Default in `LOTUS-CLONE` (when `AUTOHACK_OLLAMA_URL` is unset): `LOCAL_MODEL_ADAPTER=deterministic` (zero LLM calls).
 - Explicit opt-in A/B comparison: set `LOCAL_MODEL_ADAPTER=ollama` and `AUTOHACK_OLLAMA_URL=http://127.0.0.1:11434/api/chat`.
+
+## Hardening Guarantees
+
+1. **Closed-Loop Analytical Escalation** (`packages/security-solver/src/deterministic/specialized-escalation.ts`):
+   During `ANALYZE`, `driveDeterministicAuditTurn` runs `runClosedLoopLeadAnalysis`: it evaluates the initial lead, selectively invokes specialized adapters (`Z3`, `Joern`, `Mythril`, `Foundry`, and isolated `fast-check`) bounded per lead and cached by `(leadId, path, sha256)`, merges newly returned `ProgramFact`s and `ProgramEdge`s into `ProgramFactsGraph`, and reconsiders the lead (`assess_lead` ↔ `defer_lead`). For example, a Z3 `smt_unsat_guard` proof flips an `assess_lead` to `defer_lead`, while a Joern `taint_flow`, Mythril `symbolic_finding`, Foundry `foundry_invariant_violated`, or isolated `fast-check` `property_counterexample` flips a `defer_lead` to `assess_lead`.
+2. **Typed, Independently Verified Deterministic Review** (`evaluateDeterministicEvidenceReview`):
+   Consumes LOTUS's typed `DeterministicReviewEvidence` (`ControllerReviewGrounds`, `replay`, `entryReplay`, `chainEvidence`, typed `securityImpact`, and `analyzerFacts`) directly with zero regex extraction from serialized prompt text. Fails closed if typed evidence or `sourceDigest` is missing. A positive replay marker alone never approves a finding as a security vulnerability — both independent replay and typed verified security impact are required.
+3. **Bubblewrap Isolation for `fast-check`** (`adapters/fastcheck-adapter.ts`, `scripts/source-reproduction.py`, `scripts/reproduction-runtime/probe.cjs`):
+   Zero use of Node's `node:vm` (`vm.createContext`). `fast-check` generates and shrinks inputs in the trusted controller while delegating all untrusted JavaScript execution to LOTUS's `bubblewrap` (`bwrap --unshare-all --cap-drop ALL --clearenv` + resource limits) isolated reproduction runtime (`kind=javascript_property_batch`), failing closed (`blocked_no_sandbox`) whenever no isolated sandbox is available.

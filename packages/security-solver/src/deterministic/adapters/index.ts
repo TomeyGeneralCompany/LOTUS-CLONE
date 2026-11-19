@@ -1,9 +1,13 @@
 export { babelAstFactsAdapter } from "./babel-adapter";
 export {
+  isIsolatedJsSandboxAvailable,
   runFastCheckJsProbe,
   type FastCheckProbeRequest,
   type FastCheckProbeResult,
   type FastCheckSecurityProperty,
+  type IsolatedJsBatchEvaluator,
+  type IsolatedJsBatchObservation,
+  type IsolatedJsBatchResponse,
 } from "./fastcheck-adapter";
 export { libCstFactsAdapter, isLibCstAvailable } from "./libcst-adapter";
 export { treeSitterFactsAdapter, isTreeSitterAvailable } from "./treesitter-adapter";

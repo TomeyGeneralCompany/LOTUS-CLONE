@@ -1,6 +1,6 @@
 import {appendFile} from 'node:fs/promises';
 import {postOllamaChat} from '../../core/src/ollama-chat';
-import {evaluateDeterministicEvidenceReview,isDeterministicMode} from './deterministic';
+import {evaluateDeterministicEvidenceReview,isDeterministicMode,type DeterministicReviewEvidence} from './deterministic';
 
 type VerdictResponse={message?:{content?:string;thinking?:string};eval_count?:number;prompt_eval_count?:number;done_reason?:string};
 
@@ -22,6 +22,7 @@ export async function runEvidenceOnlyReview(input:{
   validate:(answer:string)=>string|null|Promise<string|null>;
   maxAttempts?:number;
   transport?:(payload:Record<string,unknown>,signal:AbortSignal)=>Promise<VerdictResponse>;
+  verifiedEvidence?:DeterministicReviewEvidence|null;
 }):Promise<string>{
   const attempts=input.maxAttempts??3;
   if(!Number.isSafeInteger(attempts)||attempts<1||attempts>5)
@@ -38,7 +39,7 @@ export async function runEvidenceOnlyReview(input:{
   if(!input.transport && isDeterministicMode()){
     input.signal.throwIfAborted();
     await appendFile(input.logFile,'[EVIDENCE_ONLY_REVIEW_DETERMINISTIC] '+JSON.stringify({model:'deterministic'})+'\n');
-    const verdict=evaluateDeterministicEvidenceReview(input.prompt);
+    const verdict=evaluateDeterministicEvidenceReview(input.verifiedEvidence);
     const content=JSON.stringify(verdict);
     const feedback=await input.validate(content);
     if(!feedback){

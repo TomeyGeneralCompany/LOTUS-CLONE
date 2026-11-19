@@ -46,6 +46,35 @@ async function javascript() {
   }
   return [await fn(control), await fn(attack)];
 }
+async function javascriptPropertyBatch() {
+  const module = await import(pathToFileURL(sourceFile(spec.file)).href);
+  const fn = module[spec.function] ?? module.default?.[spec.function];
+  if (typeof fn !== 'function') throw new Error('Exported function required');
+  const mode = spec.property || 'no_raw_html_reflection';
+  const inputs = Array.isArray(spec.inputs) ? spec.inputs : [];
+  if (inputs.length < 1 || inputs.length > 64) throw new Error('Invalid property batch inputs');
+  const results = [];
+  for (const rawInput of inputs) {
+    if (typeof rawInput !== 'string' || rawInput.length > 2048) throw new Error('Invalid property input');
+    try {
+      if (mode === 'no_prototype_pollution') {
+        const target = {};
+        const payload = JSON.parse('{"' + rawInput.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '":{"lotusPolluted":true}}');
+        await fn(target, payload);
+        const polluted = ({}).lotusPolluted === true || Object.prototype.lotusPolluted === true;
+        if (polluted) { delete Object.prototype.lotusPolluted; }
+        results.push({ input: rawInput, ok: true, protoPolluted: polluted });
+      } else {
+        const val = await fn(rawInput);
+        const out = val === undefined || val === null ? '' : String(val).slice(0, 4096);
+        results.push({ input: rawInput, ok: true, output: out });
+      }
+    } catch (err) {
+      results.push({ input: rawInput, ok: false, error: String(err && err.message ? err.message : err).slice(0, 300) });
+    }
+  }
+  return { property: mode, results };
+}
 async function javascriptSequence() {
   const module = await import(pathToFileURL(sourceFile(spec.file)).href);
   const sequence = spec.sequence;
@@ -264,6 +293,11 @@ contract TomeyERC1155ProbeHarness is ERC1155Upgradeable {
   } finally { await transport.disconnect(); }
 }
 (async () => {
+  if (spec.kind === 'javascript_property_batch') {
+    if (!/\.(?:js|mjs|cjs)$/.test(spec.file)) throw new Error('JavaScript source required');
+    output(JSON.stringify(await javascriptPropertyBatch()));
+    return;
+  }
   if (spec.kind === 'javascript_sequence') {
     if (!/\.(?:js|mjs|cjs)$/.test(spec.file)) throw new Error('JavaScript source required');
     output(JSON.stringify(await javascriptSequence()));

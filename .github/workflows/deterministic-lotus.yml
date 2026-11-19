@@ -23,6 +23,11 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: nightly
+      - name: Install bubblewrap (bwrap) isolated sandbox for fast-check & source reproduction
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          bwrap --version
       - name: Install npm dependencies (@babel/parser, fast-check, @solidity-parser/parser)
         run: npm ci
       - name: Install MIT Python adapters (LibCST, Tree-sitter + grammars, Z3)
@@ -62,6 +67,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+      - name: Install bubblewrap (bwrap) isolated sandbox
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          bwrap --version
       - run: npm ci
       - name: Install Mythril (MIT) + solc 0.8.19 in isolated virtualenv
         run: |

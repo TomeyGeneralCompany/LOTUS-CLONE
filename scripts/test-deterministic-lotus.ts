@@ -17,7 +17,9 @@ import {
   generateHypotheses,
   isDeterministicMode,
   resolveLocalModelAdapter,
+  type DeterministicReviewEvidence,
 } from "../packages/security-solver/src/deterministic";
+import { controllerReviewGroundDefect } from "../packages/security-solver/src/controller-review-boundary";
 import { runLocalAudit } from "../packages/security-solver/src/local-ollama-runner";
 import { runEvidenceOnlyReview } from "../packages/security-solver/src/evidence-only-review";
 import { assessFinding, assessProgram } from "../packages/security-analyzer/src/assessor";
@@ -276,17 +278,17 @@ contract GuardedVault is Ownable {
     assert.match(standaloneLogText, /\[DETERMINISTIC_DRIVER_ACTION\]/);
     assert.doesNotMatch(standaloneLogText, /AUDIT_STALLED/);
 
-    // 6. Evidence-only review in deterministic mode (zero Ollama calls!)
+    // 6. Typed, independently verified deterministic evidence review (ZERO prompt regex scraping!)
     const reviewLog = join(tmp, "review.log");
-    const approved = await runEvidenceOnlyReview({
+
+    // 6a. Prompt-only without typed verifiedEvidence MUST fail closed (even if prompt mentions positive replay)
+    const noTypedEvidence = await runEvidenceOnlyReview({
       prompt: JSON.stringify({
         sourceDigest: "b".repeat(64),
         independentlyReplayed: true,
         verifiedLocalEntryInjection: true,
-        replayedProbeKind: "html_reflection",
-        sourceBackedEscaping: [],
-        sourceBackedTextOnlyResponse: [],
-        citation: "src/profile.js:3",
+        status: "behavior_observed",
+        behavior_observed: true,
       }),
       schema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] },
       model: "deterministic",
@@ -296,21 +298,175 @@ contract GuardedVault is Ownable {
       numPredict: 512,
       validate: (raw) => {
         const v = JSON.parse(raw);
+        return v.verdict === "reject" && v.issues?.[0]?.category === "missing_typed_evidence"
+          ? null
+          : "expected fail-closed missing_typed_evidence";
+      },
+    });
+    assert.equal(JSON.parse(noTypedEvidence).verdict, "reject");
+
+    // 6b. Positive replay marker ALONE without typed security impact MUST REJECT
+    const replayOnlyEvidence: DeterministicReviewEvidence = {
+      grounds: {
+        sourceDigest: "d".repeat(64),
+        language: "javascript",
+        verifiedLocalEntryInjection: false,
+        independentlyReplayed: true,
+        replayedProbeKind: "javascript_sequence",
+        sourceBackedNonadminRoleMutation: false,
+        immutableFacts: ["src/profile.js:3: return '<div>' + name + '</div>';"],
+        unresolvedQuestions: [],
+        sourceBackedTextOnlyResponse: [],
+        sourceBackedEscaping: [],
+      },
+      replay: {
+        status: "behavior_observed",
+        kind: "javascript_sequence",
+        behavior_observed: true,
+        observations: { output: "<div>ok</div>" },
+      },
+      target: { file: "src/profile.js", selector: "renderBio", kind: "javascript_sequence" },
+      securityImpact: null,
+    };
+    const replayOnlyVerdict = evaluateDeterministicEvidenceReview(replayOnlyEvidence);
+    assert.equal(replayOnlyVerdict.verdict, "reject", "Positive replay alone MUST NOT establish a security vulnerability");
+    assert.equal(replayOnlyVerdict.issues[0]?.category, "missing_security_impact");
+    assert.equal(controllerReviewGroundDefect(replayOnlyVerdict, replayOnlyEvidence.grounds), null);
+
+    // 6c. Solidity nonadmin role mutation replay WITHOUT downstream consumer impact MUST REJECT
+    const roleMutationOnly: DeterministicReviewEvidence = {
+      grounds: {
+        sourceDigest: "e".repeat(64),
+        language: "solidity",
+        verifiedLocalEntryInjection: false,
+        independentlyReplayed: true,
+        replayedProbeKind: "solidity_sequence",
+        sourceBackedNonadminRoleMutation: true,
+        immutableFacts: ["contracts/Vault.sol:9: function setOperator(address next) external { operator = next; }"],
+        unresolvedQuestions: [],
+        sourceBackedTextOnlyResponse: [],
+        sourceBackedEscaping: [],
+      },
+      replay: {
+        status: "behavior_observed",
+        kind: "solidity_sequence",
+        behavior_observed: true,
+        observations: { steps: [] },
+      },
+      target: { file: "contracts/Vault.sol", selector: "Vault.setOperator", kind: "solidity_sequence" },
+      securityImpact: null,
+    };
+    const roleOnlyVerdict = evaluateDeterministicEvidenceReview(roleMutationOnly);
+    assert.equal(roleOnlyVerdict.verdict, "reject", "Role mutation replay without downstream consumer impact must reject");
+    assert.equal(roleOnlyVerdict.issues[0]?.category, "missing_security_impact");
+    assert.equal(controllerReviewGroundDefect(roleOnlyVerdict, roleMutationOnly.grounds), null);
+
+    // 6d. Solidity role mutation WITH typed verified downstream consumer impact -> APPROVE (dont_submit)
+    const roleWithImpact = evaluateDeterministicEvidenceReview({
+      ...roleMutationOnly,
+      securityImpact: {
+        verified: true,
+        category: "solidity_role_consumer_impact",
+        evidence: "contracts/Vault.sol:14: withdrawTreasury() permitted post-mutation with beneficiary balance delta",
+        downstreamConsumerVerified: true,
+      },
+    });
+    assert.equal(roleWithImpact.verdict, "approve");
+    assert.equal(roleWithImpact.recommendation, "dont_submit");
+    assert.equal(roleWithImpact.bet100, false);
+
+    // 6e. Controller-verified local HTML entry injection (typed grounds + entryReplay) -> APPROVE (dont_submit)
+    const htmlVerifiedEvidence: DeterministicReviewEvidence = {
+      grounds: {
+        sourceDigest: "b".repeat(64),
+        language: "javascript",
+        verifiedLocalEntryInjection: true,
+        independentlyReplayed: true,
+        replayedProbeKind: "html_reflection",
+        sourceBackedNonadminRoleMutation: false,
+        immutableFacts: [
+          "src/profile.js:3: return '<div>' + name + '</div>';",
+          "Independent sandbox entry replay preserved the exact attacker-chosen HTML markup in the handler output.",
+        ],
+        unresolvedQuestions: [],
+        sourceBackedTextOnlyResponse: [],
+        sourceBackedEscaping: [],
+      },
+      replay: {
+        status: "behavior_observed",
+        kind: "html_reflection",
+        behavior_observed: true,
+        observations: { attack_output: "<div><img src=x onerror=1></div>" },
+      },
+      entryReplay: {
+        status: "behavior_observed",
+        behavior_observed: true,
+        observations: {
+          control_input: "alice",
+          control_output: "<div>alice</div>",
+          attack_input: "<img src=x onerror=1>",
+          attack_output: "<div><img src=x onerror=1></div>",
+        },
+      } as any,
+      target: { file: "src/profile.js", selector: "renderBio", kind: "html_reflection", callerFile: "src/profile.js", callerLine: 3 },
+    };
+    const approved = await runEvidenceOnlyReview({
+      prompt: "ignored-prose-when-deterministic",
+      schema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] },
+      model: "deterministic",
+      signal: new AbortController().signal,
+      logFile: reviewLog,
+      numCtx: 8192,
+      numPredict: 512,
+      verifiedEvidence: htmlVerifiedEvidence,
+      validate: (raw) => {
+        const v = JSON.parse(raw);
         return v.verdict === "approve" && v.recommendation === "dont_submit" ? null : "expected approve/dont_submit";
       },
     });
     assert.equal(JSON.parse(approved).verdict, "approve");
 
-    const mitigated = evaluateDeterministicEvidenceReview(
-      JSON.stringify({
+    // 6f. Source-backed escaping mitigation -> REJECT (mitigation_present)
+    const mitigatedEvidence: DeterministicReviewEvidence = {
+      grounds: {
         sourceDigest: "c".repeat(64),
+        language: "javascript",
+        verifiedLocalEntryInjection: false,
         independentlyReplayed: true,
         replayedProbeKind: "html_reflection",
-        sourceBackedEscaping: ["src/profile.js:2: escapeHtml(name)"],
-      }),
-    );
+        sourceBackedNonadminRoleMutation: false,
+        immutableFacts: ["src/profile.js:2: return escapeHtml(name);"],
+        unresolvedQuestions: [],
+        sourceBackedTextOnlyResponse: [],
+        sourceBackedEscaping: ["src/profile.js:2"],
+      },
+      replay: { status: "behavior_observed", kind: "html_reflection", behavior_observed: true },
+    };
+    const mitigated = evaluateDeterministicEvidenceReview(mitigatedEvidence);
     assert.equal(mitigated.verdict, "reject");
     assert.equal(mitigated.recommendation, "dont_submit");
+    assert.equal(mitigated.issues[0]?.category, "mitigation_present");
+    assert.equal(controllerReviewGroundDefect(mitigated, mitigatedEvidence.grounds), null);
+
+    // 6g. Z3 UNSAT refutation fact -> REJECT (unreachable_guard_unsat)
+    const unsatRejected = evaluateDeterministicEvidenceReview({
+      ...htmlVerifiedEvidence,
+      analyzerFacts: [
+        {
+          id: "z3-unsat-1",
+          kind: "smt_unsat_guard",
+          language: "javascript",
+          file: "src/profile.js",
+          line: 2,
+          symbol: "renderBio",
+          severity: "info",
+          adapter: "z3",
+          detail: "Z3 proved guard constraints UNSAT: x > 10 && x < 5",
+        },
+      ],
+    });
+    assert.equal(unsatRejected.verdict, "reject");
+    assert.equal(unsatRejected.issues[0]?.category, "unreachable_guard_unsat");
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
