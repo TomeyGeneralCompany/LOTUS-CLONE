@@ -197,7 +197,7 @@ contract GuardedVault is Ownable {
         "deterministic",
         undefined,
         {
-          numCtx: 4096,
+          numCtx: 8192,
           numPredict: 512,
           numThreads: 2,
           maxTurns: 30,
@@ -259,7 +259,7 @@ contract GuardedVault is Ownable {
       "deterministic",
       undefined,
       {
-        numCtx: 4096,
+        numCtx: 8192,
         numPredict: 512,
         numThreads: 2,
         maxTurns: 12,
@@ -292,7 +292,7 @@ contract GuardedVault is Ownable {
       model: "deterministic",
       signal: new AbortController().signal,
       logFile: reviewLog,
-      numCtx: 4096,
+      numCtx: 8192,
       numPredict: 512,
       validate: (raw) => {
         const v = JSON.parse(raw);
