@@ -1798,9 +1798,10 @@ export async function runLocalAudit(
           const activeLeadMeta=stageLock?.currentStage==='ANALYZE' && analyzeModelPending ? nextAnalysisPacket() : undefined;
           const activePacket=activeLeadMeta ? analysisPackets.get(activeLeadMeta.id) : undefined;
           const snapshots:Array<{path:string;sha256:string;content:string}>=[];
+          const completedReadPaths=[...new Set([...(workflow?.snapshot().readPaths || []), ...terminalReadPages.keys()])];
           const snapshotPaths=new Set<string>();
           if(activePacket?.path)snapshotPaths.add(activePacket.path);
-          for(const rp of (workflow?.snapshot().readPaths || []).slice(-12))snapshotPaths.add(rp);
+          for(const rp of completedReadPaths.slice(-12))snapshotPaths.add(rp);
           for(const sp of snapshotPaths){
             try {
               const full=await safePath(sp);
@@ -1830,7 +1831,7 @@ export async function runLocalAudit(
             constraints,
             requestSchema,
             initialSourcePaths:limits.initialSourcePaths || [],
-            readPaths:workflow?.snapshot().readPaths || [],
+            readPaths:completedReadPaths,
             outcomes:stageLock?.outcomeCounts,
             observedCases,
             recoveredFinalJson,

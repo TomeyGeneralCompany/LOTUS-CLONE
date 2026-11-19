@@ -201,6 +201,7 @@ contract GuardedVault is Ownable {
           numPredict: 512,
           numThreads: 2,
           maxTurns: 30,
+          productionWorkflow: true,
           initialSourcePaths: ["source-1/contracts/GuardedVault.sol"],
           finalSchema,
           staticLeads: [
@@ -247,6 +248,33 @@ contract GuardedVault is Ownable {
     const logText = await readFile(logFile, "utf8");
     assert.match(logText, /\[DETERMINISTIC_DRIVER_ACTION\]/, "Runner must invoke deterministic driver");
     assert.doesNotMatch(logText, /\[MODEL_REQUEST_RECOVERY\]/, "No Ollama retries may occur in deterministic mode");
+
+    // 5b. Standalone runLocalAudit (productionWorkflow: false) must track terminalReadPages without stalling
+    const standaloneLog = join(tmp, "standalone-audit.log");
+    const standaloneAnswer = await runLocalAudit(
+      "Inspect source-1/contracts/GuardedVault.sol without productionWorkflow",
+      standaloneLog,
+      30_000,
+      tmp,
+      "deterministic",
+      undefined,
+      {
+        numCtx: 4096,
+        numPredict: 512,
+        numThreads: 2,
+        maxTurns: 12,
+        initialSourcePaths: ["source-1/contracts/GuardedVault.sol"],
+        finalSchema,
+        validateFinal: (text) => {
+          const p = JSON.parse(text);
+          return Array.isArray(p.findings) && p.outcome === "no_testable_candidate" ? null : "invalid standalone final";
+        },
+      },
+    );
+    assert.equal(JSON.parse(standaloneAnswer).outcome, "no_testable_candidate");
+    const standaloneLogText = await readFile(standaloneLog, "utf8");
+    assert.match(standaloneLogText, /\[DETERMINISTIC_DRIVER_ACTION\]/);
+    assert.doesNotMatch(standaloneLogText, /AUDIT_STALLED/);
 
     // 6. Evidence-only review in deterministic mode (zero Ollama calls!)
     const reviewLog = join(tmp, "review.log");
