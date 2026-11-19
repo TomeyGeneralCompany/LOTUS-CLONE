@@ -19,6 +19,7 @@ export interface FoundryProbeRequest {
   testContractSource: string;
   fuzzRuns?: number;
   solcVersion?: string;
+  offline?: boolean;
   timeoutMs?: number;
 }
 
@@ -144,17 +145,19 @@ export function runFoundrySolidityTest(req: FoundryProbeRequest): FoundryProbeRe
     const solName = basename(req.contractFileName || req.file || "Target.sol").replace(/[^A-Za-z0-9_.-]/g, "_");
     const fuzzRuns = Math.max(16, Math.min(req.fuzzRuns ?? 64, 512));
     const solcLine = req.solcVersion ? `solc_version = "${req.solcVersion}"\n` : "";
+    const offline = req.offline ?? process.env.LOTUS_FOUNDRY_OFFLINE === "1";
 
     writeFileSync(
       join(tmp, "foundry.toml"),
-      `[profile.default]\nsrc = "src"\nout = "out"\nlibs = []\n${solcLine}offline = true\n\n[fuzz]\nruns = ${fuzzRuns}\n`,
+      `[profile.default]\nsrc = "src"\nout = "out"\nlibs = []\n${solcLine}${offline ? "offline = true\n" : ""}\n[fuzz]\nruns = ${fuzzRuns}\n`,
       "utf8",
     );
     writeFileSync(join(srcDir, solName), req.contractSource, "utf8");
     writeFileSync(join(testDir, "Vm.sol"), VM_CHEATCODE_INTERFACE, "utf8");
     writeFileSync(join(testDir, "LotusProbe.t.sol"), req.testContractSource, "utf8");
 
-    const proc = spawnSync("forge", ["test", "--json", "--offline", "--no-match-path", "none"], {
+    const forgeArgs = ["test", "--json", ...(offline ? ["--offline"] : [])];
+    const proc = spawnSync("forge", forgeArgs, {
       cwd: tmp,
       encoding: "utf8",
       timeout: req.timeoutMs ?? 60_000,
