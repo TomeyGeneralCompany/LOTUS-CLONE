@@ -7,6 +7,8 @@
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { parse as parseSolidity } from "@solidity-parser/parser";
 import type { SourceSnapshot, StaticLeadHint } from "../controller-solidity-experiment-planner";
 
@@ -161,13 +163,10 @@ export function detectAvailableAdapters(): AdapterAvailability[] {
         availableOnHost = false;
       }
     } else if (spec.probeNodeModule) {
-      try {
-        // Resolve relative to current process module loader
-        require.resolve(spec.probeNodeModule);
-        availableOnHost = true;
-      } catch {
-        availableOnHost = spec.id === "solidity-parser";
-      }
+      const root = process.env.PROJECT_ROOT || process.cwd();
+      availableOnHost =
+        spec.id === "solidity-parser" ||
+        existsSync(join(root, "node_modules", ...spec.probeNodeModule.split("/")));
     }
     return {
       id: spec.id,

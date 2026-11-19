@@ -1810,7 +1810,7 @@ export async function runLocalAudit(
           }
           const observedCases=(workflow?.snapshot().observations || [])
             .filter(o=>o.status==='behavior_observed' && typeof o.caseId==='string' && /^[a-f0-9]{64}$/.test(o.caseId))
-            .map(o=>({caseId:o.caseId!,path:o.path,selector:o.selector,kind:o.kind}));
+            .map(o=>({caseId:o.caseId!,path:o.path,selector:o.function,kind:o.kind}));
           const recoveredFinalJson=(stageLock?.currentStage==='REVIEW' || stageLock?.currentStage==='REPORT' ||
             (constraints?.action?.length===1 && constraints.action[0]==='final')) && limits.recoverFinal
             ? await limits.recoverFinal() : null;
