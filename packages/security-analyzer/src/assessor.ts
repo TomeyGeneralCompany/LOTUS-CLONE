@@ -96,6 +96,96 @@ function computeOpportunityScore(rubric: ProgramAssessmentRubric): number {
  * Assess a security program's scope to determine opportunity for finding vulnerabilities.
  * Uses rubric-based scoring to avoid LLM score clustering.
  */
+function useDeterministicAssessment(): boolean {
+  const explicit = process.env.LOCAL_MODEL_ADAPTER?.trim();
+  if (explicit === "deterministic") return true;
+  if (explicit === "ollama" || explicit === "qwen-agent") return false;
+  if (process.env.LOTUS_DETERMINISTIC === "1" || process.env.LOTUS_DETERMINISTIC === "true") return true;
+  if (process.env.AUTOHACK_OLLAMA_URL?.trim() || process.env.ANTHROPIC_API_KEY?.trim()) return false;
+  return true;
+}
+
+export function assessProgramDeterministic(
+  program: SecurityProgram,
+  visibleScopes: Array<{ assetIdentifier: string; assetType: string; instruction?: string }>,
+  sourceCodeScopes: Array<{ assetIdentifier: string; assetType: string; instruction?: string }>,
+): ProgramAssessmentResult {
+  const hasSourceCode = sourceCodeScopes.length > 0;
+  const corpus = visibleScopes.map((s) => `${s.assetIdentifier} ${s.assetType} ${s.instruction ?? ""}`).join(" ");
+  const techStack: string[] = [];
+  if (/solidity|\.sol\b|smart.?contract|foundry|hardhat|truffle|immunefi|evm|defi/i.test(corpus) || program.provider === "immunefi") techStack.push("Solidity");
+  if (/typescript|javascript|node|npm|react|express|next/i.test(corpus)) techStack.push("JavaScript/TypeScript");
+  if (/python|django|flask|fastapi|pypi/i.test(corpus)) techStack.push("Python");
+  if (/java\b|spring|maven|gradle/i.test(corpus)) techStack.push("Java");
+  if (!techStack.length && hasSourceCode) techStack.push("Source Code");
+
+  const webApiCount = visibleScopes.filter((s) => /url|api|web|wildcard|domain/i.test(s.assetType)).length;
+  const sourceCodeQuality = !hasSourceCode ? 0 : sourceCodeScopes.length >= 3 ? 3 : sourceCodeScopes.length >= 2 ? 2 : 1;
+  const webApiSurface = webApiCount === 0 ? 0 : webApiCount >= 6 ? 3 : webApiCount >= 2 ? 2 : 1;
+  const techStackMatch = techStack.some((t) => ["Solidity", "JavaScript/TypeScript", "Python", "Java"].includes(t)) ? 3 : hasSourceCode ? 2 : 1;
+  const scopeBreadth = visibleScopes.length >= 8 ? 3 : visibleScopes.length >= 3 ? 2 : 1;
+  const maxUsd = (program.rewardMaxCents ?? 0) / 100;
+  const rewardEfficiency = maxUsd >= 25000 ? 3 : maxUsd >= 5000 ? 2 : maxUsd > 0 ? 1 : 0;
+
+  const rubric: ProgramAssessmentRubric = {
+    sourceCodeQuality,
+    webApiSurface,
+    techStackMatch,
+    scopeBreadth,
+    rewardEfficiency,
+  };
+  const opportunityScore = Number(((sourceCodeQuality + webApiSurface + techStackMatch + scopeBreadth + rewardEfficiency) / 15).toFixed(3));
+  const topTargets = visibleScopes.slice(0, 5).map((scope) => ({
+    asset: scope.assetIdentifier,
+    type: scope.assetType,
+    reasoning: sourceCodeScopes.includes(scope)
+      ? "In-scope source repository supported by deterministic static/AST/verifier pipeline"
+      : "In-scope asset ranked deterministically from supplied program scope",
+    strategy: sourceCodeScopes.includes(scope) ? "source_static_and_verifier" : "scope_triage",
+  }));
+  const recommendedApproach: ProgramAssessmentResult["recommendedApproach"] =
+    hasSourceCode && webApiCount === 0 ? "code_review"
+    : !hasSourceCode && webApiCount > 0 ? "web_testing"
+    : "mixed";
+
+  return {
+    opportunityScore,
+    rubric,
+    targetCount: visibleScopes.length,
+    topTargets,
+    techStack,
+    attackSurface: `${visibleScopes.length} in-scope asset(s) (${sourceCodeScopes.length} source repo(s), ${webApiCount} web/API asset(s)) scored deterministically.`,
+    hasSourceCode,
+    recommendedApproach,
+  };
+}
+
+export function assessFindingDeterministic(
+  finding: SecurityFinding,
+  program: SecurityProgram,
+): SecurityAssessmentResult {
+  const sevRaw = String(finding.severity ?? "low").toLowerCase();
+  const severity: SecurityAssessmentResult["severity"] =
+    sevRaw === "critical" || sevRaw === "high" || sevRaw === "medium" || sevRaw === "low" || sevRaw === "informational"
+      ? sevRaw
+      : "low";
+  const confidence = typeof finding.confidenceScore === "number"
+    ? Math.max(0, Math.min(1, finding.confidenceScore))
+    : severity === "critical" || severity === "high" ? 0.7 : 0.55;
+  const difficulty = severity === "critical" ? 0.5 : severity === "high" ? 0.45 : 0.35;
+  const maxReward = program.rewardMaxCents ?? 0;
+  const factor = severity === "critical" ? 0.5 : severity === "high" ? 0.25 : severity === "medium" ? 0.1 : 0.03;
+  return {
+    difficulty,
+    confidence,
+    severity,
+    vulnerabilityType: finding.vulnerabilityType || "Unclassified",
+    approach: "Deterministic replay verification via isolated source verifier and static fact corroboration.",
+    riskFactors: ["Requires deployment reachability verification before external submission"],
+    estimatedRewardCents: Math.round(maxReward * factor),
+  };
+}
+
 export async function assessProgram(
   program: SecurityProgram,
 ): Promise<ProgramAssessmentResult> {
@@ -136,6 +226,9 @@ export async function assessProgram(
   if (!visibleScopes.length) {
     return {opportunityScore:0, rubric:{sourceCodeQuality:0,webApiSurface:0,techStackMatch:0,scopeBreadth:0,rewardEfficiency:0},
       targetCount:0,topTargets:[],techStack:[],attackSurface:"No supplied scope assets",hasSourceCode:false,recommendedApproach:"mixed"};
+  }
+  if (useDeterministicAssessment()) {
+    return assessProgramDeterministic(program, visibleScopes, sourceCodeScopes);
   }
   const allowedAssets = [...new Set(visibleScopes.map(scope => scope.assetIdentifier))];
   const maxTargets = Math.min(5, allowedAssets.length);
@@ -325,6 +418,9 @@ export async function assessFinding(
   finding: SecurityFinding,
   program: SecurityProgram,
 ): Promise<SecurityAssessmentResult> {
+  if (useDeterministicAssessment()) {
+    return assessFindingDeterministic(finding, program);
+  }
   const config = getConfig();
 
   const rewardRange = program.rewardMinCents && program.rewardMaxCents

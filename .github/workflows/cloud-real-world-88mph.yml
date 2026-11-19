@@ -1,9 +1,19 @@
 name: Cloud Real-World 88mph Investigation
+
 on:
   push:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      engine:
+        description: "Analysis/review engine (deterministic = zero-Qwen default, ollama = Qwen3 4B A/B baseline)"
+        required: false
+        default: deterministic
+        type: choice
+        options:
+          - deterministic
+          - ollama
 
 permissions:
   contents: read
@@ -19,8 +29,8 @@ jobs:
     timeout-minutes: 90
     env:
       IMMUNEFI_ENABLED: 'true'
-      LOCAL_OLLAMA_MODEL: qwen3:4b
-      LOCAL_MODEL_ADAPTER: ollama
+      LOCAL_MODEL_ADAPTER: ${{ inputs.engine || 'deterministic' }}
+      LOCAL_OLLAMA_MODEL: ${{ (inputs.engine || 'deterministic') == 'ollama' && 'qwen3:4b' || '' }}
       LOCAL_OLLAMA_TOOL_PROTOCOL: json
       LOCAL_MODEL_PROFILE: deterministic
       LOCAL_CONTROLLER_OWNED_ACTIONS: 'true'
@@ -28,16 +38,14 @@ jobs:
       AUTOHACK_GUIDED_SOURCE_PROBES: 'true'
       LOCAL_HUNT_DYNAMIC_ALLOWANCE: 'true'
       LOCAL_CONTROLLER_FULL_SOURCE_INDEX: 'true'
-      AUTOHACK_OLLAMA_URL: http://127.0.0.1:11434/api/chat
+      AUTOHACK_OLLAMA_URL: ${{ (inputs.engine || 'deterministic') == 'ollama' && 'http://127.0.0.1:11434/api/chat' || 'http://127.0.0.1:1/api/chat' }}
       AUTOHACK_SINGLE_BOUNTY_DIAGNOSTIC: '1'
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-
       - name: Install dependencies and reproduction runtime
         run: |
           set -Eeuo pipefail
@@ -46,8 +54,8 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           npm ci
           bash scripts/install-reproduction-runtime.sh
-
-      - name: Start isolated Docker Ollama with Qwen3 4B
+      - name: Start isolated Docker Ollama with Qwen3 4B (ollama A/B mode only)
+        if: env.LOCAL_MODEL_ADAPTER == 'ollama'
         run: |
           docker run -d --name lotus-cloud-ollama -p 127.0.0.1:11434:11434 ollama/ollama:latest
           for i in $(seq 1 60); do
@@ -55,7 +63,6 @@ jobs:
             sleep 2
           done
           docker exec lotus-cloud-ollama ollama pull qwen3:4b
-
       - name: Initialize isolated database and seed 88mphV3 program
         run: |
           printf 'GITHUB_TOKEN=%s\nHACKERONE_API_USERNAME=mock-user\nHACKERONE_API_TOKEN=mock-token\n' "${{ secrets.GITHUB_TOKEN }}" > .env
@@ -88,11 +95,9 @@ jobs:
                    50000, 10000000, "USD", 0.85, "active", 0, now, now))
           print("Seeded immunefi-88mphv3 program into data/bounty.db")
           PY
-
       - name: Confirm seeded program eligibility
         run: |
           bash scripts/run-one-bounty.sh --list
-
       - name: Run authorized real-world investigation
         id: hunt
         run: |
@@ -104,13 +109,11 @@ jobs:
           set -e
           echo "$status" > data/repair-feedback/exit-code.txt
           exit "$status"
-
       - name: Collect full controller and investigation evidence
         if: always()
         run: |
           mkdir -p data/repair-feedback
           tar -czf data/repair-feedback/diagnostics.tar.gz data/one-bounty data/logs 2>/dev/null || true
-
       - name: Upload diagnostic artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -118,7 +121,6 @@ jobs:
           name: lotus-cloud-real-world-${{ github.run_id }}
           path: data/repair-feedback/**
           retention-days: 30
-
       - name: Stop Docker Ollama
-        if: always()
+        if: always() && env.LOCAL_MODEL_ADAPTER == 'ollama'
         run: docker rm -f lotus-cloud-ollama || true

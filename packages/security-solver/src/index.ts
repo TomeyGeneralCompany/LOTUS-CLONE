@@ -5,6 +5,7 @@ import { programSelectionDecision, summarizeProgramSelection } from "./program-s
 export { scoreProgram, summarizeProgramSelection } from "./program-selection";
 import type { StaticLeadFocus } from "./local-program-flow";
 import { beginLocalJob, activeLocalJobCount } from "./local-job";
+import { isDeterministicMode } from "./deterministic";
 import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -92,7 +93,7 @@ async function huntProgramImpl(
   }
 
   try {
-    if (trigger === "auto" && !(process.env.LOCAL_OLLAMA_MODEL
+    if (trigger === "auto" && !((process.env.LOCAL_OLLAMA_MODEL || isDeterministicMode())
       ? dailyHuntQuotaStatus(getConfig().SECURITY_MAX_DAILY_HUNTS).available
       : claimDailyHuntSlot(getConfig().SECURITY_MAX_DAILY_HUNTS)))
       throw new Error("Daily dispatch limit reached");
@@ -468,7 +469,7 @@ export async function forceStopSecuritySolver(): Promise<{ killed: boolean; rese
   const killed = killActiveSecurityProcess();
   // The owning hunt/review releases its lock in finally after cancellation and
   // any bounded reproduction cleanup; never let another job reuse it early.
-  if(!process.env.LOCAL_OLLAMA_MODEL && activeLocalJobCount()===0){solving=false;releaseHuntLock();}
+  if(!process.env.LOCAL_OLLAMA_MODEL && !isDeterministicMode() && activeLocalJobCount()===0){solving=false;releaseHuntLock();}
 
   const db = getDb();
   const stuck = db
@@ -700,12 +701,12 @@ async function processAdversarialQueueImpl(programId?: string): Promise<void> {
       or(eq(schema.securityFindings.status,'report_ready'),eq(schema.securityFindings.status,'reviewing'))):
       or(eq(schema.securityFindings.status,'report_ready'),eq(schema.securityFindings.status,'reviewing'))).all()
     .some(f=>{try{return !!JSON.parse(f.analysisNotes||'{}').reproductionCaseId;}catch{return false;}});
-  if(process.env.LOCAL_OLLAMA_MODEL || pendingSourceCases) {
+  if(process.env.LOCAL_OLLAMA_MODEL || isDeterministicMode() || pendingSourceCases) {
     if(solving || !acquireHuntLock())return;
     solving=true;
     try {const {processLocalReviewQueue}=await import("./local-program-flow");await processLocalReviewQueue(programId);}
     finally {solving=false;releaseHuntLock();await clearAdversarialReviewStatus().catch(()=>{});}
-    if(process.env.LOCAL_OLLAMA_MODEL)return;
+    if(process.env.LOCAL_OLLAMA_MODEL || isDeterministicMode())return;
   }
   const config = getConfig();
 
@@ -985,7 +986,7 @@ async function processAdversarialQueueImpl(programId?: string): Promise<void> {
 
         // Auto-submit if enabled and recommendation is "submit" (not "submit_cautiously")
         // Only HackerOne supports programmatic submission — other providers require manual submission
-        if (config.SECURITY_AUTO_SUBMIT && !process.env.LOCAL_OLLAMA_MODEL && finalRecommendation === "submit" && program.provider === "hackerone" && program.providerProgramId && !finding.id.startsWith("offline-")) {
+        if (config.SECURITY_AUTO_SUBMIT && !process.env.LOCAL_OLLAMA_MODEL && !isDeterministicMode() && finalRecommendation === "submit" && program.provider === "hackerone" && program.providerProgramId && !finding.id.startsWith("offline-")) {
           try {
             if (finding.reportId) throw new Error("Finding already has a provider report ID");
             assertAuthorizedTarget(program.scopeSummary, finding.targetAsset ?? "");

@@ -2,6 +2,7 @@ import type { StaticLeadFocus } from "./local-program-flow";
 import { activeLocalJobCount, requestLocalJobCancellation } from "./local-job";
 import { spawn } from "node:child_process";
 import { activeLocalAuditCount, abortLocalAudits } from "./local-ollama-runner";
+import { isDeterministicMode } from "./deterministic";
 import { authorizedSourceUrls, cloneAuthorizedSource } from "./authorized-source";
 import { writeFile, mkdir, appendFile, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -1936,7 +1937,7 @@ ${reportBody}`;
 /** Source investigations always use the deterministic source controller. Model
  * configuration chooses inference, never whether reproduction/review gates exist. */
 export function usesDeterministicSourceController(program:Pick<SecurityProgram,'scopeSummary'>):boolean {
-  if(process.env.LOCAL_OLLAMA_MODEL)return true;
+  if(process.env.LOCAL_OLLAMA_MODEL || isDeterministicMode())return true;
   try {
     const value=JSON.parse(program.scopeSummary||'{}');
     return authorizedSourceUrls(Array.isArray(value)?value:value.scopes).length>0;

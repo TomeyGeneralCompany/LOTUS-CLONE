@@ -23,6 +23,7 @@ import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequi
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { postOllamaChat } from "../../core/src/ollama-chat";
+import { driveDeterministicAuditTurn, resolveLocalModelAdapter } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { readFile, realpath, appendFile, writeFile, rename, mkdtemp } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
@@ -210,8 +211,7 @@ export async function runLocalAudit(
   if(limits.productionWorkflow && (!structured || !limits.verifyPython || limits.actionConstraints))
     throw new Error("Production workflow requires JSON protocol, source probes and no fixture constraints");
   const workflow=limits.productionWorkflow ? new InvestigationWorkflow() : undefined;
-  const adapter=process.env.LOCAL_MODEL_ADAPTER || 'ollama';
-  if(!['ollama','qwen-agent'].includes(adapter))throw new Error('Unknown LOCAL_MODEL_ADAPTER');
+  const adapter=resolveLocalModelAdapter();
   if(adapter==='qwen-agent'&&!structured)throw new Error('Qwen-Agent adapter requires JSON action protocol');
   let successfulReads = 0;
   let rejectedRequiredProbeFinals = 0;
@@ -1793,6 +1793,53 @@ export async function runLocalAudit(
       }
       const result: {message?:Message;eval_count?:number;prompt_eval_count?:number;done_reason?:string;load_duration?:number;prompt_eval_duration?:number;eval_duration?:number;total_duration?:number;client_queue_ms?:number} = controllerAction ?
         {message:{role:'assistant',content:JSON.stringify(controllerAction)}} :
+        adapter==='deterministic' ?
+        await (async () => {
+          const activeLeadMeta=stageLock?.currentStage==='ANALYZE' && analyzeModelPending ? nextAnalysisPacket() : undefined;
+          const activePacket=activeLeadMeta ? analysisPackets.get(activeLeadMeta.id) : undefined;
+          const snapshots:Array<{path:string;sha256:string;content:string}>=[];
+          const snapshotPaths=new Set<string>();
+          if(activePacket?.path)snapshotPaths.add(activePacket.path);
+          for(const rp of (workflow?.snapshot().readPaths || []).slice(-12))snapshotPaths.add(rp);
+          for(const sp of snapshotPaths){
+            try {
+              const full=await safePath(sp);
+              const content=await readFile(full,'utf8');
+              snapshots.push({path:sp,sha256:createHash('sha256').update(content).digest('hex'),content});
+            }catch{}
+          }
+          const observedCases=(workflow?.snapshot().observations || [])
+            .filter(o=>o.status==='behavior_observed' && typeof o.caseId==='string' && /^[a-f0-9]{64}$/.test(o.caseId))
+            .map(o=>({caseId:o.caseId!,path:o.path,selector:o.selector,kind:o.kind}));
+          const recoveredFinalJson=(stageLock?.currentStage==='REVIEW' || stageLock?.currentStage==='REPORT' ||
+            (constraints?.action?.length===1 && constraints.action[0]==='final')) && limits.recoverFinal
+            ? await limits.recoverFinal() : null;
+          const detAction=driveDeterministicAuditTurn({
+            stage:stageLock?.currentStage,
+            analyzeModelPending,
+            activeLead:activePacket ? {
+              leadId:activePacket.id,
+              path:activePacket.path,
+              selector:activePacket.selector,
+              sourceEvidence:activePacket.sourceEvidence,
+              sourceExcerpt:activePacket.sourceExcerpt,
+            } : null,
+            pendingLeadIds:stageLock?.analysisProgress.pendingIds || [],
+            sources:snapshots,
+            staticLeads:limits.staticLeads || [],
+            constraints,
+            requestSchema,
+            initialSourcePaths:limits.initialSourcePaths || [],
+            readPaths:workflow?.snapshot().readPaths || [],
+            outcomes:stageLock?.outcomeCounts,
+            observedCases,
+            recoveredFinalJson,
+          });
+          await appendFile(logFile,'[DETERMINISTIC_DRIVER_ACTION] '+JSON.stringify({
+            turn:turn+1,stage:stageLock?.currentStage||'default',action:detAction.action,
+            path:detAction.path,query:detAction.query,leadId:detAction.leadId})+'\n');
+          return {message:{role:'assistant',content:JSON.stringify(detAction)},eval_count:0,prompt_eval_count:0,done_reason:'deterministic'};
+        })() :
         await (async () => {
           // A stalled Ollama request must not terminate a multi-hour investigation.
           // Retry only the model generation; controller memory, read cursors,

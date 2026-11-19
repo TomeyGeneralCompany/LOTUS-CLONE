@@ -2,6 +2,7 @@ import { eq, asc } from "drizzle-orm";
 import { z } from "zod";
 import { getConfig, getDb, schema, claimDailyHuntSlot, programCandidateBlocker, assertAuthorizedTarget, authorizedSourceUrls, createLogger, type SecurityProgram } from "@bounty/core";
 import type { StaticLeadFocus } from "./local-program-flow";
+import { isDeterministicMode } from "./deterministic";
 const log = createLogger("static-lead-queue");
 const record = z.object({source:z.literal("offline_static_triage"),repository:z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
   commit:z.string().regex(/^[a-f0-9]{40}$/),lead:z.object({file:z.string().min(1).max(4096),line:z.number().int().positive(),rule:z.string().min(1).max(100)})});
@@ -11,7 +12,7 @@ let running = false;
  */
 export async function processStaticLeadQueue(investigate?: (program:SecurityProgram, focus:StaticLeadFocus) => Promise<{findingsCreated:number}>):Promise<boolean> {
   const config = getConfig();
-  if (running || !config.SECURITY_AUTO_HUNT_ENABLED || !process.env.LOCAL_OLLAMA_MODEL) return false;
+  if (running || !config.SECURITY_AUTO_HUNT_ENABLED || (!isDeterministicMode() && !process.env.LOCAL_OLLAMA_MODEL)) return false;
   running = true;
   try {
     const db=getDb();

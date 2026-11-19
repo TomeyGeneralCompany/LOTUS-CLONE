@@ -1,5 +1,6 @@
 import {appendFile} from 'node:fs/promises';
 import {postOllamaChat} from '../../core/src/ollama-chat';
+import {evaluateDeterministicEvidenceReview,isDeterministicMode} from './deterministic';
 
 type VerdictResponse={message?:{content?:string;thinking?:string};eval_count?:number;prompt_eval_count?:number;done_reason?:string};
 
@@ -34,6 +35,19 @@ export async function runEvidenceOnlyReview(input:{
   let lastFeedback='No verdict returned';
   let previousRejectedContent='';
   let repeatedRejectionCount=0;
+  if(!input.transport && isDeterministicMode()){
+    input.signal.throwIfAborted();
+    await appendFile(input.logFile,'[EVIDENCE_ONLY_REVIEW_DETERMINISTIC] '+JSON.stringify({model:'deterministic'})+'\n');
+    const verdict=evaluateDeterministicEvidenceReview(input.prompt);
+    const content=JSON.stringify(verdict);
+    const feedback=await input.validate(content);
+    if(!feedback){
+      await appendFile(input.logFile,'[EVIDENCE_ONLY_REVIEW_ACCEPTED] '+JSON.stringify({attempt:1,mode:'deterministic'})+'\n');
+      return content;
+    }
+    await appendFile(input.logFile,'[EVIDENCE_ONLY_REVIEW_CORRECTED] '+JSON.stringify({attempt:1,mode:'deterministic',reason:feedback.slice(0,600)})+'\n');
+    throw new Error('Deterministic evidence-only review failed validation: '+feedback.slice(0,600));
+  }
   const url=process.env.AUTOHACK_OLLAMA_URL||'http://127.0.0.1:11434/api/chat';
   for(let attempt=1;attempt<=attempts;attempt++){
     input.signal.throwIfAborted();

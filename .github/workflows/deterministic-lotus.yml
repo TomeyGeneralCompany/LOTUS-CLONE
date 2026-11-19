@@ -1,0 +1,26 @@
+name: Deterministic LOTUS (Zero-Qwen)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deterministic-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: TypeScript typecheck
+        run: npx tsc --noEmit --project tsconfig.json
+      - name: Run zero-Qwen end-to-end deterministic test suite
+        env:
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+        run: npx tsx scripts/test-deterministic-lotus.ts
