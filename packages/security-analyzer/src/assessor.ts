@@ -189,7 +189,6 @@ export function assessFindingDeterministic(
 export async function assessProgram(
   program: SecurityProgram,
 ): Promise<ProgramAssessmentResult> {
-  const config = getConfig();
 
   let scopes: Array<{ assetIdentifier: string; assetType: string; instruction?: string }> = [];
   let policyText = "";
@@ -230,6 +229,7 @@ export async function assessProgram(
   if (useDeterministicAssessment()) {
     return assessProgramDeterministic(program, visibleScopes, sourceCodeScopes);
   }
+  const config = getConfig();
   const allowedAssets = [...new Set(visibleScopes.map(scope => scope.assetIdentifier))];
   const maxTargets = Math.min(5, allowedAssets.length);
 
