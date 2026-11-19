@@ -234,9 +234,6 @@ export function driveDeterministicAuditTurn(
   const unread = (input.initialSourcePaths || []).filter((p) => !readSet.has(p));
   if (unread.length > 0) {
     const nextPath = unread[0];
-    if (nextPath.endsWith(".sol") && can("outline_solidity")) {
-      return { action: "outline_solidity", path: nextPath, query: "", answer: "", offset: 0 };
-    }
     if (can("read_file")) {
       return { action: "read_file", path: nextPath, query: "", answer: "", offset: 0 };
     }

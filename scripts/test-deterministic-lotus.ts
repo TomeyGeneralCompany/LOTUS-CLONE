@@ -179,47 +179,67 @@ contract GuardedVault is Ownable {
       required: ["findings", "outcome", "reason"],
     };
 
-    const answer = await runLocalAudit(
-      "Run deterministic security audit of source-1/contracts/GuardedVault.sol",
-      logFile,
-      60_000,
-      tmp,
-      "deterministic",
-      undefined,
-      {
-        numCtx: 4096,
-        numPredict: 512,
-        numThreads: 2,
-        maxTurns: 20,
-        initialSourcePaths: ["source-1/contracts/GuardedVault.sol"],
-        finalSchema,
-        staticLeads: [
-          {
-            path: "source-1/contracts/GuardedVault.sol",
-            line: 11,
-            rule: "solidity-owner-setter",
-            message: "Owner-gated setter",
-            severity: "INFO",
-            engine: "semgrep",
+    const prevControllerOwned = process.env.LOCAL_CONTROLLER_OWNED_ACTIONS;
+    const prevFullIndex = process.env.LOCAL_CONTROLLER_FULL_SOURCE_INDEX;
+    const prevGuided = process.env.AUTOHACK_GUIDED_SOURCE_PROBES;
+    const prevProtocol = process.env.LOCAL_OLLAMA_TOOL_PROTOCOL;
+    process.env.LOCAL_CONTROLLER_OWNED_ACTIONS = "true";
+    process.env.LOCAL_CONTROLLER_FULL_SOURCE_INDEX = "true";
+    process.env.AUTOHACK_GUIDED_SOURCE_PROBES = "true";
+    process.env.LOCAL_OLLAMA_TOOL_PROTOCOL = "json";
+    let answer = "";
+    try {
+      answer = await runLocalAudit(
+        "Run deterministic security audit of source-1/contracts/GuardedVault.sol",
+        logFile,
+        60_000,
+        tmp,
+        "deterministic",
+        undefined,
+        {
+          numCtx: 4096,
+          numPredict: 512,
+          numThreads: 2,
+          maxTurns: 30,
+          initialSourcePaths: ["source-1/contracts/GuardedVault.sol"],
+          finalSchema,
+          staticLeads: [
+            {
+              path: "source-1/contracts/GuardedVault.sol",
+              line: 11,
+              rule: "solidity-owner-setter",
+              message: "Owner-gated setter",
+              severity: "INFO",
+              engine: "semgrep",
+            },
+          ],
+          verifyPython: async (_path, selector, kind) =>
+            JSON.stringify({
+              status: "behavior_not_observed",
+              behavior_observed: false,
+              kind,
+              selector,
+              observations: { steps: [{ operation: "send", reverted: true, passed: true }] },
+            }),
+          validateFinal: (text) => {
+            const parsed = JSON.parse(text);
+            if (!Array.isArray(parsed.findings)) return "findings must be an array";
+            if (parsed.outcome !== "no_testable_candidate") return "expected no_testable_candidate";
+            if (typeof parsed.reason !== "string" || parsed.reason.length < 20) return "reason too short";
+            return null;
           },
-        ],
-        verifyPython: async (_path, selector, kind) =>
-          JSON.stringify({
-            status: "behavior_not_observed",
-            behavior_observed: false,
-            kind,
-            selector,
-            observations: { steps: [{ operation: "send", reverted: true, passed: true }] },
-          }),
-        validateFinal: (text) => {
-          const parsed = JSON.parse(text);
-          if (!Array.isArray(parsed.findings)) return "findings must be an array";
-          if (parsed.outcome !== "no_testable_candidate") return "expected no_testable_candidate";
-          if (typeof parsed.reason !== "string" || parsed.reason.length < 20) return "reason too short";
-          return null;
         },
-      },
-    );
+      );
+    } finally {
+      if (prevControllerOwned === undefined) delete process.env.LOCAL_CONTROLLER_OWNED_ACTIONS;
+      else process.env.LOCAL_CONTROLLER_OWNED_ACTIONS = prevControllerOwned;
+      if (prevFullIndex === undefined) delete process.env.LOCAL_CONTROLLER_FULL_SOURCE_INDEX;
+      else process.env.LOCAL_CONTROLLER_FULL_SOURCE_INDEX = prevFullIndex;
+      if (prevGuided === undefined) delete process.env.AUTOHACK_GUIDED_SOURCE_PROBES;
+      else process.env.AUTOHACK_GUIDED_SOURCE_PROBES = prevGuided;
+      if (prevProtocol === undefined) delete process.env.LOCAL_OLLAMA_TOOL_PROTOCOL;
+      else process.env.LOCAL_OLLAMA_TOOL_PROTOCOL = prevProtocol;
+    }
 
     const parsed = JSON.parse(answer);
     assert.equal(parsed.outcome, "no_testable_candidate");
