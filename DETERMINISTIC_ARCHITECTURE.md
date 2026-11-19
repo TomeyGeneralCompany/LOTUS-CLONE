@@ -1,34 +1,34 @@
-# LOTUS-CLONE: Deterministic (Qwen-Free) Security Engine
+# Deterministic LOTUS Architecture (Zero-Qwen)
 
-This standalone clone starts from verified PR #233 (`37ad946e`) and replaces the Qwen/Ollama inference hot-loop with three deterministic core capabilities while preserving existing Semgrep, Slither, `@solidity-parser/parser`, controller scheduling, and 4-language verifier infrastructure.
+`LOTUS-CLONE` replaces Qwen / Ollama LLM dependencies with a deterministic, tool-backed analysis and review stack while preserving existing Semgrep, Slither, `@solidity-parser/parser`, controller scheduling, and the 4-language isolated verifier.
 
-## Core Capabilities (`packages/security-solver/src/deterministic/`)
+## Three Core Capabilities
 
-1. **Common Program-Facts Representation (`program-facts.ts`)**
-   - Language-agnostic IR (`ProgramFactsGraph`, `ProgramSymbol`, `ProgramFact`, `ProgramEdge`) normalizing entry points, auth guards, state writes, value transfers, mint/burn, privileged primitives, initializers, HTML/path/command/SQL/deserialization sinks, and Semgrep/Slither leads.
-   - Pluggable `ProgramFactsAdapter` interface with built-in adapters (`solidity-ast`, `javascript-structural`, `python-structural`, `java-structural`, `static-leads`) and runtime catalog probing (`EXTERNAL_ADAPTER_CATALOG`, `detectAvailableAdapters`) for incremental integration of:
-     - **MIT**: Tree-sitter, Z3, Mythril, fast-check, LibCST, Babel Parser
-     - **Apache-2.0**: Joern, JavaParser
-     - **MIT/Apache-2.0**: Foundry (`forge`)
+1. **Common Program-Facts IR** (`packages/security-solver/src/deterministic/program-facts.ts`):
+   Normalizes AST/CST symbols, authorization guards, sinks, CPG taint flows, SMT feasibility proofs, symbolic issues, and fuzzing counterexamples into a single `ProgramFactsGraph` (`symbols`, `facts`, `edges`).
+2. **Deterministic Hypothesis Engine** (`packages/security-solver/src/deterministic/hypothesis-engine.ts`):
+   Synthesizes ranked, falsifiable, source-grounded security hypotheses from `ProgramFactsGraph`, boosts leads corroborated by fast-check / Foundry / Mythril / Joern / Z3 SAT witnesses, and prunes paths proven `UNSAT` by Z3.
+3. **Deterministic Analysis & Review Driver** (`packages/security-solver/src/deterministic/analysis-review-driver.ts`):
+   Replaces Ollama/Qwen in `local-ollama-runner.ts` (`ANALYZE`, `REVIEW`, `REPORT`), `evidence-only-review.ts`, `packages/security-analyzer/src/assessor.ts`, and `claude-runner.ts` (`spawnComprehensiveReview`, `deverbosifyReport`).
 
-2. **Hypothesis Engine (`hypothesis-engine.ts`)**
-   - Synthesizes deduplicated, calibrated-priority `SecurityHypothesis[]` with falsification criteria, source witnesses, and probe/adapter recommendations.
-   - Drives `ANALYZE` lead evaluation (`evaluateAnalysisLead`) deterministically with zero LLM calls.
+## Integrated Tool Adapters (12 / 12)
 
-3. **Deterministic Analysis & Review Driver (`analysis-review-driver.ts`)**
-   - `LOCAL_MODEL_ADAPTER=deterministic` (default whenever `AUTOHACK_OLLAMA_URL` is unset).
-   - Replaces Qwen across:
-     - `local-ollama-runner.ts` (`ANALYZE`, `REVIEW`, `REPORT`, navigation)
-     - `evidence-only-review.ts` (independent evidence review without `postOllamaChat`)
-     - `packages/security-analyzer/src/assessor.ts` (program & finding scoring without `runClaude`)
+| Adapter | License | Role | Implementation |
+|---|---|---|---|
+| **Semgrep** | LGPL-2.1 | Pattern & rule static lead scanning | Existing `scripts/source-static.py` + `staticLeadsFactsAdapter` |
+| **Slither** | AGPL-3.0 | Bounded Solidity static & dataflow analysis | Existing `scripts/source-static.py` + `staticLeadsFactsAdapter` |
+| **@solidity-parser/parser** | MIT | Solidity AST & symbol/guard extraction | `solidityAstFactsAdapter` |
+| **@babel/parser** | MIT | JavaScript/TypeScript/JSX AST extraction | `adapters/babel-adapter.ts` |
+| **fast-check** | MIT | JS/TS property-based security fuzzing & shrinking | `adapters/fastcheck-adapter.ts` |
+| **LibCST** | MIT | Python CST symbol, decorator, guard & sink analysis | `scripts/adapters/libcst_facts.py` + `adapters/libcst-adapter.ts` |
+| **Tree-sitter** | MIT | Error-tolerant multi-language CST structural analysis | `scripts/adapters/treesitter_facts.py` + `adapters/treesitter-adapter.ts` |
+| **Z3** | MIT | SMT constraint feasibility & counterexample witnesses | `scripts/adapters/z3_feasibility.py` + `adapters/z3-adapter.ts` |
+| **Foundry (`forge`)** | MIT/Apache-2.0 | Solidity stateful fuzzing & invariant testing | `adapters/foundry-adapter.ts` |
+| **JavaParser** | Apache-2.0 | Java AST parsing, Spring/JAX-RS annotations & sinks | `scripts/adapters/JavaParserFacts.java` + `adapters/javaparser-adapter.ts` |
+| **Mythril** | MIT | Bounded EVM bytecode symbolic execution (SWC) | `adapters/mythril-adapter.ts` |
+| **Joern** | Apache-2.0 | Code Property Graphs & interprocedural taint flows | `scripts/adapters/joern_cpg_facts.sc` + `adapters/joern-adapter.ts` |
 
-## Side-by-Side A/B Benchmarking
+## Mode Selection
 
-- **Deterministic (Qwen-free, zero Ollama required):**
-  ```bash
-  LOCAL_MODEL_ADAPTER=deterministic npx tsx scripts/test-deterministic-lotus.ts
-  ```
-- **Legacy Qwen/Ollama (opt-in for A/B comparison):**
-  ```bash
-  LOCAL_MODEL_ADAPTER=ollama AUTOHACK_OLLAMA_URL=http://127.0.0.1:11434/api/chat ...
-  ```
+- Default in `LOTUS-CLONE` (when `AUTOHACK_OLLAMA_URL` is unset): `LOCAL_MODEL_ADAPTER=deterministic` (zero LLM calls).
+- Explicit opt-in A/B comparison: set `LOCAL_MODEL_ADAPTER=ollama` and `AUTOHACK_OLLAMA_URL=http://127.0.0.1:11434/api/chat`.

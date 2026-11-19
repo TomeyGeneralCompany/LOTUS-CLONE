@@ -119,8 +119,49 @@ export function generateHypotheses(graph: ProgramFactsGraph): SecurityHypothesis
     if (!symFacts.length) continue;
 
     const hasAuthGuard = symFacts.some((f) => f.kind === "auth_guard");
+    const hasUnsatGuard = symFacts.some((f) => f.kind === "smt_unsat_guard");
+    const hasSatWitness = symFacts.some((f) => f.kind === "smt_sat_witness");
     const staticFindings = symFacts.filter((f) => f.kind === "static_finding");
-    const staticBoost = staticFindings.length ? 8 : 0;
+    const staticBoost = (staticFindings.length ? 8 : 0) + (hasSatWitness ? 6 : 0) - (hasUnsatGuard ? 35 : 0);
+
+    // 0. Direct high-signal evidence from fast-check, Foundry, Mythril, or Joern CPG
+    const directEvidenceFacts = symFacts.filter(
+      (f) =>
+        f.kind === "property_counterexample" ||
+        f.kind === "foundry_invariant_violated" ||
+        f.kind === "symbolic_finding" ||
+        f.kind === "taint_flow",
+    );
+    if (directEvidenceFacts.length && !hasUnsatGuard) {
+      const top = directEvidenceFacts[0];
+      const category: HypothesisCategory =
+        top.kind === "taint_flow"
+          ? "command_or_eval"
+          : top.kind === "property_counterexample"
+            ? "injection_html"
+            : "access_control";
+      pushUnique({
+        id: hypothesisId(sym.file, sym.qualifiedName, category),
+        language: sym.language,
+        file: sym.file,
+        line: top.line || sym.line,
+        selector: sym.qualifiedName,
+        category,
+        priority: 99,
+        disposition: "ready_for_experiment",
+        statement: `${sym.qualifiedName} has direct deterministic evidence from ${top.adapter}: ${top.detail}`,
+        falsification: `Replay the witness/counterexample against ${sym.qualifiedName} in the isolated verifier and confirm impact.`,
+        rationale: `Corroborated directly by ${[...new Set(directEvidenceFacts.map((f) => f.adapter))].join(", ")}.`,
+        recommendedProbeKind:
+          sym.language === "solidity"
+            ? "solidity_sequence"
+            : top.kind === "property_counterexample"
+              ? "html_reflection"
+              : undefined,
+        recommendedAdapters: [...new Set(directEvidenceFacts.map((f) => f.adapter))],
+        witnesses: directEvidenceFacts.map(toWitness),
+      });
+    }
 
     // 1. Privileged primitives (delegatecall / selfdestruct)
     const privFacts = symFacts.filter((f) => f.kind === "privileged_primitive");
@@ -329,6 +370,41 @@ export function generateHypotheses(graph: ProgramFactsGraph): SecurityHypothesis
         witnesses: staticFindings.map(toWitness),
       });
     }
+  }
+
+  // File-level high-signal facts from Joern/Mythril/Foundry/fast-check not attached to a parsed symbol
+  for (const fact of graph.facts) {
+    if (
+      fact.kind !== "taint_flow" &&
+      fact.kind !== "symbolic_finding" &&
+      fact.kind !== "property_counterexample" &&
+      fact.kind !== "foundry_invariant_violated"
+    ) {
+      continue;
+    }
+    const selector = fact.symbol || `${fact.file}:${fact.line}`;
+    const category: HypothesisCategory =
+      fact.kind === "taint_flow"
+        ? "command_or_eval"
+        : fact.kind === "property_counterexample"
+          ? "injection_html"
+          : "access_control";
+    pushUnique({
+      id: hypothesisId(fact.file, selector, category),
+      language: fact.language,
+      file: fact.file,
+      line: fact.line,
+      selector,
+      category,
+      priority: 96,
+      disposition: "ready_for_experiment",
+      statement: `${selector} flagged by ${fact.adapter}: ${fact.detail}`,
+      falsification: `Confirm reachability and impact of ${selector} in the isolated verifier.`,
+      rationale: `Direct deterministic evidence emitted by ${fact.adapter}.`,
+      recommendedProbeKind: fact.language === "solidity" ? "solidity_sequence" : undefined,
+      recommendedAdapters: [fact.adapter],
+      witnesses: [toWitness(fact)],
+    });
   }
 
   results.sort((a, b) => b.priority - a.priority || a.file.localeCompare(b.file) || a.line - b.line);

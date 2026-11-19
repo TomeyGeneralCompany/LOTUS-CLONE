@@ -8,7 +8,7 @@
  */
 import { createHash } from "node:crypto";
 import type { SourceSnapshot, StaticLeadHint } from "../controller-solidity-experiment-planner";
-import { buildProgramFactsGraph } from "./program-facts";
+import { buildProgramFactsGraph, createHostFactsAdapters } from "./program-facts";
 import { evaluateAnalysisLead, type LeadAnalysisInput } from "./hypothesis-engine";
 
 export type LocalModelAdapter = "deterministic" | "ollama" | "qwen-agent";

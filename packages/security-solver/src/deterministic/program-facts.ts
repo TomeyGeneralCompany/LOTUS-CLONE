@@ -10,6 +10,12 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseSolidity } from "@solidity-parser/parser";
+import { babelAstFactsAdapter } from "./adapters/babel-adapter";
+import { libCstFactsAdapter, isLibCstAvailable } from "./adapters/libcst-adapter";
+import { treeSitterFactsAdapter, isTreeSitterAvailable } from "./adapters/treesitter-adapter";
+import { javaParserFactsAdapter, isJavaParserAvailable } from "./adapters/javaparser-adapter";
+import { isMythrilAvailable } from "./adapters/mythril-adapter";
+import { isJoernAvailable } from "./adapters/joern-adapter";
 import type { SourceSnapshot, StaticLeadHint } from "../controller-solidity-experiment-planner";
 
 export type FactLanguage = "solidity" | "javascript" | "python" | "java" | "unknown";
@@ -56,7 +62,14 @@ export type ProgramFactKind =
   | "sink_sql"
   | "sink_deserialization"
   | "static_finding"
-  | "constraint_guard";
+  | "constraint_guard"
+  | "property_counterexample"
+  | "symbolic_finding"
+  | "taint_flow"
+  | "smt_unsat_guard"
+  | "smt_sat_witness"
+  | "foundry_invariant_violated"
+  | "foundry_property_held";
 
 export type FactSeverity = "critical" | "high" | "medium" | "low" | "info";
 
@@ -73,7 +86,7 @@ export interface ProgramFact {
   metadata?: Record<string, unknown>;
 }
 
-export type ProgramEdgeKind = "calls" | "inherits" | "imports" | "writes_state" | "guards";
+export type ProgramEdgeKind = "calls" | "inherits" | "imports" | "writes_state" | "guards" | "dataflow";
 
 export interface ProgramEdge {
   from: string;
@@ -129,15 +142,15 @@ export const EXTERNAL_ADAPTER_CATALOG: readonly ExternalToolAdapterSpec[] = [
   { id: "semgrep", name: "Semgrep", role: "Pattern & rule static lead scanning", license: "LGPL-2.1", languages: ["solidity", "javascript", "python", "java"], status: "integrated", probeCommand: ["semgrep", "--version"] },
   { id: "slither", name: "Slither", role: "Bounded Solidity static & dataflow analysis", license: "AGPL-3.0", languages: ["solidity"], status: "integrated", probeCommand: ["slither", "--version"] },
   { id: "solidity-parser", name: "@solidity-parser/parser", role: "Solidity AST & symbol/guard extraction", license: "MIT", languages: ["solidity"], status: "integrated", probeNodeModule: "@solidity-parser/parser" },
-  { id: "tree-sitter", name: "Tree-sitter", role: "Structural multi-language CST/AST analysis", license: "MIT", languages: ["solidity", "javascript", "python", "java"], status: "planned_adapter", probeCommand: ["tree-sitter", "--version"] },
-  { id: "joern", name: "Joern", role: "Code property graphs & interprocedural taint", license: "Apache-2.0", languages: ["javascript", "python", "java"], status: "planned_adapter", probeCommand: ["joern", "--version"] },
-  { id: "z3", name: "Z3", role: "SMT constraint solving for path & invariant feasibility", license: "MIT", languages: ["solidity", "javascript", "python", "java"], status: "planned_adapter", probeCommand: ["z3", "--version"] },
-  { id: "mythril", name: "Mythril", role: "EVM bytecode symbolic execution", license: "MIT", languages: ["solidity"], status: "planned_adapter", probeCommand: ["myth", "version"] },
-  { id: "foundry", name: "Foundry (forge)", role: "Solidity stateful fuzzing & invariant testing", license: "MIT/Apache-2.0", languages: ["solidity"], status: "planned_adapter", probeCommand: ["forge", "--version"] },
-  { id: "fast-check", name: "fast-check", role: "JavaScript/TypeScript property-based testing", license: "MIT", languages: ["javascript"], status: "planned_adapter", probeNodeModule: "fast-check" },
-  { id: "javaparser", name: "JavaParser", role: "Java AST parsing & symbol resolution", license: "Apache-2.0", languages: ["java"], status: "planned_adapter" },
-  { id: "libcst", name: "LibCST", role: "Python concrete syntax tree analysis", license: "MIT", languages: ["python"], status: "planned_adapter", probeCommand: ["python3", "-c", "import libcst"] },
-  { id: "babel-parser", name: "@babel/parser", role: "JavaScript/TypeScript AST extraction", license: "MIT", languages: ["javascript"], status: "planned_adapter", probeNodeModule: "@babel/parser" },
+  { id: "babel-parser", name: "@babel/parser", role: "JavaScript/TypeScript AST extraction", license: "MIT", languages: ["javascript"], status: "integrated", probeNodeModule: "@babel/parser" },
+  { id: "fast-check", name: "fast-check", role: "JavaScript/TypeScript property-based testing", license: "MIT", languages: ["javascript"], status: "integrated", probeNodeModule: "fast-check" },
+  { id: "libcst", name: "LibCST", role: "Python concrete syntax tree analysis", license: "MIT", languages: ["python"], status: "integrated", probeCommand: ["python3", "-c", "import libcst"] },
+  { id: "tree-sitter", name: "Tree-sitter", role: "Structural multi-language CST/AST analysis", license: "MIT", languages: ["solidity", "javascript", "python", "java"], status: "integrated", probeCommand: ["python3", "-c", "import tree_sitter"] },
+  { id: "z3", name: "Z3", role: "SMT constraint solving for path & invariant feasibility", license: "MIT", languages: ["solidity", "javascript", "python", "java"], status: "integrated", probeCommand: ["python3", "-c", "import z3"] },
+  { id: "foundry", name: "Foundry (forge)", role: "Solidity stateful fuzzing & invariant testing", license: "MIT/Apache-2.0", languages: ["solidity"], status: "integrated", probeCommand: ["forge", "--version"] },
+  { id: "javaparser", name: "JavaParser", role: "Java AST parsing & symbol resolution", license: "Apache-2.0", languages: ["java"], status: "integrated", probeCommand: ["java", "-version"] },
+  { id: "mythril", name: "Mythril", role: "EVM bytecode symbolic execution", license: "MIT", languages: ["solidity"], status: "integrated", probeCommand: ["myth", "version"] },
+  { id: "joern", name: "Joern", role: "Code property graphs & interprocedural taint", license: "Apache-2.0", languages: ["javascript", "python", "java"], status: "integrated", probeCommand: ["joern-parse", "--help"] },
 ];
 
 export interface AdapterAvailability {
@@ -152,7 +165,13 @@ export interface AdapterAvailability {
 export function detectAvailableAdapters(): AdapterAvailability[] {
   return EXTERNAL_ADAPTER_CATALOG.map((spec) => {
     let availableOnHost = false;
-    if (spec.probeCommand) {
+    if (spec.id === "javaparser") {
+      availableOnHost = isJavaParserAvailable();
+    } else if (spec.id === "mythril") {
+      availableOnHost = isMythrilAvailable();
+    } else if (spec.id === "joern") {
+      availableOnHost = isJoernAvailable();
+    } else if (spec.probeCommand) {
       try {
         execFileSync(spec.probeCommand[0], spec.probeCommand.slice(1), {
           stdio: "ignore",
@@ -714,11 +733,33 @@ export const staticLeadsFactsAdapter: ProgramFactsAdapter = {
 
 export const DEFAULT_FACTS_ADAPTERS: readonly ProgramFactsAdapter[] = [
   solidityAstFactsAdapter,
+  babelAstFactsAdapter,
   javascriptStructuralFactsAdapter,
   pythonStructuralFactsAdapter,
   javaStructuralFactsAdapter,
   staticLeadsFactsAdapter,
 ];
+
+let cachedHostAdapters: readonly ProgramFactsAdapter[] | null = null;
+
+/**
+ * Returns DEFAULT_FACTS_ADAPTERS enriched with all host-available external AST/CST
+ * adapters (LibCST, Tree-sitter, JavaParser). Probing is cached per process.
+ */
+export function createHostFactsAdapters(forceRefresh = false): readonly ProgramFactsAdapter[] {
+  if (!forceRefresh && cachedHostAdapters) return cachedHostAdapters;
+  const list: ProgramFactsAdapter[] = [
+    solidityAstFactsAdapter,
+    babelAstFactsAdapter,
+    staticLeadsFactsAdapter,
+  ];
+  if (isLibCstAvailable()) list.push(libCstFactsAdapter);
+  if (isJavaParserAvailable()) list.push(javaParserFactsAdapter);
+  if (isTreeSitterAvailable()) list.push(treeSitterFactsAdapter);
+  list.push(javascriptStructuralFactsAdapter, pythonStructuralFactsAdapter, javaStructuralFactsAdapter);
+  cachedHostAdapters = list;
+  return list;
+}
 
 export function buildProgramFactsGraph(
   input: AdapterExtractionInput,

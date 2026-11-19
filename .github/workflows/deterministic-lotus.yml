@@ -9,6 +9,7 @@ on:
 
 jobs:
   deterministic-core:
+    name: Core + AST/CST/SMT/Fuzz Adapters (Babel, fast-check, LibCST, Tree-sitter, Z3, JavaParser, Foundry)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,11 +17,70 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-      - run: npm ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+      - name: Install npm dependencies (@babel/parser, fast-check, @solidity-parser/parser)
+        run: npm ci
+      - name: Install MIT Python adapters (LibCST, Tree-sitter + grammars, Z3)
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install libcst z3-solver tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-java
+      - name: Download Apache-2.0 JavaParser core jar
+        run: |
+          mkdir -p /tmp/lotus-tools
+          curl -fsSL https://repo1.maven.org/maven2/com/github/javaparser/javaparser-core/3.26.3/javaparser-core-3.26.3.jar -o /tmp/lotus-tools/javaparser-core.jar
+          java -version
       - name: TypeScript typecheck
         run: npx tsc --noEmit --project tsconfig.json
-      - name: Run zero-Qwen end-to-end deterministic test suite
+      - name: Run zero-Qwen end-to-end deterministic core suite
         env:
           LOCAL_MODEL_ADAPTER: deterministic
           AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+          JAVAPARSER_JAR: /tmp/lotus-tools/javaparser-core.jar
         run: npx tsx scripts/test-deterministic-lotus.ts
+      - name: Run live deterministic adapters suite (7/7 core tools live)
+        env:
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+          JAVAPARSER_JAR: /tmp/lotus-tools/javaparser-core.jar
+          REQUIRE_ALL_CORE_ADAPTERS: "1"
+        run: npx tsx scripts/test-deterministic-adapters.ts
+
+  symbolic-and-cpg-adapters:
+    name: Symbolic & CPG Adapters (Mythril + Joern)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: npm ci
+      - name: Install Mythril (MIT) in isolated virtualenv
+        run: |
+          python3 -m venv /tmp/mythril-venv
+          /tmp/mythril-venv/bin/pip install --upgrade pip "setuptools<70" wheel
+          /tmp/mythril-venv/bin/pip install mythril
+          /tmp/mythril-venv/bin/myth version
+      - name: Install Joern CLI (Apache-2.0)
+        run: |
+          mkdir -p /tmp/joern-install
+          curl -fsSL https://github.com/joernio/joern/releases/latest/download/joern-cli.zip -o /tmp/joern-cli.zip
+          unzip -q /tmp/joern-cli.zip -d /tmp/joern-install
+          chmod +x /tmp/joern-install/joern-cli/joern /tmp/joern-install/joern-cli/joern-parse
+          /tmp/joern-install/joern-cli/joern-parse --help | head -n 5
+      - name: Run live Mythril + Joern adapter verification
+        env:
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+          MYTHRIL_BIN: /tmp/mythril-venv/bin/myth
+          JOERN_HOME: /tmp/joern-install/joern-cli
+          REQUIRE_SYMBOLIC_CPG_ADAPTERS: "1"
+        run: npx tsx scripts/test-deterministic-adapters.ts
