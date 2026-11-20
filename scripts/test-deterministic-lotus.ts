@@ -185,6 +185,13 @@ contract GuardedVault is Ownable {
 }
 `;
     await writeFile(join(repoDir, "GuardedVault.sol"), vaultSource, "utf8");
+    // Real candidate admission requires an acquired, versioned source revision.
+    // Commit the test fixture instead of bypassing source-identity validation.
+    execFileSync("git", ["init", "-q"], { cwd: repoDir });
+    execFileSync("git", ["-c", "user.name=LOTUS Fixture", "-c", "user.email=fixture@localhost",
+      "add", "GuardedVault.sol"], { cwd: repoDir });
+    execFileSync("git", ["-c", "user.name=LOTUS Fixture", "-c", "user.email=fixture@localhost",
+      "-c", "core.hooksPath=/dev/null", "commit", "-qm", "Versioned source fixture"], { cwd: repoDir });
     const logFile = join(tmp, "audit.log");
     const finalSchema = {
       type: "object",
