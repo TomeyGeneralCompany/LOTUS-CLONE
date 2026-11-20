@@ -102,6 +102,10 @@ jobs:
 
           echo "SETUP_OK: dependencies and installed state available; deterministic engine selected (no Ollama required)" | tee -a data/repair-feedback/setup.log
 
+      - name: Reject accidental Qwen model runtime or workflow restoration
+        shell: bash
+        run: npx tsx scripts/test-no-model-runtime.ts
+
       - name: Verify Round 3 full-inventory lifecycle before laptop hunt
         shell: bash
         run: |
