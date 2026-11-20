@@ -150,22 +150,10 @@ export function prioritizeSolidityStagedPlans<T extends {id:string;plan:{path:st
     else if(entry.base>=40)tiers.tier3++;
     else tiers.tier4++;
   }
-  const tier4PerPath=new Map<string,number>();
-  const capTier4=scored.length>16;
-  const selected:T[]=[];
-  let droppedTier4Count=0;
-  for(const entry of scored){
-    if(capTier4 && entry.base<=10){
-      const count=tier4PerPath.get(entry.item.plan.path)||0;
-      if(count>=3){
-        droppedTier4Count++;
-        continue;
-      }
-      tier4PerPath.set(entry.item.plan.path,count+1);
-    }
-    selected.push(entry.item);
-  }
-  return {selected,droppedTier4Count,tiers};
+  // Priority controls order, not total eligibility. Previously the per-file
+  // Tier 4 cap silently discarded valid source-grounded experiments.
+  const selected=scored.map(entry=>entry.item);
+  return {selected,droppedTier4Count:0,tiers};
 }
 
 export function controllerGroundedSolidityOptions(
