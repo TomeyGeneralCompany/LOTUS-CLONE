@@ -23,7 +23,7 @@ import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequi
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { postOllamaChat } from "../../core/src/ollama-chat";
-import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
+import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
@@ -441,6 +441,14 @@ export async function runLocalAudit(
   let messageBudget=0;
   let pageSize=Math.max(128,Math.min(2000,messageBudget-JSON.stringify(messages).length-800));
   try {
+    if(adapter==='deterministic'){
+      const caps=detectAvailableAdapters();
+      await appendFile(logFile,'[DETERMINISTIC_HOST_CAPABILITIES] '+JSON.stringify({
+        available:caps.filter(c=>c.availableOnHost).map(c=>c.name),
+        unavailable:caps.filter(c=>!c.availableOnHost).map(c=>c.name),
+        adapters:caps,
+      })+'\n');
+    }
     const budget=allocateAuditContext(messages,structured?actionSchema:availableTools,settings.numCtx,generationBudget,workflow?3000:0);
     generationBudget=budget.generationBudget;contextBudget=budget.contextBudget;messageBudget=budget.messageBudget;
     pageSize=Math.max(128,Math.min(2000,messageBudget-(workflow?3000:0)-JSON.stringify(messages).length-800));

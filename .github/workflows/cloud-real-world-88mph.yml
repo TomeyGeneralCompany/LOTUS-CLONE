@@ -40,13 +40,20 @@ jobs:
       LOCAL_CONTROLLER_FULL_SOURCE_INDEX: 'true'
       AUTOHACK_OLLAMA_URL: ${{ (inputs.engine || 'deterministic') == 'ollama' && 'http://127.0.0.1:11434/api/chat' || 'http://127.0.0.1:1/api/chat' }}
       AUTOHACK_SINGLE_BOUNTY_DIAGNOSTIC: '1'
+      JAVAPARSER_JAR: /tmp/lotus-tools/javaparser-core.jar
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install dependencies and reproduction runtime
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+      - name: Install dependencies, reproduction runtime, and deterministic specialist adapters
         run: |
           set -Eeuo pipefail
           sudo apt-get update
@@ -54,6 +61,17 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           npm ci
           bash scripts/install-reproduction-runtime.sh
+          python3 -m pip install --upgrade pip
+          pip install libcst z3-solver tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-java
+          mkdir -p /tmp/lotus-tools data/repair-feedback
+          curl -fsSL https://repo1.maven.org/maven2/com/github/javaparser/javaparser-core/3.26.3/javaparser-core-3.26.3.jar -o /tmp/lotus-tools/javaparser-core.jar
+          forge --version
+          python3 -c "import z3, libcst, tree_sitter; print('Python specialists OK: z3', z3.get_version_string())"
+      - name: Preflight deterministic host capability inventory
+        run: |
+          set -Eeuo pipefail
+          mkdir -p data/repair-feedback
+          npx tsx -e 'import { detectAvailableAdapters } from "./packages/security-solver/src/deterministic"; const caps = detectAvailableAdapters(); console.log(JSON.stringify({ available: caps.filter(c => c.availableOnHost).map(c => c.name), unavailable: caps.filter(c => !c.availableOnHost).map(c => c.name), adapters: caps }, null, 2));' | tee data/repair-feedback/host-capabilities.json
       - name: Start isolated Docker Ollama with Qwen3 4B (ollama A/B mode only)
         if: env.LOCAL_MODEL_ADAPTER == 'ollama'
         run: |
