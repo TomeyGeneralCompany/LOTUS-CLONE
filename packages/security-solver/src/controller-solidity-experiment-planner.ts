@@ -11,7 +11,7 @@ import type {SoliditySequence} from './solidity-sequence';
 import {sourceGroundedSolidityProbes} from './controller-solidity-security-probes';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
 import {extractAccountingObservations} from './deterministic/accounting-observations';
-import {resolveSourceFixtureDependencies} from './deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies, type PreparedDeployment} from './deterministic/fixture-dependency-planner';
 
 export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
@@ -49,6 +49,8 @@ export interface SourceInvariantTransitionPlan {
   balanceMappingGetter?: string;
   totalScalarGetter?: string;
   typedObservation?: {getter:string;args:string[];expectPath?:number[];baseline:string;afterInflow:string;afterOutflow:string};
+  dependencyDeployments?:PreparedDeployment[];
+  dependencyBindings?:Record<string,string>;
 }
 
 export interface SourceInvariant {
@@ -1526,7 +1528,8 @@ function findAuthorityGetter(contract:any,chain:readonly ContractEntry[],menu:re
 function resolveFlexibleSetup(
   snapshot:SourceSnapshot,contract:any,chain:readonly ContractEntry[],
   sources:ReadonlyMap<string,SourceSnapshot>,menu:readonly SolidityProbeDeclaration[],
-  mockToken:MockTokenInfo|null,ownerAccount='$account0'
+  mockToken:MockTokenInfo|null,ownerAccount='$account0',
+  dependencyBindings:Readonly<Record<string,string>>={}
 ):{constructorArgs:SolidityArgValue[];constructorValueWei?:string;initSignature:string|null;initArgs:SolidityArgValue[];usesToken:boolean;tokenInitNeeded:boolean}|null {
   if(isAbstractContractNode(contract,chain))return null;
   const members:any[]=contract.subNodes||[];
@@ -1541,7 +1544,8 @@ function resolveFlexibleSetup(
       const abi=canonicalAbiType(cp.typeName);
       if(!abi)return null;
       const tokenRef=mockToken?'$deployment:token':undefined;
-      const arg=pickFlexibleArg(abi,cp.name||'',{ownerAccount,tokenRef});
+      const bound=dependencyBindings[cp.name||''];
+      const arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,cp.name||'',{ownerAccount,tokenRef});
       if(arg===null)return null;
       if(arg==='$deployment:token')usesToken=true;
       constructorArgs.push(arg);
@@ -1561,7 +1565,8 @@ function resolveFlexibleSetup(
         const abi=canonicalAbiType(ip.typeName);
         if(!abi){ok=false;break;}
         const tokenRef=mockToken?'$deployment:token':undefined;
-        const arg=pickFlexibleArg(abi,ip.name||'',{ownerAccount,tokenRef});
+        const bound=dependencyBindings[ip.name||''];
+        const arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,ip.name||'',{ownerAccount,tokenRef});
         if(arg===null){ok=false;break;}
         if(arg==='$deployment:token'){usesToken=true;tokenInitNeeded=true;}
         abiTypes.push(abi);
@@ -1923,11 +1928,17 @@ export function extractSourceInvariantDescriptor(
       unresolvedExt.push(`${recv}.${fnCalled}`);
     }
   }
-  if (unresolvedExt.length > 0) {
+  const dependencyPlan=resolveSourceFixtureDependencies(snapshot,contract.name,[...sources.values()]);
+  const unresolvedRemaining=unresolvedExt.filter(call=>{
+    if(dependencyPlan.status!=="resolved")return true;
+    const recv=call.split('.')[0];
+    return !Object.prototype.hasOwnProperty.call(dependencyPlan.substitutions,recv);
+  });
+  if (unresolvedRemaining.length > 0) {
     return {
       ok: false,
       category: 'unresolved_dependency',
-      reason: `Unresolved external dependency (${unresolvedExt.slice(0, 3).join(', ')}) inside ${contract.name}.${inflowFn.name}/${outflowFn.name}`,
+      reason: `Unresolved external dependency (${unresolvedRemaining.slice(0, 3).join(', ')}) inside ${contract.name}.${inflowFn.name}/${outflowFn.name}; acquired-source fixture: ${dependencyPlan.status==='unresolved'?dependencyPlan.missingDependencies.join(', '):'receiver not bound to concrete constructor parameter'}`,
       witnesses: pairWitnesses,
     };
   }
@@ -2004,7 +2015,8 @@ export function extractSourceInvariantDescriptor(
   }
 
   // Verify local fixture constructibility via existing resolveFlexibleSetup (wiring acquired mockToken when present)
-  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0');
+  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0',
+    dependencyPlan.status==='resolved'?dependencyPlan.substitutions:{});
   if (!setup) {
     return {
       ok: false,
@@ -2162,6 +2174,10 @@ export function extractSourceInvariantDescriptor(
         balanceMappingGetter: balanceGetterSig,
         totalScalarGetter: totalGetterSig,
         typedObservation,
+        ...(dependencyPlan.status==='resolved'&&dependencyPlan.deployments.length?{
+          dependencyDeployments:dependencyPlan.deployments,
+          dependencyBindings:dependencyPlan.substitutions,
+        }:{}),
       },
     },
   };
@@ -2216,7 +2232,7 @@ export function constructCoreInvariantExperiment(
   const tp = admitted.transitionPlan!;
   const { chain } = resolveInheritance(snapshot, contract, sources);
   const mockToken = tp.usesMockToken || tp.mode === 'erc20_deposit_withdraw' ? findRepositoryMockToken(sources) : null;
-  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0');
+  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0',tp.dependencyBindings||{});
   if (!setup) return null;
   if(tp.typedObservation){
     const observed=extractAccountingObservations(snapshot,contract.name,declarations);
@@ -2228,21 +2244,15 @@ export function constructCoreInvariantExperiment(
   }
   if (tp.mode === 'erc20_deposit_withdraw' && (!mockToken || !setup.usesToken)) return null;
 
-  const preparation =
-    setup.usesToken && mockToken
-      ? {
-          deployments: [
-            {
-              id: 'token',
-              file: mockToken.snapshot.path,
-              contract: mockToken.contractName,
-              constructorArgs: mockToken.constructorArgs,
-            },
-          ],
-          operations: [],
-          checks: [],
-        }
-      : undefined;
+  const deployments=[
+    ...(setup.usesToken&&mockToken?[{
+      id:'token',file:mockToken.snapshot.path,contract:mockToken.contractName,
+      constructorArgs:mockToken.constructorArgs,
+    }]:[]),
+    ...(tp.dependencyDeployments||[]),
+  ];
+  const preparation=deployments.length?{deployments,operations:[],checks:[]}:undefined;
+
 
   const steps: SoliditySequence['steps'] = [];
   if (setup.initSignature) {
