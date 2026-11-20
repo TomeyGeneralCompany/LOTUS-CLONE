@@ -97,11 +97,8 @@ function computeOpportunityScore(rubric: ProgramAssessmentRubric): number {
  * Uses rubric-based scoring to avoid LLM score clustering.
  */
 function useDeterministicAssessment(): boolean {
-  const explicit = process.env.LOCAL_MODEL_ADAPTER?.trim();
-  if (explicit === "deterministic") return true;
-  if (explicit === "ollama" || explicit === "qwen-agent") return false;
-  if (process.env.LOTUS_DETERMINISTIC === "1" || process.env.LOTUS_DETERMINISTIC === "true") return true;
-  if (process.env.AUTOHACK_OLLAMA_URL?.trim() || process.env.ANTHROPIC_API_KEY?.trim()) return false;
+  // The clone has no model-backed assessment mode. Old .env model URLs
+  // and profile settings cannot reactivate a network inference path.
   return true;
 }
 
