@@ -1621,9 +1621,15 @@ contract MixedProtocolVault {
       const completePayload = JSON.parse(completeMatch![1]);
       assert.equal(completePayload.batchCoverage, "complete");
       assert.ok(completePayload.inventoryTotal >= 2, `Expected >=2 total candidates, got ${completePayload.inventoryTotal}`);
-      assert.equal(completePayload.admittedCount, 1);
-      assert.ok(completePayload.queuedRemaining >= 1, "Expected remaining queued candidates when bounded to 1");
-      assert.equal(completePayload.inventoryCoverage, "partial_bounded_batch");
+      const coverageBatches = covLogText.split("\n")
+        .filter(line=>line.startsWith("[ANALYSIS_BATCH_STARTED] "))
+        .map(line=>JSON.parse(line.slice("[ANALYSIS_BATCH_STARTED] ".length)) as {admitted:number});
+      assert.ok(coverageBatches.length>=2, "Batch size one must process multiple batches");
+      assert.ok(coverageBatches.every(batch=>batch.admitted===1), "Every batch must obey the one-candidate bound");
+      assert.equal(completePayload.admittedCount, completePayload.inventoryTotal,
+        "Every eligible candidate must be accounted for before ANALYZE closes");
+      assert.equal(completePayload.queuedRemaining,0);
+      assert.equal(completePayload.inventoryCoverage,"complete");
     } finally {
       await rm(covAuditDir, { recursive: true, force: true });
     }
