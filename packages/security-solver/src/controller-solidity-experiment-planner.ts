@@ -1982,7 +1982,7 @@ export function extractSourceInvariantDescriptor(
   const sourceObservations=extractAccountingObservations(snapshot,contract.name,declarations);
   const findTypedObservation=():SourceInvariantTransitionPlan['typedObservation']|undefined=>{
     for(const observation of sourceObservations){
-      const {push,pop,fieldDecrement}=accountingTransitionPatterns(observation.stateVariable,observation.fieldName);
+      const {push,pop,fieldDecrement}=accountingTransitionPatterns(observation.stateVariable,observation.kind==='struct_field'?observation.fieldName:'');
       if(observation.kind==='collection_length' && push.test(inflowBody) && pop.test(outflowBody))
         return {getter:observation.getter,args:[],baseline:'0',afterInflow:'1',afterOutflow:'0'};
       // A struct field check requires literal storage updates witnessed in both
