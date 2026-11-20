@@ -1973,7 +1973,7 @@ export function extractSourceInvariantDescriptor(
   const sourceObservations=extractAccountingObservations(snapshot,contract.name,declarations);
   const findTypedObservation=():SourceInvariantTransitionPlan['typedObservation']|undefined=>{
     for(const observation of sourceObservations){
-      const varName=observation.stateVariable.replace(/[.*+?^\${}()|[\]\]/g,'\$&');
+      const varName=observation.stateVariable.replace(/[.*+?^\${}()|[\]\\]/g,'\\      const varName=observation.stateVariable.replace(/[.*+?^\${}()|[\]\]/g,'\$&');');
       const push=new RegExp('\\b'+varName+'\\s*\\.\\s*push\\s*\\(');
       const pop=new RegExp('\\b'+varName+'\\s*\\.\\s*pop\\s*\\(');
       if(observation.kind==='collection_length' && push.test(inflowBody) && pop.test(outflowBody))
