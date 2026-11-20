@@ -1997,13 +1997,19 @@ export async function runLocalAudit(
             onEscalation:(res)=>{lastEscalation=res;},
             onAnalysisResult:(res)=>{lastAnalysisResult=res;},
           });
-          if(lastAnalysisResult && (lastAnalysisResult as DeterministicAnalysisResult).unresolvedReasons.length>0){
+          if(lastAnalysisResult && ((lastAnalysisResult as DeterministicAnalysisResult).unresolvedReasons.length>0 || (lastAnalysisResult as DeterministicAnalysisResult).constructionFeasibility.attempted)){
             const ar=lastAnalysisResult as DeterministicAnalysisResult;
-            await appendFile(logFile,'[DETERMINISTIC_EXPERIMENT_UNRESOLVED] '+JSON.stringify({
-              turn:turn+1,leadId:detAction.leadId,path:detAction.path,query:detAction.query,
-              candidateCount:ar.experimentCandidates.length,
-              unresolvedReasons:ar.unresolvedReasons.slice(0,4),
-            })+'\n');
+            if(ar.unresolvedReasons.length>0){
+              await appendFile(logFile,'[DETERMINISTIC_EXPERIMENT_UNRESOLVED] '+JSON.stringify({
+                turn:turn+1,leadId:detAction.leadId,path:detAction.path,query:detAction.query,
+                analyticalStatus:ar.analyticalDisposition.status,
+                constructionAttempted:ar.constructionFeasibility.attempted,
+                constructionFeasible:ar.constructionFeasibility.feasible,
+                candidateCount:ar.experimentCandidates.length,
+                unresolvedCategories:ar.constructionFeasibility.unresolvedCategories,
+                unresolvedReasons:ar.unresolvedReasons.slice(0,4),
+              })+'\n');
+            }
           }
           if(lastEscalation && ((lastEscalation as ClosedLoopLeadResult).steps.length>0 || (lastEscalation as ClosedLoopLeadResult).escalatedAdapters.length>0 || (lastEscalation as ClosedLoopLeadResult).reconsidered)) {
             const esc=lastEscalation as ClosedLoopLeadResult;

@@ -71,6 +71,8 @@ export {
   evaluateDeterministicAnalysisTurn,
   evaluateDeterministicEvidenceReview,
   type LocalModelAdapter,
+  type AnalyticalDisposition,
+  type ConstructionFeasibility,
   type DeterministicAnalysisResult,
   type PreparedExperimentCandidate,
   type DeterministicAuditAction,

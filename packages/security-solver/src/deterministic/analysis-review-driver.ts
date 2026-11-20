@@ -129,8 +129,26 @@ export interface PreparedExperimentCandidate {
   prerequisites: PreparedSecurityExperiment["prerequisites"];
 }
 
+export interface AnalyticalDisposition {
+  action: "assess_lead" | "defer_lead";
+  status: "supported" | "uncertain" | "contradicted";
+  reason: string;
+  smtRefuted: boolean;
+}
+
+export interface ConstructionFeasibility {
+  attempted: boolean;
+  feasible: boolean;
+  candidateCount: number;
+  unresolvedCategories: string[];
+  unresolvedReasons: string[];
+  skippedReason?: string;
+}
+
 export interface DeterministicAnalysisResult {
   decision: LeadAnalysisDecision;
+  analyticalDisposition: AnalyticalDisposition;
+  constructionFeasibility: ConstructionFeasibility;
   experimentCandidates: PreparedExperimentCandidate[];
   unresolvedReasons: string[];
   closedLoop: ClosedLoopLeadResult;
@@ -261,8 +279,32 @@ export function evaluateDeterministicAnalysisTurn(
   });
 
   const decision = closedLoop.finalDecision;
+  const activeFileFacts = graph.byFile.get(input.activeLead.path)?.facts || [];
+  const smtRefuted =
+    activeFileFacts.some(
+      (f) =>
+        f.kind === "smt_unsat_guard" &&
+        (!f.symbol ||
+          f.symbol === input.activeLead!.selector ||
+          f.symbol.endsWith("." + input.activeLead!.selector) ||
+          input.activeLead!.selector.endsWith("." + f.symbol)),
+    ) || /proved unsatisfiable/i.test(decision.hypothesis);
+
+  const analyticalDisposition: AnalyticalDisposition = {
+    action: decision.action,
+    status: smtRefuted
+      ? "contradicted"
+      : decision.action === "assess_lead"
+        ? "supported"
+        : "uncertain",
+    reason: decision.answer,
+    smtRefuted,
+  };
+
   const experimentCandidates: PreparedExperimentCandidate[] = [];
   const unresolvedReasons: string[] = [];
+  const constructionUnresolvedCategories: string[] = [];
+  const constructionUnresolvedReasons: string[] = [];
 
   for (const hyp of decision.matchedHypotheses) {
     if (hyp.relational?.unresolvedPrerequisites?.length) {
@@ -274,12 +316,19 @@ export function evaluateDeterministicAnalysisTurn(
     }
   }
 
-  if (
-    decision.action === "assess_lead" &&
-    input.activeLead.path.endsWith(".sol") &&
-    input.declarations &&
-    input.declarations.length > 0
-  ) {
+  // Evaluate construction feasibility independently of analytical deferral so a
+  // deferred relational hypothesis never blocks an alternative constructible property
+  // on the same function (except when Z3 SMT proved guard unreachability).
+  let constructionAttempted = false;
+  let skippedReason: string | undefined;
+  if (smtRefuted) {
+    skippedReason = "smt_unsat_guard";
+  } else if (!input.activeLead.path.endsWith(".sol")) {
+    skippedReason = "non_solidity_lead";
+  } else if (!input.declarations || input.declarations.length === 0) {
+    skippedReason = "missing_declarations";
+  } else {
+    constructionAttempted = true;
     const constructed = constructSolidityExperiments({
       repositoryCommit: input.repositoryCommit || "",
       targetPath: input.activeLead.path,
@@ -305,12 +354,30 @@ export function evaluateDeterministicAnalysisTurn(
       }
     } else {
       const cat = constructed.unresolvedCategory ? `(${constructed.unresolvedCategory})` : "";
-      unresolvedReasons.push(`${constructed.code}${cat}: ${constructed.detail}`);
+      const detail = `${constructed.code}${cat}: ${constructed.detail}`;
+      if (constructed.unresolvedCategory) {
+        constructionUnresolvedCategories.push(constructed.unresolvedCategory);
+      }
+      constructionUnresolvedReasons.push(detail);
+      if (!unresolvedReasons.includes(detail)) {
+        unresolvedReasons.push(detail);
+      }
     }
   }
 
+  const constructionFeasibility: ConstructionFeasibility = {
+    attempted: constructionAttempted,
+    feasible: experimentCandidates.length > 0,
+    candidateCount: experimentCandidates.length,
+    unresolvedCategories: [...new Set(constructionUnresolvedCategories)],
+    unresolvedReasons: constructionUnresolvedReasons,
+    ...(skippedReason ? { skippedReason } : {}),
+  };
+
   return {
     decision,
+    analyticalDisposition,
+    constructionFeasibility,
     experimentCandidates,
     unresolvedReasons,
     closedLoop,
