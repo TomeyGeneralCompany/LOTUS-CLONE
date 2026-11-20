@@ -378,6 +378,22 @@ export async function runLocalAudit(
     analysisProgressStore.processedBatches++;
     analysisInventoryMeta.queuedRemaining=analysisProgressStore.remaining;
     await analysisProgressStore.save();
+    // Update the human-readable inventory artifact after every batch. The
+    // initial snapshot alone would misleadingly report zero processed forever.
+    const inventorySnapshot={
+      totalCandidates:analysisProgressStore.records.size,
+      admittedCount:analysisProgressStore.assessed,
+      queuedCount:analysisProgressStore.remaining,
+      blockedCount:analysisInventoryMeta.blockedCount,
+      processedBatches:analysisProgressStore.processedBatches,
+      candidates:analysisProgressStore.candidates.map(({sourceExcerpt:_excerpt,...candidate})=>({
+        ...candidate,lifecycle:analysisProgressStore!.records.get(candidate.id)?.lifecycle,
+      })),
+    };
+    const inventoryDestination=logFile+".analysis-candidates.json";
+    const inventoryTemporary=inventoryDestination+"."+process.pid+".tmp";
+    await writeFile(inventoryTemporary,JSON.stringify(inventorySnapshot,null,2),{mode:0o600});
+    await rename(inventoryTemporary,inventoryDestination);
     await appendFile(logFile,"[ANALYSIS_BATCH_COMPLETE] "+JSON.stringify({
       batch:analysisProgressStore.processedBatches,
       resolved:analysisProgressStore.assessed,
