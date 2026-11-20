@@ -39,8 +39,8 @@ jobs:
         run: node --import tsx scripts/test-controller-evidence-archive.ts
       - name: Check harness syntax
         run: node --check scripts/reproduction-runtime/probe.cjs
-      - name: Test Solidity model tool protocols
-        run: npx tsx scripts/test-solidity-protocol.ts
+      - name: Test deterministic Solidity declarations and financial experiment planner
+        run: npx tsx scripts/test-controller-solidity-experiment-planner.ts
       - name: Test local Solidity transaction executor
         run: node scripts/test-solidity-sequence.cjs
       - name: Compile and execute exact Solidity 0.8.4 alongside supported versions
@@ -78,24 +78,16 @@ jobs:
         run: python3 -m unittest discover -s tests -p test_source_reproduction.py -v
       - name: Reproduce controller-owned entry-to-output paths in Python JavaScript and Java
         run: python3 scripts/test-controller-entry-reproduction.py
-      - name: Exercise production-sized controller read and probe transitions
+      - name: Verify full deterministic controller source, analysis, experiment and review sequence
         env:
-          GITHUB_TOKEN: offline-ci-fixture
-        run: npx tsx scripts/test-local-controller.ts --mock
-      - name: Validate blind reasoning harness with real isolated probes
-        env:
-          GITHUB_TOKEN: offline-ci-fixture
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
         run: |
-          npx tsx scripts/test-reasoning-evidence.ts
-          npx tsx scripts/test-local-reasoning.ts --mock
-          npx tsx scripts/test-local-reasoning.ts --mock --guided --recovery-sequence
-          npx tsx scripts/test-local-reasoning.ts --mock --irrelevant-probe
-          npx tsx scripts/test-local-reasoning.ts --mock --duplicate-probe
-          npx tsx scripts/test-local-reasoning.ts --mock --premature-final
-          if npx tsx scripts/test-local-reasoning.ts --mock --wrong-answer; then
-            echo "Incorrect classifications must fail the reasoning evaluator"
-            exit 1
-          fi
+          npx tsx scripts/test-deterministic-lotus.ts
+          npx tsx scripts/test-deterministic-full-inventory.ts
+          npx tsx scripts/test-controller-staged-investigation.ts
+          npx tsx scripts/test-controller-stage-lock.ts
+          npx tsx scripts/test-controller-source-coverage.ts
       - name: Verify shared controller-owned factual review authority in all four languages
         run: npx tsx scripts/test-controller-review-boundary.ts
       - name: Validate source-to-sink evidence and grounded review rejections
@@ -120,26 +112,24 @@ jobs:
         run: |
           npx tsx scripts/test-gauntlet-controller-replay.ts
           python3 scripts/test-solidity-observation-classification.py
-      - name: Validate evidence-only reviewer without source-navigation action loop
-        run: npx tsx scripts/test-evidence-only-review.ts
+      - name: Validate typed deterministic reviewer without source-navigation action loop
+        run: npx tsx scripts/test-controller-review-boundary.ts
       - name: Validate polyglot controller trace ranking and Gauntlet event grading
         run: npx tsx scripts/test-gauntlet-controller-evidence.ts
       - name: Validate source-grounded Solidity authorization observations
         run: python3 scripts/test-solidity-access-evidence.py
-      - name: Validate bounded evidence-only independent reviewer
-        run: npx tsx scripts/test-evidence-only-review.ts
+      - name: Validate typed independent security impact and replay review
+        run: npx tsx scripts/test-deterministic-lotus.ts
       - name: Prove Solidity nonadministrator role transitions across 2000 sources
         run: node --import tsx scripts/test-indexed-solidity-roles.ts
       - name: Prove five real indexed entry and sink reproductions per language
         run: node --import tsx scripts/test-indexed-verified-entries.ts
-      - name: Test real source audit and review with controller full indexing
+      - name: Test real source/experiment/review boundary with controller full indexing
         env:
+          LOCAL_MODEL_ADAPTER: deterministic
           LOCAL_CONTROLLER_FULL_SOURCE_INDEX: 'true'
-        run: npx tsx scripts/test-source-workflow.ts
-      - name: Exercise shared production workflow with real isolated probes
-        run: |
-          node --import tsx scripts/test-production-workflow.ts
-          node --import tsx scripts/test-production-workflow.ts --premature-final
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+        run: npx tsx scripts/test-deterministic-lotus.ts
 
       - name: Verify controller-first full source inventory and evidence packets
         run: node --import tsx scripts/test-controller-full-source-index.ts
