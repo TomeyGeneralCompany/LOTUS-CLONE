@@ -14,8 +14,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import urllib.request
-from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS: dict[str, dict] = {}
@@ -41,15 +39,6 @@ def runtime_settings() -> dict:
     return json.loads(proc.stdout)
 
 
-def ollama_tags_url(chat_url: str) -> str:
-    url = urlsplit(chat_url)
-    if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
-        raise ValueError("AUTOHACK_OLLAMA_URL must be an HTTP(S) chat endpoint without credentials or query")
-    if not url.path.endswith("/api/chat"):
-        raise ValueError("AUTOHACK_OLLAMA_URL must end in /api/chat")
-    return urlunsplit((url.scheme, url.netloc, url.path[:-len("chat")] + "tags", "", ""))
-
-
 def emit(args, profile: str) -> int:
     result = {"profile": profile, "production_verified": False, "checks": RESULTS}
     if args.report:
@@ -69,7 +58,7 @@ def main() -> int:
     parser.add_argument("--offline", action="store_true",
                         help="Run isolated regressions only; does not establish host/provider readiness")
     parser.add_argument("--model-only", action="store_true",
-                        help="Only rerun configured model inference and tool/pipeline checks")
+                        help="Only rerun the deterministic analysis and review regression checks")
     parser.add_argument("--provider", action="store_true",
                         help="Also make one read-only authenticated HackerOne account request")
     parser.add_argument("--report", help="Write acceptance evidence as a private JSON file")
@@ -90,8 +79,6 @@ def main() -> int:
             # All of these tests are local-only and intercept or mock outbound traffic.
             # They never submit to a real platform or contact program assets.
             for test_name, script in [
-                ("ollama_http_deadline", "scripts/test-ollama-http.ts"),
-                ("mock_ollama", "scripts/test-mock-agent.ts"),
                 ("mock_program_assessment", "scripts/test-mock-assessment.ts"),
                 ("authorized_source", "scripts/test-authorized-source.ts"),
                 ("program_selection", "scripts/test-program-selection.ts"),
@@ -128,57 +115,23 @@ def main() -> int:
             return emit(args, "offline_regression")
     try:
         settings = runtime_settings()
-        tags_url = ollama_tags_url(settings["ollamaUrl"])
-        record("runtime_settings", True, f"Runtime settings loaded: model={settings['model']}; tool_protocol={settings['toolProtocol']}")
+        record("runtime_settings", True, "Runtime settings loaded; deterministic engine required")
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
-        record("runtime_settings", False, "Invalid Ollama URL or unavailable Node dependencies")
+        record("runtime_settings", False, "Runtime settings unavailable; install Node dependencies")
         return emit(args, "host_acceptance")
-    try:
-        with urllib.request.urlopen(tags_url, timeout=4) as response:
-            models = json.load(response).get("models", [])
-        names = [m.get("name") for m in models]
-        record("local_model", settings["model"] in names, "Available models: " + ", ".join(str(n) for n in names))
-    except Exception as exc:
-        record("local_model", False, type(exc).__name__ + ": " + str(exc))
-    if RESULTS.get("local_model", {}).get("passed"):
-        try:
-            payload = json.dumps({"model": settings["model"], "stream": False, "think": False,
-                                  "messages": [{"role": "user", "content": "Reply with the single word READY."}],
-                                  "options": {"num_predict":24, "num_ctx":2048, "num_thread":4, "temperature":0}}).encode()
-            request = urllib.request.Request(settings["ollamaUrl"], data=payload,
-                                             headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(request, timeout=120) as response:
-                answer = json.load(response).get("message", {}).get("content", "")
-            record("local_inference", isinstance(answer, str) and "READY" in answer.upper(),
-                   "Ollama produced a response" if answer else "Ollama returned no response")
-        except Exception as exc:
-            record("local_inference", False, str(exc))
+    if not shutil.which("npx"):
+        record("deterministic_controller", False, "npx is required for the local controller regression")
     else:
-        record("local_inference", False, "Local model unavailable")
-    # Offline workers use Ollama directly. Claude Code is only required for
-    # the optional interactive security-solver, not for the offline pipeline.
-    if RESULTS["local_inference"]["passed"] and shutil.which("npx"):
-        model_timeout = settings["agentTimeoutMs"] // 1000 + 30
-        run("agent_backend", ["node", "--import", "tsx", "scripts/test-local-agent.ts"], model_timeout)
-        if RESULTS["agent_backend"]["passed"]:
-            run("real_model_fixture_pipeline", ["node", "--import", "tsx", "scripts/test-offline-end-to-end.ts", "--real-model"], model_timeout)
-            # Report serialization is not proof that the production controller
-            # can inspect source, execute probes, and classify their observations.
-            run("real_model_production_workflow", ["node", "--import", "tsx", "scripts/test-production-workflow.ts", "--real-model", "--prefetch", "--host-timeout"], model_timeout)
-        else:
-            record("real_model_fixture_pipeline", False, "Blocked by failed file-read agent check; fix that result first")
-            record("real_model_production_workflow", False, "Blocked by failed file-read agent check")
-    else:
-        record("agent_backend", False, "Local inference or tsx unavailable")
-        record("real_model_fixture_pipeline", False, "Local inference or tsx unavailable")
-        record("real_model_production_workflow", False, "Local inference or tsx unavailable")
-    if settings.get("discoveryDirect"):
-        if RESULTS.get("local_model", {}).get("passed") and settings["assessmentModel"] in names:
-            run("local_program_assessment", ["node", "--import", "tsx", "scripts/test-local-assessment.ts"], 210)
-        else:
-            record("local_program_assessment", False, "Configured discovery assessment model unavailable")
+        run("deterministic_controller",
+            ["node", "--import", "tsx", "scripts/test-deterministic-lotus.ts"], 240,
+            env={**os.environ, "LOCAL_MODEL_ADAPTER":"deterministic",
+                 "AUTOHACK_OLLAMA_URL":"http://127.0.0.1:1/api/chat"})
+        run("deterministic_inventory",
+            ["node", "--import", "tsx", "scripts/test-deterministic-full-inventory.ts"], 240,
+            env={**os.environ, "LOCAL_MODEL_ADAPTER":"deterministic",
+                 "AUTOHACK_OLLAMA_URL":"http://127.0.0.1:1/api/chat"})
     if args.model_only:
-        return emit(args, "model_acceptance")
+        return emit(args, "deterministic_acceptance")
     # Confirm the live solver retains the submission boundary for static leads.
     solver_source = (ROOT / "packages/security-solver/src/index.ts").read_text()
     record("offline_submission_boundary",
