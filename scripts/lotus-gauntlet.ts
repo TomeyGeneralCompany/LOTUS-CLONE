@@ -132,8 +132,7 @@ async function main(){
  try{
   process.env.PROJECT_ROOT=app;
   process.env.GITHUB_TOKEN='owned-gauntlet-fixture';
-  process.env.LOCAL_OLLAMA_MODEL ||= 'qwen3:4b';
-  process.env.LOCAL_OLLAMA_TOOL_PROTOCOL='json';
+  process.env.LOCAL_MODEL_ADAPTER='deterministic';
   process.env.AUTOHACK_AUTO_SOURCE_PREFETCH='true';
   process.env.AUTOHACK_GUIDED_SOURCE_PROBES='true';
   process.env.LOCAL_HUNT_DYNAMIC_ALLOWANCE='true';
