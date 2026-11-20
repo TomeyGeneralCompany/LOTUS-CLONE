@@ -2,7 +2,7 @@
 # Deterministic specialist provisioning for the self-hosted LOTUS laptop.
 # Isolated from system Python, project node_modules, and the installed LOTUS instance.
 set -Eeuo pipefail
-ROOT="\${LOTUS_SPECIALIST_ROOT:-$HOME/.lotus-tools}"
+ROOT="${LOTUS_SPECIALIST_ROOT:-$HOME/.lotus-tools}"
 mkdir -p "$ROOT/bin" "$ROOT/downloads" "$ROOT/logs"
 LOG="$ROOT/logs/install.log"
 exec > >(tee -a "$LOG") 2>&1
@@ -39,19 +39,19 @@ setup_javaparser() {
   local jar="$ROOT/javaparser-core-3.26.3.jar" url="https://repo.maven.apache.org/maven2/com/github/javaparser/javaparser-core/3.26.3/javaparser-core-3.26.3.jar"
   fetch "$url" "$jar"
   local expected
-  expected="$(curl -fsSL "$url.sha256" | tr -d '\r\n ')"
-  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]]
-  echo "$expected  $jar" | sha256sum -c -
+  expected="$(curl -fsSL "$url.sha1" | tr -d '\r\n ')"
+  [[ "$expected" =~ ^[0-9a-fA-F]{40}$ ]]
+  echo "$expected  $jar" | sha1sum -c -
   java -version
   export JAVAPARSER_JAR="$jar"
   echo "$jar" > "$ROOT/javaparser-path.txt"
 }
 setup_foundry() {
   local version="v1.10.0" base="https://github.com/foundry-rs/foundry/releases/download/v1.10.0"
-  local file="$ROOT/downloads/foundry_\${version}_linux_amd64.tar.gz"
-  fetch "$base/foundry_\${version}_linux_amd64.tar.gz" "$file"
+  local file="$ROOT/downloads/foundry_${version}_linux_amd64.tar.gz"
+  fetch "$base/foundry_${version}_linux_amd64.tar.gz" "$file"
   local expected
-  expected="$(curl -fsSL "$base/foundry_\${version}_linux_amd64.sha256" | awk '{print $1}')"
+  expected="$(curl -fsSL "$base/foundry_${version}_linux_amd64.sha256" | awk '{print $1}')"
   [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]]
   echo "$expected  $file" | sha256sum -c -
   tar -xzf "$file" -C "$ROOT/bin" forge cast anvil chisel
@@ -102,5 +102,5 @@ echo "[SPECIALIST_VERSIONS]"
 python3 -m pip freeze 2>/dev/null | grep -E '^(libcst|z3-solver|tree-sitter)' || true
 "$ROOT/bin/forge" --version 2>/dev/null || true
 "$MYTHRIL_BIN" version 2>/dev/null || true
-printf '[SPECIALIST_INSTALL_RESULT] failed=%s\n' "\${FAILURES[*]-}"
-if (("\${#FAILURES[@]}" > 0)); then exit 1; fi
+printf '[SPECIALIST_INSTALL_RESULT] failed=%s\n' "${FAILURES[*]-}"
+if (("${#FAILURES[@]}" > 0)); then exit 1; fi
