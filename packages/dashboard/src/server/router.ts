@@ -34,7 +34,7 @@ export const appRouter = router({
       SECURITY_MAX_DAILY_HUNTS: config.SECURITY_MAX_DAILY_HUNTS,
       SECURITY_HUNT_TIMEOUT_MINUTES: config.SECURITY_HUNT_TIMEOUT_MINUTES,
       SECURITY_SOURCE_CODE_TIMEOUT_MINUTES: config.SECURITY_SOURCE_CODE_TIMEOUT_MINUTES,
-      LOCAL_MODEL_ACTIVE: Boolean(process.env.LOCAL_OLLAMA_MODEL),
+      LOCAL_MODEL_ACTIVE: false,
       SECURITY_MIN_CONFIDENCE: config.SECURITY_MIN_CONFIDENCE,
       SECURITY_HUNT_COOLDOWN_HOURS: config.SECURITY_HUNT_COOLDOWN_HOURS,
       SECURITY_MIN_REWARD_CENTS: config.SECURITY_MIN_REWARD_CENTS,
@@ -563,7 +563,7 @@ export const appRouter = router({
     securityAnalyzeState.total = unassessed.length;
     securityAnalyzeState.startedAt = Date.now();
 
-    const CONCURRENCY = process.env.OLLAMA_DISCOVERY_DIRECT === "true" ? 1 : 5;
+    const CONCURRENCY = 5;
 
     void withPipeline(async () => {
       try {
