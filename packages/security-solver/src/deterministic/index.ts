@@ -37,7 +37,10 @@ export {
 
 export {
   generateHypotheses,
+  generateRelationalHypotheses,
   evaluateAnalysisLead,
+  type RelationalHypothesis,
+  type RelationalPropertyKind,
   type HypothesisCategory,
   type HypothesisDisposition,
   type HypothesisWitness,

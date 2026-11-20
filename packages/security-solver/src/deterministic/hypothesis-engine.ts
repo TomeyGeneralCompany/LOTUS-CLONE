@@ -20,12 +20,35 @@ export type HypothesisCategory =
   | "value_extraction"
   | "reinitialization"
   | "access_control"
+  | "accounting_invariant"
+  | "relational_state"
   | "injection_html"
   | "path_traversal"
   | "command_or_eval"
   | "deserialization"
   | "sql_injection"
   | "static_triage";
+
+export type RelationalPropertyKind =
+  | "conservation"
+  | "supply-accounting"
+  | "share-accounting"
+  | "interest-accrual"
+  | "authorization-chain"
+  | "state-coupling";
+
+export interface RelationalHypothesis {
+  id: string;
+  file: string;
+  language: FactLanguage;
+  entrypoints: string[];
+  stateDependencies: string[];
+  sourceWitnesses: HypothesisWitness[];
+  propertyKind: RelationalPropertyKind;
+  expectedRelation: string;
+  requiredObservations: string[];
+  unresolvedPrerequisites: string[];
+}
 
 export type HypothesisDisposition =
   | "ready_for_experiment"
@@ -56,6 +79,7 @@ export interface SecurityHypothesis {
   recommendedProbeKind?: "solidity_sequence" | "html_reflection" | "path_construction";
   recommendedAdapters: string[];
   witnesses: HypothesisWitness[];
+  relational?: RelationalHypothesis;
 }
 
 export interface LeadAnalysisInput {
@@ -93,6 +117,286 @@ function toWitness(fact: ProgramFact): HypothesisWitness {
     factKind: fact.kind,
     detail: fact.detail,
   };
+}
+
+
+const ROLE_STATE_RE = /(?:^|\.)(?:owner|admin|administrator|operator|manager|guardian|controller|authority|minter|pauser|governance|keeper)$/i;
+const SUPPLY_STATE_RE = /(?:^|\.)(?:totalSupply|supply|minted|burned)$/i;
+const SHARE_STATE_RE = /(?:^|\.)(?:shares?|totalShares|vaultShares|exchangeRate)$/i;
+const INTEREST_STATE_RE = /(?:^|\.)(?:interest|accrued|accruedInterest|rate|index|rewardPerToken|rewards?)$/i;
+const CONSERVATION_STATE_RE = /(?:^|\.)(?:balances?|totalDeposits|totalAssets|totalStaked|totalDebt|deposits?|reserves?|liquidity|principal|debt)$/i;
+
+function classifyRelationalProperty(stateVars: readonly string[]): RelationalPropertyKind {
+  if (stateVars.some((v) => INTEREST_STATE_RE.test(v))) return "interest-accrual";
+  if (stateVars.some((v) => SHARE_STATE_RE.test(v))) return "share-accounting";
+  if (stateVars.some((v) => SUPPLY_STATE_RE.test(v))) return "supply-accounting";
+  if (stateVars.some((v) => CONSERVATION_STATE_RE.test(v))) return "conservation";
+  if (stateVars.some((v) => ROLE_STATE_RE.test(v))) return "authorization-chain";
+  return "state-coupling";
+}
+
+function relationalId(file: string, entrypoints: readonly string[], stateDeps: readonly string[], kind: RelationalPropertyKind): string {
+  return createHash("sha256")
+    .update(JSON.stringify([file, [...entrypoints].sort(), [...stateDeps].sort(), kind]))
+    .digest("hex")
+    .slice(0, 32);
+}
+
+/**
+ * Second-pass multi-function relational hypothesis generator.
+ * Traverses ProgramFactsGraph edges (`writes_state`, `reads_state`, `precedes`,
+ * `value_flow`, resolved `calls_resolved`, `external_call`, and `inherits`) to
+ * synthesize cross-function accounting, authorization-chain, and state-coupling
+ * hypotheses with complete multi-function source witnesses and explicit
+ * unresolved prerequisites.
+ */
+export function generateRelationalHypotheses(graph: ProgramFactsGraph): RelationalHypothesis[] {
+  const results: RelationalHypothesis[] = [];
+  const seen = new Set<string>();
+
+  const symbolByQualified = new Map<string, ProgramSymbol>();
+  const stateVarSymbols = new Map<string, ProgramSymbol>();
+  const entrypoints = new Set<string>();
+
+  for (const sym of graph.symbols) {
+    if (sym.kind === "function" || sym.kind === "method") {
+      symbolByQualified.set(sym.qualifiedName, sym);
+      const isSolEntry =
+        sym.language === "solidity" &&
+        sym.name !== "constructor" &&
+        (sym.visibility === "public" || sym.visibility === "external") &&
+        sym.mutability !== "view" &&
+        sym.mutability !== "pure";
+      if (isSolEntry) {
+        entrypoints.add(sym.qualifiedName);
+      }
+    } else if (sym.kind === "state_var") {
+      stateVarSymbols.set(sym.qualifiedName, sym);
+    }
+  }
+
+  // Index unresolved/ambiguous calls per function so we never disguise guessed targets as resolved
+  const unresolvedByFn = new Map<string, string[]>();
+  const resolvedInternalCalls = new Map<string, Array<{ to: string; file: string; line: number }>>();
+  const stateWriters = new Map<string, Array<{ fn: string; file: string; line: number; operator?: string }>>();
+  const stateReaders = new Map<string, Array<{ fn: string; file: string; line: number }>>();
+  const valueFlowFns = new Set<string>();
+
+  for (const edge of graph.edges) {
+    if (edge.kind === "writes_state") {
+      const list = stateWriters.get(edge.to) || [];
+      list.push({
+        fn: edge.from,
+        file: edge.file,
+        line: edge.line,
+        operator: typeof edge.metadata?.operator === "string" ? edge.metadata.operator : undefined,
+      });
+      stateWriters.set(edge.to, list);
+    } else if (edge.kind === "reads_state") {
+      const list = stateReaders.get(edge.to) || [];
+      list.push({ fn: edge.from, file: edge.file, line: edge.line });
+      stateReaders.set(edge.to, list);
+    } else if (edge.kind === "value_flow") {
+      valueFlowFns.add(edge.from);
+    } else if (edge.kind === "calls_resolved") {
+      if (edge.resolution === "resolved") {
+        const list = resolvedInternalCalls.get(edge.from) || [];
+        list.push({ to: edge.to, file: edge.file, line: edge.line });
+        resolvedInternalCalls.set(edge.from, list);
+      } else if (edge.resolution === "ambiguous" || edge.resolution === "unresolved") {
+        const list = unresolvedByFn.get(edge.from) || [];
+        list.push(`${edge.resolution}_call:${edge.to}`);
+        unresolvedByFn.set(edge.from, list);
+      }
+    } else if (edge.kind === "external_call") {
+      const isLowLevel = edge.metadata?.lowLevel === true;
+      if (edge.resolution !== "resolved" && !isLowLevel) {
+        const list = unresolvedByFn.get(edge.from) || [];
+        list.push(`unresolved_external_call:${edge.to}`);
+        unresolvedByFn.set(edge.from, list);
+      }
+    }
+  }
+
+  // Propagate internal helper state writes/reads to external entrypoints via resolved calls ONLY
+  const effectiveWrites = new Map<string, Set<string>>();
+  const effectiveReads = new Map<string, Set<string>>();
+  for (const [stateVar, writers] of stateWriters) {
+    for (const w of writers) {
+      const s = effectiveWrites.get(w.fn) || new Set<string>();
+      s.add(stateVar);
+      effectiveWrites.set(w.fn, s);
+    }
+  }
+  for (const [stateVar, readers] of stateReaders) {
+    for (const r of readers) {
+      const s = effectiveReads.get(r.fn) || new Set<string>();
+      s.add(stateVar);
+      effectiveReads.set(r.fn, s);
+    }
+  }
+  for (const [caller, callees] of resolvedInternalCalls) {
+    for (const c of callees) {
+      for (const sv of effectiveWrites.get(c.to) || []) {
+        const s = effectiveWrites.get(caller) || new Set<string>();
+        s.add(sv);
+        effectiveWrites.set(caller, s);
+        const list = stateWriters.get(sv) || [];
+        if (!list.some((x) => x.fn === caller)) {
+          list.push({ fn: caller, file: c.file, line: c.line });
+          stateWriters.set(sv, list);
+        }
+      }
+      for (const sv of effectiveReads.get(c.to) || []) {
+        const s = effectiveReads.get(caller) || new Set<string>();
+        s.add(sv);
+        effectiveReads.set(caller, s);
+        const list = stateReaders.get(sv) || [];
+        if (!list.some((x) => x.fn === caller)) {
+          list.push({ fn: caller, file: c.file, line: c.line });
+          stateReaders.set(sv, list);
+        }
+      }
+    }
+  }
+
+  const buildWitnessForFn = (fn: string, factKind: ProgramFact["kind"], detail: string): HypothesisWitness => {
+    const sym = symbolByQualified.get(fn);
+    return {
+      file: sym?.file || "",
+      line: sym?.line || 1,
+      symbol: fn,
+      factKind,
+      detail,
+    };
+  };
+
+  // Pass A: Pairwise entrypoints coupled through shared state variables (especially accounting & role state)
+  const pairStates = new Map<string, { a: string; b: string; file: string; vars: Set<string>; ordered: boolean }>();
+  for (const edge of graph.edges) {
+    if (edge.kind === "precedes" && entrypoints.has(edge.from) && entrypoints.has(edge.to)) {
+      const vars = Array.isArray(edge.metadata?.stateVars) ? (edge.metadata!.stateVars as string[]) : [];
+      if (!vars.length) continue;
+      const key = `${edge.from}->${edge.to}`;
+      const existing = pairStates.get(key) || {
+        a: edge.from,
+        b: edge.to,
+        file: edge.file,
+        vars: new Set<string>(),
+        ordered: true,
+      };
+      for (const v of vars) existing.vars.add(v);
+      pairStates.set(key, existing);
+    }
+  }
+
+  // Also capture unordered co-writers of the same accounting/role state variable
+  for (const [stateVar, writers] of stateWriters) {
+    const entryWriters = [...new Set(writers.map((w) => w.fn).filter((fn) => entrypoints.has(fn)))].sort();
+    if (entryWriters.length < 2) continue;
+    for (let i = 0; i < entryWriters.length; i++) {
+      for (let j = i + 1; j < entryWriters.length; j++) {
+        const a = entryWriters[i];
+        const b = entryWriters[j];
+        if (pairStates.has(`${a}->${b}`) || pairStates.has(`${b}->${a}`)) {
+          const existing = pairStates.get(`${a}->${b}`) || pairStates.get(`${b}->${a}`)!;
+          existing.vars.add(stateVar);
+          continue;
+        }
+        const symA = symbolByQualified.get(a);
+        if (!symA) continue;
+        const key = `${a}<->${b}`;
+        const existing = pairStates.get(key) || {
+          a,
+          b,
+          file: symA.file,
+          vars: new Set<string>(),
+          ordered: false,
+        };
+        existing.vars.add(stateVar);
+        pairStates.set(key, existing);
+      }
+    }
+  }
+
+  for (const pair of pairStates.values()) {
+    const stateDeps = [...pair.vars].sort();
+    const propertyKind = classifyRelationalProperty(stateDeps);
+    const hasAccountingOrRole =
+      propertyKind !== "state-coupling" ||
+      valueFlowFns.has(pair.a) ||
+      valueFlowFns.has(pair.b);
+    if (!hasAccountingOrRole) continue;
+
+    const entryList = pair.ordered ? [pair.a, pair.b] : [pair.a, pair.b].sort();
+    const id = relationalId(pair.file, entryList, stateDeps, propertyKind);
+    if (seen.has(id)) continue;
+    seen.add(id);
+
+    const requiredObservations: string[] = [];
+    const unresolvedPrerequisites: string[] = [];
+
+    for (const sv of stateDeps) {
+      const svSym = stateVarSymbols.get(sv);
+      if (svSym?.visibility === "public") {
+        const getterSig = svSym.returnType === "mapping" ? `${svSym.name}(address)` : `${svSym.name}()`;
+        requiredObservations.push(getterSig);
+      } else {
+        unresolvedPrerequisites.push(`missing_public_getter:${sv}`);
+      }
+    }
+
+    for (const fn of entryList) {
+      for (const u of unresolvedByFn.get(fn) || []) {
+        if (!unresolvedPrerequisites.includes(u)) {
+          unresolvedPrerequisites.push(u);
+        }
+      }
+    }
+
+    const witnesses: HypothesisWitness[] = [
+      buildWitnessForFn(pair.a, "state_write", `${pair.a} mutates shared state (${stateDeps.join(", ")})`),
+      buildWitnessForFn(
+        pair.b,
+        effectiveWrites.get(pair.b)?.size ? "state_write" : "entry_point",
+        `${pair.b} reads/mutates shared state (${stateDeps.join(", ")})`,
+      ),
+    ];
+
+    const expectedRelation =
+      propertyKind === "conservation"
+        ? `Sequence ${entryList.join(" -> ")} must conserve tracked accounting state across [${stateDeps.join(", ")}] so post-state equals net inflow minus outflow.`
+        : propertyKind === "supply-accounting"
+          ? `Sequence ${entryList.join(" -> ")} must keep supply accounting [${stateDeps.join(", ")}] consistent with minted/burned balances.`
+          : propertyKind === "share-accounting"
+            ? `Sequence ${entryList.join(" -> ")} must keep share accounting [${stateDeps.join(", ")}] proportional to underlying assets.`
+            : propertyKind === "interest-accrual"
+              ? `Sequence ${entryList.join(" -> ")} must preserve monotonic, bounded interest/reward accounting across [${stateDeps.join(", ")}].`
+              : propertyKind === "authorization-chain"
+                ? `Unauthorized mutation via ${entryList[0]} must not satisfy privilege guard consumed by ${entryList[1]} on [${stateDeps.join(", ")}].`
+                : `Ordered interaction ${entryList.join(" -> ")} must preserve state consistency across [${stateDeps.join(", ")}].`;
+
+    results.push({
+      id,
+      file: pair.file,
+      language: symbolByQualified.get(pair.a)?.language || "solidity",
+      entrypoints: entryList,
+      stateDependencies: stateDeps,
+      sourceWitnesses: witnesses,
+      propertyKind,
+      expectedRelation,
+      requiredObservations: [...new Set(requiredObservations)].sort(),
+      unresolvedPrerequisites: [...new Set(unresolvedPrerequisites)].sort(),
+    });
+  }
+
+  results.sort(
+    (a, b) =>
+      a.file.localeCompare(b.file) ||
+      a.entrypoints.join(",").localeCompare(b.entrypoints.join(",")) ||
+      a.id.localeCompare(b.id),
+  );
+  return results;
 }
 
 export function generateHypotheses(graph: ProgramFactsGraph): SecurityHypothesis[] {
@@ -405,6 +709,42 @@ export function generateHypotheses(graph: ProgramFactsGraph): SecurityHypothesis
       recommendedAdapters: [fact.adapter],
       witnesses: [toWitness(fact)],
     });
+  }
+
+  // Pass 2: Multi-function relational hypotheses across graph edges (state reads/writes,
+  // resolved calls, precedence, value flow, and inheritance).
+  const relationalHypotheses = generateRelationalHypotheses(graph);
+  for (const rel of relationalHypotheses) {
+    const primarySelector = rel.entrypoints[rel.entrypoints.length - 1] || rel.entrypoints[0];
+    const primaryWitness = rel.sourceWitnesses[rel.sourceWitnesses.length - 1] || rel.sourceWitnesses[0];
+    const isFinancial =
+      rel.propertyKind === "conservation" ||
+      rel.propertyKind === "supply-accounting" ||
+      rel.propertyKind === "share-accounting" ||
+      rel.propertyKind === "interest-accrual";
+    const category: HypothesisCategory = isFinancial ? "accounting_invariant" : "relational_state";
+    const ready = rel.unresolvedPrerequisites.length === 0 && rel.requiredObservations.length > 0;
+    for (const ep of rel.entrypoints) {
+      const epWitness = rel.sourceWitnesses.find((w) => w.symbol === ep) || primaryWitness;
+      pushUnique({
+        id: createHash("sha256").update(`rel|${rel.id}|${ep}`).digest("hex").slice(0, 32),
+        language: rel.language,
+        file: rel.file,
+        line: epWitness?.line || 1,
+        selector: ep,
+        category,
+        priority: isFinancial ? (ready ? 91 : 76) : (ready ? 84 : 64),
+        disposition: ready ? "ready_for_experiment" : "needs_deeper_analysis",
+        statement: rel.expectedRelation,
+        falsification: `Execute ordered sequence [${rel.entrypoints.join(" -> ")}] observing [${rel.requiredObservations.join(", ") || rel.stateDependencies.join(", ")}]; falsified if post-state satisfies the expected accounting/authorization relation.`,
+        rationale: `Relational graph analysis linked [${rel.entrypoints.join(", ")}] via shared state [${rel.stateDependencies.join(", ")}] (${rel.propertyKind}${rel.unresolvedPrerequisites.length ? `; unresolved: ${rel.unresolvedPrerequisites.join(", ")}` : ""}).`,
+        recommendedProbeKind: rel.language === "solidity" ? "solidity_sequence" : undefined,
+        recommendedAdapters: isFinancial ? ["solidity-ast", "foundry", "z3"] : ["solidity-ast", "foundry", "mythril"],
+        witnesses: rel.sourceWitnesses,
+        relational: rel,
+      });
+    }
+    void primarySelector;
   }
 
   results.sort((a, b) => b.priority - a.priority || a.file.localeCompare(b.file) || a.line - b.line);
