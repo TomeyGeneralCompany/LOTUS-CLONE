@@ -1,4 +1,7 @@
 name: Round 3 Qwen-removal audit
+concurrency:
+  group: round3-qwen-removal-audit
+  cancel-in-progress: true
 on:
   push:
     branches: [repair/round3-exhaustive-deterministic-laptop]
