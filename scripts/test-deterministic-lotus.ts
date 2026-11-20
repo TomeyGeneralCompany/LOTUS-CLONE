@@ -1300,7 +1300,7 @@ contract BuggyERC20Vault {
         (fixedErc20Plan as any).experiments.find((e: any) => e.securityProperty.includes("conservation")).sequence,
       );
       assert.ok(
-        fixedErc20Run.steps.every((s: any) => (s.operation === "call" ? s.passed === true : s.reverted === false)),
+        fixedErc20Run.steps.every((s: any) => (s.operation === "call" || s.operation === "setup" ? s.passed === true : s.reverted === false)),
         `FixedERC20Vault must pass every step on live EVM: ${JSON.stringify(fixedErc20Run.steps)}`,
       );
       console.log("LIVE_EVM_BUGGY_VS_FIXED_ERC20_VAULT_PASSED");
