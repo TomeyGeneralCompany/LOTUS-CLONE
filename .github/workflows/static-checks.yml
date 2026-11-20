@@ -56,7 +56,7 @@ jobs:
         run: npx tsx scripts/test-defi-probes-and-analyze-review.ts
       - name: Verify source acquisition, scope, and controller gates
         run: |
-          npx tsx scripts/test-missing-source-loop.ts
+          npx tsx scripts/test-controller-source-coverage.ts
           npx tsx scripts/test-investigation-records.ts
           npx tsx scripts/test-source-candidates.ts
           npx tsx scripts/test-guided-source-probes.ts

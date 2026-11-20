@@ -29,6 +29,8 @@ for(const path of [
   'scripts/install-reproduction-runtime.sh',
   'scripts/lotus-gauntlet.ts',
   'scripts/lotus-crucible-run.ts',
+  'scripts/one-bounty-settings.ts',
+  'scripts/one-bounty.ts',
 ]) assert.doesNotMatch(read(path),/qwen3:4b|ollama\s+pull|ollama\s+serve|ollama\/ollama/i,path);
 for(const file of readdirSync(resolve(root,'.github/workflows')).filter(x=>/\.ya?ml$/.test(x))){
   const path='.github/workflows/'+file;
@@ -42,3 +44,4 @@ assert.doesNotMatch(read('scripts/install-reproduction-runtime.sh'),/install-qwe
 assert.match(read('scripts/run-one-bounty.sh'),/LOCAL_MODEL_ADAPTER=deterministic/);
 assert.match(read('run-complete-autohack.sh'),/LOCAL_MODEL_ADAPTER=deterministic/);
 console.log('QWEN_FREE_PRODUCTION_RUNTIME_PASSED');
+

@@ -8,7 +8,7 @@ import {mkdirSync, writeFileSync, readdirSync, statSync, readFileSync, openSync,
 import {advanceBountyProgress,consumeTelemetryChunk,idleBountyExpired,latestModelLifecycleEvent,pickLatestProgressEvent,type BountyProgress} from './one-bounty-progress';
 import {join, resolve} from 'node:path';
 import {eq} from 'drizzle-orm';
-import {ensureOneBountyLocalModel} from './one-bounty-settings';
+import {ensureOneBountyDeterministicEngine} from './one-bounty-settings';
 
 type Args={list:boolean; program?:string; timeoutMin:number; help:boolean};
 export function parseOneBountyArgs(argv:string[]):Args {
@@ -47,7 +47,7 @@ async function main() {
   process.env.PROJECT_ROOT=root;
   // This opt-out is process-local; never alter the operator's saved settings.
   process.env.AUTOHACK_SINGLE_BOUNTY_DIAGNOSTIC='1';
-  // Match the configured application's Qwen3 default when .env omits the optional name.
+  // Enforce the deterministic investigator even when .env contains legacy model settings.
   ensureOneBountyLocalModel(process.env);
   const {getDb,schema}=await import('../packages/core/src/index');
   const {rankEligiblePrograms,huntProgram,processAdversarialQueue,getProgramSelectionSummary}=await import('../packages/security-solver/src/index');
@@ -186,7 +186,7 @@ async function main() {
       const elapsed=Math.floor((now-startedAt)/60000);
       const quiet=Math.floor((now-progress.lastActivityAt)/1000);
       // Do not present an old controller event as a fresh failure every
-      // 15 seconds while a long local Qwen inference is still running.
+      // 15 seconds while a controller action is still progressing.
       const currentActivity=lastProgressEventAt && now-lastProgressEventAt<=30000
         ? 'event='+lastProgressNote
         : modelRequestAt ? 'model inference in progress '+Math.floor((now-modelRequestAt)/1000)+'s'
