@@ -41,21 +41,66 @@ export interface AnalysisCandidateQueueOptions {
   graph?: ProgramFactsGraph | null;
   maxAdmitted?: number;
   maxPerFile?: number;
+  /** Explicitly opt into admitting test/mock/echidna harness contracts (default: false). */
+  includeTestContracts?: boolean;
 }
 
 export interface AnalysisCandidateQueueResult {
-  /** Complete inventory of every eligible function candidate (deterministic order). */
+  /** Complete inventory of every eligible production function candidate (deterministic order). */
   inventory: AnalysisCandidate[];
   /** Bounded subset admitted to the active ANALYZE window. */
   admitted: AnalysisCandidate[];
   /** Unprocessed candidates retained in the queue for subsequent passes. */
   queued: AnalysisCandidate[];
-  /** Candidates blocked because acquired repository commit or declaration span was unavailable. */
+  /** Candidates blocked (e.g., test/mock harness, missing commit, or declaration span unavailable). */
   blocked: Array<{ path: string; selector: string; reason: string }>;
 }
 
+const TEST_OR_MOCK_DIR_RE =
+  /(?:^|\/)(?:mocks?|tests?|__tests__|fixtures?|echidna|fuzz|foundry-test|harness)(?:\/|$)/i;
+const TEST_OR_MOCK_PREFIX_RE =
+  /(?:^|\/)(?:Echidna|Mock|Test|Fuzz|Harness|Fake|Stub)[A-Z_][A-Za-z0-9_]*\.sol$/;
+const TEST_OR_MOCK_LOWER_PREFIX_RE =
+  /(?:^|\/)(?:echidna|mock|test|fuzz|harness)[_-][A-Za-z0-9_.-]*\.sol$/i;
+const TEST_OR_MOCK_SUFFIX_RE =
+  /(?:Mock|Mocks|Test|Tests|Echidna|Fuzz|Harness|Spec|Fake|Stub)\.sol$/;
+const FOUNDRY_TEST_SUFFIX_RE = /\.t\.sol$/i;
+
+/**
+ * Consistent repository-wide test/mock/fuzz harness path classifier.
+ * Keeps test harnesses available as supporting repository source without admitting
+ * them as primary production vulnerability candidates.
+ */
+export function isTestOrMockContractPath(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  return (
+    TEST_OR_MOCK_DIR_RE.test(normalized) ||
+    TEST_OR_MOCK_PREFIX_RE.test(normalized) ||
+    TEST_OR_MOCK_LOWER_PREFIX_RE.test(normalized) ||
+    TEST_OR_MOCK_SUFFIX_RE.test(normalized) ||
+    FOUNDRY_TEST_SUFFIX_RE.test(normalized)
+  );
+}
+
+const EXTERNAL_ADAPTER_PATH_RE =
+  /(?:^|\/)(?:models\/)?(?:money[-_]?markets?|adapters?|connectors?|integrations?|wrappers?)(?:\/|$)/i;
+const EXTERNAL_ADAPTER_FILE_RE = /(?:Market|Adapter|Connector|Wrapper)\.sol$/;
+
+/**
+ * Identifies thin external-protocol adapter/wrapper contracts (e.g., money market
+ * integrations such as BenqiERC20Market.sol or HarvestMarket.sol) so core protocol
+ * contracts receive higher initial admission priority.
+ */
+export function isExternalAdapterOrMarketPath(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  return EXTERNAL_ADAPTER_PATH_RE.test(normalized) || EXTERNAL_ADAPTER_FILE_RE.test(normalized);
+}
+
+const CORE_PROTOCOL_NAME_RE =
+  /(?:^|\/)(?:DInterest|MPHMinter|Minter|Vesting\d*|Vault|Pool|Treasury|Controller|Router|Staking|Exchange|LendingPool|ClearingHouse|Governor|Timelock|Escrow|Ledger|Factory|ZeroCouponBond|NFT)[A-Za-z0-9_]*\.sol$/i;
+
 const FINANCIAL_ENTRYPOINT_RE =
-  /^(?:deposit|withdraw|earlyWithdraw|topupDeposit|rolloverDeposit|mintVested|fund|claim|redeem|stake|unstake|borrow|repay|liquidate|swap|zap|rescue|skim|mint|burn|accrue|distribute|settle|collect|harvest|rebalance|flashLoan)$/i;
+  /^(?:deposit|withdraw|earlyWithdraw|topupDeposit|rolloverDeposit|mintVested|fund|claim|redeem|stake|unstake|borrow|repay|liquidate|swap|zap|rescue|skim|mint|burn|accrue|distribute|settle|collect|harvest|rebalance|flashLoan|withdrawInterest|payInterestToFunders|takeBackDepositedAmount)$/i;
 
 const ACCOUNTING_STATE_HINT_RE =
   /\b(?:balances?|totalSupply|totalAssets|totalDeposits|shares?|debt|principal|accrued|reserves?|liquidity|reward(?:s|PerToken)?|deposits?)\b/;
@@ -136,26 +181,74 @@ export function buildAnalysisCandidateQueue(
   const graph = options.graph || null;
   const maxAdmitted = Math.max(1, Math.min(options.maxAdmitted ?? 18, 128));
   const maxPerFile = Math.max(1, Math.min(options.maxPerFile ?? 4, maxAdmitted));
+  const includeTestContracts = options.includeTestContracts === true;
 
   const blocked: Array<{ path: string; selector: string; reason: string }> = [];
   const rawCandidates: AnalysisCandidate[] = [];
   const seenIds = new Set<string>();
 
-  // Pre-index shared-state variables across functions if a graph is supplied
+  // Pre-index graph coupling, unresolved external call dominance, and core protocol centrality
   const varWriters = new Map<string, Set<string>>();
+  const fnUnresolvedExtCount = new Map<string, number>();
+  const fnOwnStateWriteCount = new Map<string, number>();
+  const fileInboundReferrers = new Map<string, Set<string>>();
+  const contractNameToFile = new Map<string, string>();
+
   if (graph) {
+    for (const sym of graph.symbols) {
+      if (sym.kind === "contract" && sym.name && sym.file) {
+        contractNameToFile.set(sym.name, sym.file);
+      }
+    }
     for (const edge of graph.edges) {
-      if (String(edge.kind) === "writes_state" || String(edge.kind) === "reads_state") {
+      const kind = String(edge.kind);
+      if (kind === "writes_state" || kind === "reads_state") {
         const set = varWriters.get(edge.to) || new Set<string>();
         set.add(edge.from);
         varWriters.set(edge.to, set);
+        if (kind === "writes_state") {
+          fnOwnStateWriteCount.set(edge.from, (fnOwnStateWriteCount.get(edge.from) || 0) + 1);
+        }
+      } else if (
+        (kind === "external_call" && edge.resolution !== "resolved" && edge.metadata?.lowLevel !== true) ||
+        (kind === "calls_resolved" && (edge.resolution === "unresolved" || edge.resolution === "ambiguous"))
+      ) {
+        fnUnresolvedExtCount.set(edge.from, (fnUnresolvedExtCount.get(edge.from) || 0) + 1);
+      } else if (kind === "imports" || kind === "inherits") {
+        const targetName = edge.to.split("/").pop()?.replace(/\.sol$/i, "") || edge.to;
+        const targetFile =
+          contractNameToFile.get(targetName) ||
+          (graph.byFile.has(edge.to) ? edge.to : undefined);
+        if (targetFile && targetFile !== edge.file) {
+          const refs = fileInboundReferrers.get(targetFile) || new Set<string>();
+          refs.add(edge.file);
+          fileInboundReferrers.set(targetFile, refs);
+        }
       }
     }
   }
 
   for (const item of options.items) {
+    const isTestOrMock = isTestOrMockContractPath(item.path);
+    if (isTestOrMock && !includeTestContracts) {
+      for (const selector of item.unqueuedSelectors) {
+        blocked.push({
+          path: item.path,
+          selector,
+          reason: "test_or_mock_contract",
+        });
+      }
+      continue;
+    }
+
     const sourceSha256 = createHash("sha256").update(item.sourceContent).digest("hex");
     const fileLeads = staticLeads.filter((l) => l.path === item.path);
+    const isExternalAdapter = isExternalAdapterOrMarketPath(item.path);
+    const isCoreProtocolName = CORE_PROTOCOL_NAME_RE.test(item.path) && !isExternalAdapter;
+    const inboundRefCount = fileInboundReferrers.get(item.path)?.size || 0;
+    const financialEntryCount = item.unqueuedSelectors.filter((sel) =>
+      FINANCIAL_ENTRYPOINT_RE.test(sel.split(".").pop() || ""),
+    ).length;
 
     for (const selector of item.unqueuedSelectors) {
       if (!/^[a-f0-9]{40}$/.test(item.sourceCommit)) {
@@ -200,14 +293,32 @@ export function buildAnalysisCandidateQueue(
         selectionReasons.push("accounting_state_reference");
       }
 
-      // 3. Function-localized static leads vs broader file leads
+      // 3. Core protocol prioritization vs thin external market adapters
+      if (isCoreProtocolName) {
+        priority += 25;
+        selectionReasons.push("core_protocol_contract");
+      }
+      if (inboundRefCount > 0 && !isExternalAdapter) {
+        priority += Math.min(20, inboundRefCount * 8);
+        selectionReasons.push(`core_protocol_inbound_refs:${inboundRefCount}`);
+      }
+      if (financialEntryCount >= 2 && !isExternalAdapter) {
+        priority += 15;
+        selectionReasons.push(`multi_entrypoint_accounting_contract:${financialEntryCount}`);
+      }
+      if (isExternalAdapter) {
+        priority -= 25;
+        selectionReasons.push("demoted_external_adapter_path");
+      }
+
+      // 4. Function-localized static leads vs broader file leads
       const matchedFnLeads = fileLeads.filter(
         (l) =>
           (l.line >= span.lineStart && l.line <= span.lineEnd) ||
           (method.length >= 3 && l.message.includes(method)),
       );
       if (matchedFnLeads.length > 0) {
-        const boost = Math.min(45, matchedFnLeads.length * 20);
+        const boost = Math.min(isExternalAdapter ? 20 : 45, matchedFnLeads.length * (isExternalAdapter ? 10 : 20));
         priority += boost;
         for (const l of matchedFnLeads) {
           staticLeadIds.push(stableStaticLeadId(l));
@@ -221,7 +332,7 @@ export function buildAnalysisCandidateQueue(
         selectionReasons.push(`file_static_leads:${fileLeads.length}`);
       }
 
-      // 4. Program-facts graph signals (when available)
+      // 5. Program-facts graph signals (when available)
       if (graph) {
         const fileBucket = graph.byFile.get(item.path);
         const symFacts = (fileBucket?.facts || []).filter(
@@ -257,6 +368,13 @@ export function buildAnalysisCandidateQueue(
         if (coupledVars.size > 0) {
           priority += Math.min(20, coupledVars.size * 10);
           selectionReasons.push(`shared_state_coupling:${[...coupledVars].sort().slice(0, 3).join(",")}`);
+        }
+        // Demote thin external-call-dominated wrappers with zero own state writes
+        const unresolvedExt = fnUnresolvedExtCount.get(selector) || 0;
+        const ownWrites = fnOwnStateWriteCount.get(selector) || 0;
+        if (unresolvedExt >= 2 && ownWrites === 0) {
+          priority -= 18;
+          selectionReasons.push(`demoted_external_call_dominated:${unresolvedExt}`);
         }
       }
 

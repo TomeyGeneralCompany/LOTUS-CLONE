@@ -23,7 +23,7 @@ import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequi
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { postOllamaChat } from "../../core/src/ollama-chat";
-import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
+import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
@@ -285,6 +285,7 @@ export async function runLocalAudit(
   let deterministicProgramGraph:ProgramFactsGraph|null=null;
   let deterministicSourceSnapshots:SourceSnapshot[]=[];
   const deterministicDeclarationsCache=new Map<string,SolidityProbeDeclaration[]>();
+  let analysisInventoryMeta={inventoryTotal:0,admittedCount:0,queuedRemaining:0,blockedCount:0};
   const nextAnalysisPacket=()=>stageLock?.analysisLeads.find(x=>x.state.kind==='pending');
   // Current controller instruction is reconstructed from stage-owned state for
   // every inference, not carried as disposable conversational history.
@@ -321,8 +322,22 @@ export async function runLocalAudit(
     stageLock.completeAnalysis(status,reason);
     limits.onAnalysisCertificate?.(cert);
     analyzeModelPending=false;analyzeTurnsRemaining=0;
+    const batchCoverage=status;
+    const inventoryCoverage=status==='complete'
+      ? (analysisInventoryMeta.queuedRemaining>0 ? 'partial_bounded_batch' : 'complete')
+      : 'partial';
     await appendFile(logFile,'['+(status==='complete'?'ANALYSIS_COMPLETE':'ANALYSIS_INCOMPLETE')+'] '+
-      JSON.stringify({...cert,candidates:stageLock.candidateCount,modelAdded:analyzeApprovedIds.size})+'\n');
+      JSON.stringify({
+        ...cert,
+        batchCoverage,
+        inventoryCoverage,
+        inventoryTotal:analysisInventoryMeta.inventoryTotal,
+        admittedCount:analysisInventoryMeta.admittedCount,
+        queuedRemaining:analysisInventoryMeta.queuedRemaining,
+        blockedCount:analysisInventoryMeta.blockedCount,
+        candidates:stageLock.candidateCount,
+        modelAdded:analyzeApprovedIds.size,
+      })+'\n');
     await appendFile(logFile,'[STAGE_UNLOCK] ANALYZE -> EXPERIMENT\n');
   };
   const hypotheses:Array<{turn:number;path:string;statement:string}>=[];
@@ -816,7 +831,7 @@ export async function runLocalAudit(
                 solCandidateBuffer.push({id,plan});
                 queuedSelectorsForPath.add(selector);
               }
-              const isMockOrTest=/(?:^|\/)(?:mocks?|tests?|__tests__|fixtures)(?:\/|$)|Mock\.sol$/i.test(path);
+              const isMockOrTest=isTestOrMockContractPath(path);
               if(!isMockOrTest){
                 const unqueuedNonSetters=menu
                   .filter(entry=>entry.operation==='send' && !queuedSelectorsForPath.has(entry.selector))
@@ -931,7 +946,7 @@ export async function runLocalAudit(
           for(const rel of relHyps){
             const targetPath=rel.file;
             if(!targetPath || !targetPath.endsWith('.sol'))continue;
-            const isMockOrTest=/(?:^|\/)(?:mocks?|tests?|__tests__|fixtures)(?:\/|$)|Mock\.sol$/i.test(targetPath);
+            const isMockOrTest=isTestOrMockContractPath(targetPath);
             if(isMockOrTest)continue;
             const menu=deterministicDeclarationsCache.get(targetPath)||[];
             for(const fnSel of rel.entrypoints){
@@ -983,12 +998,20 @@ export async function runLocalAudit(
         for(const blocked of candidateQueue.blocked){
           await appendFile(logFile,'[ANALYSIS_LEAD_BLOCKED] '+JSON.stringify(blocked)+'\n');
         }
+        analysisInventoryMeta={
+          inventoryTotal:candidateQueue.inventory.length,
+          admittedCount:candidateQueue.admitted.length,
+          queuedRemaining:candidateQueue.queued.length,
+          blockedCount:candidateQueue.blocked.length,
+        };
         try {
           await writeFile(logFile+'.analysis-candidates.json',JSON.stringify({
             totalCandidates:candidateQueue.inventory.length,
             admittedCount:candidateQueue.admitted.length,
             queuedCount:candidateQueue.queued.length,
             blockedCount:candidateQueue.blocked.length,
+            inventoryCoverage:candidateQueue.queued.length>0?'partial_bounded_batch':'complete',
+            blocked:candidateQueue.blocked,
             candidates:candidateQueue.inventory.map(({sourceExcerpt:_ex,...rest})=>rest),
           },null,2),{mode:0o600});
         }catch{}

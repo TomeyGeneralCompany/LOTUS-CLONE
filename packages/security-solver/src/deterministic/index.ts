@@ -1,5 +1,7 @@
 export {
   buildAnalysisCandidateQueue,
+  isTestOrMockContractPath,
+  isExternalAdapterOrMarketPath,
   type AnalysisCandidate,
   type AnalysisCandidateQueueOptions,
   type AnalysisCandidateQueueResult,
