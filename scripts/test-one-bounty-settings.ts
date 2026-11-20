@@ -17,5 +17,5 @@ console.log('One-bounty local deterministic engine cannot reactivate Qwen PASSED
 // The live entrypoint must call the imported deterministic initializer. This
 // regression caught a post-merge ReferenceError that stopped the laptop hunt.
 const entrypoint=readFileSync(new URL('./one-bounty.ts',import.meta.url),'utf8');
-assert.match(entrypoint,/ensureOneBountyDeterministicEngine\\(process\\.env\\)/);
-assert.doesNotMatch(entrypoint,/ensureOneBountyLocalModel\\s*\\(/);
+assert.ok(entrypoint.includes('ensureOneBountyDeterministicEngine(process.env);'));
+assert.ok(!entrypoint.includes('ensureOneBountyLocalModel('));
