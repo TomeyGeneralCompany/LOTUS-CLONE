@@ -47,6 +47,13 @@ export interface RelationalHypothesis {
   propertyKind: RelationalPropertyKind;
   expectedRelation: string;
   requiredObservations: string[];
+  /** Prerequisites strictly required to observe or define this specific property (e.g. missing public getters). */
+  propertyRequiredPrerequisites: string[];
+  /** External protocol/token dependencies required to instantiate a local execution fixture. */
+  fixturePrerequisites: string[];
+  /** Unresolved calls that do not block the asserted property or its local fixture. */
+  unrelatedUnresolvedCalls: string[];
+  /** Combined property + fixture prerequisites (excludes unrelated unresolved calls). */
   unresolvedPrerequisites: string[];
 }
 
@@ -120,19 +127,69 @@ function toWitness(fact: ProgramFact): HypothesisWitness {
 }
 
 
-const ROLE_STATE_RE = /(?:^|\.)(?:owner|admin|administrator|operator|manager|guardian|controller|authority|minter|pauser|governance|keeper)$/i;
-const SUPPLY_STATE_RE = /(?:^|\.)(?:totalSupply|supply|minted|burned)$/i;
+const ROLE_STATE_RE = /(?:^|\.)(?:owner|admin|administrator|operator|manager|guardian|controller|authority|minter|pauser|governance|governor|keeper)$/i;
+const SUPPLY_STATE_RE = /(?:^|\.)(?:totalSupply|supply|minted|burned|vestedSupply)$/i;
 const SHARE_STATE_RE = /(?:^|\.)(?:shares?|totalShares|vaultShares|exchangeRate)$/i;
-const INTEREST_STATE_RE = /(?:^|\.)(?:interest|accrued|accruedInterest|rate|index|rewardPerToken|rewards?)$/i;
-const CONSERVATION_STATE_RE = /(?:^|\.)(?:balances?|totalDeposits|totalAssets|totalStaked|totalDebt|deposits?|reserves?|liquidity|principal|debt)$/i;
+const INTEREST_STATE_RE = /(?:^|\.)(?:interest|accrued|accruedInterest|rate|index|rewardPerToken|rewards?|surplus|yield)$/i;
+const CONSERVATION_STATE_RE = /(?:^|\.)(?:balances?|totalDeposits|totalAssets|totalStaked|totalDebt|totalDeposit|deposits?|reserves?|liquidity|principal|debt|staked|vested)$/i;
+const CONFIG_OR_ADDRESS_STATE_RE =
+  /(?:^|\.)(?:stablecoin|token|underlying|asset|cToken|aToken|yVault|fVault|vault|lendingPool|pool|comptroller|registry|factory|router|oracle|priceFeed|feeModel|interestModel|moneyMarket|mph|mphMinter|vesting|stakingPool|distributor|implementation|proxy|paused|initialized|isInitialized|decimals|symbol|name|recipient|treasury|beneficiary|strategy|gauge|market|rewardsToken|stakingToken|depositToken)$/i;
+const INITIALIZER_FN_RE = /(?:^|\.)(?:initialize|init|__[A-Za-z0-9_]*init)$/i;
+const CONFIG_SETTER_FN_RE = /(?:^|\.)(?:set[A-Z][A-Za-z0-9_]*|update[A-Z][A-Za-z0-9_]*|change[A-Z][A-Za-z0-9_]*)$/i;
+const UTILITY_CALL_TARGET_RE =
+  /^(?:SafeMath|Math|SignedSafeMath|Address|Strings|Arrays|Counters|ECDSA|MerkleProof|Clones|Create2|BitMaps|EnumerableSet|EnumerableMap|SafeCast|FixedPoint|PRBMath|DecMath|Console|console|console2|abi|type|super|this)(?:\.|$)/i;
+const FIXTURE_CALL_TARGET_RE =
+  /\.(?:transfer|transferFrom|safeTransfer|safeTransferFrom|approve|safeApprove|safeIncreaseAllowance|safeDecreaseAllowance|mint|burn|deposit|withdraw|redeem|redeemUnderlying|borrow|repay|repayBorrow|balanceOf|claim|claimComp|getReward|exit|credit|debit|flashLoan|swap)\b|(?:^|:)(?:ERC20|IERC20|SafeERC20|ICERC20|ILendingPool|IComptroller|IVault|IHarvestVault|IYVault|IMoneyMarket|IBenqi|ICToken|AToken|CToken)\b/i;
+const TOKEN_ONLY_FIXTURE_RE =
+  /(?:^|:)(?:ERC20|IERC20|SafeERC20|token|stablecoin|underlying|asset)(?:\.(?:transfer|transferFrom|safeTransfer|safeTransferFrom|approve|safeApprove|safeIncreaseAllowance|safeDecreaseAllowance|balanceOf|allowance))?$/i;
+
+function isAccountingStateVar(stateVar: string): boolean {
+  if (CONFIG_OR_ADDRESS_STATE_RE.test(stateVar) || ROLE_STATE_RE.test(stateVar)) {
+    return false;
+  }
+  return (
+    INTEREST_STATE_RE.test(stateVar) ||
+    SHARE_STATE_RE.test(stateVar) ||
+    SUPPLY_STATE_RE.test(stateVar) ||
+    CONSERVATION_STATE_RE.test(stateVar)
+  );
+}
 
 function classifyRelationalProperty(stateVars: readonly string[]): RelationalPropertyKind {
-  if (stateVars.some((v) => INTEREST_STATE_RE.test(v))) return "interest-accrual";
-  if (stateVars.some((v) => SHARE_STATE_RE.test(v))) return "share-accounting";
-  if (stateVars.some((v) => SUPPLY_STATE_RE.test(v))) return "supply-accounting";
-  if (stateVars.some((v) => CONSERVATION_STATE_RE.test(v))) return "conservation";
+  const accountingVars = stateVars.filter(isAccountingStateVar);
+  if (accountingVars.some((v) => INTEREST_STATE_RE.test(v))) return "interest-accrual";
+  if (accountingVars.some((v) => SHARE_STATE_RE.test(v))) return "share-accounting";
+  if (accountingVars.some((v) => SUPPLY_STATE_RE.test(v))) return "supply-accounting";
+  if (accountingVars.some((v) => CONSERVATION_STATE_RE.test(v))) return "conservation";
   if (stateVars.some((v) => ROLE_STATE_RE.test(v))) return "authorization-chain";
   return "state-coupling";
+}
+
+function isFinancialRelationalKind(kind: RelationalPropertyKind): boolean {
+  return (
+    kind === "conservation" ||
+    kind === "supply-accounting" ||
+    kind === "share-accounting" ||
+    kind === "interest-accrual"
+  );
+}
+
+function classifyUnresolvedCallForProperty(
+  unresolvedItem: string,
+  propertyKind: RelationalPropertyKind,
+): "fixture" | "unrelated" {
+  const target = unresolvedItem.replace(/^(?:unresolved_external_call|unresolved_call|ambiguous_call):/, "");
+  if (UTILITY_CALL_TARGET_RE.test(target)) {
+    return "unrelated";
+  }
+  if (propertyKind === "authorization-chain") {
+    // Role-state takeover tests depend on authority state mutation, not unrelated downstream token/market calls.
+    return "unrelated";
+  }
+  if (isFinancialRelationalKind(propertyKind) && FIXTURE_CALL_TARGET_RE.test(target)) {
+    return "fixture";
+  }
+  return "unrelated";
 }
 
 function relationalId(file: string, entrypoints: readonly string[], stateDeps: readonly string[], kind: RelationalPropertyKind): string {
@@ -320,13 +377,35 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
   }
 
   for (const pair of pairStates.values()) {
-    const stateDeps = [...pair.vars].sort();
-    const propertyKind = classifyRelationalProperty(stateDeps);
-    const hasAccountingOrRole =
-      propertyKind !== "state-coupling" ||
-      valueFlowFns.has(pair.a) ||
-      valueFlowFns.has(pair.b);
-    if (!hasAccountingOrRole) continue;
+    const rawStateDeps = [...pair.vars].sort();
+    const accountingDeps = rawStateDeps.filter(isAccountingStateVar);
+    const roleDeps = rawStateDeps.filter((v) => ROLE_STATE_RE.test(v));
+    const nonConfigDeps = rawStateDeps.filter((v) => !CONFIG_OR_ADDRESS_STATE_RE.test(v));
+    const propertyKind = classifyRelationalProperty(rawStateDeps);
+    const isFinancial = isFinancialRelationalKind(propertyKind);
+
+    // Do not elevate ordinary configuration/address references (e.g. initialize + withdraw
+    // sharing `stablecoin`, `lendingPool`, or `vault`) into accounting invariants.
+    if (isFinancial) {
+      if (accountingDeps.length === 0) continue;
+      if (INITIALIZER_FN_RE.test(pair.a) || INITIALIZER_FN_RE.test(pair.b)) continue;
+      if (CONFIG_SETTER_FN_RE.test(pair.a) && CONFIG_SETTER_FN_RE.test(pair.b)) continue;
+    } else if (propertyKind === "authorization-chain") {
+      if (roleDeps.length === 0) continue;
+    } else {
+      // Pure config/address coupling without accounting or role state is not a relational
+      // accounting invariant; skip even if one function happens to perform a token transfer.
+      if (nonConfigDeps.length === 0) continue;
+      if (INITIALIZER_FN_RE.test(pair.a) || INITIALIZER_FN_RE.test(pair.b)) continue;
+      const hasValueFlow = valueFlowFns.has(pair.a) || valueFlowFns.has(pair.b);
+      if (!hasValueFlow) continue;
+    }
+
+    const stateDeps = isFinancial
+      ? accountingDeps
+      : propertyKind === "authorization-chain"
+        ? roleDeps
+        : nonConfigDeps;
 
     const entryList = pair.ordered ? [pair.a, pair.b] : [pair.a, pair.b].sort();
     const id = relationalId(pair.file, entryList, stateDeps, propertyKind);
@@ -334,7 +413,9 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
     seen.add(id);
 
     const requiredObservations: string[] = [];
-    const unresolvedPrerequisites: string[] = [];
+    const propertyRequiredPrerequisites: string[] = [];
+    const fixturePrerequisites: string[] = [];
+    const unrelatedUnresolvedCalls: string[] = [];
 
     for (const sv of stateDeps) {
       const svSym = stateVarSymbols.get(sv);
@@ -342,17 +423,24 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
         const getterSig = svSym.returnType === "mapping" ? `${svSym.name}(address)` : `${svSym.name}()`;
         requiredObservations.push(getterSig);
       } else {
-        unresolvedPrerequisites.push(`missing_public_getter:${sv}`);
+        propertyRequiredPrerequisites.push(`missing_public_getter:${sv}`);
       }
     }
 
     for (const fn of entryList) {
       for (const u of unresolvedByFn.get(fn) || []) {
-        if (!unresolvedPrerequisites.includes(u)) {
-          unresolvedPrerequisites.push(u);
+        const bucket = classifyUnresolvedCallForProperty(u, propertyKind);
+        if (bucket === "fixture") {
+          if (!fixturePrerequisites.includes(u)) fixturePrerequisites.push(u);
+        } else {
+          if (!unrelatedUnresolvedCalls.includes(u)) unrelatedUnresolvedCalls.push(u);
         }
       }
     }
+
+    const unresolvedPrerequisites = [
+      ...new Set([...propertyRequiredPrerequisites, ...fixturePrerequisites]),
+    ].sort();
 
     const witnesses: HypothesisWitness[] = [
       buildWitnessForFn(pair.a, "state_write", `${pair.a} mutates shared state (${stateDeps.join(", ")})`),
@@ -386,7 +474,10 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
       propertyKind,
       expectedRelation,
       requiredObservations: [...new Set(requiredObservations)].sort(),
-      unresolvedPrerequisites: [...new Set(unresolvedPrerequisites)].sort(),
+      propertyRequiredPrerequisites: [...new Set(propertyRequiredPrerequisites)].sort(),
+      fixturePrerequisites: [...new Set(fixturePrerequisites)].sort(),
+      unrelatedUnresolvedCalls: [...new Set(unrelatedUnresolvedCalls)].sort(),
+      unresolvedPrerequisites,
     });
   }
 
@@ -723,7 +814,11 @@ export function generateHypotheses(graph: ProgramFactsGraph): SecurityHypothesis
       rel.propertyKind === "share-accounting" ||
       rel.propertyKind === "interest-accrual";
     const category: HypothesisCategory = isFinancial ? "accounting_invariant" : "relational_state";
-    const ready = rel.unresolvedPrerequisites.length === 0 && rel.requiredObservations.length > 0;
+    const nonTokenFixturePrereqs = rel.fixturePrerequisites.filter((p) => !TOKEN_ONLY_FIXTURE_RE.test(p));
+    const ready =
+      rel.propertyRequiredPrerequisites.length === 0 &&
+      nonTokenFixturePrereqs.length === 0 &&
+      rel.requiredObservations.length > 0;
     for (const ep of rel.entrypoints) {
       const epWitness = rel.sourceWitnesses.find((w) => w.symbol === ep) || primaryWitness;
       pushUnique({
