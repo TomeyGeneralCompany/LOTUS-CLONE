@@ -5,15 +5,6 @@ on:
     branches:
       - main
   workflow_dispatch:
-    inputs:
-      engine:
-        description: "Analysis/review engine (deterministic = zero-Qwen default, ollama = Qwen3 4B A/B baseline)"
-        required: false
-        default: deterministic
-        type: choice
-        options:
-          - deterministic
-          - ollama
 
 permissions:
   contents: read
@@ -29,16 +20,14 @@ jobs:
     timeout-minutes: 90
     env:
       IMMUNEFI_ENABLED: 'true'
-      LOCAL_MODEL_ADAPTER: ${{ inputs.engine || 'deterministic' }}
-      LOCAL_OLLAMA_MODEL: ${{ (inputs.engine || 'deterministic') == 'ollama' && 'qwen3:4b' || '' }}
-      LOCAL_OLLAMA_TOOL_PROTOCOL: json
+      LOCAL_MODEL_ADAPTER: deterministic
       LOCAL_MODEL_PROFILE: deterministic
       LOCAL_CONTROLLER_OWNED_ACTIONS: 'true'
       AUTOHACK_AUTO_SOURCE_PREFETCH: 'true'
       AUTOHACK_GUIDED_SOURCE_PROBES: 'true'
       LOCAL_HUNT_DYNAMIC_ALLOWANCE: 'true'
       LOCAL_CONTROLLER_FULL_SOURCE_INDEX: 'true'
-      AUTOHACK_OLLAMA_URL: ${{ (inputs.engine || 'deterministic') == 'ollama' && 'http://127.0.0.1:11434/api/chat' || 'http://127.0.0.1:1/api/chat' }}
+      AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
       AUTOHACK_SINGLE_BOUNTY_DIAGNOSTIC: '1'
       JAVAPARSER_JAR: /tmp/lotus-tools/javaparser-core.jar
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -72,15 +61,6 @@ jobs:
           set -Eeuo pipefail
           mkdir -p data/repair-feedback
           npx tsx -e 'import { detectAvailableAdapters } from "./packages/security-solver/src/deterministic"; const caps = detectAvailableAdapters(); console.log(JSON.stringify({ available: caps.filter(c => c.availableOnHost).map(c => c.name), unavailable: caps.filter(c => !c.availableOnHost).map(c => c.name), adapters: caps }, null, 2));' | tee data/repair-feedback/host-capabilities.json
-      - name: Start isolated Docker Ollama with Qwen3 4B (ollama A/B mode only)
-        if: env.LOCAL_MODEL_ADAPTER == 'ollama'
-        run: |
-          docker run -d --name lotus-cloud-ollama -p 127.0.0.1:11434:11434 ollama/ollama:latest
-          for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then break; fi
-            sleep 2
-          done
-          docker exec lotus-cloud-ollama ollama pull qwen3:4b
       - name: Initialize isolated database and seed 88mphV3 program
         run: |
           printf 'GITHUB_TOKEN=%s\nHACKERONE_API_USERNAME=mock-user\nHACKERONE_API_TOKEN=mock-token\n' "${{ secrets.GITHUB_TOKEN }}" > .env
@@ -139,6 +119,3 @@ jobs:
           name: lotus-cloud-real-world-${{ github.run_id }}
           path: data/repair-feedback/**
           retention-days: 30
-      - name: Stop Docker Ollama
-        if: always() && env.LOCAL_MODEL_ADAPTER == 'ollama'
-        run: docker rm -f lotus-cloud-ollama || true
