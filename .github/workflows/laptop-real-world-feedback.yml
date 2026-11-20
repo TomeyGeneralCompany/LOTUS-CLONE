@@ -22,8 +22,10 @@ jobs:
     # hunt is stopped by the existing progress/inactivity controller.
     timeout-minutes: 7200
     env:
-      LOCAL_OLLAMA_MODEL: qwen3:4b
-      LOCAL_MODEL_ADAPTER: ollama
+      # Exercise the Qwen-free LOTUS engine, regardless of the installed laptop .env.
+      LOCAL_OLLAMA_MODEL: ''
+      LOCAL_MODEL_ADAPTER: deterministic
+      AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
       LOCAL_OLLAMA_TOOL_PROTOCOL: json
       LOCAL_MODEL_PROFILE: deterministic
       LOCAL_CONTROLLER_OWNED_ACTIONS: 'true'
@@ -79,20 +81,7 @@ jobs:
             echo "Restored installed LOTUS state" | tee -a data/repair-feedback/setup.log
           fi
 
-          if ! command -v ollama >/dev/null 2>&1; then
-            for bin in /usr/local/bin/ollama /usr/bin/ollama "$HOME/.local/bin/ollama"; do
-              if [[ -x "$bin" ]]; then export PATH="${bin%/*}:$PATH"; break; fi
-            done
-          fi
-          if ! command -v ollama >/dev/null 2>&1; then
-            echo "SETUP_FAILED: ollama executable not available to runner service" | tee -a data/repair-feedback/setup.log
-            exit 1
-          fi
-          if ! ollama show qwen3:4b >/dev/null 2>&1; then
-            echo "SETUP_FAILED: Ollama qwen3:4b unavailable to runner service" | tee -a data/repair-feedback/setup.log
-            exit 1
-          fi
-          echo "SETUP_OK: dependencies, installed state and Ollama model available" | tee -a data/repair-feedback/setup.log
+          echo "SETUP_OK: dependencies and installed state available; deterministic engine selected (no Ollama required)" | tee -a data/repair-feedback/setup.log
 
       - name: Run authorized real-world investigation
         id: hunt
