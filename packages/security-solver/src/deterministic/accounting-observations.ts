@@ -1,6 +1,7 @@
 /** Source-backed typed accounting observations, never guessed return values. */
 import {parse} from "@solidity-parser/parser";
-import type {SourceSnapshot,SolidityProbeDeclaration} from "../controller-solidity-experiment-planner";
+import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
+import type {SolidityProbeDeclaration} from "../solidity-probe-inputs";
 
 export type AccountingObservation =
   | {kind:"scalar";getter:string;sourceWitness:string;stateVariable:string}
