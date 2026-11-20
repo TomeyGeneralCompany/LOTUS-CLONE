@@ -252,10 +252,10 @@ contract PlainVault {
   assert.equal(prioritized.selected[0].id, "eth-extract", "Tier 1 extraction probe must be first");
   assert.equal(prioritized.selected[1].id, "defi-deposit", "Tier 2 core DeFi probe must precede setters");
   assert.equal(prioritized.droppedTier4Count, 0, "Round 3 must not discard valid low-priority experiments");
-  assert.equal(prioritized.selected.length + prioritized.deferred.length, items.length,
-    "All experiment options must remain accounted for across selected and deferred queues");
-  assert.equal(new Set([...prioritized.selected, ...prioritized.deferred].map(item=>item.id)).size, items.length,
-    "Each experiment must be retained exactly once");
+  assert.equal(prioritized.selected.length, items.length,
+    "Priority must order all valid options without discarding any");
+  assert.equal(new Set(prioritized.selected.map(item=>item.id)).size, items.length,
+    "Each valid option must be retained exactly once");
 }
 
 // 4. Protocol decodeAuditAction in ANALYZE stage
