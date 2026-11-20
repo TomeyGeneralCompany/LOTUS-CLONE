@@ -50,10 +50,12 @@ export type EscalationAdapterName = "z3" | "joern" | "mythril" | "foundry" | "fa
 
 export interface EscalationStepRecord {
   adapter: EscalationAdapterName;
+  attempted: boolean;
   reason: string;
   status: "executed" | "unavailable" | "skipped" | "error";
   factsAdded: number;
   edgesAdded: number;
+  elapsedMs: number;
   detail?: string;
 }
 
@@ -481,57 +483,84 @@ export function runClosedLoopLeadAnalysis(input: ClosedLoopLeadInput): ClosedLoo
     symbolFacts,
     input.lead.sourceExcerpt,
   );
-  if (
-    escalationsRun < maxEscalations &&
-    extractedGuards.constraints.length >= 2 &&
-    (input.hooks?.runZ3 || isZ3Available())
-  ) {
-    escalationsRun++;
-    try {
-      const z3Input = {
-        file: input.lead.path,
-        line: extractedGuards.line,
-        language,
-        symbol: input.lead.selector,
-        constraints: extractedGuards.constraints,
-        variables: extractedGuards.variables,
-      };
-      const z3Fact = input.hooks?.runZ3
-        ? input.hooks.runZ3(z3Input)
-        : checkGuardFeasibilityFact(z3Input);
-      if (z3Fact) {
-        addedFacts.push({
-          ...z3Fact,
-          symbol: z3Fact.symbol || input.lead.selector,
-        });
-        escalatedAdapters.push("z3");
-        steps.push({
-          adapter: "z3",
-          reason: `Checked ${extractedGuards.constraints.length} guard constraint(s)`,
-          status: "executed",
-          factsAdded: 1,
-          edgesAdded: 0,
-          detail: z3Fact.detail,
-        });
-      } else {
-        steps.push({
-          adapter: "z3",
-          reason: `Checked ${extractedGuards.constraints.length} guard constraint(s)`,
-          status: "executed",
-          factsAdded: 0,
-          edgesAdded: 0,
-          detail: "Z3 returned unknown/no new fact",
-        });
-      }
-    } catch (err) {
+  if (extractedGuards.constraints.length >= 2) {
+    if (!input.hooks?.runZ3 && !isZ3Available()) {
       steps.push({
         adapter: "z3",
-        reason: "Z3 guard feasibility check",
-        status: "error",
+        attempted: false,
+        reason: "tool_unavailable",
+        status: "unavailable",
         factsAdded: 0,
         edgesAdded: 0,
-        detail: String(err instanceof Error ? err.message : err).slice(0, 200),
+        elapsedMs: 0,
+        detail: "Z3 SMT solver is unavailable on host; guard feasibility was not evaluated.",
       });
+    } else if (escalationsRun >= maxEscalations) {
+      steps.push({
+        adapter: "z3",
+        attempted: false,
+        reason: "escalation_budget_exhausted",
+        status: "skipped",
+        factsAdded: 0,
+        edgesAdded: 0,
+        elapsedMs: 0,
+      });
+    } else {
+      escalationsRun++;
+      const t0 = Date.now();
+      try {
+        const z3Input = {
+          file: input.lead.path,
+          line: extractedGuards.line,
+          language,
+          symbol: input.lead.selector,
+          constraints: extractedGuards.constraints,
+          variables: extractedGuards.variables,
+        };
+        const z3Fact = input.hooks?.runZ3
+          ? input.hooks.runZ3(z3Input)
+          : checkGuardFeasibilityFact(z3Input);
+        const elapsedMs = Date.now() - t0;
+        if (z3Fact) {
+          addedFacts.push({
+            ...z3Fact,
+            symbol: z3Fact.symbol || input.lead.selector,
+          });
+          escalatedAdapters.push("z3");
+          steps.push({
+            adapter: "z3",
+            attempted: true,
+            reason: `Checked ${extractedGuards.constraints.length} guard constraint(s)`,
+            status: "executed",
+            factsAdded: 1,
+            edgesAdded: 0,
+            elapsedMs,
+            detail: z3Fact.detail,
+          });
+        } else {
+          steps.push({
+            adapter: "z3",
+            attempted: true,
+            reason: `Checked ${extractedGuards.constraints.length} guard constraint(s)`,
+            status: "executed",
+            factsAdded: 0,
+            edgesAdded: 0,
+            elapsedMs,
+            detail: "Z3 returned unknown/no new fact",
+          });
+        }
+      } catch (err) {
+        steps.push({
+          adapter: "z3",
+          attempted: true,
+          reason: "Z3 guard feasibility check",
+          status: "error",
+          factsAdded: 0,
+          edgesAdded: 0,
+          elapsedMs: Date.now() - t0,
+          detail: String(err instanceof Error ? err.message : err).slice(0, 200),
+        });
+      }
     }
   }
 
@@ -541,164 +570,271 @@ export function runClosedLoopLeadAnalysis(input: ClosedLoopLeadInput): ClosedLoo
   // 2. Isolated fast-check (bubblewrap) for JavaScript targets
   if (
     !provedUnsat &&
-    escalationsRun < maxEscalations &&
     language === "javascript" &&
     targetSource &&
-    (needsDeeper || recommended.has("fast-check") || symbolFacts.some((f) => f.kind === "sink_html" || f.kind === "sink_path")) &&
-    (input.hooks?.isolatedJsEvaluator || isIsolatedJsSandboxAvailable())
+    (needsDeeper ||
+      recommended.has("fast-check") ||
+      symbolFacts.some((f) => f.kind === "sink_html" || f.kind === "sink_path"))
   ) {
-    escalationsRun++;
-    const property = chooseJsFastCheckProperty(symbolFacts, targetSource.content);
-    const res = runFastCheckJsProbe({
-      file: input.lead.path,
-      symbol: shortSymbolName(input.lead.selector),
-      sourceCode: targetSource.content,
-      repositoryDir: input.repositoryDir,
-      property,
-      numRuns: 16,
-      seed: 1337,
-      timeoutMs: 10_000,
-      isolatedEvaluator: input.hooks?.isolatedJsEvaluator,
-    });
-    if (res.status === "counterexample_found" || res.status === "property_held") {
-      const normalizedFacts = res.fact
-        ? [
-            {
-              ...res.fact,
-              file: input.lead.path,
-              symbol: input.lead.selector,
-            },
-          ]
-        : [];
-      addedFacts.push(...normalizedFacts);
-      escalatedAdapters.push("fast-check");
+    if (!input.hooks?.isolatedJsEvaluator && !isIsolatedJsSandboxAvailable()) {
       steps.push({
         adapter: "fast-check",
-        reason: `Isolated ${res.isolation} property probe (${property})`,
-        status: "executed",
-        factsAdded: normalizedFacts.length,
-        edgesAdded: 0,
-        detail: res.counterexample ? `Counterexample: ${res.counterexample.slice(0, 120)}` : res.detail,
-      });
-    } else {
-      steps.push({
-        adapter: "fast-check",
-        reason: `Isolated property probe (${property})`,
-        status: res.status === "blocked_no_sandbox" ? "unavailable" : "error",
+        attempted: false,
+        reason: "tool_unavailable",
+        status: "unavailable",
         factsAdded: 0,
         edgesAdded: 0,
-        detail: res.detail,
+        elapsedMs: 0,
+        detail: "Isolated bubblewrap sandbox is unavailable on host; JS property probe was not executed.",
       });
+    } else if (escalationsRun >= maxEscalations) {
+      steps.push({
+        adapter: "fast-check",
+        attempted: false,
+        reason: "escalation_budget_exhausted",
+        status: "skipped",
+        factsAdded: 0,
+        edgesAdded: 0,
+        elapsedMs: 0,
+      });
+    } else {
+      escalationsRun++;
+      const t0 = Date.now();
+      const property = chooseJsFastCheckProperty(symbolFacts, targetSource.content);
+      const res = runFastCheckJsProbe({
+        file: input.lead.path,
+        symbol: shortSymbolName(input.lead.selector),
+        sourceCode: targetSource.content,
+        repositoryDir: input.repositoryDir,
+        property,
+        numRuns: 16,
+        seed: 1337,
+        timeoutMs: 10_000,
+        isolatedEvaluator: input.hooks?.isolatedJsEvaluator,
+      });
+      const elapsedMs = Date.now() - t0;
+      if (res.status === "counterexample_found" || res.status === "property_held") {
+        const normalizedFacts = res.fact
+          ? [
+              {
+                ...res.fact,
+                file: input.lead.path,
+                symbol: input.lead.selector,
+              },
+            ]
+          : [];
+        addedFacts.push(...normalizedFacts);
+        escalatedAdapters.push("fast-check");
+        steps.push({
+          adapter: "fast-check",
+          attempted: true,
+          reason: `Isolated ${res.isolation} property probe (${property})`,
+          status: "executed",
+          factsAdded: normalizedFacts.length,
+          edgesAdded: 0,
+          elapsedMs,
+          detail: res.counterexample ? `Counterexample: ${res.counterexample.slice(0, 120)}` : res.detail,
+        });
+      } else {
+        const blocked = res.status === "blocked_no_sandbox";
+        steps.push({
+          adapter: "fast-check",
+          attempted: !blocked,
+          reason: blocked ? "tool_unavailable" : `Isolated property probe (${property})`,
+          status: blocked ? "unavailable" : "error",
+          factsAdded: 0,
+          edgesAdded: 0,
+          elapsedMs,
+          detail: res.detail,
+        });
+      }
     }
   }
 
   // 3. Joern CPG taint-flow escalation for Java / Python / JavaScript targets
   if (
     !provedUnsat &&
-    escalationsRun < maxEscalations &&
     (language === "java" || language === "python" || language === "javascript") &&
     targetSource &&
-    (needsDeeper || recommended.has("joern")) &&
-    (input.hooks?.runJoern || isJoernAvailable())
+    (needsDeeper || recommended.has("joern"))
   ) {
-    escalationsRun++;
-    const joernRes = input.hooks?.runJoern
-      ? input.hooks.runJoern({ sources: [targetSource], lead: input.lead })
-      : runJoernCpgAnalysis({ sources: [targetSource] }, 45_000);
-    if (joernRes.status === "completed") {
-      const normalizedFacts = joernRes.facts.map((f) => ({
-        ...f,
-        file: f.file || input.lead.path,
-        symbol: f.symbol || input.lead.selector,
-      }));
-      addedFacts.push(...normalizedFacts);
-      addedEdges.push(...joernRes.edges);
-      escalatedAdapters.push("joern");
+    if (!input.hooks?.runJoern && !isJoernAvailable()) {
       steps.push({
         adapter: "joern",
-        reason: `CPG taint/dataflow escalation for ${language} lead`,
-        status: "executed",
-        factsAdded: normalizedFacts.length,
-        edgesAdded: joernRes.edges.length,
-      });
-    } else {
-      steps.push({
-        adapter: "joern",
-        reason: `CPG taint/dataflow escalation for ${language} lead`,
-        status: joernRes.status === "unavailable" ? "unavailable" : "error",
+        attempted: false,
+        reason: "tool_unavailable",
+        status: "unavailable",
         factsAdded: 0,
         edgesAdded: 0,
-        detail: joernRes.error,
+        elapsedMs: 0,
+        detail: `Joern CLI is unavailable on host; CPG taint/dataflow escalation for ${language} was not executed.`,
       });
+    } else if (escalationsRun >= maxEscalations) {
+      steps.push({
+        adapter: "joern",
+        attempted: false,
+        reason: "escalation_budget_exhausted",
+        status: "skipped",
+        factsAdded: 0,
+        edgesAdded: 0,
+        elapsedMs: 0,
+      });
+    } else {
+      escalationsRun++;
+      const t0 = Date.now();
+      const joernRes = input.hooks?.runJoern
+        ? input.hooks.runJoern({ sources: [targetSource], lead: input.lead })
+        : runJoernCpgAnalysis({ sources: [targetSource] }, 45_000);
+      const elapsedMs = Date.now() - t0;
+      if (joernRes.status === "completed") {
+        const normalizedFacts = joernRes.facts.map((f) => ({
+          ...f,
+          file: f.file || input.lead.path,
+          symbol: f.symbol || input.lead.selector,
+        }));
+        addedFacts.push(...normalizedFacts);
+        addedEdges.push(...joernRes.edges);
+        escalatedAdapters.push("joern");
+        steps.push({
+          adapter: "joern",
+          attempted: true,
+          reason: `CPG taint/dataflow escalation for ${language} lead`,
+          status: "executed",
+          factsAdded: normalizedFacts.length,
+          edgesAdded: joernRes.edges.length,
+          elapsedMs,
+        });
+      } else {
+        const unavail = joernRes.status === "unavailable";
+        steps.push({
+          adapter: "joern",
+          attempted: !unavail,
+          reason: unavail ? "tool_unavailable" : `CPG taint/dataflow escalation for ${language} lead`,
+          status: unavail ? "unavailable" : "error",
+          factsAdded: 0,
+          edgesAdded: 0,
+          elapsedMs,
+          detail: joernRes.error,
+        });
+      }
     }
   }
 
   // 4. Mythril EVM symbolic escalation for Solidity targets
   if (
     !provedUnsat &&
-    escalationsRun < maxEscalations &&
     language === "solidity" &&
     targetSource &&
-    (needsDeeper || recommended.has("mythril")) &&
-    (input.hooks?.runMythril || isMythrilAvailable())
+    (needsDeeper || recommended.has("mythril"))
   ) {
-    escalationsRun++;
-    const mythRes = input.hooks?.runMythril
-      ? input.hooks.runMythril({
-          file: input.lead.path,
-          contractSource: targetSource.content,
-          lead: input.lead,
-        })
-      : runMythrilSymbolicAnalysis({
-          file: input.lead.path,
-          contractSource: targetSource.content,
-          executionTimeoutSec: 15,
-          maxDepth: 12,
-          timeoutMs: 30_000,
-        });
-    if (mythRes.status === "completed") {
-      const normalizedFacts = mythRes.facts.map((f) => ({
-        ...f,
-        file: f.file || input.lead.path,
-        symbol: f.symbol || input.lead.selector,
-      }));
-      addedFacts.push(...normalizedFacts);
-      escalatedAdapters.push("mythril");
+    if (!input.hooks?.runMythril && !isMythrilAvailable()) {
       steps.push({
         adapter: "mythril",
-        reason: "EVM symbolic analysis escalation for Solidity lead",
-        status: "executed",
-        factsAdded: normalizedFacts.length,
-        edgesAdded: 0,
-      });
-    } else {
-      steps.push({
-        adapter: "mythril",
-        reason: "EVM symbolic analysis escalation for Solidity lead",
-        status: mythRes.status === "unavailable" ? "unavailable" : "error",
+        attempted: false,
+        reason: "tool_unavailable",
+        status: "unavailable",
         factsAdded: 0,
         edgesAdded: 0,
-        detail: mythRes.error,
+        elapsedMs: 0,
+        detail: "Mythril is unavailable on host; EVM symbolic analysis was not executed.",
       });
+    } else if (escalationsRun >= maxEscalations) {
+      steps.push({
+        adapter: "mythril",
+        attempted: false,
+        reason: "escalation_budget_exhausted",
+        status: "skipped",
+        factsAdded: 0,
+        edgesAdded: 0,
+        elapsedMs: 0,
+      });
+    } else {
+      escalationsRun++;
+      const t0 = Date.now();
+      const mythRes = input.hooks?.runMythril
+        ? input.hooks.runMythril({
+            file: input.lead.path,
+            contractSource: targetSource.content,
+            lead: input.lead,
+          })
+        : runMythrilSymbolicAnalysis({
+            file: input.lead.path,
+            contractSource: targetSource.content,
+            executionTimeoutSec: 15,
+            maxDepth: 12,
+            timeoutMs: 30_000,
+          });
+      const elapsedMs = Date.now() - t0;
+      if (mythRes.status === "completed") {
+        const normalizedFacts = mythRes.facts.map((f) => ({
+          ...f,
+          file: f.file || input.lead.path,
+          symbol: f.symbol || input.lead.selector,
+        }));
+        addedFacts.push(...normalizedFacts);
+        escalatedAdapters.push("mythril");
+        steps.push({
+          adapter: "mythril",
+          attempted: true,
+          reason: "EVM symbolic analysis escalation for Solidity lead",
+          status: "executed",
+          factsAdded: normalizedFacts.length,
+          edgesAdded: 0,
+          elapsedMs,
+        });
+      } else {
+        const unavail = mythRes.status === "unavailable";
+        steps.push({
+          adapter: "mythril",
+          attempted: !unavail,
+          reason: unavail ? "tool_unavailable" : "EVM symbolic analysis escalation for Solidity lead",
+          status: unavail ? "unavailable" : "error",
+          factsAdded: 0,
+          edgesAdded: 0,
+          elapsedMs,
+          detail: mythRes.error,
+        });
+      }
     }
   }
 
   // 5. Foundry stateful fuzzing escalation for Solidity targets
   if (
     !provedUnsat &&
-    escalationsRun < maxEscalations &&
     language === "solidity" &&
     targetSource &&
-    (needsDeeper || recommended.has("foundry")) &&
-    (input.hooks?.runFoundry || isFoundryAvailable())
+    (needsDeeper || recommended.has("foundry"))
   ) {
-    if (input.hooks?.runFoundry) {
+    if (!input.hooks?.runFoundry && !isFoundryAvailable()) {
+      steps.push({
+        adapter: "foundry",
+        attempted: false,
+        reason: "tool_unavailable",
+        status: "unavailable",
+        factsAdded: 0,
+        edgesAdded: 0,
+        elapsedMs: 0,
+        detail: "Foundry (forge) is unavailable on host; stateful Solidity fuzz escalation was not executed.",
+      });
+    } else if (escalationsRun >= maxEscalations) {
+      steps.push({
+        adapter: "foundry",
+        attempted: false,
+        reason: "escalation_budget_exhausted",
+        status: "skipped",
+        factsAdded: 0,
+        edgesAdded: 0,
+        elapsedMs: 0,
+      });
+    } else if (input.hooks?.runFoundry) {
       escalationsRun++;
+      const t0 = Date.now();
       const fRes = input.hooks.runFoundry({
         file: input.lead.path,
         contractSource: targetSource.content,
         lead: input.lead,
       });
+      const elapsedMs = Date.now() - t0;
       if (fRes.status === "completed") {
         const normalizedFacts = fRes.facts.map((f) => ({
           ...f,
@@ -709,18 +845,23 @@ export function runClosedLoopLeadAnalysis(input: ClosedLoopLeadInput): ClosedLoo
         escalatedAdapters.push("foundry");
         steps.push({
           adapter: "foundry",
+          attempted: true,
           reason: "Foundry stateful invariant escalation",
           status: "executed",
           factsAdded: normalizedFacts.length,
           edgesAdded: 0,
+          elapsedMs,
         });
       } else {
+        const unavail = fRes.status === "unavailable";
         steps.push({
           adapter: "foundry",
-          reason: "Foundry stateful invariant escalation",
-          status: fRes.status === "unavailable" ? "unavailable" : "error",
+          attempted: !unavail,
+          reason: unavail ? "tool_unavailable" : "Foundry stateful invariant escalation",
+          status: unavail ? "unavailable" : "error",
           factsAdded: 0,
           edgesAdded: 0,
+          elapsedMs,
           detail: fRes.error,
         });
       }
@@ -732,6 +873,7 @@ export function runClosedLoopLeadAnalysis(input: ClosedLoopLeadInput): ClosedLoo
       );
       if (synthesized) {
         escalationsRun++;
+        const t0 = Date.now();
         const fRes = runFoundrySolidityTest({
           file: input.lead.path,
           contractSource: targetSource.content,
@@ -740,6 +882,7 @@ export function runClosedLoopLeadAnalysis(input: ClosedLoopLeadInput): ClosedLoo
           fuzzRuns: 32,
           timeoutMs: 45_000,
         });
+        const elapsedMs = Date.now() - t0;
         if (fRes.status === "completed") {
           const normalizedFacts = fRes.facts.map((f) => ({
             ...f,
@@ -750,21 +893,37 @@ export function runClosedLoopLeadAnalysis(input: ClosedLoopLeadInput): ClosedLoo
           escalatedAdapters.push("foundry");
           steps.push({
             adapter: "foundry",
+            attempted: true,
             reason: "Synthesized Foundry unauthorized role-mutation fuzz probe",
             status: "executed",
             factsAdded: normalizedFacts.length,
             edgesAdded: 0,
+            elapsedMs,
           });
         } else {
+          const unavail = fRes.status === "unavailable";
           steps.push({
             adapter: "foundry",
-            reason: "Synthesized Foundry probe",
-            status: fRes.status === "unavailable" ? "unavailable" : "error",
+            attempted: !unavail,
+            reason: unavail ? "tool_unavailable" : "Synthesized Foundry probe",
+            status: unavail ? "unavailable" : "error",
             factsAdded: 0,
             edgesAdded: 0,
+            elapsedMs,
             detail: fRes.error,
           });
         }
+      } else {
+        steps.push({
+          adapter: "foundry",
+          attempted: false,
+          reason: "no_synthesized_probe",
+          status: "skipped",
+          factsAdded: 0,
+          edgesAdded: 0,
+          elapsedMs: 0,
+          detail: "No source-grounded Foundry probe template matched this Solidity lead.",
+        });
       }
     }
   }

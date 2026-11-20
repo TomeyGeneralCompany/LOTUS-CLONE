@@ -87,12 +87,16 @@ jobs:
       - name: Install Joern CLI (Apache-2.0)
         run: |
           mkdir -p /tmp/joern-install
-          curl -fsSL https://github.com/joernio/joern/releases/latest/download/joern-cli-linux-x86_64.zip -o /tmp/joern-cli.zip
+          curl -fsSL --retry 4 --retry-delay 5 https://github.com/joernio/joern/releases/latest/download/joern-cli-linux-x86_64.zip -o /tmp/joern-cli.zip
           unzip -q /tmp/joern-cli.zip -d /tmp/joern-install
-          JOERN_BIN_DIR=$(dirname "$(find /tmp/joern-install -maxdepth 4 -name joern-parse -type f | head -n 1)")
-          chmod +x "$JOERN_BIN_DIR/joern" "$JOERN_BIN_DIR/joern-parse"
+          JOERN_MAIN=$(find /tmp/joern-install -maxdepth 4 -type f -name joern | head -n 1)
+          JOERN_PARSE=$(find /tmp/joern-install -maxdepth 4 -type f -name joern-parse | head -n 1)
+          test -n "$JOERN_MAIN" && test -n "$JOERN_PARSE"
+          chmod +x "$JOERN_MAIN" "$JOERN_PARSE"
+          JOERN_BIN_DIR=$(dirname "$JOERN_MAIN")
+          if [ ! -f "$JOERN_BIN_DIR/joern-parse" ]; then ln -sf "$JOERN_PARSE" "$JOERN_BIN_DIR/joern-parse"; fi
           echo "JOERN_HOME=$JOERN_BIN_DIR" >> "$GITHUB_ENV"
-          "$JOERN_BIN_DIR/joern-parse" --help | head -n 5
+          "$JOERN_PARSE" --help | head -n 5
       - name: Run live Mythril + Joern adapter verification
         env:
           LOCAL_MODEL_ADAPTER: deterministic

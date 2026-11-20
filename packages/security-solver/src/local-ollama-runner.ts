@@ -1951,14 +1951,19 @@ export async function runLocalAudit(
               unresolvedReasons:ar.unresolvedReasons.slice(0,4),
             })+'\n');
           }
-          if(lastEscalation && ((lastEscalation as ClosedLoopLeadResult).escalatedAdapters.length>0 || (lastEscalation as ClosedLoopLeadResult).reconsidered)) {
+          if(lastEscalation && ((lastEscalation as ClosedLoopLeadResult).steps.length>0 || (lastEscalation as ClosedLoopLeadResult).escalatedAdapters.length>0 || (lastEscalation as ClosedLoopLeadResult).reconsidered)) {
             const esc=lastEscalation as ClosedLoopLeadResult;
             await appendFile(logFile,'[DETERMINISTIC_ESCALATION] '+JSON.stringify({
               turn:turn+1,leadId:detAction.leadId,path:detAction.path,query:detAction.query,
               initialAction:esc.initialDecision.action,finalAction:esc.finalDecision.action,
               reconsidered:esc.reconsidered,adapters:esc.escalatedAdapters,
               factsAdded:esc.addedFacts.length,edgesAdded:esc.addedEdges.length,
-              fromCache:esc.fromCache})+'\n');
+              fromCache:esc.fromCache,
+              steps:esc.steps.map(st=>({
+                adapter:st.adapter,attempted:st.attempted,status:st.status,
+                reason:st.reason,factsAdded:st.factsAdded,edgesAdded:st.edgesAdded,
+                elapsedMs:st.elapsedMs,
+              }))})+'\n');
           }
           await appendFile(logFile,'[DETERMINISTIC_DRIVER_ACTION] '+JSON.stringify({
             turn:turn+1,stage:stageLock?.currentStage||'default',action:detAction.action,
