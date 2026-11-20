@@ -31,7 +31,7 @@ jobs:
       - name: Install npm dependencies (@babel/parser, fast-check, @solidity-parser/parser)
         run: |
           npm ci
-          npm --prefix scripts/reproduction-runtime ci
+          npm install --prefix scripts/reproduction-runtime --ignore-scripts --no-audit --no-fund
       - name: Install MIT Python adapters (LibCST, Tree-sitter + grammars, Z3)
         run: |
           python3 -m pip install --upgrade pip
