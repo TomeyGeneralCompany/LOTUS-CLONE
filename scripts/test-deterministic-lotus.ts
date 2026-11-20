@@ -47,7 +47,9 @@ process.env.AUTOHACK_OLLAMA_URL = "http://127.0.0.1:1/api/chat"; // guaranteed u
 try {
   // 1. Adapter resolution rules
   assert.equal(resolveLocalModelAdapter({}), "deterministic", "Default with no env must be deterministic");
-  assert.equal(resolveLocalModelAdapter({ AUTOHACK_OLLAMA_URL: "http://127.0.0.1:11434/api/chat" }), "ollama", "Explicit AUTOHACK_OLLAMA_URL without adapter keeps Ollama compatibility");
+  assert.equal(resolveLocalModelAdapter({ AUTOHACK_OLLAMA_URL: "http://127.0.0.1:11434/api/chat" }), "deterministic", "Legacy model URL must not reactivate Ollama");
+  assert.throws(() => resolveLocalModelAdapter({ LOCAL_MODEL_ADAPTER: "ollama" }), /LOTUS_MODEL_REMOVED/);
+  assert.throws(() => resolveLocalModelAdapter({ LOCAL_MODEL_ADAPTER: "qwen-agent" }), /LOTUS_MODEL_REMOVED/);
   assert.equal(resolveLocalModelAdapter({ LOCAL_MODEL_ADAPTER: "deterministic", AUTOHACK_OLLAMA_URL: "http://127.0.0.1:11434/api/chat" }), "deterministic");
   assert.equal(isDeterministicMode(), true);
 
