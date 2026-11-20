@@ -1124,13 +1124,17 @@ contract SiblingPool${n} {
         generatedBuggySequence,
       );
       const buggyTotalStep = buggyRun.steps.find(
-        (s: any) => s.operation === "call" && s.function === "totalDeposits()" && s.expect === "600",
+        (s: any) => s.operation === "call" && s.function === "totalDeposits()" && String(s.expected) === "600",
       );
       const buggyBalanceStep = buggyRun.steps.find(
-        (s: any) => s.operation === "call" && s.function === "balances(address)" && s.expect === "600",
+        (s: any) => s.operation === "call" && s.function === "balances(address)" && String(s.expected) === "600",
       );
-      assert.ok(buggyTotalStep && buggyBalanceStep);
+      assert.ok(
+        buggyTotalStep && buggyBalanceStep,
+        `Expected post-withdraw call assertions in steps: ${JSON.stringify(buggyRun.steps)}`,
+      );
       assert.equal(buggyBalanceStep.passed, true, "balances($account0) decremented to 600 on BuggyAccountingVault");
+      assert.equal(String(buggyTotalStep.actual), "1000", "BuggyAccountingVault totalDeposits() must remain stale at 1000");
       assert.equal(
         buggyTotalStep.passed,
         false,
