@@ -58,22 +58,13 @@ jobs:
       - run: npm ci
       - name: Production-fidelity controller corpus (four languages)
         run: node --import tsx scripts/test-production-fidelity-gauntlet.ts
-      - name: Production workflow with isolated Python probes
-        run: node --import tsx scripts/test-production-workflow.ts
-      - name: Premature-final recovery on production runner
-        run: node --import tsx scripts/test-production-workflow.ts --premature-final
-      - name: Duplicate-probe recovery on production runner
-        run: node --import tsx scripts/test-production-workflow.ts --mock-probes --prefetch --duplicate-probe-plan
-      - name: Empty-final recovery on production runner
-        run: node --import tsx scripts/test-production-workflow.ts --empty-final-recovery
-      - name: Malformed probe sequence rejection
-        run: node --import tsx scripts/test-production-workflow.ts --empty-sequence
-      - name: Production model-context compaction and checkpoint
-        run: node --import tsx scripts/test-production-workflow.ts --large-context
-      - name: Escaped source negative case
-        run: node --import tsx scripts/test-production-workflow.ts --variant=1
-      - name: Alternate source syntax
-        run: node --import tsx scripts/test-production-workflow.ts --variant=2
+      - name: Production deterministic controller and evidence review across four languages
+        env:
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+        run: npx tsx scripts/test-deterministic-lotus.ts
+      - name: Full inventory, checkpoint, stage gates and stale-source rejection
+        run: npx tsx scripts/test-deterministic-full-inventory.ts
       - name: Four-language source tracing and deterministic probe plans
         run: node --import tsx scripts/test-controller-next-action.ts
 
@@ -139,12 +130,14 @@ jobs:
         run: node --import tsx scripts/test-controller-next-action.ts
       - name: Verify full controller source inventory and evidence packets
         run: node --import tsx scripts/test-controller-full-source-index.ts
-      - name: Run production workflow with real isolated reproduction
-        run: node --import tsx scripts/test-production-workflow.ts
-      - name: Run source audit with full controller indexing
+      - name: Validate isolated deterministic source-to-experiment-to-review sequence
         env:
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
           LOCAL_CONTROLLER_FULL_SOURCE_INDEX: 'true'
-        run: node --import tsx scripts/test-source-workflow.ts
+        run: |
+          npx tsx scripts/test-deterministic-lotus.ts
+          npx tsx scripts/test-controller-review-boundary.ts
       - name: Preserve failure evidence
         if: always()
         uses: actions/upload-artifact@v4
