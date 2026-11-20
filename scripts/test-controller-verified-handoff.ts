@@ -58,8 +58,8 @@ try {
     assert.equal(result.outcome,'no_testable_candidate',name);
     assert.deepEqual(result.findings,[],name);
     const events=await readFile(log,'utf8');
-    assert.match(events,/\\[DETERMINISTIC_DRIVER_ACTION\\]/,name+': production runner must invoke deterministic driver');
-    assert.doesNotMatch(events,/\\[MODEL_REQUEST_RECOVERY\\]/,name+': no model retry');
+    assert.match(events,/\[DETERMINISTIC_DRIVER_ACTION\]/,name+': production runner must invoke deterministic driver');
+    assert.doesNotMatch(events,/\[MODEL_REQUEST_RECOVERY\]/,name+': no model retry');
   }
   console.log('Four-language deterministic source handoff and finalization PASSED');
 } finally {
