@@ -1784,6 +1784,15 @@ const BALANCE_MAPPING_RE = /^(?:balances|balanceOf|deposits|shares|staked|stakes
  * unresolved reason distinguishing missing fixtures, missing observable state,
  * unresolved external dependencies, or absence of a supported property).
  */
+export function accountingTransitionPatterns(variable: string, field: string): {push:RegExp;pop:RegExp;fieldDecrement:RegExp} {
+  const escape=(value:string)=>value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const prefix='\\b'+escape(variable)+'\\s*';
+  return {
+    push:new RegExp(prefix+'\\.\\s*push\\s*\\('),
+    pop:new RegExp(prefix+'\\.\\s*pop\\s*\\('),
+    fieldDecrement:new RegExp(prefix+'\\[\\s*0\\s*\\]\\s*\\.\\s*'+escape(field)+'\\s*-='),
+  };
+}
 export function extractSourceInvariantDescriptor(
   snapshot: SourceSnapshot,
   contract: any,
@@ -1973,16 +1982,14 @@ export function extractSourceInvariantDescriptor(
   const sourceObservations=extractAccountingObservations(snapshot,contract.name,declarations);
   const findTypedObservation=():SourceInvariantTransitionPlan['typedObservation']|undefined=>{
     for(const observation of sourceObservations){
-      const varName=observation.stateVariable.replace(/[.*+?^\${}()|[\]\\]/g,'\\      const varName=observation.stateVariable.replace(/[.*+?^\${}()|[\]\]/g,'\$&');');
-      const push=new RegExp('\\b'+varName+'\\s*\\.\\s*push\\s*\\(');
-      const pop=new RegExp('\\b'+varName+'\\s*\\.\\s*pop\\s*\\(');
+      const {push,pop,fieldDecrement}=accountingTransitionPatterns(observation.stateVariable,observation.fieldName);
       if(observation.kind==='collection_length' && push.test(inflowBody) && pop.test(outflowBody))
         return {getter:observation.getter,args:[],baseline:'0',afterInflow:'1',afterOutflow:'0'};
       // A struct field check requires literal storage updates witnessed in both
       // operations. A shared variable name or ABI compatibility is insufficient.
       if(observation.kind==='struct_field' && observation.keyType.startsWith('uint') &&
          push.test(inflowBody) &&
-         new RegExp('\\b'+varName+'\\s*\\[\\s*0\\s*\\]\\s*\\.\\s*'+observation.fieldName+'\\s*-=').test(outflowBody)){
+         fieldDecrement.test(outflowBody)){
         return {getter:observation.getter,args:['0'],expectPath:[observation.fieldIndex],
           baseline:'0',afterInflow:'1000',afterOutflow:'600'};
       }
