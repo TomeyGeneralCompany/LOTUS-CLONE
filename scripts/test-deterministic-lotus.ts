@@ -1229,8 +1229,9 @@ contract BuggyERC20Vault {
         { selector: `${name}.totalDeposits`, operation: "call" as const, inputs: [] },
         { selector: `${name}.balances`, operation: "call" as const, inputs: ["address"] },
       ];
+      const erc20CommitSha = "c".repeat(40);
       const buggyErc20Plan = constructSolidityExperiments({
-        repositoryCommit: commitSha,
+        repositoryCommit: erc20CommitSha,
         targetPath: buggyErc20Path,
         targetSelector: "BuggyERC20Vault.withdraw",
         sources: [buggyErc20Snap, mockSnap],
@@ -1238,7 +1239,7 @@ contract BuggyERC20Vault {
       });
       assert.equal(buggyErc20Plan.ok, true, "Controller must construct ERC20 accounting experiment for BuggyERC20Vault");
       const fixedErc20Plan = constructSolidityExperiments({
-        repositoryCommit: commitSha,
+        repositoryCommit: erc20CommitSha,
         targetPath: fixedErc20Path,
         targetSelector: "FixedERC20Vault.withdraw",
         sources: [fixedErc20Snap, mockSnap],
