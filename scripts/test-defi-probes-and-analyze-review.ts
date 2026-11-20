@@ -336,10 +336,13 @@ contract PlainVault {
       assert.ok(leadIdMatch,'A model action must be scoped to a source-hashed lead packet');
       const [,leadId,leadPath,selector]=leadIdMatch;
       const method=selector.split('.').at(-1);
+      // Assess every source-backed lead; only the owner-gated deposit admits
+      // this authorization experiment. Do not invent guards for other methods.
+      const hasSourceGuard=selector==="VaultA.deposit";
       res.end(JSON.stringify({
         message: {
           role: "assistant",
-          content: JSON.stringify({
+          content: JSON.stringify(hasSourceGuard ? {
             action: "discover_experiment",
             leadId,
             path: leadPath,
@@ -353,6 +356,12 @@ contract PlainVault {
                 { operation: "send", function: method+"(uint256)", args: ["10"], sender: 1, expectRevert: true },
               ],
             },
+          } : {
+            action: "defer_lead",
+            leadId,
+            path: leadPath,
+            query: selector,
+            answer: "The inspected function does not have the owner guard or source-proven invariant required for this particular test.",
           }),
         },
       }));
@@ -436,7 +445,7 @@ contract PlainVault {
     execFileSync("git", ["-C", repoDir, "add", "."]);
     execFileSync("git", ["-C", repoDir, "commit", "-q", "-m", "init"]);
 
-    process.env.LOCAL_ANALYZE_MODEL_TURNS = "1";
+    process.env.LOCAL_ANALYZE_MODEL_TURNS = "12";
     const auditLog = join(tmp, "audit.log");
     const answer = await runLocalAudit(
       "Audit DeFi contracts",
