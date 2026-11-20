@@ -1973,16 +1973,16 @@ export function extractSourceInvariantDescriptor(
   const sourceObservations=extractAccountingObservations(snapshot,contract.name,declarations);
   const findTypedObservation=():SourceInvariantTransitionPlan['typedObservation']|undefined=>{
     for(const observation of sourceObservations){
-      const varName=observation.stateVariable.replace(/[.*+?^\${}()|[\]\\]/g,'\\$&');
-      const push=new RegExp('\\\\b'+varName+'\\\\s*\\\\.\\\\s*push\\\\s*\\\\(');
-      const pop=new RegExp('\\\\b'+varName+'\\\\s*\\\\.\\\\s*pop\\\\s*\\\\(');
+      const varName=observation.stateVariable.replace(/[.*+?^\${}()|[\]\]/g,'\$&');
+      const push=new RegExp('\\b'+varName+'\\s*\\.\\s*push\\s*\\(');
+      const pop=new RegExp('\\b'+varName+'\\s*\\.\\s*pop\\s*\\(');
       if(observation.kind==='collection_length' && push.test(inflowBody) && pop.test(outflowBody))
         return {getter:observation.getter,args:[],baseline:'0',afterInflow:'1',afterOutflow:'0'};
       // A struct field check requires literal storage updates witnessed in both
       // operations. A shared variable name or ABI compatibility is insufficient.
       if(observation.kind==='struct_field' && observation.keyType.startsWith('uint') &&
          push.test(inflowBody) &&
-         new RegExp('\\\\b'+varName+'\\\\s*\\\\[\\\\s*0\\\\s*\\\\]\\\\s*\\\\.\\\\s*'+observation.fieldName+'\\\\s*-=').test(outflowBody)){
+         new RegExp('\\b'+varName+'\\s*\\[\\s*0\\s*\\]\\s*\\.\\s*'+observation.fieldName+'\\s*-=').test(outflowBody)){
         return {getter:observation.getter,args:['0'],expectPath:[observation.fieldIndex],
           baseline:'0',afterInflow:'1000',afterOutflow:'600'};
       }
