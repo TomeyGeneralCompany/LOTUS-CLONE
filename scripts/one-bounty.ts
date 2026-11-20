@@ -48,7 +48,7 @@ async function main() {
   // This opt-out is process-local; never alter the operator's saved settings.
   process.env.AUTOHACK_SINGLE_BOUNTY_DIAGNOSTIC='1';
   // Enforce the deterministic investigator even when .env contains legacy model settings.
-  ensureOneBountyLocalModel(process.env);
+  ensureOneBountyDeterministicEngine(process.env);
   const {getDb,schema}=await import('../packages/core/src/index');
   const {rankEligiblePrograms,huntProgram,processAdversarialQueue,getProgramSelectionSummary}=await import('../packages/security-solver/src/index');
   const {requestLocalJobCancellation}=await import('../packages/security-solver/src/local-job');
