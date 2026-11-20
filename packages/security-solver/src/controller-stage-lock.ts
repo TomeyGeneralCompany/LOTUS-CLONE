@@ -32,6 +32,8 @@ export class ControllerStageLock {
  private finalized=false;
  private sourcePreclassified=new Map<string,'indexed-options-built'|'source-unavailable'>();
  private leads=new Map<string,LeadAssessment>();
+ private inventoryIds:Set<string>|null=null;
+ private inventoriedResolved=new Set<string>();
  private analysisCertificate:AnalysisCertificate|null=null;
  private policy:{sha256:string;characters:number;pages:Array<[number,number,string]>}|null=null;
  constructor(readonly auditPolicyRequired=false){}
@@ -120,10 +122,34 @@ export class ControllerStageLock {
       throw new Error('INVALID_SOURCE_PRECLASSIFICATION');
     this.sourcePreclassified.set(path,status);
   }
+  registerAnalysisInventory(ids:readonly string[]){
+    if(this.stage!=='ANALYZE'||this.inventoryIds)throw new Error('ANALYSIS_INVENTORY_REGISTRATION_FORBIDDEN');
+    if(ids.some(id=>!id)||new Set(ids).size!==ids.length)throw new Error('INVALID_ANALYSIS_INVENTORY');
+    this.inventoryIds=new Set(ids);
+  }
+  get analysisInventoryProgress(){
+    const total=this.inventoryIds?.size||0;
+    return {total,resolved:this.inventoriedResolved.size,remaining:total-this.inventoriedResolved.size};
+  }
+  completeAnalysisBatch(){
+    if(this.stage!=='ANALYZE'||!this.inventoryIds)throw new Error('ANALYSIS_BATCH_STAGE_OR_INVENTORY_MISSING');
+    const pending=this.analysisProgress.pendingIds;
+    if(pending.length)throw new Error('ANALYSIS_BATCH_HAS_PENDING_LEADS: '+pending.length);
+    for(const [id,lead] of this.leads){
+      if(lead.state.kind==='pending')throw new Error('ANALYSIS_LEAD_UNRESOLVED: '+id);
+      this.inventoriedResolved.add(id);
+    }
+  }
+  assertAnalysisInventoryExhausted(){
+    if(!this.inventoryIds)throw new Error('ANALYSIS_INVENTORY_UNREGISTERED');
+    if(this.inventoriedResolved.size!==this.inventoryIds.size)
+      throw new Error('ANALYSIS_INVENTORY_INCOMPLETE: '+(this.inventoryIds.size-this.inventoriedResolved.size)+' candidates remain');
+  }
   registerAnalysisLead(lead:Omit<LeadAssessment,'state'|'assessedBy'>){
     if(this.stage!=='ANALYZE'||!this.coverage.hasIndexed(lead.path)||
       !/^[a-f0-9]{40}$/.test(lead.sourceCommit)||!/^[a-f0-9]{64}$/.test(lead.sourceSha256)||
-      !lead.id||!lead.selector||this.leads.has(lead.id))
+      !lead.id||!lead.selector||this.leads.has(lead.id)||
+      (this.inventoryIds!==null&&!this.inventoryIds.has(lead.id)))
       throw new Error('INVALID_ANALYSIS_LEAD');
     this.leads.set(lead.id,{...lead,state:{kind:'pending'},assessedBy:null});
   }
@@ -157,6 +183,7 @@ export class ControllerStageLock {
     if(this.stage!=='ANALYZE'||this.sourcePreclassified.size!==this.coverage.count)
       throw new Error('ANALYSIS_PRECLASSIFICATION_INCOMPLETE');
     const cert=this.analysisClosureCertificate(status,reason);
+    if(status==='complete')this.assertAnalysisInventoryExhausted();
     if(status==='complete'&&cert.pendingIds.length)
       throw new Error('ANALYSIS_INCOMPLETE: pending lead IDs '+cert.pendingIds.join(','));
     if(status==='partial'&&!reason.trim())throw new Error('ANALYSIS_PARTIAL_REASON_REQUIRED');
