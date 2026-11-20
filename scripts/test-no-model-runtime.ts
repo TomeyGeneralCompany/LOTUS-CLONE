@@ -27,6 +27,8 @@ for(const path of [
   'run-complete-autohack.sh',
   'run-local-autohack.sh',
   'scripts/install-reproduction-runtime.sh',
+  'scripts/lotus-gauntlet.ts',
+  'scripts/lotus-crucible-run.ts',
 ]) assert.doesNotMatch(read(path),/qwen3:4b|ollama\s+pull|ollama\s+serve|ollama\/ollama/i,path);
 for(const file of readdirSync(resolve(root,'.github/workflows')).filter(x=>/\.ya?ml$/.test(x))){
   const path='.github/workflows/'+file;
