@@ -34,5 +34,4 @@ python3 --version
 node --version
 javac -version
 
-bash "$ROOT/scripts/install-qwen-agent.sh"
 bash "$ROOT/scripts/install-static-analysis.sh"

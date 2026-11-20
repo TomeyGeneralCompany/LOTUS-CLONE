@@ -563,7 +563,7 @@ export const appRouter = router({
     securityAnalyzeState.total = unassessed.length;
     securityAnalyzeState.startedAt = Date.now();
 
-    const CONCURRENCY = 5;
+    const CONCURRENCY = 1;
 
     void withPipeline(async () => {
       try {

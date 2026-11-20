@@ -26,6 +26,7 @@ for(const path of [
   'scripts/runtime-settings.ts',
   'run-complete-autohack.sh',
   'run-local-autohack.sh',
+  'scripts/install-reproduction-runtime.sh',
 ]) assert.doesNotMatch(read(path),/qwen3:4b|ollama\s+pull|ollama\s+serve|ollama\/ollama/i,path);
 for(const file of readdirSync(resolve(root,'.github/workflows')).filter(x=>/\.ya?ml$/.test(x))){
   const path='.github/workflows/'+file;
@@ -35,6 +36,7 @@ assert.doesNotMatch(read('packages/security-solver/src/local-ollama-runner.ts'),
   /\b(?:postOllamaChat|postQwenAgentJson)\b/,'Network inference must not be reachable from investigator');
 assert.doesNotMatch(read('packages/security-solver/src/evidence-only-review.ts'),
   /\b(?:postOllamaChat|postQwenAgentJson|postOllamaJson)\b/,'Independent review must not call inference');
+assert.doesNotMatch(read('scripts/install-reproduction-runtime.sh'),/install-qwen-agent|qwen-agent-bridge/);
 assert.match(read('scripts/run-one-bounty.sh'),/LOCAL_MODEL_ADAPTER=deterministic/);
 assert.match(read('run-complete-autohack.sh'),/LOCAL_MODEL_ADAPTER=deterministic/);
 console.log('QWEN_FREE_PRODUCTION_RUNTIME_PASSED');

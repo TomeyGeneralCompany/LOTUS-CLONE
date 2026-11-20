@@ -13,7 +13,7 @@ try {
   const startedAt=new Date(Date.now()-1000).toISOString();
   assert.equal((await readLocalActivity(root,{active:true,startedAt})).lastProgressAt,null);
   const path=join(root,"logs","local-hunt-bb.log");
-  const content="[OLLAMA] turn 1/20: request started; model=local\nTARGET SOURCE SECRET\n[TOOL] read_file\n[READ_OK] source-1/render.sol\n";
+  const content="[DETERMINISTIC_CONTROLLER] turn 1: action computed in 4ms\nTARGET SOURCE SECRET\n[TOOL] read_file\n[READ_OK] source-1/render.sol\n";
   await writeFile(path,content);
   let result=await readLocalActivity(root,{active:true,startedAt});
   assert.equal(result.task,"Inspecting source");
@@ -32,11 +32,11 @@ try {
   assert.equal(result.counts.filesRead,1,'Generation does not add to the one recorded source read');
   assert.equal((await readLocalActivity(root,{active:false,startedAt})).task,"No active source hunt");
   assert.equal(describeHuntFailure("No supported function reproduction completed").stage,"Source reproduction");
-  assert.equal(describeHuntFailure("Ollama audit timed out").stage,"Model inspection");
+  assert.equal(describeHuntFailure("Deterministic analysis failed").stage,"Source analysis");
   assert.match(describeHuntFailure(null).reason,/not retained/);
   assert.equal(describeHuntFailure("Bearer secret-value").reason.includes("secret-value"),false);
   const event=(value:Record<string,unknown>)=>"[ACTIVITY] "+JSON.stringify({at:new Date().toISOString(),...value});
-  assert.equal(describeHuntFailure("Latest audit exchange exceeds the context budget; narrow the probe output").stage,"Model context");
+  assert.equal(describeHuntFailure("Latest audit exchange exceeds the context budget; narrow the probe output").stage,"Analysis context");
   const paged=parseWorkEvents(event({phase:"completed",tool:"read_file",path:"source/file.js",offset:128,end:256,nextOffset:256}));
   assert.match(paged.events[0].detail,/offset 128–256.*next 256/);
   const eof=parseWorkEvents(event({phase:"completed",tool:"read_file",path:"source/file.js",offset:256,end:300,nextOffset:null}));
@@ -61,14 +61,14 @@ try {
   assert.equal(JSON.stringify(trail).includes("model commentary"),false);
   assert.equal(parseWorkEvents(Array(100).fill(event({phase:"completed",tool:"read_file",path:"a.py"})).join("\n")).events.length,30);
   const live=parseWorkEvents([
-    event({phase:"started",tool:"model_generation",turn:11,model:"qwen3:4b"}),
+    event({phase:"started",tool:"model_generation",turn:11,model:"deterministic"}),
     event({phase:"completed",tool:"model_generation",turn:11,model:"qwen3:4b",generatedTokens:230,durationMs:800}),
     event({phase:"completed",tool:"controller_action",selectedAction:"read_file",path:"source-1/src/renderer.cjs",turn:12,origin:"controller"}),
     event({phase:"completed",tool:"probe_plan",path:"source-1/contracts/Vault.sol",query:"Vault.settle",kind:"solidity_sequence",origin:"controller"}),
     event({phase:"completed",tool:"verify_source",path:"source-1/contracts/Vault.sol",query:"Vault.settle",kind:"solidity_sequence",status:"observation_only"})
   ].join("\n"));
-  assert.ok(live.events.some(e=>e.title==="Qwen generating"));
-  assert.ok(live.events.some(e=>e.title==="Qwen responded"&&e.detail.includes("230 tokens")));
+  assert.ok(live.events.some(e=>e.title==="Controller analyzing"));
+  assert.ok(live.events.some(e=>e.title==="Controller assessed"&&e.detail.includes("230 tokens")));
   assert.ok(live.events.some(e=>e.title.includes("Controller → read_file")&&e.detail.includes("renderer.cjs")));
   assert.ok(live.events.some(e=>e.title==="Accepted probe plan"&&e.detail.includes("Vault.settle")));
   assert.ok(live.events.some(e=>e.tool==="verify_source"&&e.detail.includes("Vault.settle")));
