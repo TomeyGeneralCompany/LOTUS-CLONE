@@ -93,7 +93,28 @@ function locateFunctionSpan(
   const start = Math.max(0, match.index - 160);
   const end = Math.min(content.length, match.index + 1100);
   const lineStart = computeLineNumber(content, match.index);
-  const lineEnd = computeLineNumber(content, Math.min(content.length, match.index + 1100));
+  // Locate the exact closing brace (or semicolon for interface decl) of this function
+  // so static leads localize strictly to this function rather than neighboring functions.
+  let fnEndIdx = Math.min(content.length, match.index + 1100);
+  let braceDepth = 0;
+  let seenBrace = false;
+  for (let i = match.index; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === "{") {
+      braceDepth++;
+      seenBrace = true;
+    } else if (ch === "}") {
+      braceDepth--;
+      if (seenBrace && braceDepth === 0) {
+        fnEndIdx = i;
+        break;
+      }
+    } else if (ch === ";" && !seenBrace) {
+      fnEndIdx = i;
+      break;
+    }
+  }
+  const lineEnd = computeLineNumber(content, fnEndIdx);
   return {
     start,
     end,

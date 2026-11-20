@@ -69,6 +69,7 @@ export interface ConstructionInput {
   sources:readonly SourceSnapshot[];
   declarations:readonly SolidityProbeDeclaration[];
   skipLegacy?:boolean;
+  skipFinancialInvariants?:boolean;
   staticLeads?:readonly StaticLeadHint[];
   invariants?:readonly SourceInvariant[];
 }
@@ -1848,14 +1849,28 @@ export function extractSourceInvariantDescriptor(
     witness(snapshot, outflowFn, `${contract.name}.${outflowFn.name}`),
   ];
 
-  // Refuse when an unresolved external contract/token call is executed inside the pair
-  const externalCallRe = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?:safeTransferFrom|transferFrom|safeTransfer|deposit|withdraw|mint|burn|accrue|borrow|repay|liquidate|swap|getPrice|latestRoundData)\s*\(/g;
+  // Refuse when an unresolved external contract/interface/token call is executed inside the pair
+  const stateDeclsForExt = allNodes
+    .filter((n: any) => n.type === 'StateVariableDeclaration')
+    .flatMap((n: any) => n.variables || [])
+    .filter((v: any) => v?.name);
+  const externalContractVars = new Set<string>(
+    stateDeclsForExt
+      .filter((v: any) => v?.typeName?.type === 'UserDefinedTypeName')
+      .map((v: any) => String(v.name)),
+  );
   const unresolvedExt: string[] = [];
+  const externalCallRe = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
+  const knownExternalMethods = /^(?:safeTransferFrom|transferFrom|safeTransfer|deposit|withdraw|mint|burn|accrue|borrow|repay|liquidate|swap|getPrice|latestRoundData|credit|debit|quote|notifyRewardAmount)$/;
   let extMatch: RegExpExecArray | null;
   while ((extMatch = externalCallRe.exec(combinedBody)) !== null) {
     const recv = extMatch[1];
-    if (!['msg', 'abi', 'this', 'super', 'payable'].includes(recv)) {
-      unresolvedExt.push(`${recv}.${extMatch[0].split('.').pop()}`);
+    const fnCalled = extMatch[2];
+    if (['msg', 'abi', 'this', 'super', 'payable', 'block', 'tx', 'type', 'Math', 'SafeMath'].includes(recv)) {
+      continue;
+    }
+    if (externalContractVars.has(recv) || knownExternalMethods.test(fnCalled)) {
+      unresolvedExt.push(`${recv}.${fnCalled}`);
     }
   }
   if (unresolvedExt.length > 0) {
@@ -2241,7 +2256,9 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   const suppliedInvariant = (input.invariants || []).find(
     (inv) => inv.target === input.targetSelector && inv.sourceSha256 === target.sha256,
   );
-  if (suppliedInvariant) {
+  if (input.skipFinancialInvariants) {
+    // Caller explicitly defers financial-invariant discovery to the ANALYZE stage.
+  } else if (suppliedInvariant) {
     const built = constructCoreInvariantExperiment(suppliedInvariant, target, contract, input.declarations, indexed);
     if (built) {
       choices.push(built);
@@ -2271,13 +2288,17 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   if (!choices.length) {
     const unresolvedCategory: InvariantUnresolvedCategory =
       invariantUnresolved?.category || 'no_supported_property';
+    const isFinancialEntry = /^(?:deposit|withdraw|borrow|repay|mint|burn|redeem|swap|stake|unstake|claim|liquidate|flash|vest|fund|rebalance|harvest|compound)/i.test(input.targetSelector.split('.').pop() || '');
+    const prefix = isFinancialEntry
+      ? 'Financial entrypoint exists, but no source-derived prestate/assertion invariant could be constructed: '
+      : '';
     return {
       ok: false,
       code: 'UNKNOWN_ASSERTION',
       unresolvedCategory,
       detail: invariantUnresolved
-        ? `[${unresolvedCategory}] ${invariantUnresolved.reason}`
-        : `No source-grounded security setup and falsifiable assertion for ${input.targetSelector}`,
+        ? `${prefix}[${unresolvedCategory}] ${invariantUnresolved.reason}`
+        : `${prefix}No source-grounded security setup and falsifiable assertion for ${input.targetSelector}`,
     };
   }
   const seen=new Set<string>(),out:PreparedSecurityExperiment[]=[];

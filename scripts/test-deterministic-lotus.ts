@@ -4,21 +4,30 @@
  * LOCAL_MODEL_ADAPTER=deterministic to guarantee ZERO Ollama/LLM calls.
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildAnalysisCandidateQueue,
   buildProgramFactsGraph,
   detectAvailableAdapters,
+  driveDeterministicAuditTurn,
   evaluateAnalysisLead,
+  evaluateDeterministicAnalysisTurn,
   evaluateDeterministicEvidenceReview,
   EXTERNAL_ADAPTER_CATALOG,
   generateHypotheses,
+  generateRelationalHypotheses,
   isDeterministicMode,
   resolveLocalModelAdapter,
+  runClosedLoopLeadAnalysis,
   type DeterministicReviewEvidence,
 } from "../packages/security-solver/src/deterministic";
+import { constructSolidityExperiments } from "../packages/security-solver/src/controller-solidity-experiment-planner";
 import { controllerReviewGroundDefect } from "../packages/security-solver/src/controller-review-boundary";
 import { runLocalAudit } from "../packages/security-solver/src/local-ollama-runner";
 import { runEvidenceOnlyReview } from "../packages/security-solver/src/evidence-only-review";
@@ -497,6 +506,658 @@ contract GuardedVault is Ownable {
   );
   assert.equal(findingResult.severity, "high");
   assert.equal(findingResult.estimatedRewardCents, 1_250_000);
+
+
+  // 8. Regression Case 1: Candidate inventory > 6 across multiple files ->
+  //    preserves every candidate, admits top-priority bounded batch, deterministic across runs.
+  {
+    const commitSha = "a".repeat(40);
+    const makeVault = (idx: number) => `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract MultiVault${idx} {
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+    }
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "low");
+        balances[msg.sender] -= amount;
+        totalDeposits -= amount;
+    }
+    function ping(uint256 x) external {
+        totalDeposits = totalDeposits + (x - x);
+    }
+}`;
+    const items = [1, 2, 3, 4].map((idx) => ({
+      path: `source-0/contracts/MultiVault${idx}.sol`,
+      sourceCommit: commitSha,
+      sourceContent: makeVault(idx),
+      unqueuedSelectors: [
+        `MultiVault${idx}.deposit`,
+        `MultiVault${idx}.withdraw`,
+        `MultiVault${idx}.ping`,
+      ],
+    }));
+    const q1 = buildAnalysisCandidateQueue({
+      items,
+      staticLeads: [
+        {
+          path: "source-0/contracts/MultiVault3.sol",
+          line: 10,
+          rule: "solidity-accounting-check",
+          message: "Inspect MultiVault3.withdraw accounting update",
+          severity: "WARNING",
+        },
+      ],
+      maxAdmitted: 6,
+      maxPerFile: 2,
+    });
+    const q2 = buildAnalysisCandidateQueue({
+      items,
+      staticLeads: [
+        {
+          path: "source-0/contracts/MultiVault3.sol",
+          line: 10,
+          rule: "solidity-accounting-check",
+          message: "Inspect MultiVault3.withdraw accounting update",
+          severity: "WARNING",
+        },
+      ],
+      maxAdmitted: 6,
+      maxPerFile: 2,
+    });
+    assert.equal(q1.inventory.length, 12, "All 12 candidates across 4 files must be preserved");
+    assert.equal(q1.admitted.length, 6, "Bounded admission must select exactly 6 candidates");
+    assert.equal(q1.queued.length, 6, "Remaining 6 candidates must stay queued rather than discarded");
+    assert.equal(q1.blocked.length, 0);
+    assert.equal(
+      q1.admitted[0].selector,
+      "MultiVault3.withdraw",
+      "Function-localized static lead + financial entrypoint must rank #1",
+    );
+    const countsByFile = new Map<string, number>();
+    for (const c of q1.admitted) {
+      countsByFile.set(c.path, (countsByFile.get(c.path) || 0) + 1);
+    }
+    for (const [f, cnt] of countsByFile) {
+      assert.ok(cnt <= 2, `Per-file cap maxPerFile=2 violated for ${f}: ${cnt}`);
+    }
+    assert.deepEqual(
+      q1.inventory.map((c) => ({ id: c.id, selector: c.selector, priority: c.priority, status: c.status })),
+      q2.inventory.map((c) => ({ id: c.id, selector: c.selector, priority: c.priority, status: c.status })),
+      "Candidate inventory IDs, scores, and ordering must be 100% deterministic across repeated runs",
+    );
+  }
+
+  // Shared Toy Accounting-Defect Contracts (Buggy vs Corrected) for Tests 9-13
+  const buggyAccountingVault = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract BuggyAccountingVault {
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+
+    function deposit() external payable {
+        require(msg.value > 0, "zero");
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+    }
+
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "insufficient");
+        balances[msg.sender] -= amount;
+        // Accounting defect: forgets totalDeposits -= amount;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "transfer failed");
+    }
+}
+`;
+  const fixedAccountingVault = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract FixedAccountingVault {
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+
+    function deposit() external payable {
+        require(msg.value > 0, "zero");
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+    }
+
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "insufficient");
+        balances[msg.sender] -= amount;
+        totalDeposits -= amount;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "transfer failed");
+    }
+}
+`;
+  const callResolutionContract = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+interface IPriceFeed { function latestPrice() external view returns (uint256); }
+contract BaseA { function _shared(uint256 a) internal virtual pure returns (uint256) { return a; } }
+contract BaseB { function _shared(uint256 a) internal virtual pure returns (uint256) { return a + 1; } }
+contract CallResolutionDemo is BaseA, BaseB {
+    uint256 public counter;
+    IPriceFeed public feed;
+    address public unknownExt;
+    function _bump(uint256 n) internal { counter += n; }
+    function run(uint256 x) external returns (uint256) {
+        _bump(x);
+        uint256 v = _shared(x);
+        (bool ok, ) = unknownExt.call("");
+        require(ok);
+        return v + feed.latestPrice();
+    }
+}
+`;
+
+  // 9. Regression Case 2: Shared-state multi-function edges + CallResolutionStatus + RelationalHypothesis
+  {
+    const relGraph = buildProgramFactsGraph({
+      sources: [
+        {
+          path: "source-0/contracts/BuggyAccountingVault.sol",
+          content: buggyAccountingVault,
+          sha256: sha(buggyAccountingVault),
+        },
+        {
+          path: "source-0/contracts/CallResolutionDemo.sol",
+          content: callResolutionContract,
+          sha256: sha(callResolutionContract),
+        },
+      ],
+    });
+    assert.ok(
+      relGraph.edges.some((e) => e.kind === "writes_state" && e.from === "BuggyAccountingVault.deposit" && e.to.endsWith(".totalDeposits")),
+      "Graph must emit writes_state edge from deposit to totalDeposits",
+    );
+    assert.ok(
+      relGraph.edges.some((e) => e.kind === "reads_state" && e.from === "BuggyAccountingVault.withdraw" && e.to.endsWith(".balances")),
+      "Graph must emit reads_state edge from withdraw to balances",
+    );
+    assert.ok(
+      relGraph.edges.some((e) => e.kind === "value_flow" && e.from === "BuggyAccountingVault.deposit"),
+      "Graph must emit value_flow edge on payable deposit",
+    );
+    assert.ok(
+      relGraph.edges.some((e) => e.kind === "precedes" && e.from === "BuggyAccountingVault.deposit" && e.to === "BuggyAccountingVault.withdraw"),
+      "Graph must emit producer->consumer precedes edge from deposit to withdraw",
+    );
+    assert.ok(
+      relGraph.edges.some((e) => e.kind === "calls_resolved" && e.from === "CallResolutionDemo.run" && e.to === "CallResolutionDemo._bump" && e.resolution === "resolved"),
+      "Unique internal call must be marked resolution=resolved",
+    );
+    assert.ok(
+      relGraph.edges.some((e) => e.kind === "calls_resolved" && e.from === "CallResolutionDemo.run" && e.resolution === "ambiguous"),
+      "Multi-base inherited call must be marked resolution=ambiguous",
+    );
+    assert.ok(
+      relGraph.edges.some((e) => e.kind === "external_call" && e.from === "CallResolutionDemo.run" && e.to === "IPriceFeed.latestPrice" && e.resolution === "resolved"),
+      "Typed interface external call must be marked external_call with resolution=resolved",
+    );
+    assert.ok(
+      relGraph.edges.some((e) => e.kind === "external_call" && e.from === "CallResolutionDemo.run" && e.resolution === "unresolved"),
+      "Low-level untyped external call must be marked external_call with resolution=unresolved",
+    );
+
+    const relHyps = generateRelationalHypotheses(relGraph);
+    const vaultRel = relHyps.find(
+      (r) =>
+        r.entrypoints.includes("BuggyAccountingVault.deposit") &&
+        r.entrypoints.includes("BuggyAccountingVault.withdraw"),
+    );
+    assert.ok(vaultRel, "Relational hypothesis engine must link deposit and withdraw across shared accounting state");
+    assert.ok(
+      vaultRel!.sourceWitnesses.some((w) => w.symbol === "BuggyAccountingVault.deposit") &&
+        vaultRel!.sourceWitnesses.some((w) => w.symbol === "BuggyAccountingVault.withdraw"),
+      "Relational hypothesis must attach source witnesses for both functions",
+    );
+    const allHyps = generateHypotheses(relGraph);
+    assert.ok(
+      allHyps.some((h) => h.category === "accounting_invariant" && h.relational?.id === vaultRel!.id),
+      "generateHypotheses must integrate RelationalHypothesis into prioritized output",
+    );
+  }
+
+  // 10. Regression Case 3: Insufficient evidence -> UNKNOWN_ASSERTION, zero fabricated experiments
+  {
+    const privateVault = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract PrivateVault {
+    mapping(address => uint256) private balances;
+    uint256 private totalDeposits;
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+    }
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "low");
+        balances[msg.sender] -= amount;
+    }
+}`;
+    const privPath = "source-0/contracts/PrivateVault.sol";
+    const privSha = sha(privateVault);
+    const privLeadId = sha("priv-lead-1");
+    const privSources = [{ path: privPath, sha256: privSha, content: privateVault }];
+    const privDecls = [
+      { selector: "PrivateVault.deposit", operation: "send" as const, inputs: [] },
+      { selector: "PrivateVault.withdraw", operation: "send" as const, inputs: ["uint256"] },
+    ];
+    const privAnalysis = evaluateDeterministicAnalysisTurn({
+      stage: "ANALYZE",
+      analyzeModelPending: true,
+      activeLead: {
+        leadId: privLeadId,
+        path: privPath,
+        selector: "PrivateVault.deposit",
+        sourceEvidence: `${privPath}:0-200:${privSha}`,
+        sourceExcerpt: privateVault,
+      },
+      sources: privSources,
+      repositoryCommit: "b".repeat(40),
+      declarations: privDecls,
+      enableSpecializedEscalation: false,
+    });
+    assert.ok(privAnalysis);
+    assert.equal(privAnalysis!.experimentCandidates.length, 0, "Missing observable state must produce 0 fabricated experiments");
+    assert.ok(
+      privAnalysis!.unresolvedReasons.some((r) => r.includes("UNKNOWN_ASSERTION(missing_observable_state)") || r.includes("missing_public_getter")),
+      `Expected missing_observable_state unresolved reason, got: ${JSON.stringify(privAnalysis!.unresolvedReasons)}`,
+    );
+    const privAction = driveDeterministicAuditTurn({
+      stage: "ANALYZE",
+      analyzeModelPending: true,
+      activeLead: {
+        leadId: privLeadId,
+        path: privPath,
+        selector: "PrivateVault.deposit",
+        sourceEvidence: `${privPath}:0-200:${privSha}`,
+        sourceExcerpt: privateVault,
+      },
+      sources: privSources,
+      repositoryCommit: "b".repeat(40),
+      declarations: privDecls,
+      constraints: { action: ["assess_lead", "defer_lead", "discover_experiment"] },
+      enableSpecializedEscalation: false,
+    });
+    assert.notEqual(privAction.action, "discover_experiment", "Driver must never emit discover_experiment when prerequisites are missing");
+  }
+
+  // 11. Regression Cases 4 & 5: Supported relational hypothesis -> discover_experiment ->
+  //     [ANALYSIS_MODEL_EXPERIMENT_ADDED] in runLocalAudit + duplicate suppression/rejection.
+  let generatedBuggySequence: any = null;
+  {
+    const vaultPath = "source-0/contracts/BuggyAccountingVault.sol";
+    const vaultSha = sha(buggyAccountingVault);
+    const vaultDecls = [
+      { selector: "BuggyAccountingVault.deposit", operation: "send" as const, inputs: [] },
+      { selector: "BuggyAccountingVault.withdraw", operation: "send" as const, inputs: ["uint256"] },
+      { selector: "BuggyAccountingVault.totalDeposits", operation: "call" as const, inputs: [] },
+      { selector: "BuggyAccountingVault.balances", operation: "call" as const, inputs: ["address"] },
+    ];
+    const leadId = sha("buggy-withdraw-lead");
+    const sources = [{ path: vaultPath, sha256: vaultSha, content: buggyAccountingVault }];
+
+    // Pretend legacy unauthorized ETH extraction probe is already queued -> driver must skip it
+    // and emit discover_experiment for the financial conservation invariant!
+    const preConstructed = constructSolidityExperiments({
+      repositoryCommit: "c".repeat(40),
+      targetPath: vaultPath,
+      targetSelector: "BuggyAccountingVault.withdraw",
+      sources,
+      declarations: vaultDecls,
+    });
+    assert.equal(preConstructed.ok, true);
+    const legacyExp = preConstructed.ok ? preConstructed.experiments[0] : null;
+    const conservationExp = preConstructed.ok
+      ? preConstructed.experiments.find((e) => e.securityProperty.includes("conservation"))
+      : null;
+    assert.ok(legacyExp && conservationExp, "withdraw must yield both legacy and conservation candidates");
+
+    const existingIds = new Set<string>([legacyExp!.id]);
+    const discoverAction = driveDeterministicAuditTurn({
+      stage: "ANALYZE",
+      analyzeModelPending: true,
+      activeLead: {
+        leadId,
+        path: vaultPath,
+        selector: "BuggyAccountingVault.withdraw",
+        sourceEvidence: `${vaultPath}:0-400:${vaultSha}`,
+        sourceExcerpt: buggyAccountingVault,
+      },
+      sources,
+      repositoryCommit: "c".repeat(40),
+      declarations: vaultDecls,
+      existingExperimentIds: existingIds,
+      constraints: { action: ["assess_lead", "defer_lead", "discover_experiment"] },
+      enableSpecializedEscalation: false,
+    });
+    assert.equal(discoverAction.action, "discover_experiment", "Supported financial invariant must emit discover_experiment");
+    assert.equal(discoverAction.query, "BuggyAccountingVault.withdraw");
+    assert.equal(discoverAction.answer, "solidity_sequence");
+    assert.ok(discoverAction.sequence, "discover_experiment must include a valid solidity_sequence");
+    assert.ok(
+      discoverAction.sequence!.steps.some((s: any) => s.operation === "call" && s.function === "totalDeposits()" && s.expect === "600"),
+      "Discovered experiment must assert totalDeposits() == 600",
+    );
+    generatedBuggySequence = discoverAction.sequence;
+
+    // Duplicate suppression: once BOTH legacyExp and conservationExp are in existingExperimentIds,
+    // driver must NOT re-propose a duplicate discover_experiment.
+    existingIds.add(conservationExp!.id);
+    const dupCheckAction = driveDeterministicAuditTurn({
+      stage: "ANALYZE",
+      analyzeModelPending: true,
+      activeLead: {
+        leadId,
+        path: vaultPath,
+        selector: "BuggyAccountingVault.withdraw",
+        sourceEvidence: `${vaultPath}:0-400:${vaultSha}`,
+        sourceExcerpt: buggyAccountingVault,
+      },
+      sources,
+      repositoryCommit: "c".repeat(40),
+      declarations: vaultDecls,
+      existingExperimentIds: existingIds,
+      constraints: { action: ["assess_lead", "defer_lead", "discover_experiment"] },
+      enableSpecializedEscalation: false,
+    });
+    assert.notEqual(dupCheckAction.action, "discover_experiment", "Already-queued experiment must not be re-proposed as duplicate");
+
+    // Full runLocalAudit integration with stageLock + controllerIndex + real git repo in source-0
+    const auditDir = await mkdtemp(join(tmpdir(), "lotus-det-accounting-"));
+    try {
+      const repoDir = join(auditDir, "source-0");
+      await mkdir(join(repoDir, "contracts"), { recursive: true });
+      await writeFile(join(repoDir, "contracts/BuggyAccountingVault.sol"), buggyAccountingVault, "utf8");
+      // Add 3 sibling contracts (>6 unqueued functions total) to verify candidate inventory persistence
+      for (const n of [1, 2, 3]) {
+        const sibling = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract SiblingPool${n} {
+    uint256 public marker;
+    function pokeA(uint256 v) external { marker = v; }
+    function pokeB(uint256 v) external { marker = v + 1; }
+    function pokeC(uint256 v) external { marker = v + 2; }
+}
+`;
+        await writeFile(join(repoDir, `contracts/SiblingPool${n}.sol`), sibling, "utf8");
+      }
+      execFileSync("git", ["init", "-q"], { cwd: repoDir });
+      execFileSync("git", ["config", "user.email", "test@lotus.local"], { cwd: repoDir });
+      execFileSync("git", ["config", "user.name", "LOTUS Test"], { cwd: repoDir });
+      execFileSync("git", ["add", "."], { cwd: repoDir });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: repoDir });
+
+      const logPath = join(auditDir, "audit.log");
+      const prevMaxLeads = process.env.LOCAL_ANALYZE_MAX_LEADS;
+      process.env.LOCAL_ANALYZE_MAX_LEADS = "6";
+      try {
+        await runLocalAudit(
+          "Audit Solidity contracts in source-0.",
+          logPath,
+          60_000,
+          auditDir,
+          "deterministic",
+          undefined,
+          {
+            maxTurns: 40,
+            numCtx: 8192,
+            numPredict: 1024,
+            productionWorkflow: true,
+            verifyPython: true,
+            controllerIndex: true,
+            initialSourcePaths: [
+              "source-0/contracts/BuggyAccountingVault.sol",
+              "source-0/contracts/SiblingPool1.sol",
+              "source-0/contracts/SiblingPool2.sol",
+              "source-0/contracts/SiblingPool3.sol",
+            ],
+            // Stubbed verifier returning clean structured negative/observation records so test
+            // verifies controller admission, graph reuse, candidate persistence & escalation logs
+            // without requiring host bwrap/solc.
+            validateFinal: () => null,
+            verifySource: async (_path, _selector, _kind) =>
+              JSON.stringify({ status: "not_observed", behavior_observed: false, note: "stubbed_local_verifier" }),
+          },
+        );
+      } finally {
+        if (prevMaxLeads === undefined) delete process.env.LOCAL_ANALYZE_MAX_LEADS;
+        else process.env.LOCAL_ANALYZE_MAX_LEADS = prevMaxLeads;
+      }
+
+      const auditLog = await readFile(logPath, "utf8");
+      const graphBuilds = auditLog.match(/\[DETERMINISTIC_FACTS_GRAPH_BUILT\]/g) || [];
+      assert.equal(graphBuilds.length, 1, "ProgramFactsGraph must be built ONCE per investigation and reused");
+      assert.match(auditLog, /\[ANALYSIS_CANDIDATE_INVENTORY\]/, "Full candidate inventory telemetry must be logged");
+      assert.match(
+        auditLog,
+        /\[ANALYSIS_MODEL_EXPERIMENT_ADDED\][^\n]*BuggyAccountingVault\.(?:deposit|withdraw)/,
+        "Deterministic discover_experiment for BuggyAccountingVault must pass controller admission gate and log [ANALYSIS_MODEL_EXPERIMENT_ADDED]",
+      );
+      assert.match(
+        auditLog,
+        /\[DETERMINISTIC_ESCALATION\][^\n]*"steps":\[/,
+        "Escalation telemetry must log complete specialist dispositions including unavailable tools",
+      );
+      const persistedQueue = JSON.parse(await readFile(logPath + ".analysis-candidates.json", "utf8"));
+      assert.ok(
+        persistedQueue.totalCandidates > 6,
+        `Expected >6 candidates persisted in inventory, got ${persistedQueue.totalCandidates}`,
+      );
+      assert.equal(persistedQueue.admittedCount, 6, "Bounded admission must cap admitted batch at 6");
+      assert.equal(
+        persistedQueue.queuedCount,
+        persistedQueue.totalCandidates - persistedQueue.admittedCount,
+        "Unadmitted candidates must remain preserved in queued inventory",
+      );
+    } finally {
+      await rm(auditDir, { recursive: true, force: true });
+    }
+  }
+
+  // 12. Regression Case 6: Unavailable specialist telemetry records explicit attempted=false, reason=tool_unavailable
+  //     and NEVER claims a negative finding or flips assess_lead -> defer_lead.
+  {
+    const vaultPath = "source-0/contracts/BuggyAccountingVault.sol";
+    const vaultSha = sha(buggyAccountingVault);
+    const sources = [{ path: vaultPath, sha256: vaultSha, content: buggyAccountingVault }];
+    const g = buildProgramFactsGraph({ sources });
+    const esc = runClosedLoopLeadAnalysis({
+      graph: g,
+      lead: {
+        leadId: sha("unavail-specialist-lead"),
+        path: vaultPath,
+        selector: "BuggyAccountingVault.withdraw",
+        sourceEvidence: `${vaultPath}:0-400:${vaultSha}`,
+        sourceExcerpt: buggyAccountingVault,
+      },
+      sources,
+      hooks: {
+        runMythril: () => ({ status: "unavailable", facts: [], error: "myth binary not installed" }),
+        runFoundry: () => ({ status: "unavailable", facts: [], error: "forge binary not installed" }),
+      },
+    });
+    const foundryStep = esc.steps.find((s) => s.adapter === "foundry");
+    assert.ok(foundryStep, "Foundry unavailability must be recorded in steps for withdraw");
+    assert.equal(foundryStep!.attempted, false);
+    assert.equal(foundryStep!.status, "unavailable");
+    assert.equal(foundryStep!.reason, "tool_unavailable");
+    assert.equal(esc.reconsidered, false, "Unavailable specialists must never flip lead disposition");
+    assert.equal(esc.finalDecision.action, esc.initialDecision.action);
+
+    // Also verify deeper-analysis lead records both Mythril and Foundry unavailability explicitly
+    const escDeposit = runClosedLoopLeadAnalysis({
+      graph: g,
+      lead: {
+        leadId: sha("unavail-specialist-lead-deposit"),
+        path: vaultPath,
+        selector: "BuggyAccountingVault.deposit",
+        sourceEvidence: `${vaultPath}:0-400:${vaultSha}`,
+        sourceExcerpt: buggyAccountingVault,
+      },
+      sources,
+      hooks: {
+        runMythril: () => ({ status: "unavailable", facts: [], error: "myth binary not installed" }),
+        runFoundry: () => ({ status: "unavailable", facts: [], error: "forge binary not installed" }),
+      },
+    });
+    const mythStep = escDeposit.steps.find((s) => s.adapter === "mythril");
+    const foundryStepDep = escDeposit.steps.find((s) => s.adapter === "foundry");
+    assert.ok(mythStep && foundryStepDep, "Both Mythril and Foundry unavailability must be recorded for deeper lead");
+    assert.equal(mythStep!.attempted, false);
+    assert.equal(mythStep!.status, "unavailable");
+    assert.equal(mythStep!.reason, "tool_unavailable");
+    assert.equal(foundryStepDep!.attempted, false);
+    assert.equal(foundryStepDep!.status, "unavailable");
+    assert.equal(foundryStepDep!.reason, "tool_unavailable");
+    assert.equal(escDeposit.reconsidered, false);
+  }
+
+  // 13. Regression Cases 7 & 8: Toy Accounting-Defect Acceptance Test
+  //     (BuggyAccountingVault.sol vs FixedAccountingVault.sol)
+  {
+    // Verify identical conservation sequence is also constructed for FixedAccountingVault (no bug-specific hardcoding)
+    const fixedPath = "source-0/contracts/FixedAccountingVault.sol";
+    const fixedSha = sha(fixedAccountingVault);
+    const fixedRes = constructSolidityExperiments({
+      repositoryCommit: "d".repeat(40),
+      targetPath: fixedPath,
+      targetSelector: "FixedAccountingVault.withdraw",
+      sources: [{ path: fixedPath, sha256: fixedSha, content: fixedAccountingVault }],
+      declarations: [
+        { selector: "FixedAccountingVault.deposit", operation: "send", inputs: [] },
+        { selector: "FixedAccountingVault.withdraw", operation: "send", inputs: ["uint256"] },
+        { selector: "FixedAccountingVault.totalDeposits", operation: "call", inputs: [] },
+        { selector: "FixedAccountingVault.balances", operation: "call", inputs: ["address"] },
+      ],
+    });
+    assert.equal(fixedRes.ok, true);
+    const fixedSeq = fixedRes.ok
+      ? fixedRes.experiments.find((e) => e.securityProperty.includes("conservation"))?.sequence
+      : null;
+    assert.deepEqual(
+      fixedSeq,
+      generatedBuggySequence,
+      "Planner must construct the exact same source-derived accounting invariant test for both buggy and fixed contracts",
+    );
+
+    // Case 7: Negative control — when no violation is observed on FixedAccountingVault,
+    // deterministic evidence review keeps finding unverified/rejected with dont_submit.
+    const fixedReview = evaluateDeterministicEvidenceReview({
+      grounds: {
+        sourceDigest: fixedSha,
+        sourcePath: fixedPath,
+        language: "solidity",
+        replayedProbeKind: "solidity_sequence",
+        independentlyReplayed: true,
+        sourceBackedNonadminRoleMutation: false,
+        sourceBackedTextOnlyResponse: [],
+        sourceBackedEscaping: [],
+      },
+      replay: {
+        status: "not_observed",
+        kind: "solidity_sequence",
+        behavior_observed: false,
+      },
+      target: {
+        file: fixedPath,
+        selector: "FixedAccountingVault.withdraw",
+        kind: "solidity_sequence",
+      },
+    });
+    assert.equal(fixedReview.verdict, "reject", "No violation observed on corrected contract must stay rejected");
+    assert.equal(fixedReview.recommendation, "dont_submit");
+    assert.equal(fixedReview.issues[0]?.category, "unreproduced_behavior");
+
+    // Live EVM execution via scripts/reproduction-runtime (solc + ganache + runSequence)
+    // Runs whenever reproduction-runtime is installed, and is MANDATORY in CI (REQUIRE_EVM_ACCOUNTING_TEST=1).
+    const requireEvm = process.env.REQUIRE_EVM_ACCOUNTING_TEST === "1";
+    const solcPath = join(process.cwd(), "scripts/reproduction-runtime/node_modules/solc");
+    const hasEvmRuntime = existsSync(solcPath);
+    if (requireEvm && !hasEvmRuntime) {
+      throw new Error("REQUIRE_EVM_ACCOUNTING_TEST=1 set, but scripts/reproduction-runtime/node_modules/solc is missing");
+    }
+    if (hasEvmRuntime) {
+      const req = createRequire(import.meta.url);
+      const solc = req("./reproduction-runtime/node_modules/solc");
+      const ganache = req("./reproduction-runtime/node_modules/ganache");
+      const { runSequence } = req("./reproduction-runtime/solidity-sequence.cjs");
+
+      const runOnEvm = async (fileName: string, contractName: string, sourceCode: string, seq: unknown) => {
+        const compiled = JSON.parse(
+          solc.compile(
+            JSON.stringify({
+              language: "Solidity",
+              sources: { [fileName]: { content: sourceCode } },
+              settings: {
+                evmVersion: "shanghai",
+                outputSelection: { "*": { "*": ["abi", "evm.bytecode.object"] } },
+              },
+            }),
+          ),
+        );
+        const errs = (compiled.errors || []).filter((e: any) => e.severity === "error");
+        assert.deepEqual(errs, [], `solc compile errors for ${contractName}: ${JSON.stringify(errs)}`);
+        const artifact = compiled.contracts[fileName][contractName];
+        const provider = ganache.provider({
+          logging: { quiet: true },
+          wallet: { deterministic: true, totalAccounts: 3 },
+          chain: { hardfork: "shanghai", chainId: 1337, time: new Date("2020-01-01T00:00:00Z") },
+          miner: { blockGasLimit: 12000000, timestampIncrement: 1 },
+        });
+        try {
+          return await runSequence(artifact, seq, provider);
+        } finally {
+          await provider.disconnect();
+        }
+      };
+
+      // BuggyAccountingVault: totalDeposits() remains 1000 instead of 600 -> assertion FAILS (violation observed!)
+      const buggyRun = await runOnEvm(
+        "BuggyAccountingVault.sol",
+        "BuggyAccountingVault",
+        buggyAccountingVault,
+        generatedBuggySequence,
+      );
+      const buggyTotalStep = buggyRun.steps.find(
+        (s: any) => s.operation === "call" && s.function === "totalDeposits()" && s.expect === "600",
+      );
+      const buggyBalanceStep = buggyRun.steps.find(
+        (s: any) => s.operation === "call" && s.function === "balances(address)" && s.expect === "600",
+      );
+      assert.ok(buggyTotalStep && buggyBalanceStep);
+      assert.equal(buggyBalanceStep.passed, true, "balances($account0) decremented to 600 on BuggyAccountingVault");
+      assert.equal(
+        buggyTotalStep.passed,
+        false,
+        "BuggyAccountingVault must FAIL totalDeposits() == 600 assertion (accounting defect observed!)",
+      );
+
+      // FixedAccountingVault: ALL steps pass -> zero violation!
+      const fixedRun = await runOnEvm(
+        "FixedAccountingVault.sol",
+        "FixedAccountingVault",
+        fixedAccountingVault,
+        fixedSeq,
+      );
+      assert.ok(
+        fixedRun.steps.every((s: any) => (s.operation === "call" ? s.passed === true : s.reverted === false)),
+        `FixedAccountingVault must pass every step with zero violation: ${JSON.stringify(fixedRun.steps)}`,
+      );
+      const fixedReplay = await runOnEvm(
+        "FixedAccountingVault.sol",
+        "FixedAccountingVault",
+        fixedAccountingVault,
+        fixedSeq,
+      );
+      assert.deepEqual(fixedReplay, fixedRun, "Independent deterministic EVM replay must match exactly");
+      console.log("LIVE_EVM_BUGGY_VS_FIXED_ACCOUNTING_VAULT_PASSED");
+    }
+  }
 
   console.log("DETERMINISTIC_LOTUS_END_TO_END_PASSED");
 } finally {

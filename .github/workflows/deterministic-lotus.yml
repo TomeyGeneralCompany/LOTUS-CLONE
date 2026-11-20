@@ -29,7 +29,9 @@ jobs:
           sudo apt-get install -y -qq bubblewrap
           bwrap --version
       - name: Install npm dependencies (@babel/parser, fast-check, @solidity-parser/parser)
-        run: npm ci
+        run: |
+          npm ci
+          npm --prefix scripts/reproduction-runtime ci
       - name: Install MIT Python adapters (LibCST, Tree-sitter + grammars, Z3)
         run: |
           python3 -m pip install --upgrade pip
@@ -41,11 +43,14 @@ jobs:
           java -version
       - name: TypeScript typecheck
         run: npx tsc --noEmit --project tsconfig.json
-      - name: Run zero-Qwen end-to-end deterministic core suite
+      - name: Run Solidity financial-invariant planner suite
+        run: npx tsx scripts/test-controller-solidity-experiment-planner.ts
+      - name: Run zero-Qwen end-to-end deterministic core suite (including live EVM Buggy vs Fixed Vault)
         env:
           LOCAL_MODEL_ADAPTER: deterministic
           AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
           JAVAPARSER_JAR: /tmp/lotus-tools/javaparser-core.jar
+          REQUIRE_EVM_ACCOUNTING_TEST: "1"
         run: npx tsx scripts/test-deterministic-lotus.ts
       - name: Run live deterministic adapters suite (7/7 core tools live)
         env:

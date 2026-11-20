@@ -23,7 +23,7 @@ import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequi
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { postOllamaChat } from "../../core/src/ollama-chat";
-import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, driveDeterministicAuditTurn, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
+import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
@@ -169,7 +169,8 @@ export function prioritizeSolidityStagedPlans<T extends {id:string;plan:{path:st
 export function controllerGroundedSolidityOptions(
   path:string,source:string,menu:SolidityProbeDeclaration[],
   snapshots:readonly SourceSnapshot[],repositoryCommit:string|null,
-  staticLeads?:readonly StaticLeadHint[]
+  staticLeads?:readonly StaticLeadHint[],
+  options?:{skipFinancialInvariants?:boolean}
 ):Array<{selector:string;probe:GroundedSolidityProbe}> {
   const peers=snapshots.map(s=>({path:s.path,source:s.content}));
   const legacy=sourceGroundedSolidityProbes(source,menu,{path,peers});
@@ -182,7 +183,8 @@ export function controllerGroundedSolidityOptions(
     if(eligible.has(entry.selector))continue;
     const candidate=constructSolidityExperiments({
       repositoryCommit,targetPath:path,targetSelector:entry.selector,
-      sources:snapshots,declarations:menu,skipLegacy:true,staticLeads
+      sources:snapshots,declarations:menu,skipLegacy:true,
+      skipFinancialInvariants:options?.skipFinancialInvariants,staticLeads
     });
     if(!candidate.ok)continue;
     const constructed=candidate.experiments[0];
@@ -497,7 +499,7 @@ export async function runLocalAudit(
       sourceRepositoryCommits.set(dir,revision);
       return revision;
     };
-    const groundedControllerOptions=async(path:string,source:string,menu:SolidityProbeDeclaration[])=>{
+    const groundedControllerOptions=async(path:string,source:string,menu:SolidityProbeDeclaration[],options?:{skipFinancialInvariants?:boolean})=>{
       const sourceEntries=new Map(accessibleSoliditySources);
       sourceEntries.set(path,source);
       const repoPrefix=path.split('/')[0]+'/';
@@ -510,7 +512,7 @@ export async function runLocalAudit(
       if(!revision)await appendFile(logFile,'[CONTROLLER_SCENARIO_REVISION_UNAVAILABLE] '+
         JSON.stringify({path})+'\n');
       const pathLeads=(limits.staticLeads||[]).filter(l=>l.path===path);
-      return controllerGroundedSolidityOptions(path,source,menu,snapshots,revision,pathLeads);
+      return controllerGroundedSolidityOptions(path,source,menu,snapshots,revision,pathLeads,options);
     };
     // Production controller: freeze the entire authorized source inventory
     // before the first paginated source read. Indexing can inspect bytes to
@@ -807,7 +809,7 @@ export async function runLocalAudit(
               const menu=await solidityIndex.probeMenu(full,256);
               deterministicDeclarationsCache.set(path,menu);
               const queuedSelectorsForPath=new Set<string>();
-              for(const {selector,probe} of await groundedControllerOptions(path,source,menu)){
+              for(const {selector,probe} of await groundedControllerOptions(path,source,menu,{skipFinancialInvariants:adapter==='deterministic'})){
                 const plan={action:'plan_probe' as const,path,query:selector,
                   answer:'solidity_sequence',hypothesis:probe.hypothesis,sequence:probe.sequence};
                 const id=JSON.stringify([path,selector,plan.answer]);
@@ -897,31 +899,6 @@ export async function runLocalAudit(
         // Build the complete deterministic function-level candidate inventory across
         // ALL unqueued non-setters, persist it alongside the log, and admit a scored,
         // bounded batch while keeping remaining candidates queued for later passes.
-        const commitByDir=new Map<string,string>();
-        const candidateSourceItems:Array<{path:string;sourceCommit:string;sourceContent:string;unqueuedSelectors:string[]}>=[];
-        for(const item of nonMockSolSummaries){
-          const content=accessibleSoliditySources.get(item.path);
-          if(!content||!item.unqueuedNonSetters.length)continue;
-          const full=await safePath(item.path);
-          const dirKey=dirname(full);
-          let sourceCommit=commitByDir.get(dirKey)??'';
-          if(!commitByDir.has(dirKey)){
-            try {sourceCommit=execFileSync('git',['-c','core.hooksPath=/dev/null','rev-parse','HEAD'],
-              {cwd:dirKey,encoding:'utf8',timeout:5000}).trim();}
-            catch{sourceCommit='';}
-            commitByDir.set(dirKey,sourceCommit);
-          }
-          candidateSourceItems.push({
-            path:item.path,
-            sourceCommit,
-            sourceContent:content,
-            unqueuedSelectors:item.unqueuedNonSetters,
-          });
-        }
-        const envMaxLeads=Number(process.env.LOCAL_ANALYZE_MAX_LEADS??18);
-        const maxAdmittedLeads=Number.isSafeInteger(envMaxLeads)&&envMaxLeads>=1?Math.min(envMaxLeads,64):18;
-        const envMaxPerFile=Number(process.env.LOCAL_ANALYZE_MAX_PER_FILE??4);
-        const maxPerFileLeads=Number.isSafeInteger(envMaxPerFile)&&envMaxPerFile>=1?Math.min(envMaxPerFile,16):4;
         // Build the host-enriched ProgramFactsGraph ONCE per investigation and reuse
         // it across both candidate prioritization and every deterministic ANALYZE turn.
         deterministicSourceSnapshots=[...accessibleSoliditySources.entries()].map(([p,content])=>({
@@ -942,6 +919,60 @@ export async function runLocalAudit(
             adapters:deterministicProgramGraph.adaptersUsed,
           })+'\n');
         }
+        // Include non-setter selectors that have a multi-function relational hypothesis
+        // whose conservation/accounting invariant is not yet covered by stagedPlans
+        // (for instance when pre-ANALYZE only queued a legacy authorization check).
+        const selectorsByPath=new Map<string,Set<string>>();
+        for(const item of nonMockSolSummaries){
+          selectorsByPath.set(item.path,new Set(item.unqueuedNonSetters));
+        }
+        if(deterministicProgramGraph){
+          const relHyps=generateRelationalHypotheses(deterministicProgramGraph);
+          for(const rel of relHyps){
+            const targetPath=rel.file;
+            if(!targetPath || !targetPath.endsWith('.sol'))continue;
+            const isMockOrTest=/(?:^|\/)(?:mocks?|tests?|__tests__|fixtures)(?:\/|$)|Mock\.sol$/i.test(targetPath);
+            if(isMockOrTest)continue;
+            const menu=deterministicDeclarationsCache.get(targetPath)||[];
+            for(const fnSel of rel.entrypoints){
+              const isSend=menu.some(e=>e.selector===fnSel && e.operation==='send');
+              if(!isSend)continue;
+              const alreadyCoversConservation=stagedPlans.some(entry=>
+                entry.plan.path===targetPath && entry.plan.query===fnSel &&
+                /conservation|accounting|must equal/i.test(entry.plan.hypothesis));
+              if(alreadyCoversConservation)continue;
+              const set=selectorsByPath.get(targetPath)||new Set<string>();
+              set.add(fnSel);
+              selectorsByPath.set(targetPath,set);
+            }
+          }
+        }
+        const commitByDir=new Map<string,string>();
+        const candidateSourceItems:Array<{path:string;sourceCommit:string;sourceContent:string;unqueuedSelectors:string[]}>=[];
+        for(const [itemPath,selSet] of selectorsByPath.entries()){
+          const content=accessibleSoliditySources.get(itemPath);
+          const unqueuedSelectors=[...selSet];
+          if(!content||!unqueuedSelectors.length)continue;
+          const full=await safePath(itemPath);
+          const dirKey=dirname(full);
+          let sourceCommit=commitByDir.get(dirKey)??'';
+          if(!commitByDir.has(dirKey)){
+            try {sourceCommit=execFileSync('git',['-c','core.hooksPath=/dev/null','rev-parse','HEAD'],
+              {cwd:dirKey,encoding:'utf8',timeout:5000}).trim();}
+            catch{sourceCommit='';}
+            commitByDir.set(dirKey,sourceCommit);
+          }
+          candidateSourceItems.push({
+            path:itemPath,
+            sourceCommit,
+            sourceContent:content,
+            unqueuedSelectors,
+          });
+        }
+        const envMaxLeads=Number(process.env.LOCAL_ANALYZE_MAX_LEADS??18);
+        const maxAdmittedLeads=Number.isSafeInteger(envMaxLeads)&&envMaxLeads>=1?Math.min(envMaxLeads,64):18;
+        const envMaxPerFile=Number(process.env.LOCAL_ANALYZE_MAX_PER_FILE??4);
+        const maxPerFileLeads=Number.isSafeInteger(envMaxPerFile)&&envMaxPerFile>=1?Math.min(envMaxPerFile,16):4;
         const candidateQueue=buildAnalysisCandidateQueue({
           items:candidateSourceItems,
           staticLeads:solLeads,

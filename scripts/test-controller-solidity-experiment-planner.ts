@@ -409,4 +409,199 @@ assert.equal(constructSolidityExperiments({
   staticLeads: [{path: 'contracts/SafePack.sol', line: 5, rule: 'solidity-abi-encode-packed-hash', message: 'Inspect abi.encodePacked'}]
 }).ok, false, 'Non-dangerous static lead on unguarded function must not fabricate auth experiment');
 
+
+// --- 3-stage Financial-Invariant Pipeline & Negative Controls ---
+
+// 1. ETH deposit -> withdraw accounting defect (BuggyAccountingVault vs FixedAccountingVault)
+const buggyVaultSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract BuggyAccountingVault {
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+    function deposit() external payable {
+        require(msg.value > 0, "zero");
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+    }
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "insufficient");
+        balances[msg.sender] -= amount;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "transfer failed");
+    }
+}`;
+const fixedVaultSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract FixedAccountingVault {
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+    function deposit() external payable {
+        require(msg.value > 0, "zero");
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+    }
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "insufficient");
+        balances[msg.sender] -= amount;
+        totalDeposits -= amount;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "transfer failed");
+    }
+}`;
+for (const [name, code] of [['BuggyAccountingVault', buggyVaultSrc], ['FixedAccountingVault', fixedVaultSrc]] as const) {
+  const vaultSha = createHash('sha256').update(code).digest('hex');
+  const vaultDecls = [
+    {selector: `${name}.deposit`, operation: 'send' as const, inputs: []},
+    {selector: `${name}.withdraw`, operation: 'send' as const, inputs: ['uint256']},
+    {selector: `${name}.totalDeposits`, operation: 'call' as const, inputs: []},
+    {selector: `${name}.balances`, operation: 'call' as const, inputs: ['address']},
+  ];
+  const res = constructSolidityExperiments({
+    repositoryCommit: 'e'.repeat(40),
+    targetPath: `contracts/${name}.sol`,
+    targetSelector: `${name}.withdraw`,
+    sources: [{path: `contracts/${name}.sol`, sha256: vaultSha, content: code}],
+    declarations: vaultDecls,
+  });
+  assert.equal(res.ok, true, `${name}.withdraw must construct financial conservation experiment`);
+  if (res.ok) {
+    const invExp = res.experiments.find((e) => e.securityProperty.includes('conservation'));
+    assert.ok(invExp, `${name}.withdraw must include conservation experiment`);
+    assert.ok(invExp!.witnesses.length >= 2, 'Conservation experiment must cite both deposit and withdraw witnesses');
+    const stepFns = invExp!.sequence.steps.map((s) => ('function' in s ? s.function : s.operation));
+    assert.ok(stepFns.includes('deposit()'), 'Sequence must call deposit()');
+    assert.ok(stepFns.includes('withdraw(uint256)'), 'Sequence must call withdraw(uint256)');
+    assert.ok(
+      invExp!.sequence.steps.some((s) => s.operation === 'call' && s.function === 'totalDeposits()' && s.expect === '600'),
+      'Sequence must assert totalDeposits() == 600 after deposit(1000) -> withdraw(400)',
+    );
+  }
+}
+
+// 2. Internal ledger deposit(uint256) -> withdraw(uint256) conservation
+const internalLedgerSrc = `pragma solidity ^0.8.20;
+contract InternalLedgerVault {
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+    function deposit(uint256 amount) external {
+        require(amount > 0, "zero");
+        balances[msg.sender] += amount;
+        totalDeposits += amount;
+    }
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "insufficient");
+        balances[msg.sender] -= amount;
+        totalDeposits -= amount;
+    }
+}`;
+const internalLedgerRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: 'contracts/InternalLedgerVault.sol',
+  targetSelector: 'InternalLedgerVault.withdraw',
+  sources: [{path: 'contracts/InternalLedgerVault.sol', sha256: createHash('sha256').update(internalLedgerSrc).digest('hex'), content: internalLedgerSrc}],
+  declarations: [
+    {selector: 'InternalLedgerVault.deposit', operation: 'send', inputs: ['uint256']},
+    {selector: 'InternalLedgerVault.withdraw', operation: 'send', inputs: ['uint256']},
+    {selector: 'InternalLedgerVault.totalDeposits', operation: 'call', inputs: []},
+    {selector: 'InternalLedgerVault.balances', operation: 'call', inputs: ['address']},
+  ],
+});
+assert.equal(internalLedgerRes.ok, true, 'Internal ledger deposit/withdraw must construct conservation invariant');
+
+// 3. Mint/burn totalSupply conservation
+const mintBurnSrc = `pragma solidity ^0.8.20;
+contract MintBurnVault {
+    mapping(address => uint256) public balanceOf;
+    uint256 public totalSupply;
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+        totalSupply += amount;
+    }
+    function burn(address from, uint256 amount) external {
+        require(balanceOf[from] >= amount, "insufficient");
+        balanceOf[from] -= amount;
+        totalSupply -= amount;
+    }
+}`;
+const mintBurnRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: 'contracts/MintBurnVault.sol',
+  targetSelector: 'MintBurnVault.burn',
+  sources: [{path: 'contracts/MintBurnVault.sol', sha256: createHash('sha256').update(mintBurnSrc).digest('hex'), content: mintBurnSrc}],
+  declarations: [
+    {selector: 'MintBurnVault.mint', operation: 'send', inputs: ['address', 'uint256']},
+    {selector: 'MintBurnVault.burn', operation: 'send', inputs: ['address', 'uint256']},
+    {selector: 'MintBurnVault.totalSupply', operation: 'call', inputs: []},
+    {selector: 'MintBurnVault.balanceOf', operation: 'call', inputs: ['address']},
+  ],
+});
+assert.equal(mintBurnRes.ok, true, 'Mint/burn conservation invariant must construct');
+
+// 4. Negative control: private state without public getters -> UNKNOWN_ASSERTION(missing_observable_state)
+const privateVaultSrc = `pragma solidity ^0.8.20;
+contract PrivateAccountingVault {
+    mapping(address => uint256) private balances;
+    uint256 private totalDeposits;
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+    }
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "insufficient");
+        balances[msg.sender] -= amount;
+    }
+}`;
+const privateVaultRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: 'contracts/PrivateAccountingVault.sol',
+  targetSelector: 'PrivateAccountingVault.deposit',
+  sources: [{path: 'contracts/PrivateAccountingVault.sol', sha256: createHash('sha256').update(privateVaultSrc).digest('hex'), content: privateVaultSrc}],
+  declarations: [
+    {selector: 'PrivateAccountingVault.deposit', operation: 'send', inputs: []},
+    {selector: 'PrivateAccountingVault.withdraw', operation: 'send', inputs: ['uint256']},
+  ],
+});
+assert.equal(privateVaultRes.ok, false, 'Private accounting state with no observable getter must refuse to fabricate');
+if (!privateVaultRes.ok) {
+  assert.equal(privateVaultRes.code, 'UNKNOWN_ASSERTION');
+  assert.equal(privateVaultRes.unresolvedCategory, 'missing_observable_state');
+}
+
+// 5. Negative control: unresolvable external dependency -> UNKNOWN_ASSERTION, zero fabricated experiments
+const oracleVaultSrc = `pragma solidity ^0.8.20;
+interface IExternalBook { function credit(address u, uint256 a) external; function debit(address u, uint256 a) external; }
+contract ExternalOracleVault {
+    IExternalBook public book;
+    uint256 public totalDeposits;
+    constructor(address _book) { book = IExternalBook(_book); }
+    function deposit(uint256 amount) external {
+        book.credit(msg.sender, amount);
+        totalDeposits += amount;
+    }
+    function withdraw(uint256 amount) external {
+        book.debit(msg.sender, amount);
+        totalDeposits -= amount;
+    }
+}`;
+const oracleVaultRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: 'contracts/ExternalOracleVault.sol',
+  targetSelector: 'ExternalOracleVault.withdraw',
+  sources: [{path: 'contracts/ExternalOracleVault.sol', sha256: createHash('sha256').update(oracleVaultSrc).digest('hex'), content: oracleVaultSrc}],
+  declarations: [
+    {selector: 'ExternalOracleVault.deposit', operation: 'send', inputs: ['uint256']},
+    {selector: 'ExternalOracleVault.withdraw', operation: 'send', inputs: ['uint256']},
+    {selector: 'ExternalOracleVault.totalDeposits', operation: 'call', inputs: []},
+  ],
+});
+assert.equal(oracleVaultRes.ok, false, 'External unresolved dependency must refuse to fabricate experiment');
+if (!oracleVaultRes.ok) {
+  assert.equal(oracleVaultRes.code, 'UNKNOWN_ASSERTION');
+  assert.ok(
+    oracleVaultRes.unresolvedCategory === 'unresolved_dependency' ||
+      oracleVaultRes.unresolvedCategory === 'missing_fixture',
+    `Expected unresolved_dependency or missing_fixture, got ${oracleVaultRes.unresolvedCategory}`,
+  );
+}
+
 console.log('Standalone experiment construction passed');
