@@ -1,3 +1,4 @@
+import {readFileSync} from 'node:fs';
 import assert from 'node:assert/strict';
 import {ensureOneBountyDeterministicEngine} from './one-bounty-settings';
 for(const initial of [
@@ -12,3 +13,9 @@ for(const initial of [
   assert.equal(initial.LOCAL_OLLAMA_MODEL,undefined);
 }
 console.log('One-bounty local deterministic engine cannot reactivate Qwen PASSED');
+
+// The live entrypoint must call the imported deterministic initializer. This
+// regression caught a post-merge ReferenceError that stopped the laptop hunt.
+const entrypoint=readFileSync(new URL('./one-bounty.ts',import.meta.url),'utf8');
+assert.ok(entrypoint.includes('ensureOneBountyDeterministicEngine(process.env);'));
+assert.ok(!entrypoint.includes('ensureOneBountyLocalModel('));
