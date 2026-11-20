@@ -27,6 +27,8 @@ flock -n 9 || { echo "AutoHack orchestrator is running. Stop it before one-bount
 export PROJECT_ROOT="$ROOT"
 # Use the same explicit investigation settings as the successful Level 6
 # Crucible. The full source index is opt-in in local-program-flow.ts.
+export LOCAL_MODEL_ADAPTER=deterministic
+unset LOCAL_OLLAMA_MODEL LOCAL_MODEL_PROFILE
 export LOCAL_OLLAMA_TOOL_PROTOCOL=json
 export AUTOHACK_AUTO_SOURCE_PREFETCH=true
 export AUTOHACK_GUIDED_SOURCE_PROBES=true
