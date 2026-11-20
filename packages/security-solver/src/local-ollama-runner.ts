@@ -29,6 +29,8 @@ import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node
 import { resolve, relative, sep, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
+import {homedir} from "node:os";
+import {AnalysisProgressStore} from "./deterministic/analysis-progress-store";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
 async function recordToolActivity(logFile:string,event:Record<string,unknown>):Promise<void> {
@@ -286,6 +288,11 @@ export async function runLocalAudit(
   let deterministicSourceSnapshots:SourceSnapshot[]=[];
   const deterministicDeclarationsCache=new Map<string,SolidityProbeDeclaration[]>();
   let analysisInventoryMeta={inventoryTotal:0,admittedCount:0,queuedRemaining:0,blockedCount:0};
+  let analysisProgressStore:AnalysisProgressStore|null=null;
+  let analysisBatchSize=18;
+  let analysisPerFileCap=4;
+  let analysisTurnBudget=24;
+  const analysisResults=new Map<string,DeterministicAnalysisResult>();
   const nextAnalysisPacket=()=>stageLock?.analysisLeads.find(x=>x.state.kind==='pending');
   // Current controller instruction is reconstructed from stage-owned state for
   // every inference, not carried as disposable conversational history.
@@ -316,29 +323,99 @@ export async function runLocalAudit(
       'Do not finalize_analysis while any lead remains pending. '+
       'This excerpt is source evidence, not proof of exploitability. /no_think';
   };
+  const admitNextAnalysisBatch=async():Promise<number>=>{
+    if(!analysisProgressStore||!stageLock||stageLock.currentStage!=="ANALYZE")
+      throw new Error("ANALYSIS_BATCH_CONTROLLER_NOT_READY");
+    const batch=analysisProgressStore.nextBatch(analysisBatchSize,analysisPerFileCap);
+    if(!batch.length)return 0;
+    for(const cand of batch){
+      stageLock.registerAnalysisLead({
+        id:cand.id,sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
+        path:cand.path,selector:cand.selector,
+      });
+      analysisPackets.set(cand.id,{
+        id:cand.id,path:cand.path,selector:cand.selector,
+        sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
+        sourceEvidence:cand.sourceEvidence,sourceExcerpt:cand.sourceExcerpt,
+        excerptStart:cand.excerptStart,truncated:cand.truncated,
+      });
+      await appendFile(logFile,"[ANALYSIS_LEAD_SELECTED] "+JSON.stringify({
+        id:cand.id,path:cand.path,selector:cand.selector,
+        sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
+        sourceEvidence:cand.sourceEvidence,priority:cand.priority,
+        staticLeadIds:cand.staticLeadIds,selectionReasons:cand.selectionReasons,
+        batch:analysisProgressStore.processedBatches+1,
+      })+"\\n");
+    }
+    analyzeModelPending=true;
+    analyzeTurnsRemaining=Math.max(analysisTurnBudget,batch.length+6);
+    analysisInventoryMeta.admittedCount+=batch.length;
+    analysisInventoryMeta.queuedRemaining=analysisProgressStore.remaining;
+    await analysisProgressStore.save();
+    await appendFile(logFile,"[ANALYSIS_BATCH_STARTED] "+JSON.stringify({
+      batch:analysisProgressStore.processedBatches+1,
+      admitted:batch.length,queuedRemaining:analysisProgressStore.remaining,
+      turnsAvailable:analyzeTurnsRemaining,
+    })+"\\n");
+    return batch.length;
+  };
   const closeAnalysis=async(status:'complete'|'partial',reason='')=>{
     if(!stageLock||stageLock.currentStage!=='ANALYZE')return;
+    if(!analysisProgressStore)throw new Error("ANALYSIS_PROGRESS_STORE_MISSING");
+    // An exhausted turn budget or missing analytical evidence is a suspended
+    // investigation, never a successful REPORT with abandoned candidates.
+    if(status!=="complete"){
+      await analysisProgressStore.save();
+      await appendFile(logFile,"[ANALYSIS_SUSPENDED] "+JSON.stringify({
+        reason,pendingIds:stageLock.analysisProgress.pendingIds,
+        remainingInventory:analysisProgressStore.remaining,
+      })+"\\n");
+      throw new Error("ANALYSIS_INCOMPLETE_SUSPENDED: "+reason);
+    }
+    stageLock.completeAnalysisBatch();
+    for(const lead of stageLock.analysisLeads){
+      const record=analysisProgressStore.records.get(lead.id);
+      if(!record||record.lifecycle==="queued")continue;
+      if(["analysis_exhausted","dependencies_pending","experiment_pending","experiment_completed","blocked"].includes(record.lifecycle))continue;
+      const detail=analysisResults.get(lead.id);
+      analysisProgressStore.recordAssessment(
+        lead.id,
+        detail?.decision.matchedHypotheses.map(x=>x.id)||[],
+        detail?.unresolvedReasons||[],
+        detail?.experimentCandidates.map(x=>x.id)||[],
+      );
+      analysisProgressStore.markTerminalAssessment(lead.id,
+        lead.state.kind==="assessed" ? lead.state.reason : undefined);
+    }
+    analysisProgressStore.processedBatches++;
+    analysisInventoryMeta.queuedRemaining=analysisProgressStore.remaining;
+    await analysisProgressStore.save();
+    await appendFile(logFile,"[ANALYSIS_BATCH_COMPLETE] "+JSON.stringify({
+      batch:analysisProgressStore.processedBatches,
+      resolved:analysisProgressStore.assessed,
+      inventoryTotal:analysisProgressStore.records.size,
+      queuedRemaining:analysisProgressStore.remaining,
+    })+"\\n");
+    if(analysisProgressStore.remaining>0){
+      const admitted=await admitNextAnalysisBatch();
+      if(admitted===0)throw new Error("ANALYSIS_INVENTORY_STALLED: queued candidates could not be admitted");
+      return;
+    }
+    stageLock.assertAnalysisInventoryExhausted();
     const cert=stageLock.analysisClosureCertificate(status,reason);
     stageLock.completeAnalysis(status,reason);
     limits.onAnalysisCertificate?.(cert);
     analyzeModelPending=false;analyzeTurnsRemaining=0;
-    const batchCoverage=status;
-    const inventoryCoverage=status==='complete'
-      ? (analysisInventoryMeta.queuedRemaining>0 ? 'partial_bounded_batch' : 'complete')
-      : 'partial';
-    await appendFile(logFile,'['+(status==='complete'?'ANALYSIS_COMPLETE':'ANALYSIS_INCOMPLETE')+'] '+
-      JSON.stringify({
-        ...cert,
-        batchCoverage,
-        inventoryCoverage,
-        inventoryTotal:analysisInventoryMeta.inventoryTotal,
-        admittedCount:analysisInventoryMeta.admittedCount,
-        queuedRemaining:analysisInventoryMeta.queuedRemaining,
-        blockedCount:analysisInventoryMeta.blockedCount,
-        candidates:stageLock.candidateCount,
-        modelAdded:analyzeApprovedIds.size,
-      })+'\n');
-    await appendFile(logFile,'[STAGE_UNLOCK] ANALYZE -> EXPERIMENT\n');
+    analysisInventoryMeta.queuedRemaining=0;
+    await appendFile(logFile,"[ANALYSIS_COMPLETE] "+JSON.stringify({
+      ...cert,batchCoverage:"complete",inventoryCoverage:"complete",
+      inventoryTotal:analysisProgressStore.records.size,
+      admittedCount:analysisProgressStore.records.size,
+      queuedRemaining:0,blockedCount:analysisInventoryMeta.blockedCount,
+      candidates:stageLock.candidateCount,modelAdded:analyzeApprovedIds.size,
+      processedBatches:analysisProgressStore.processedBatches,
+    })+"\\n");
+    await appendFile(logFile,"[STAGE_UNLOCK] ANALYZE -> EXPERIMENT\\n");
   };
   const hypotheses:Array<{turn:number;path:string;statement:string}>=[];
   const renew=async(turn:number)=>{
@@ -1008,74 +1085,59 @@ export async function runLocalAudit(
         }
         analysisInventoryMeta={
           inventoryTotal:candidateQueue.inventory.length,
-          admittedCount:candidateQueue.admitted.length,
-          queuedRemaining:candidateQueue.queued.length,
+          admittedCount:0,
+          queuedRemaining:candidateQueue.inventory.length,
           blockedCount:candidateQueue.blocked.length,
         };
-        try {
-          await writeFile(logFile+'.analysis-candidates.json',JSON.stringify({
+        // The source fingerprint and path are stable across self-hosted runner
+        // workspaces. The checkpoint stays on the laptop outside git-clean.
+        const inventoryFingerprint=createHash("sha256").update(JSON.stringify(
+          candidateQueue.inventory.map(c=>[c.id,c.sourceCommit,c.sourceSha256]).sort()
+        )).digest("hex");
+        const progressRoot=process.env.LOTUS_ANALYSIS_CHECKPOINT_ROOT||
+          join(homedir(),".lotus-clone-analysis");
+        const progressFile=join(progressRoot,inventoryFingerprint+".json");
+        analysisProgressStore=await AnalysisProgressStore.open(progressFile,candidateQueue.inventory);
+        stageLock.registerAnalysisInventory(candidateQueue.inventory.map(c=>c.id));
+        for(const record of analysisProgressStore.records.values()){
+          if(record.lifecycle!=="queued")stageLock.restoreResolvedAnalysisCandidate(record.id);
+        }
+        const envMaxLeads=Number(process.env.LOCAL_ANALYZE_MAX_LEADS??18);
+        analysisBatchSize=Number.isSafeInteger(envMaxLeads)&&envMaxLeads>=1?Math.min(envMaxLeads,64):18;
+        const envMaxPerFile=Number(process.env.LOCAL_ANALYZE_MAX_PER_FILE??4);
+        analysisPerFileCap=Number.isSafeInteger(envMaxPerFile)&&envMaxPerFile>=1?Math.min(envMaxPerFile,16):4;
+        const envAnalyzeTurns=Number(process.env.LOCAL_ANALYZE_MODEL_TURNS??24);
+        analysisTurnBudget=Number.isSafeInteger(envAnalyzeTurns)&&envAnalyzeTurns>=1?Math.min(envAnalyzeTurns,200):24;
+        for(const blocked of candidateQueue.blocked){
+          await appendFile(logFile,"[ANALYSIS_LEAD_BLOCKED] "+JSON.stringify(blocked)+"\\n");
+        }
+        try{
+          await writeFile(logFile+".analysis-candidates.json",JSON.stringify({
             totalCandidates:candidateQueue.inventory.length,
-            admittedCount:candidateQueue.admitted.length,
-            queuedCount:candidateQueue.queued.length,
+            admittedCount:analysisProgressStore.assessed,
+            queuedCount:analysisProgressStore.remaining,
             blockedCount:candidateQueue.blocked.length,
-            inventoryCoverage:candidateQueue.queued.length>0?'partial_bounded_batch':'complete',
-            blocked:candidateQueue.blocked,
             candidates:candidateQueue.inventory.map(({sourceExcerpt:_ex,...rest})=>rest),
           },null,2),{mode:0o600});
         }catch{}
-        await appendFile(logFile,'[ANALYSIS_CANDIDATE_INVENTORY] '+JSON.stringify({
+        await appendFile(logFile,"[ANALYSIS_CANDIDATE_INVENTORY] "+JSON.stringify({
           totalCandidates:candidateQueue.inventory.length,
-          admittedCount:candidateQueue.admitted.length,
-          queuedCount:candidateQueue.queued.length,
+          queuedCount:analysisProgressStore.remaining,
+          resumedProcessed:analysisProgressStore.assessed,
           blockedCount:candidateQueue.blocked.length,
-          maxAdmittedLeads,
-          maxPerFileLeads,
-        })+'\n');
-        for(const cand of candidateQueue.admitted){
-          stageLock.registerAnalysisLead({
-            id:cand.id,sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
-            path:cand.path,selector:cand.selector,
-          });
-          analysisPackets.set(cand.id,{
-            id:cand.id,path:cand.path,selector:cand.selector,
-            sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
-            sourceEvidence:cand.sourceEvidence,sourceExcerpt:cand.sourceExcerpt,
-            excerptStart:cand.excerptStart,truncated:cand.truncated,
-          });
-          await appendFile(logFile,'[ANALYSIS_LEAD_SELECTED] '+JSON.stringify({
-            id:cand.id,path:cand.path,selector:cand.selector,
-            sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
-            sourceEvidence:cand.sourceEvidence,priority:cand.priority,
-            staticLeadIds:cand.staticLeadIds,selectionReasons:cand.selectionReasons,
-          })+'\n');
-        }
-        // Four Qwen turns were insufficient to correct even one rejected
-        // sequence. Preserve a configurable bounded window without treating
-        // an invalid schema attempt as a successful experiment.
-        const envAnalyzeTurns=Number(process.env.LOCAL_ANALYZE_MODEL_TURNS??24);
-        const maxAnalyzeTurns=Number.isSafeInteger(envAnalyzeTurns)&&envAnalyzeTurns>=0?Math.min(envAnalyzeTurns,200):24;
-        const enableAnalyzeModel=structured && !!workflow &&
-          process.env.LOCAL_MODEL_SOLIDITY_ANALYZE!=='false' && maxAnalyzeTurns>0 &&
-          (process.env.LOCAL_MODEL_SOLIDITY_ANALYZE==='true' || solLeads.length>0 ||
-           (nonMockSolSummaries.length>=2 && totalUnqueuedNonSetters>=2) ||
-           (adapter==='deterministic' && candidateQueue.admitted.length>0));
-        if(enableAnalyzeModel){
-          analyzeModelPending=true;
-          analyzeTurnsRemaining=maxAnalyzeTurns;
-          await appendFile(logFile,'[ANALYSIS_MODEL_WINDOW_STARTED] '+JSON.stringify({
-            maxAnalyzeTurns,solLeads:solLeads.length,nonMockSolFiles:nonMockSolSummaries.length,
-            totalUnqueuedNonSetters,selectedModelLeads:stageLock.analysisProgress.selected})+'\n');
-          // Historical stage overview is advisory/evictable. The authoritative
-          // current lead and source excerpt are delivered anew with every call.
-          messages.push({role:'user',content:'ANALYZE STAGE: You have '+maxAnalyzeTurns+
-            ' bounded model turns. Assess or defer the controller-selected pending lead, '+
-            'using its immutable leadId, exact selector, verified source and a specific reason. '+
-            'Propose discover_experiment only with a source-grounded invariant and a valid '+
-            'solidity_sequence. Do not finalize while any selected lead is pending. '+
-            'The next pending lead and its bounded evidence appear in the current controller task. /no_think'});
-        } else {
-          await closeAnalysis(stageLock.analysisProgress.pendingIds.length?'partial':'complete',
-            stageLock.analysisProgress.pendingIds.length?'model_analysis_disabled':'');
+          maxAdmittedLeads:analysisBatchSize,
+          maxPerFileLeads:analysisPerFileCap,
+          progressFile,
+        })+"\\n");
+        await admitNextAnalysisBatch();
+        if(!analysisProgressStore?.remaining&&stageLock?.analysisProgress.pendingIds.length===0){
+          await closeAnalysis("complete");
+        } else if(analyzeModelPending){
+          await appendFile(logFile,"[ANALYSIS_MODEL_WINDOW_STARTED] "+JSON.stringify({
+            maxAnalyzeTurns:analyzeTurnsRemaining,
+            selectedModelLeads:stageLock.analysisProgress.selected,
+            totalInventory:analysisProgressStore?.records.size,
+          })+"\\n");
         }
         constraints=workflow?await workflow.constraints():constraints;
       }
@@ -2003,7 +2065,7 @@ export async function runLocalAudit(
             escalationCache:deterministicEscalationCache,
             repositoryDir:cwd,
             onEscalation:(res)=>{lastEscalation=res;},
-            onAnalysisResult:(res)=>{lastAnalysisResult=res;},
+            onAnalysisResult:(res)=>{lastAnalysisResult=res; if(activePacket)analysisResults.set(activePacket.id,res);},
           });
           if(lastAnalysisResult && ((lastAnalysisResult as DeterministicAnalysisResult).unresolvedReasons.length>0 || (lastAnalysisResult as DeterministicAnalysisResult).constructionFeasibility.attempted)){
             const ar=lastAnalysisResult as DeterministicAnalysisResult;
