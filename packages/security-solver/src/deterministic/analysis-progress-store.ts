@@ -63,6 +63,8 @@ export class AnalysisProgressStore {
         throw new Error("ANALYSIS_CHECKPOINT_SOURCE_MISMATCH: "+r.id);
       if(!Array.isArray(r.properties)||!Array.isArray(r.experimentIds)||!Number.isSafeInteger(r.attempts))
         throw new Error("ANALYSIS_CHECKPOINT_CORRUPT: "+r.id);
+      // A process crash must never strand an admitted but unassessed candidate.
+      if(r.lifecycle==="admitted"||r.lifecycle==="analyzing")r.lifecycle="queued";
       store.records.set(r.id,r);
     }
     store.processedBatches=parsed.processedBatches||0;
