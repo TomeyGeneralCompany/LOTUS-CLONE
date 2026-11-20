@@ -52,9 +52,9 @@ jobs:
         run: npx tsx scripts/test-dashboard-activity.ts
       - name: Preserve offline scanner failure diagnostics
         run: npx tsx scripts/test-static-scanner-diagnostics.ts
-      - name: Verify DeFi probes, ANALYZE hypothesis window, and REVIEW anti-bias
+      - name: Verify DeFi prioritization and deterministic analysis selection
         run: npx tsx scripts/test-defi-probes-and-analyze-review.ts
-      - name: Verify hunt capability, reachability and context management
+      - name: Verify source acquisition, scope, and controller gates
         run: |
           npx tsx scripts/test-missing-source-loop.ts
           npx tsx scripts/test-investigation-records.ts
@@ -73,19 +73,19 @@ jobs:
           node --import tsx scripts/test-stateful-probe-declarations.ts
           node --import tsx scripts/test-production-audit-regressions.ts
           node --import tsx scripts/test-production-source-routing.ts
-          npx tsx scripts/test-audit-context-loop.ts
-          node --import tsx scripts/test-production-workflow.ts --mock-probes --large-context
-          node --import tsx scripts/test-production-workflow.ts --mock-probes --premature-final
-          node --import tsx scripts/test-production-workflow.ts --mock-probes --prefetch
-          node --import tsx scripts/test-production-workflow.ts --mock-probes --empty-sequence
-          node --import tsx scripts/test-production-workflow.ts --mock-probes --prefetch --empty-final-recovery
-          node --import tsx scripts/test-production-workflow.ts --mock-probes --prefetch --duplicate-probe-plan
-          npx tsx scripts/test-audit-output-budget.ts
-          npx tsx scripts/test-native-batch.ts
-          npx tsx scripts/test-audit-stalls.ts
-          npx tsx scripts/test-audit-navigation-recovery.ts
           npx tsx scripts/test-solidity-source-index.ts
           npx tsx scripts/test-submodule-acquisition.ts
+      - name: Prove zero-Qwen stage-lock, inventory and evidence review integrity
+        env:
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+        run: |
+          npx tsx scripts/test-controller-stage-lock.ts
+          npx tsx scripts/test-controller-staged-investigation.ts
+          npx tsx scripts/test-controller-source-coverage.ts
+          npx tsx scripts/test-controller-review-boundary.ts
+          npx tsx scripts/test-controller-solidity-experiment-planner.ts
+          npx tsx scripts/test-deterministic-full-inventory.ts
       - name: Regress Level 6 source ranking and completed-page recovery
         run: |
           node --import tsx scripts/test-level6-controller-candidate-recovery.ts
