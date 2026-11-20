@@ -25,6 +25,7 @@ export {
   type FactLanguage,
   type FactSeverity,
   type ProgramEdge,
+  type CallResolutionStatus,
   type ProgramEdgeKind,
   type ProgramFact,
   type ProgramFactKind,

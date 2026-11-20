@@ -86,7 +86,20 @@ export interface ProgramFact {
   metadata?: Record<string, unknown>;
 }
 
-export type ProgramEdgeKind = "calls" | "inherits" | "imports" | "writes_state" | "guards" | "dataflow";
+export type ProgramEdgeKind =
+  | "calls"
+  | "calls_resolved"
+  | "external_call"
+  | "inherits"
+  | "imports"
+  | "writes_state"
+  | "reads_state"
+  | "guards"
+  | "dataflow"
+  | "value_flow"
+  | "precedes";
+
+export type CallResolutionStatus = "resolved" | "ambiguous" | "unresolved";
 
 export interface ProgramEdge {
   from: string;
@@ -94,6 +107,8 @@ export interface ProgramEdge {
   kind: ProgramEdgeKind;
   file: string;
   line: number;
+  resolution?: CallResolutionStatus;
+  metadata?: Record<string, unknown>;
 }
 
 export interface AdapterExtractionInput {
@@ -235,12 +250,69 @@ export const solidityAstFactsAdapter: ProgramFactsAdapter = {
   name: "solidity-ast",
   languages: ["solidity"],
   license: "MIT",
-  role: "AST extraction for Solidity contracts, auth guards, state writes, transfers, and privileged primitives",
+  role: "Solidity AST symbol, guard, state read/write, resolved/external call, value-flow & precedence extraction (@solidity-parser/parser)",
   extract(input: AdapterExtractionInput): AdapterExtractionResult {
     const symbols: ProgramSymbol[] = [];
     const facts: ProgramFact[] = [];
     const edges: ProgramEdge[] = [];
 
+    const extractTypeName = (typeNode: any): string => {
+      if (!typeNode) return "";
+      if (typeNode.type === "ElementaryTypeName") return String(typeNode.name || "");
+      if (typeNode.type === "UserDefinedTypeName") return String(typeNode.namePath || "");
+      if (typeNode.type === "Mapping") return "mapping";
+      if (typeNode.type === "ArrayTypeName") return `${extractTypeName(typeNode.baseTypeName)}[]`;
+      return "";
+    };
+
+    const BUILTIN_CALLS = new Set([
+      "require",
+      "assert",
+      "revert",
+      "keccak256",
+      "sha256",
+      "ripemd160",
+      "ecrecover",
+      "addmod",
+      "mulmod",
+      "gasleft",
+      "blockhash",
+      "address",
+      "payable",
+      "uint256",
+      "uint128",
+      "uint64",
+      "uint32",
+      "uint8",
+      "int256",
+      "bytes32",
+      "bytes",
+      "string",
+      "bool",
+      "type",
+      "isContract",
+    ]);
+
+    const BUILTIN_RECEIVERS = new Set(["abi", "msg", "tx", "block", "type", "Math", "SafeMath"]);
+    const LOW_LEVEL_CALLS = new Set(["call", "delegatecall", "staticcall", "send", "transfer"]);
+    const AMOUNT_PARAM_RE = /(?:amount|amt|value|val|wad|shares?|assets?|qty|quantity|deposit|withdraw|tokens?|principal|debt|mint|burn|fee|reward)/i;
+    const ACCOUNTING_VAR_RE = /(?:balance|balances|totalSupply|totalAssets|totalDeposits|totalStaked|totalDebt|totalShares|shares|deposits|debt|principal|accrued|reserves|liquidity|rewards?|vault|pool|supply|allowance)/i;
+
+    type ParsedContractInfo = {
+      src: SourceSnapshot;
+      node: any;
+      contractName: string;
+      kind: ProgramSymbolKind;
+      bases: string[];
+      stateVars: Map<string, string>; // varName -> typeName
+      functions: Set<string>;
+      lines: string[];
+    };
+
+    const parsedContracts: ParsedContractInfo[] = [];
+    const contractsByName = new Map<string, ParsedContractInfo[]>();
+
+    // Pass 1: Parse all Solidity sources and build contract symbol tables
     for (const src of input.sources) {
       if (detectLanguage(src.path) !== "solidity") continue;
       let ast: any;
@@ -279,9 +351,11 @@ export const solidityAstFactsAdapter: ProgramFactsAdapter = {
           params: [],
         });
 
+        const bases: string[] = [];
         for (const base of node.baseContracts || []) {
           const baseName = base?.baseName?.namePath;
           if (baseName) {
+            bases.push(baseName);
             edges.push({
               from: contractName,
               to: baseName,
@@ -292,12 +366,14 @@ export const solidityAstFactsAdapter: ProgramFactsAdapter = {
           }
         }
 
-        const stateVars = new Set<string>();
+        const stateVars = new Map<string, string>();
+        const fnSet = new Set<string>();
         for (const sub of node.subNodes || []) {
           if (sub.type === "StateVariableDeclaration") {
             for (const v of sub.variables || []) {
               if (!v?.name) continue;
-              stateVars.add(v.name);
+              const typeName = extractTypeName(v.typeName);
+              stateVars.set(v.name, typeName);
               symbols.push({
                 id: stableId(["sym", src.path, contractName, v.name, sub.loc?.start?.line]),
                 language: "solidity",
@@ -308,232 +384,599 @@ export const solidityAstFactsAdapter: ProgramFactsAdapter = {
                 qualifiedName: `${contractName}.${v.name}`,
                 parent: contractName,
                 visibility: v.visibility || "internal",
+                returnType: typeName || undefined,
                 modifiers: [],
                 params: [],
               });
             }
+          } else if (sub.type === "FunctionDefinition" && sub.name) {
+            fnSet.add(sub.name);
           }
         }
 
-        if (kind !== "contract") continue;
+        const info: ParsedContractInfo = {
+          src,
+          node,
+          contractName,
+          kind,
+          bases,
+          stateVars,
+          functions: fnSet,
+          lines,
+        };
+        parsedContracts.push(info);
+        const list = contractsByName.get(contractName) || [];
+        list.push(info);
+        contractsByName.set(contractName, list);
+      }
+    }
 
-        for (const sub of node.subNodes || []) {
-          if (sub.type !== "FunctionDefinition" || !sub.body) continue;
-          const fnName: string = sub.isConstructor ? "constructor" : sub.isReceiveEther ? "receive" : sub.isFallback ? "fallback" : (sub.name || "");
-          if (!fnName) continue;
-          const visibility: string = sub.visibility || "public";
-          const mutability: string = sub.stateMutability || "";
-          const fnLine: number = sub.loc?.start?.line ?? contractLine;
-          const endLine: number = sub.loc?.end?.line ?? fnLine;
-          const modifiers: string[] = (sub.modifiers || []).map((m: any) => String(m?.name || "")).filter(Boolean);
-          const params: string[] = (sub.parameters || []).map((p: any) => String(p?.name || p?.typeName?.name || "arg"));
-          const qualifiedName = `${contractName}.${fnName}`;
+    const collectInheritedStateVars = (info: ParsedContractInfo): Map<string, string> => {
+      const merged = new Map<string, string>(info.stateVars);
+      const visited = new Set<string>([info.contractName]);
+      const queue = [...info.bases];
+      while (queue.length > 0) {
+        const baseName = queue.shift()!;
+        if (visited.has(baseName)) continue;
+        visited.add(baseName);
+        for (const baseInfo of contractsByName.get(baseName) || []) {
+          for (const [k, v] of baseInfo.stateVars) {
+            if (!merged.has(k)) merged.set(k, v);
+          }
+          for (const nextBase of baseInfo.bases) {
+            if (!visited.has(nextBase)) queue.push(nextBase);
+          }
+        }
+      }
+      return merged;
+    };
 
-          symbols.push({
-            id: stableId(["sym", src.path, qualifiedName, fnLine]),
-            language: "solidity",
+    const resolveInternalCallee = (
+      info: ParsedContractInfo,
+      callee: string,
+      superOnly = false,
+    ): { target: string; resolution: CallResolutionStatus } => {
+      if (!superOnly && info.functions.has(callee)) {
+        return { target: `${info.contractName}.${callee}`, resolution: "resolved" };
+      }
+      const matches = new Set<string>();
+      const visited = new Set<string>([info.contractName]);
+      const queue = [...info.bases];
+      while (queue.length > 0) {
+        const baseName = queue.shift()!;
+        if (visited.has(baseName)) continue;
+        visited.add(baseName);
+        for (const baseInfo of contractsByName.get(baseName) || []) {
+          if (baseInfo.functions.has(callee)) {
+            matches.add(`${baseInfo.contractName}.${callee}`);
+          }
+          for (const nextBase of baseInfo.bases) {
+            if (!visited.has(nextBase)) queue.push(nextBase);
+          }
+        }
+      }
+      if (matches.size === 1) {
+        return { target: [...matches][0], resolution: "resolved" };
+      }
+      if (matches.size > 1) {
+        return { target: `${info.contractName}.${callee}`, resolution: "ambiguous" };
+      }
+      return { target: callee, resolution: "unresolved" };
+    };
+
+    // Pass 2: Extract function facts, state reads/writes, resolved/external calls, value_flow & precedes
+    for (const info of parsedContracts) {
+      if (info.kind !== "contract") continue;
+      const { src, node, contractName, lines } = info;
+      const contractLine: number = node.loc?.start?.line ?? 1;
+      const allStateVars = collectInheritedStateVars(info);
+
+      // Track per-contract writers/readers to synthesize `precedes` edges
+      const fnWrites = new Map<string, { line: number; vars: Set<string>; increments: Set<string>; isEntry: boolean }>();
+      const fnReads = new Map<string, { line: number; vars: Set<string>; decrements: Set<string>; isEntry: boolean }>();
+
+      for (const sub of node.subNodes || []) {
+        if (sub.type !== "FunctionDefinition" || !sub.body) continue;
+        const fnName: string = sub.isConstructor
+          ? "constructor"
+          : sub.isReceiveEther
+            ? "receive"
+            : sub.isFallback
+              ? "fallback"
+              : (sub.name || "");
+        if (!fnName) continue;
+        const visibility: string = sub.visibility || "public";
+        const mutability: string = sub.stateMutability || "";
+        const fnLine: number = sub.loc?.start?.line ?? contractLine;
+        const endLine: number = sub.loc?.end?.line ?? fnLine;
+        const modifiers: string[] = (sub.modifiers || []).map((m: any) => String(m?.name || "")).filter(Boolean);
+        const paramTypes = new Map<string, string>();
+        const amountParams = new Set<string>();
+        const params: string[] = [];
+        for (const p of sub.parameters || []) {
+          const pName = String(p?.name || "");
+          const pType = extractTypeName(p?.typeName);
+          params.push(pName || pType || "arg");
+          if (pName) {
+            paramTypes.set(pName, pType);
+            if (/^u?int/i.test(pType) || AMOUNT_PARAM_RE.test(pName)) {
+              amountParams.add(pName);
+            }
+          }
+        }
+        const qualifiedName = `${contractName}.${fnName}`;
+
+        symbols.push({
+          id: stableId(["sym", src.path, qualifiedName, fnLine]),
+          language: "solidity",
+          file: src.path,
+          line: fnLine,
+          endLine,
+          kind: "function",
+          name: fnName,
+          qualifiedName,
+          parent: contractName,
+          visibility,
+          mutability,
+          modifiers,
+          params,
+        });
+
+        const isEntry =
+          !sub.isConstructor &&
+          (visibility === "public" || visibility === "external") &&
+          mutability !== "view" &&
+          mutability !== "pure";
+
+        const writtenVars = new Set<string>();
+        const readVars = new Set<string>();
+        const incrementedVars = new Set<string>();
+        const decrementedVars = new Set<string>();
+        const localVarTypes = new Map<string, string>(paramTypes);
+        const valueFlowTargets = new Set<string>();
+        let hasPrivilegedPrimitive = false;
+        let hasValueTransfer = false;
+        let hasMintOrBurn = false;
+        let hasConstraintGuard = false;
+        let privLine = fnLine;
+        let transferLine = fnLine;
+        let mintLine = fnLine;
+
+        const rootIdentName = (expr: any): string => {
+          if (!expr) return "";
+          if (expr.type === "Identifier") return String(expr.name || "");
+          if (expr.type === "IndexAccess") return rootIdentName(expr.base);
+          if (expr.type === "MemberAccess") return rootIdentName(expr.expression);
+          return "";
+        };
+
+        const exprReferencesValue = (expr: any): string | null => {
+          let found: string | null = null;
+          walkAst(expr, (n) => {
+            if (found) return;
+            if (n.type === "MemberAccess" && n.expression?.type === "Identifier" && n.expression.name === "msg" && n.memberName === "value") {
+              found = "msg.value";
+            } else if (n.type === "Identifier" && amountParams.has(String(n.name || ""))) {
+              found = String(n.name);
+            }
+          });
+          return found;
+        };
+
+        const collectReads = (expr: any) => {
+          walkAst(expr, (n) => {
+            if (n.type === "Identifier" && typeof n.name === "string" && allStateVars.has(n.name) && !localVarTypes.has(n.name)) {
+              readVars.add(n.name);
+            }
+          });
+        };
+
+        // Pre-scan local variable declarations for type tracking (e.g. IERC20 tok = ...)
+        walkAst(sub.body, (n) => {
+          if (n.type === "VariableDeclaration" && n.name) {
+            localVarTypes.set(String(n.name), extractTypeName(n.typeName));
+          }
+        });
+
+        walkAst(sub.body, (n) => {
+          const line = n.loc?.start?.line ?? fnLine;
+          if (n.type === "BinaryOperation" && ["=", "+=", "-=", "*=", "/="].includes(n.operator)) {
+            const target = rootIdentName(n.left);
+            if (target && allStateVars.has(target) && !localVarTypes.has(target)) {
+              writtenVars.add(target);
+              edges.push({
+                from: qualifiedName,
+                to: `${contractName}.${target}`,
+                kind: "writes_state",
+                file: src.path,
+                line,
+                resolution: "resolved",
+                metadata: { operator: n.operator },
+              });
+              if (n.operator === "+=") {
+                readVars.add(target);
+                incrementedVars.add(target);
+              } else if (n.operator === "-=") {
+                readVars.add(target);
+                decrementedVars.add(target);
+              } else if (n.operator === "=") {
+                // Detect `x = x + y` / `x = x - y`
+                if (n.right?.type === "BinaryOperation" && rootIdentName(n.right.left) === target) {
+                  if (n.right.operator === "+") incrementedVars.add(target);
+                  if (n.right.operator === "-") decrementedVars.add(target);
+                }
+              }
+              const valSrc = exprReferencesValue(n.right);
+              if (valSrc && (ACCOUNTING_VAR_RE.test(target) || mutability === "payable")) {
+                const vfKey = `${contractName}.${target}|${valSrc}`;
+                if (!valueFlowTargets.has(vfKey)) {
+                  valueFlowTargets.add(vfKey);
+                  edges.push({
+                    from: qualifiedName,
+                    to: `${contractName}.${target}`,
+                    kind: "value_flow",
+                    file: src.path,
+                    line,
+                    resolution: "resolved",
+                    metadata: { source: valSrc, operator: n.operator },
+                  });
+                }
+              }
+            }
+            // Collect reads from RHS and index expressions on LHS
+            collectReads(n.right);
+            if (n.left?.type === "IndexAccess") {
+              collectReads(n.left.index);
+            }
+          } else if (n.type === "UnaryOperation" && (n.operator === "++" || n.operator === "--" || n.operator === "delete")) {
+            const target = rootIdentName(n.subExpression);
+            if (target && allStateVars.has(target) && !localVarTypes.has(target)) {
+              writtenVars.add(target);
+              readVars.add(target);
+              if (n.operator === "++") incrementedVars.add(target);
+              if (n.operator === "--" || n.operator === "delete") decrementedVars.add(target);
+              edges.push({
+                from: qualifiedName,
+                to: `${contractName}.${target}`,
+                kind: "writes_state",
+                file: src.path,
+                line,
+                resolution: "resolved",
+                metadata: { operator: n.operator },
+              });
+            }
+          } else if (n.type === "IfStatement" && n.condition) {
+            collectReads(n.condition);
+          } else if (n.type === "ReturnStatement" && n.expression) {
+            collectReads(n.expression);
+          } else if (n.type === "FunctionCall") {
+            for (const arg of n.arguments || []) {
+              collectReads(arg);
+            }
+            const expr = n.expression;
+            const callee =
+              expr?.type === "Identifier"
+                ? String(expr.name || "")
+                : expr?.type === "MemberAccess"
+                  ? String(expr.memberName || "")
+                  : expr?.type === "NameValueExpression" && expr.expression?.type === "MemberAccess"
+                    ? String(expr.expression.memberName || "")
+                    : "";
+
+            if (callee) {
+              edges.push({ from: qualifiedName, to: callee, kind: "calls", file: src.path, line });
+            }
+
+            if (expr?.type === "Identifier" && callee && !BUILTIN_CALLS.has(callee)) {
+              const resolved = resolveInternalCallee(info, callee, false);
+              edges.push({
+                from: qualifiedName,
+                to: resolved.target,
+                kind: "calls_resolved",
+                file: src.path,
+                line,
+                resolution: resolved.resolution,
+              });
+            } else if (expr?.type === "MemberAccess" || (expr?.type === "NameValueExpression" && expr.expression?.type === "MemberAccess")) {
+              const ma = expr.type === "MemberAccess" ? expr : expr.expression;
+              const receiverName = rootIdentName(ma.expression);
+              if (receiverName === "super" && callee) {
+                const resolved = resolveInternalCallee(info, callee, true);
+                edges.push({
+                  from: qualifiedName,
+                  to: resolved.target,
+                  kind: "calls_resolved",
+                  file: src.path,
+                  line,
+                  resolution: resolved.resolution,
+                  metadata: { via: "super" },
+                });
+              } else if (receiverName === "this" && callee) {
+                const resolved = resolveInternalCallee(info, callee, false);
+                edges.push({
+                  from: qualifiedName,
+                  to: resolved.target,
+                  kind: "external_call",
+                  file: src.path,
+                  line,
+                  resolution: resolved.resolution,
+                  metadata: { receiver: "this" },
+                });
+              } else if (callee && !BUILTIN_RECEIVERS.has(receiverName)) {
+                const receiverType =
+                  localVarTypes.get(receiverName) ||
+                  allStateVars.get(receiverName) ||
+                  (ma.expression?.type === "FunctionCall" && ma.expression.expression?.type === "Identifier"
+                    ? String(ma.expression.expression.name || "")
+                    : "");
+                let resolution: CallResolutionStatus = "unresolved";
+                let target = receiverType ? `${receiverType}.${callee}` : `${receiverName || "unknown"}.${callee}`;
+                if (LOW_LEVEL_CALLS.has(callee) && (!receiverType || receiverType === "address" || receiverType === "payable")) {
+                  resolution = "unresolved";
+                  target = `${receiverName || "address"}.${callee}`;
+                } else if (receiverType && contractsByName.has(receiverType)) {
+                  const candidates = contractsByName.get(receiverType)!.filter((c) => c.functions.has(callee));
+                  if (candidates.length === 1) {
+                    resolution = "resolved";
+                    target = `${candidates[0].contractName}.${callee}`;
+                  } else if (candidates.length > 1) {
+                    resolution = "ambiguous";
+                  }
+                }
+                edges.push({
+                  from: qualifiedName,
+                  to: target,
+                  kind: "external_call",
+                  file: src.path,
+                  line,
+                  resolution,
+                  metadata: {
+                    receiver: receiverName || undefined,
+                    receiverType: receiverType || undefined,
+                    lowLevel: LOW_LEVEL_CALLS.has(callee) || undefined,
+                  },
+                });
+              }
+            }
+
+            if (callee === "delegatecall" || callee === "selfdestruct" || callee === "suicide") {
+              hasPrivilegedPrimitive = true;
+              privLine = line;
+            } else if (
+              /^(?:transfer|transferFrom|safeTransfer|safeTransferFrom|send|sendValue|withdraw|sweep|rescue)$/i.test(callee) ||
+              (callee === "call" && expr?.type === "NameValueExpression")
+            ) {
+              hasValueTransfer = true;
+              transferLine = line;
+              const valSrc = (n.arguments || []).map(exprReferencesValue).find(Boolean) || (mutability === "payable" ? "msg.value" : null);
+              if (valSrc) {
+                const vfKey = `call:${callee}|${valSrc}`;
+                if (!valueFlowTargets.has(vfKey)) {
+                  valueFlowTargets.add(vfKey);
+                  edges.push({
+                    from: qualifiedName,
+                    to: callee,
+                    kind: "value_flow",
+                    file: src.path,
+                    line,
+                    resolution: "resolved",
+                    metadata: { source: valSrc, sink: callee },
+                  });
+                }
+              }
+            } else if (/^(?:_?mint|_?burn|_?safeMint)$/i.test(callee)) {
+              hasMintOrBurn = true;
+              mintLine = line;
+            } else if (callee === "require" || callee === "isContract") {
+              hasConstraintGuard = true;
+            }
+          }
+        });
+
+        for (const rv of [...readVars].sort()) {
+          edges.push({
+            from: qualifiedName,
+            to: `${contractName}.${rv}`,
+            kind: "reads_state",
             file: src.path,
             line: fnLine,
-            endLine,
-            kind: "function",
-            name: fnName,
-            qualifiedName,
-            parent: contractName,
-            visibility,
-            mutability,
-            modifiers,
-            params,
+            resolution: "resolved",
           });
+        }
 
-          const isEntry = !sub.isConstructor && (visibility === "public" || visibility === "external") && mutability !== "view" && mutability !== "pure";
-          if (!isEntry) continue;
+        if (writtenVars.size > 0) {
+          fnWrites.set(qualifiedName, {
+            line: fnLine,
+            vars: writtenVars,
+            increments: incrementedVars,
+            isEntry,
+          });
+        }
+        if (readVars.size > 0) {
+          fnReads.set(qualifiedName, {
+            line: fnLine,
+            vars: readVars,
+            decrements: decrementedVars,
+            isEntry,
+          });
+        }
 
+        if (!isEntry) continue;
+
+        facts.push({
+          id: stableId(["fact", "entry_point", src.path, qualifiedName, fnLine]),
+          kind: "entry_point",
+          language: "solidity",
+          file: src.path,
+          line: fnLine,
+          symbol: qualifiedName,
+          severity: "info",
+          adapter: "solidity-ast",
+          detail: `${visibility} state-changing Solidity entrypoint ${qualifiedName}`,
+          metadata: { visibility, mutability, modifiers },
+        });
+
+        const fnSource = lines.slice(Math.max(0, fnLine - 1), Math.min(lines.length, endLine)).join("\n");
+        const hasAuthModifier = modifiers.some((m) => AUTH_MODIFIER_RE.test(m));
+        const hasInitModifier = modifiers.some((m) => INIT_MODIFIER_RE.test(m));
+        const hasInlineAuth = INLINE_AUTH_GUARD_RE.test(fnSource);
+        const isAuthGuarded = hasAuthModifier || hasInlineAuth;
+
+        if (isAuthGuarded) {
           facts.push({
-            id: stableId(["fact", "entry_point", src.path, qualifiedName, fnLine]),
-            kind: "entry_point",
+            id: stableId(["fact", "auth_guard", src.path, qualifiedName, fnLine]),
+            kind: "auth_guard",
             language: "solidity",
             file: src.path,
             line: fnLine,
             symbol: qualifiedName,
             severity: "info",
             adapter: "solidity-ast",
-            detail: `${visibility} state-changing Solidity entrypoint ${qualifiedName}`,
-            metadata: { visibility, mutability, modifiers },
+            detail: hasAuthModifier
+              ? `Authorization modifier(s): ${modifiers.filter((m) => AUTH_MODIFIER_RE.test(m)).join(", ")}`
+              : `Inline caller authorization check detected in ${qualifiedName}`,
+            metadata: { modifiers, hasInlineAuth },
           });
+        }
 
-          const fnSource = lines.slice(Math.max(0, fnLine - 1), Math.min(lines.length, endLine)).join("\n");
-          const hasAuthModifier = modifiers.some((m) => AUTH_MODIFIER_RE.test(m));
-          const hasInitModifier = modifiers.some((m) => INIT_MODIFIER_RE.test(m));
-          const hasInlineAuth = INLINE_AUTH_GUARD_RE.test(fnSource);
-          const isAuthGuarded = hasAuthModifier || hasInlineAuth;
+        if (/^(?:initialize|init|__[A-Za-z0-9_]+_init)$/i.test(fnName)) {
+          facts.push({
+            id: stableId(["fact", "initializer", src.path, qualifiedName, fnLine]),
+            kind: "initializer",
+            language: "solidity",
+            file: src.path,
+            line: fnLine,
+            symbol: qualifiedName,
+            severity: hasInitModifier || isAuthGuarded ? "low" : "high",
+            adapter: "solidity-ast",
+            detail: `Initializer function ${qualifiedName} (${hasInitModifier ? "guarded by initializer modifier" : "no initializer modifier detected"})`,
+            metadata: { hasInitModifier, isAuthGuarded },
+          });
+        }
 
-          if (isAuthGuarded) {
+        if (writtenVars.size > 0) {
+          facts.push({
+            id: stableId(["fact", "state_write", src.path, qualifiedName, fnLine]),
+            kind: "state_write",
+            language: "solidity",
+            file: src.path,
+            line: fnLine,
+            symbol: qualifiedName,
+            severity: "info",
+            adapter: "solidity-ast",
+            detail: `${qualifiedName} writes state variable(s): ${[...writtenVars].sort().join(", ")}`,
+            metadata: { variables: [...writtenVars].sort(), isAuthGuarded },
+          });
+          if (!isAuthGuarded && !hasInitModifier) {
             facts.push({
-              id: stableId(["fact", "auth_guard", src.path, qualifiedName, fnLine]),
-              kind: "auth_guard",
+              id: stableId(["fact", "unguarded_mutation", src.path, qualifiedName, fnLine]),
+              kind: "unguarded_mutation",
               language: "solidity",
               file: src.path,
               line: fnLine,
               symbol: qualifiedName,
-              severity: "info",
+              severity: "medium",
               adapter: "solidity-ast",
-              detail: hasAuthModifier
-                ? `Authorization modifier(s): ${modifiers.filter((m) => AUTH_MODIFIER_RE.test(m)).join(", ")}`
-                : `Inline caller authorization check detected in ${qualifiedName}`,
-              metadata: { modifiers, hasInlineAuth },
+              detail: `${qualifiedName} mutates state (${[...writtenVars].sort().join(", ")}) without an explicit auth modifier or inline sender check`,
+              metadata: { variables: [...writtenVars].sort() },
             });
           }
+        }
 
-          if (/^(?:initialize|init|__[A-Za-z0-9_]+_init)$/i.test(fnName)) {
-            facts.push({
-              id: stableId(["fact", "initializer", src.path, qualifiedName, fnLine]),
-              kind: "initializer",
-              language: "solidity",
-              file: src.path,
-              line: fnLine,
-              symbol: qualifiedName,
-              severity: hasInitModifier || isAuthGuarded ? "low" : "high",
-              adapter: "solidity-ast",
-              detail: hasInitModifier || isAuthGuarded
-                ? `Guarded initializer ${qualifiedName} (${modifiers.join(", ") || "inline check"})`
-                : `Initializer ${qualifiedName} lacks initializer/reinitializer or explicit caller guard`,
-              metadata: { hasInitModifier, isAuthGuarded, modifiers },
-            });
-          }
-
-          const writtenVars = new Set<string>();
-          let hasValueTransfer = false;
-          let hasMintOrBurn = false;
-          let hasPrivilegedPrimitive = false;
-          let hasConstraintGuard = false;
-          let transferLine = fnLine;
-          let mintLine = fnLine;
-          let privLine = fnLine;
-
-          walkAst(sub.body, (n: any) => {
-            const line = n?.loc?.start?.line ?? fnLine;
-            if (n.type === "BinaryOperation" && ["=", "+=", "-=", "*=", "/="].includes(n.operator)) {
-              let lhs = n.left;
-              while (lhs && (lhs.type === "IndexAccess" || lhs.type === "MemberAccess")) {
-                lhs = lhs.base ?? lhs.expression;
-              }
-              if (lhs?.type === "Identifier" && stateVars.has(lhs.name)) {
-                writtenVars.add(lhs.name);
-                edges.push({ from: qualifiedName, to: `${contractName}.${lhs.name}`, kind: "writes_state", file: src.path, line });
-              }
-            }
-            if (n.type === "FunctionCall") {
-              const expr = n.expression;
-              const callee =
-                expr?.type === "Identifier" ? expr.name
-                : expr?.type === "MemberAccess" ? expr.memberName
-                : expr?.type === "NameValueExpression" && expr.expression?.type === "MemberAccess" ? expr.expression.memberName
-                : "";
-              if (callee) {
-                edges.push({ from: qualifiedName, to: callee, kind: "calls", file: src.path, line });
-              }
-              if (callee === "delegatecall" || callee === "selfdestruct" || callee === "suicide") {
-                hasPrivilegedPrimitive = true;
-                privLine = line;
-              } else if (/^(?:transfer|transferFrom|safeTransfer|safeTransferFrom|send|sendValue|withdraw|sweep|rescue)$/i.test(callee) ||
-                         (callee === "call" && expr?.type === "NameValueExpression")) {
-                hasValueTransfer = true;
-                transferLine = line;
-              } else if (/^(?:_?mint|_?burn|_?safeMint)$/i.test(callee)) {
-                hasMintOrBurn = true;
-                mintLine = line;
-              } else if (callee === "require" || callee === "isContract") {
-                hasConstraintGuard = true;
-              }
-            }
+        if (hasPrivilegedPrimitive) {
+          facts.push({
+            id: stableId(["fact", "privileged_primitive", src.path, qualifiedName, privLine]),
+            kind: "privileged_primitive",
+            language: "solidity",
+            file: src.path,
+            line: privLine,
+            symbol: qualifiedName,
+            severity: isAuthGuarded ? "medium" : "critical",
+            adapter: "solidity-ast",
+            detail: `${qualifiedName} invokes delegatecall/selfdestruct (${isAuthGuarded ? "auth-guarded" : "unguarded"})`,
+            metadata: { isAuthGuarded },
           });
+        }
 
-          if (writtenVars.size > 0) {
-            facts.push({
-              id: stableId(["fact", "state_write", src.path, qualifiedName, fnLine]),
-              kind: "state_write",
-              language: "solidity",
-              file: src.path,
-              line: fnLine,
-              symbol: qualifiedName,
-              severity: "info",
-              adapter: "solidity-ast",
-              detail: `${qualifiedName} writes state variable(s): ${[...writtenVars].sort().join(", ")}`,
-              metadata: { variables: [...writtenVars].sort(), isAuthGuarded },
-            });
-            if (!isAuthGuarded && !hasInitModifier) {
-              facts.push({
-                id: stableId(["fact", "unguarded_mutation", src.path, qualifiedName, fnLine]),
-                kind: "unguarded_mutation",
-                language: "solidity",
+        if (hasValueTransfer) {
+          facts.push({
+            id: stableId(["fact", "value_transfer", src.path, qualifiedName, transferLine]),
+            kind: "value_transfer",
+            language: "solidity",
+            file: src.path,
+            line: transferLine,
+            symbol: qualifiedName,
+            severity: isAuthGuarded ? "low" : "high",
+            adapter: "solidity-ast",
+            detail: `${qualifiedName} transfers ETH/tokens (${isAuthGuarded ? "auth-guarded" : "no explicit auth guard"})`,
+            metadata: { isAuthGuarded },
+          });
+        }
+
+        if (hasMintOrBurn) {
+          facts.push({
+            id: stableId(["fact", "mint_or_burn", src.path, qualifiedName, mintLine]),
+            kind: "mint_or_burn",
+            language: "solidity",
+            file: src.path,
+            line: mintLine,
+            symbol: qualifiedName,
+            severity: isAuthGuarded ? "low" : "high",
+            adapter: "solidity-ast",
+            detail: `${qualifiedName} invokes mint/burn primitive (${isAuthGuarded ? "auth-guarded" : "no explicit auth guard"})`,
+            metadata: { isAuthGuarded },
+          });
+        }
+
+        if (hasConstraintGuard) {
+          facts.push({
+            id: stableId(["fact", "constraint_guard", src.path, qualifiedName, fnLine]),
+            kind: "constraint_guard",
+            language: "solidity",
+            file: src.path,
+            line: fnLine,
+            symbol: qualifiedName,
+            severity: "info",
+            adapter: "solidity-ast",
+            detail: `${qualifiedName} enforces runtime require/isContract precondition(s)`,
+          });
+        }
+      }
+
+      // Pass 3: Synthesize source-supported `precedes` edges between state writers and consumers
+      const precedesSeen = new Set<string>();
+      for (const [writerFn, wInfo] of fnWrites) {
+        if (!wInfo.isEntry) continue;
+        for (const [readerFn, rInfo] of fnReads) {
+          if (!rInfo.isEntry || writerFn === readerFn) continue;
+          const shared: string[] = [];
+          for (const v of wInfo.vars) {
+            if (!rInfo.vars.has(v)) continue;
+            // Prioritize directional producer->consumer pairs (e.g. increment -> decrement, or write -> read-only/guard)
+            const producerToConsumer =
+              (wInfo.increments.has(v) && rInfo.decrements.has(v)) ||
+              (wInfo.vars.has(v) && !fnWrites.get(readerFn)?.vars.has(v));
+            if (producerToConsumer) {
+              shared.push(v);
+            }
+          }
+          if (shared.length > 0) {
+            const key = `${writerFn}|${readerFn}`;
+            if (!precedesSeen.has(key)) {
+              precedesSeen.add(key);
+              edges.push({
+                from: writerFn,
+                to: readerFn,
+                kind: "precedes",
                 file: src.path,
-                line: fnLine,
-                symbol: qualifiedName,
-                severity: "medium",
-                adapter: "solidity-ast",
-                detail: `${qualifiedName} mutates state (${[...writtenVars].sort().join(", ")}) without an explicit auth modifier or inline sender check`,
-                metadata: { variables: [...writtenVars].sort() },
+                line: wInfo.line,
+                resolution: "resolved",
+                metadata: {
+                  contract: contractName,
+                  stateVars: shared.sort().map((v) => `${contractName}.${v}`),
+                },
               });
             }
-          }
-
-          if (hasPrivilegedPrimitive) {
-            facts.push({
-              id: stableId(["fact", "privileged_primitive", src.path, qualifiedName, privLine]),
-              kind: "privileged_primitive",
-              language: "solidity",
-              file: src.path,
-              line: privLine,
-              symbol: qualifiedName,
-              severity: isAuthGuarded ? "medium" : "critical",
-              adapter: "solidity-ast",
-              detail: `${qualifiedName} invokes delegatecall/selfdestruct (${isAuthGuarded ? "auth-guarded" : "unguarded"})`,
-              metadata: { isAuthGuarded },
-            });
-          }
-
-          if (hasValueTransfer) {
-            facts.push({
-              id: stableId(["fact", "value_transfer", src.path, qualifiedName, transferLine]),
-              kind: "value_transfer",
-              language: "solidity",
-              file: src.path,
-              line: transferLine,
-              symbol: qualifiedName,
-              severity: isAuthGuarded ? "low" : "high",
-              adapter: "solidity-ast",
-              detail: `${qualifiedName} transfers ETH/tokens (${isAuthGuarded ? "auth-guarded" : "no explicit auth guard"})`,
-              metadata: { isAuthGuarded },
-            });
-          }
-
-          if (hasMintOrBurn) {
-            facts.push({
-              id: stableId(["fact", "mint_or_burn", src.path, qualifiedName, mintLine]),
-              kind: "mint_or_burn",
-              language: "solidity",
-              file: src.path,
-              line: mintLine,
-              symbol: qualifiedName,
-              severity: isAuthGuarded ? "low" : "critical",
-              adapter: "solidity-ast",
-              detail: `${qualifiedName} performs mint/burn operation (${isAuthGuarded ? "auth-guarded" : "no explicit auth guard"})`,
-              metadata: { isAuthGuarded },
-            });
-          }
-
-          if (hasConstraintGuard) {
-            facts.push({
-              id: stableId(["fact", "constraint_guard", src.path, qualifiedName, fnLine]),
-              kind: "constraint_guard",
-              language: "solidity",
-              file: src.path,
-              line: fnLine,
-              symbol: qualifiedName,
-              severity: "info",
-              adapter: "solidity-ast",
-              detail: `${qualifiedName} enforces runtime require/isContract precondition(s)`,
-            });
           }
         }
       }
