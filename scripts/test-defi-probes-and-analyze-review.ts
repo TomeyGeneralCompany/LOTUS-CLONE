@@ -332,8 +332,12 @@ contract PlainVault {
       assert.ok(Array.isArray(payload.format?.properties?.leadId?.enum) && payload.format.properties.leadId.enum.length === 1,
         "ANALYZE format must pin leadId to exact pending enum instead of 64-char regex");
       const packetText=payload.messages.map((m:any)=>String(m.content||'')).join('\n');
-      const leadIdMatch=packetText.match(/"id":"([a-f0-9]{64})","path":"(source-[^"]+\.sol)","selector":"([^"]+)"/);
-      assert.ok(leadIdMatch,'A model action must be scoped to a source-hashed lead packet');
+      // The conversation includes previous lead packets. Follow the controller's
+      // *current* immutable leadId constraint, not the first historical packet.
+      const pinnedLeadId=payload.format.properties.leadId.enum[0] as string;
+      const leadIdMatch=[...packetText.matchAll(/"id":"([a-f0-9]{64})","path":"(source-[^"]+\.sol)","selector":"([^"]+)"/g)]
+        .find(match=>match[1]===pinnedLeadId);
+      assert.ok(leadIdMatch,'The pinned pending lead must have a source-hashed packet in the transcript');
       const [,leadId,leadPath,selector]=leadIdMatch;
       const method=selector.split('.').at(-1);
       // Assess every source-backed lead; only the owner-gated deposit admits
