@@ -94,8 +94,8 @@ contract Vault is Parent {
     assert.equal(JSON.parse(result).outcome,'no_testable_candidate');
     assert.ok(readCount>0,'Deterministic inspection must actually read the source');
     const log=await readFile(join(root,'deterministic.log'),'utf8');
-    assert.match(log,/\\[DETERMINISTIC_DRIVER_ACTION\\]/);
-    assert.doesNotMatch(log,/\\[MODEL_REQUEST_RECOVERY\\]/);
+    assert.match(log,/\[DETERMINISTIC_DRIVER_ACTION\]/);
+    assert.doesNotMatch(log,/\[MODEL_REQUEST_RECOVERY\]/);
   } finally {
     for(const [key,value] of Object.entries({
       LOCAL_MODEL_ADAPTER:oldAdapter,LOCAL_OLLAMA_TOOL_PROTOCOL:oldProtocol,
