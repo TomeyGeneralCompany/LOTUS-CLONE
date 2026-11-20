@@ -177,6 +177,11 @@ contract GuardedVault is Ownable {
   function setFee(uint256 nextFee) external onlyOwner {
     fee = nextFee;
   }
+  // An eligible, non-setter entrypoint keeps ANALYZE non-empty so this
+  // integration case proves the deterministic driver actually executes.
+  function recordNothing(uint256 amount) external {
+    require(amount == 0, "no state change");
+  }
 }
 `;
     await writeFile(join(repoDir, "GuardedVault.sol"), vaultSource, "utf8");
