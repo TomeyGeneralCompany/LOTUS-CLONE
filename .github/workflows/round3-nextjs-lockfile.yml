@@ -1,0 +1,50 @@
+name: Round 3 one-time Next.js lockfile repair
+on:
+  push:
+    branches:
+      - repair/round3-exhaustive-deterministic-laptop
+    paths:
+      - packages/dashboard/package.json
+permissions:
+  contents: write
+jobs:
+  patch-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Resolve exact patched Next.js in npm lockfile
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(node -p 'require("./packages/dashboard/package.json").dependencies.next')" = "15.5.29"
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          node - <<'NODE'
+          const fs=require('fs');
+          const pkg=require('./package-lock.json').packages;
+          if(pkg['node_modules/next']?.version!=='15.5.29')throw Error('Next.js lockfile version incorrect');
+          if(pkg['node_modules/@next/env']?.version!=='15.5.29')throw Error('Next.js env lockfile version incorrect');
+          for(const [path,entry] of Object.entries(pkg)){
+            if(path.startsWith('node_modules/@next/swc-')&&entry.version!=='15.5.29')
+              throw Error('Stale Next.js SWC binding: '+path);
+          }
+          console.log('Exact Next.js 15.5.29 and matching platform bindings resolved');
+          NODE
+          npm ci
+          npm audit --audit-level=moderate
+          npx tsc --noEmit --project tsconfig.json
+      - name: Commit only dashboard dependency, regenerated lockfile, and remove temporary workflow
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -- .github/workflows/round3-nextjs-lockfile.yml
+          git add -- package-lock.json
+          test "$(git diff --cached --name-only | grep -E -v '^(package-lock.json|.github/workflows/round3-nextjs-lockfile.yml)$' | wc -l)" -eq 0
+          git commit -m "Round 3: lock Next.js security patch 15.5.29 and remove temporary resolver"
+          git push origin HEAD:repair/round3-exhaustive-deterministic-laptop
