@@ -7,7 +7,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE = ROOT / ".autohack-next-stage"
@@ -16,7 +15,7 @@ checks = {}
 def executable(name):
     checks[name] = shutil.which(name) or "missing"
 
-for tool in ("node", "npm", "python3", "git", "ollama", "bwrap", "podman", "docker"):
+for tool in ("node", "npm", "python3", "git", "bwrap", "podman", "docker"):
     executable(tool)
 
 checks["node_modules"] = (ROOT / "node_modules").is_dir()
@@ -35,13 +34,7 @@ checks["workers"] = {
         "evidence": "autonomous/worker.py",
     }.items()
 }
-try:
-    request = urllib.request.Request("http://127.0.0.1:11434/api/tags")
-    with urllib.request.urlopen(request, timeout=3) as response:
-        models = json.load(response).get("models", [])
-    checks["ollama_models"] = [m.get("name") for m in models if isinstance(m, dict)]
-except Exception as exc:
-    checks["ollama_models"] = f"unavailable: {type(exc).__name__}"
+checks["analysis_engine"] = "deterministic (no local model service required)"
 try:
     cfg = json.loads((STAGE / "research-engine/config.json").read_text())
     checks["research_model"] = cfg.get("model")
