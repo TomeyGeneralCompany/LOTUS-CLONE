@@ -5,6 +5,7 @@ on:
       - repair/round3-exhaustive-deterministic-laptop
     paths:
       - packages/dashboard/package.json
+      - .github/workflows/round3-nextjs-lockfile.yml
 permissions:
   contents: write
 jobs:
@@ -22,7 +23,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           test "$(node -p 'require("./packages/dashboard/package.json").dependencies.next')" = "15.5.29"
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --workspace=@bounty/dashboard next@15.5.29 --save-exact
           node - <<'NODE'
           const fs=require('fs');
           const pkg=require('./package-lock.json').packages;
