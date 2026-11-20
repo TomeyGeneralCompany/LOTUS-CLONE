@@ -74,14 +74,11 @@ export function killActiveSecurityProcess(): boolean {
 function getClaudeEnv() {
   const config = getConfig();
   const env = { ...process.env };
-  if (isDeterministicMode()) {
-    env.ANTHROPIC_BASE_URL = "http://127.0.0.1:11434";
-    env.ANTHROPIC_AUTH_TOKEN = "ollama";
-    env.ANTHROPIC_API_KEY = "ollama";
-    env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-  } else if (config.CLAUDE_BACKEND === "cli") {
-    delete env.ANTHROPIC_API_KEY;
-  }
+  // The production controller is deterministic; never introduce a model
+  // endpoint or fabricated credentials through the legacy CLI environment.
+  delete env.ANTHROPIC_BASE_URL;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  if (config.CLAUDE_BACKEND === "cli") delete env.ANTHROPIC_API_KEY;
   return env;
 }
 
