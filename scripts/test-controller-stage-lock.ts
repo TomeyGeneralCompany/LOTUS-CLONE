@@ -48,13 +48,13 @@ async function run(){
  for(const [id,selector] of [[idA,'Analysis.deposit'],[idB,'Analysis.withdraw']]){
    assessed.registerAnalysisLead({id,sourceCommit:commit,sourceSha256:hash(content),path:source,selector});
  }
- assert.throws(()=>assessed.completeAnalysis(),new RegExp(idA));
+ assert.throws(()=>assessed.completeAnalysis(),/ANALYSIS_INVENTORY_INCOMPLETE/);
  assert.equal(assessed.analysisProgress.pendingIds.length,2);
  const cited=source+':0-'+content.length+':'+hash(content);
  assessed.recordLeadAssessment(idA,{kind:'assessed',sourceEvidence:[cited],
    hypothesis:'An unauthorized sender changes protected state',disposition:'test',
    reason:'Controller inspected the exact declaration and authorized caller guard'},'model');
- assert.throws(()=>assessed.completeAnalysis(),new RegExp(idB));
+ assert.throws(()=>assessed.completeAnalysis(),/ANALYSIS_INVENTORY_INCOMPLETE/);
  assessed.recordLeadAssessment(idB,{kind:'assessed',sourceEvidence:[cited],
    hypothesis:'No testable property established',disposition:'defer',
    reason:'No valid fixture for a full state transition is proven by source'},'model');
@@ -70,7 +70,7 @@ async function run(){
  unavailable.noteSourcePreclassified(source,'indexed-options-built');
  unavailable.registerAnalysisInventory([idA]);
  unavailable.registerAnalysisLead({id:idA,sourceCommit:commit,sourceSha256:hash(content),path:source,selector:'Analysis.deposit'});
- assert.throws(()=>unavailable.completeAnalysis(),/ANALYSIS_INCOMPLETE/);
+ assert.throws(()=>unavailable.completeAnalysis(),/ANALYSIS_INVENTORY_INCOMPLETE/);
  unavailable.completeAnalysis('partial','qwen_model_unavailable_after_bounded_retries');
  assert.equal(unavailable.recordedAnalysisCertificate?.pendingIds[0],idA);
  assert.equal(unavailable.recordedAnalysisCertificate?.status,'partial');
