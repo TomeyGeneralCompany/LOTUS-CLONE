@@ -23,9 +23,9 @@ import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequi
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { postOllamaChat } from "../../core/src/ollama-chat";
-import { driveDeterministicAuditTurn, resolveLocalModelAdapter, type ClosedLoopLeadResult, type EscalationCache } from "./deterministic";
+import { buildAnalysisCandidateQueue, driveDeterministicAuditTurn, resolveLocalModelAdapter, type ClosedLoopLeadResult, type EscalationCache } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
-import { readFile, realpath, appendFile, writeFile, rename, mkdtemp } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
@@ -821,7 +821,7 @@ export async function runLocalAudit(
                   });
                 if(unqueuedNonSetters.length){
                   totalUnqueuedNonSetters+=unqueuedNonSetters.length;
-                  nonMockSolSummaries.push({path,unqueuedNonSetters:unqueuedNonSetters.slice(0,8)});
+                  nonMockSolSummaries.push({path,unqueuedNonSetters});
                 }
               }
             } else {
@@ -890,37 +890,77 @@ export async function runLocalAudit(
         // the fully preserved source inventory and controller experiment queue.
         // Derive the real acquired repository SHA from its checked-out source,
         // not from a model guess or the LOTUS application commit.
-        const rankedUnqueued=[...nonMockSolSummaries].sort((a,b)=>{
-          const score=(item:typeof a)=>solLeads.filter(lead=>lead.path===item.path).length;
-          return score(b)-score(a);
-        });
-        for(const item of rankedUnqueued.slice(0,6)){
-          const selector=item.unqueuedNonSetters[0];
+        // Build the complete deterministic function-level candidate inventory across
+        // ALL unqueued non-setters, persist it alongside the log, and admit a scored,
+        // bounded batch while keeping remaining candidates queued for later passes.
+        const commitByDir=new Map<string,string>();
+        const candidateSourceItems:Array<{path:string;sourceCommit:string;sourceContent:string;unqueuedSelectors:string[]}>=[];
+        for(const item of nonMockSolSummaries){
           const content=accessibleSoliditySources.get(item.path);
-          if(!selector||!content)continue;
+          if(!content||!item.unqueuedNonSetters.length)continue;
           const full=await safePath(item.path);
-          let sourceCommit='';
-          try {sourceCommit=execFileSync('git',['-c','core.hooksPath=/dev/null','rev-parse','HEAD'],
-            {cwd:dirname(full),encoding:'utf8',timeout:5000}).trim();}
-          catch{}
-          if(!/^[a-f0-9]{40}$/.test(sourceCommit)){
-            await appendFile(logFile,'[ANALYSIS_LEAD_BLOCKED] '+JSON.stringify({
-              path:item.path,selector,reason:'acquired_repository_commit_unavailable'})+'\n');
-            continue;
+          const dirKey=dirname(full);
+          let sourceCommit=commitByDir.get(dirKey)??'';
+          if(!commitByDir.has(dirKey)){
+            try {sourceCommit=execFileSync('git',['-c','core.hooksPath=/dev/null','rev-parse','HEAD'],
+              {cwd:dirKey,encoding:'utf8',timeout:5000}).trim();}
+            catch{sourceCommit='';}
+            commitByDir.set(dirKey,sourceCommit);
           }
-          const method=selector.split('.').pop()||'';
-          const match=new RegExp('\\bfunction\\s+'+method.replace(/[^A-Za-z0-9_]/g,'')+'\\s*\\(').exec(content);
-          if(!match)continue;
-          const start=Math.max(0,match.index-160),end=Math.min(content.length,match.index+1100);
-          const sourceSha256=createHash('sha256').update(content).digest('hex');
-          const id=createHash('sha256').update(JSON.stringify([sourceCommit,sourceSha256,item.path,selector])).digest('hex');
-          const sourceEvidence=item.path+':'+start+'-'+end+':'+sourceSha256;
-          stageLock.registerAnalysisLead({id,sourceCommit,sourceSha256,path:item.path,selector});
-          analysisPackets.set(id,{id,path:item.path,selector,sourceCommit,sourceSha256,
-            sourceEvidence,sourceExcerpt:content.slice(start,end),excerptStart:start,truncated:end<content.length});
+          candidateSourceItems.push({
+            path:item.path,
+            sourceCommit,
+            sourceContent:content,
+            unqueuedSelectors:item.unqueuedNonSetters,
+          });
+        }
+        const envMaxLeads=Number(process.env.LOCAL_ANALYZE_MAX_LEADS??18);
+        const maxAdmittedLeads=Number.isSafeInteger(envMaxLeads)&&envMaxLeads>=1?Math.min(envMaxLeads,64):18;
+        const envMaxPerFile=Number(process.env.LOCAL_ANALYZE_MAX_PER_FILE??4);
+        const maxPerFileLeads=Number.isSafeInteger(envMaxPerFile)&&envMaxPerFile>=1?Math.min(envMaxPerFile,16):4;
+        const candidateQueue=buildAnalysisCandidateQueue({
+          items:candidateSourceItems,
+          staticLeads:solLeads,
+          maxAdmitted:maxAdmittedLeads,
+          maxPerFile:maxPerFileLeads,
+        });
+        for(const blocked of candidateQueue.blocked){
+          await appendFile(logFile,'[ANALYSIS_LEAD_BLOCKED] '+JSON.stringify(blocked)+'\n');
+        }
+        try {
+          await writeFile(logFile+'.analysis-candidates.json',JSON.stringify({
+            totalCandidates:candidateQueue.inventory.length,
+            admittedCount:candidateQueue.admitted.length,
+            queuedCount:candidateQueue.queued.length,
+            blockedCount:candidateQueue.blocked.length,
+            candidates:candidateQueue.inventory.map(({sourceExcerpt:_ex,...rest})=>rest),
+          },null,2),{mode:0o600});
+        }catch{}
+        await appendFile(logFile,'[ANALYSIS_CANDIDATE_INVENTORY] '+JSON.stringify({
+          totalCandidates:candidateQueue.inventory.length,
+          admittedCount:candidateQueue.admitted.length,
+          queuedCount:candidateQueue.queued.length,
+          blockedCount:candidateQueue.blocked.length,
+          maxAdmittedLeads,
+          maxPerFileLeads,
+        })+'\n');
+        for(const cand of candidateQueue.admitted){
+          stageLock.registerAnalysisLead({
+            id:cand.id,sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
+            path:cand.path,selector:cand.selector,
+          });
+          analysisPackets.set(cand.id,{
+            id:cand.id,path:cand.path,selector:cand.selector,
+            sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
+            sourceEvidence:cand.sourceEvidence,sourceExcerpt:cand.sourceExcerpt,
+            excerptStart:cand.excerptStart,truncated:cand.truncated,
+          });
           await appendFile(logFile,'[ANALYSIS_LEAD_SELECTED] '+JSON.stringify({
-            id,path:item.path,selector,sourceCommit,sourceSha256,sourceEvidence,
-            priority:solLeads.filter(lead=>lead.path===item.path).length})+'\n');
+            id:cand.id,path:cand.path,selector:cand.selector,
+            sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
+            sourceEvidence:cand.sourceEvidence,priority:cand.priority,
+            staticLeadIds:cand.staticLeadIds,selectionReasons:cand.selectionReasons,
+          })+'\n');
         }
         // Four Qwen turns were insufficient to correct even one rejected
         // sequence. Preserve a configurable bounded window without treating

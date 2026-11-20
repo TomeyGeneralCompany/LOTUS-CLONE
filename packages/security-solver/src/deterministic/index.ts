@@ -1,4 +1,12 @@
 export {
+  buildAnalysisCandidateQueue,
+  type AnalysisCandidate,
+  type AnalysisCandidateQueueOptions,
+  type AnalysisCandidateQueueResult,
+  type AnalysisCandidateSourceItem,
+} from "./analysis-candidate-queue";
+
+export {
   buildProgramFactsGraph,
   createHostFactsAdapters,
   detectAvailableAdapters,
