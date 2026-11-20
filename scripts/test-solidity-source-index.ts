@@ -1,13 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createServer } from 'node:http';
 import { SoliditySourceIndex } from '../packages/security-solver/src/solidity-source-index';
 import { SourceReads } from '../packages/security-solver/src/source-inspection';
 import { runLocalAudit } from '../packages/security-solver/src/local-ollama-runner';
 const root=await mkdtemp(join(tmpdir(),'solidity-index-'));
-const server=createServer();
 try {
   const base='pragma solidity ^0.8.20; contract Base { mapping(address=>uint) internal balances; bool locked; modifier nonReentrant() { require(!locked); locked=true; _; locked=false; } function helper(uint x) internal pure returns(uint) { return x; } }';
   const source=`// Unicode before declarations: café 🦆\npragma solidity ^0.8.20;
@@ -71,41 +69,40 @@ contract Vault is Parent {
   await writeFile(join(root,'Cycle.sol'),'import * as B from "./CycleBase.sol"; contract Cycle is B.CycleBase { function f() external {} }');
   await writeFile(join(root,'CycleBase.sol'),'import "./Cycle.sol"; contract CycleBase { uint value; }');
   assert.ok((await index.context(join(root,'Cycle.sol'),'Cycle.f',0,4000)).excerpts.some(x=>x.path==='CycleBase.sol'&&x.text.includes('uint value')));
-  // Exercise both production model protocols. An outline alone is not a source read.
+  // Exercise the production deterministic runner without an obsolete model server.
+  // An outline alone must not be counted as a source read.
   await writeFile(join(root,'Tiny.sol'),'contract Tiny { uint value; function set(uint x) external { value=x; } }');
-  for(const protocol of ['json','native']) {
-    process.env.LOCAL_OLLAMA_TOOL_PROTOCOL=protocol;let calls=0,readCount=0;
-    server.removeAllListeners('request');
-    server.on('request',async(req,res)=>{
-      let raw='';for await(const chunk of req)raw+=chunk;const request=JSON.parse(raw);calls++;
-      if(calls===2)assert.equal(readCount,0,'Outline must not establish evidence');
-      if(calls===3)assert.match(request.messages.at(-1).content,/No source file has been successfully read/);
-      if(calls===4)assert.ok(readCount>0);
-      const name=calls===1?'outline_solidity':calls===3?'read_solidity':'final';
-      const args={path:'Tiny.sol',query:'Tiny.set',offset:0};
-      res.end(JSON.stringify({message:protocol==='json'?{role:'assistant',content:JSON.stringify({action:name,...args,answer:'DONE'})}:
-        name==='final'?{role:'assistant',content:'DONE'}:{role:'assistant',content:'',tool_calls:[{function:{name,arguments:args}}]}}));
-    });
-    if(!server.listening)await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
-    process.env.AUTOHACK_OLLAMA_URL=`http://127.0.0.1:${(server.address() as any).port}/api/chat`;
-    assert.equal(await runLocalAudit('Inspect Tiny.sol',join(root,protocol+'.log'),15000,root,'mock',undefined,
-      {numCtx:8192,numPredict:128,onRead:(path,span)=>{assert.equal(path,'Tiny.sol');assert.ok(span.end>span.start);readCount++;}}),'DONE');
-    assert.equal(calls,4);
+  const oldAdapter=process.env.LOCAL_MODEL_ADAPTER;
+  const oldProtocol=process.env.LOCAL_OLLAMA_TOOL_PROTOCOL;
+  const oldUrl=process.env.AUTOHACK_OLLAMA_URL;
+  try {
+    process.env.LOCAL_MODEL_ADAPTER='deterministic';
+    process.env.LOCAL_OLLAMA_TOOL_PROTOCOL='json';
+    process.env.AUTOHACK_OLLAMA_URL='http://127.0.0.1:1/api/chat';
+    let readCount=0;
+    const result=await runLocalAudit('Inspect Tiny.sol',join(root,'deterministic.log'),30000,root,
+      'deterministic',undefined,{
+        numCtx:8192,numPredict:512,numThreads:1,maxTurns:12,
+        initialSourcePaths:['Tiny.sol'],
+        onRead:(path,span)=>{assert.equal(path,'Tiny.sol');assert.ok(span.end>span.start);readCount++;},
+        validateFinal:raw=>{
+          const result=JSON.parse(raw);
+          return Array.isArray(result.findings) && result.outcome==='no_testable_candidate'
+            ? null : 'Invalid deterministic final';
+        },
+      });
+    assert.equal(JSON.parse(result).outcome,'no_testable_candidate');
+    assert.ok(readCount>0,'Deterministic inspection must actually read the source');
+    const log=await readFile(join(root,'deterministic.log'),'utf8');
+    assert.match(log,/\\[DETERMINISTIC_DRIVER_ACTION\\]/);
+    assert.doesNotMatch(log,/\\[MODEL_REQUEST_RECOVERY\\]/);
+  } finally {
+    for(const [key,value] of Object.entries({
+      LOCAL_MODEL_ADAPTER:oldAdapter,LOCAL_OLLAMA_TOOL_PROTOCOL:oldProtocol,
+      AUTOHACK_OLLAMA_URL:oldUrl,
+    })) {
+      if(value===undefined)delete process.env[key];else process.env[key]=value;
+    }
   }
-  for(const protocol of ['json','native']) {
-    process.env.LOCAL_OLLAMA_TOOL_PROTOCOL=protocol;let calls=0,reads=0;
-    server.removeAllListeners('request');
-    server.on('request',async(req,res)=>{
-      let raw='';for await(const chunk of req)raw+=chunk;const request=JSON.parse(raw);calls++;
-      if(calls===2){assert.match(request.messages.at(-1).content,/Tool error/);assert.equal(reads,0);}
-      const name=calls===1?'outline_solidity':calls===2?'read_file':'final';
-      const args={path:'Bad.sol',query:'',offset:0};
-      res.end(JSON.stringify({message:protocol==='json'?{role:'assistant',content:JSON.stringify({action:name,...args,answer:'DONE'})}:
-        name==='final'?{role:'assistant',content:'DONE'}:{role:'assistant',content:'',tool_calls:[{function:{name,arguments:args}}]}}));
-    });
-    assert.equal(await runLocalAudit('Inspect malformed fixture',join(root,protocol+'-fallback.log'),15000,root,'mock',undefined,
-      {numCtx:8192,numPredict:128,onRead:()=>reads++}),'DONE');
-    assert.equal(reads,1);
-  }
-  console.log('Solidity AST outline, aliases/inheritance/modifiers, exact spans, bounded context, cache invalidation, fallback and both model protocols PASSED');
-} finally {server.closeAllConnections();server.close();await rm(root,{recursive:true,force:true});}
+  console.log('Solidity AST outline, aliases/inheritance/modifiers, exact spans, bounded context, cache invalidation, deterministic runner integration PASSED');
+} finally {await rm(root,{recursive:true,force:true});}
