@@ -1,6 +1,6 @@
-/** LOTUS-CLONE uses its deterministic controller, not model sampling profiles. */
+/** LOTUS-CLONE has one controller engine; legacy model profile variables
+ * cannot affect the investigation or its evidence evaluation.
+ */
 export function modelProfile(_stage?:string) {
-  const name=process.env.LOCAL_MODEL_PROFILE || 'deterministic';
-  if(name!=='deterministic')throw new Error('LOTUS_MODEL_REMOVED: non-deterministic profiles are unsupported');
   return {name:'deterministic' as const,think:false,options:{temperature:0}};
 }
