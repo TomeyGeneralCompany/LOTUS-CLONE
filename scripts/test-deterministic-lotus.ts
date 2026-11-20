@@ -1286,7 +1286,7 @@ contract BuggyERC20Vault {
         buggyErc20Path,
         "BuggyERC20Vault",
         liveBuggyErc20Vault,
-        (buggyErc20Plan as any).experiments[0].sequence,
+        (buggyErc20Plan as any).experiments.find((e: any) => e.securityProperty.includes("conservation")).sequence,
       );
       const buggyErc20Total = buggyErc20Run.steps.find(
         (s: any) => s.operation === "call" && s.function === "totalDeposits()" && String(s.expected) === "600",
@@ -1297,7 +1297,7 @@ contract BuggyERC20Vault {
         fixedErc20Path,
         "FixedERC20Vault",
         liveFixedErc20Vault,
-        (fixedErc20Plan as any).experiments[0].sequence,
+        (fixedErc20Plan as any).experiments.find((e: any) => e.securityProperty.includes("conservation")).sequence,
       );
       assert.ok(
         fixedErc20Run.steps.every((s: any) => (s.operation === "call" ? s.passed === true : s.reverted === false)),
