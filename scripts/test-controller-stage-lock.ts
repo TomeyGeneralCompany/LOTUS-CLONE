@@ -23,6 +23,7 @@ async function run(){
  lock.noteSourcePreclassified('source-1/A.sol','indexed-options-built');
  lock.noteSourcePreclassified('source-1/B.sol','indexed-options-built');
  assert.throws(()=>lock.assertActionAllowed('verify_source'),/STAGE_LOCKED/);
+ lock.registerAnalysisInventory([]);
  lock.completeAnalysis();
  assert.equal(lock.currentStage,'EXPERIMENT');
  lock.requireCandidate('A.suspect');
@@ -43,6 +44,7 @@ async function run(){
  await assessed.completeReading(async()=>content);
  assessed.noteSourcePreclassified(source,'indexed-options-built');
  const commit='a'.repeat(40),idA=hash('lead:A'),idB=hash('lead:B');
+ assessed.registerAnalysisInventory([idA,idB]);
  for(const [id,selector] of [[idA,'Analysis.deposit'],[idB,'Analysis.withdraw']]){
    assessed.registerAnalysisLead({id,sourceCommit:commit,sourceSha256:hash(content),path:source,selector});
  }
@@ -57,6 +59,7 @@ async function run(){
    hypothesis:'No testable property established',disposition:'defer',
    reason:'No valid fixture for a full state transition is proven by source'},'model');
  assert.equal(assessed.analysisProgress.deferred,1);
+ assessed.completeAnalysisBatch();
  assessed.completeAnalysis();
  assert.equal(assessed.recordedAnalysisCertificate?.modelAssessed,2);
  assert.equal(assessed.recordedAnalysisCertificate?.status,'complete');
@@ -65,6 +68,7 @@ async function run(){
  unavailable.recordRead({path:source,start:0,end:content.length,totalCharacters:content.length,text:content});
  await unavailable.completeReading(async()=>content);
  unavailable.noteSourcePreclassified(source,'indexed-options-built');
+ unavailable.registerAnalysisInventory([idA]);
  unavailable.registerAnalysisLead({id:idA,sourceCommit:commit,sourceSha256:hash(content),path:source,selector:'Analysis.deposit'});
  assert.throws(()=>unavailable.completeAnalysis(),/ANALYSIS_INCOMPLETE/);
  unavailable.completeAnalysis('partial','qwen_model_unavailable_after_bounded_retries');
