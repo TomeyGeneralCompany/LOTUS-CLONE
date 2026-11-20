@@ -93,7 +93,7 @@ async function huntProgramImpl(
   }
 
   try {
-    if (trigger === "auto" && !((process.env.LOCAL_OLLAMA_MODEL || isDeterministicMode())
+    if (trigger === "auto" && !((isDeterministicMode())
       ? dailyHuntQuotaStatus(getConfig().SECURITY_MAX_DAILY_HUNTS).available
       : claimDailyHuntSlot(getConfig().SECURITY_MAX_DAILY_HUNTS)))
       throw new Error("Daily dispatch limit reached");
@@ -469,7 +469,7 @@ export async function forceStopSecuritySolver(): Promise<{ killed: boolean; rese
   const killed = killActiveSecurityProcess();
   // The owning hunt/review releases its lock in finally after cancellation and
   // any bounded reproduction cleanup; never let another job reuse it early.
-  if(!process.env.LOCAL_OLLAMA_MODEL && !isDeterministicMode() && activeLocalJobCount()===0){solving=false;releaseHuntLock();}
+  if(!isDeterministicMode() && activeLocalJobCount()===0){solving=false;releaseHuntLock();}
 
   const db = getDb();
   const stuck = db
@@ -701,7 +701,7 @@ async function processAdversarialQueueImpl(programId?: string): Promise<void> {
       or(eq(schema.securityFindings.status,'report_ready'),eq(schema.securityFindings.status,'reviewing'))):
       or(eq(schema.securityFindings.status,'report_ready'),eq(schema.securityFindings.status,'reviewing'))).all()
     .some(f=>{try{return !!JSON.parse(f.analysisNotes||'{}').reproductionCaseId;}catch{return false;}});
-  if(process.env.LOCAL_OLLAMA_MODEL || isDeterministicMode() || pendingSourceCases) {
+  if(isDeterministicMode() || pendingSourceCases) {
     if(solving || !acquireHuntLock())return;
     solving=true;
     try {const {processLocalReviewQueue}=await import("./local-program-flow");await processLocalReviewQueue(programId);}
