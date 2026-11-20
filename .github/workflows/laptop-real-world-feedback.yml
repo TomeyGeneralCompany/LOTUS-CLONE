@@ -58,6 +58,13 @@ jobs:
             exit 1
           fi
           source "$LOTUS_SPECIALIST_ROOT/env.sh"
+          # GitHub runs each step in a fresh shell; persist all specialist paths
+          # for the regression gate and the real investigation steps.
+          echo "$LOTUS_SPECIALIST_ROOT/bin" >> "$GITHUB_PATH"
+          echo "$LOTUS_SPECIALIST_ROOT/python/bin" >> "$GITHUB_PATH"
+          echo "MYTHRIL_BIN=$MYTHRIL_BIN" >> "$GITHUB_ENV"
+          echo "JOERN_HOME=$JOERN_HOME" >> "$GITHUB_ENV"
+          echo "JAVAPARSER_JAR=$JAVAPARSER_JAR" >> "$GITHUB_ENV"
           npx tsx -e 'import { detectAvailableAdapters } from "./packages/security-solver/src/deterministic"; const caps = detectAvailableAdapters(); console.log(JSON.stringify({ available: caps.filter(c => c.availableOnHost).map(c => c.name), unavailable: caps.filter(c => !c.availableOnHost).map(c => c.name), adapters: caps }, null, 2));' | tee data/repair-feedback/host-capabilities.json | tee -a data/repair-feedback/setup.log
 
           # Preserve the actual setup failure instead of reporting a fabricated test exit code.
