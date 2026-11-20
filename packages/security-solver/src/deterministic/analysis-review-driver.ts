@@ -8,15 +8,28 @@
  * Zero LLM calls are made when LOCAL_MODEL_ADAPTER=deterministic (the default in
  * LOTUS-CLONE when AUTOHACK_OLLAMA_URL is not explicitly configured).
  */
-import type { SourceSnapshot, StaticLeadHint } from "../controller-solidity-experiment-planner";
+import { createHash } from "node:crypto";
+import {
+  constructSolidityExperiments,
+  type PreparedSecurityExperiment,
+  type SourceSnapshot,
+  type StaticLeadHint,
+} from "../controller-solidity-experiment-planner";
+import type { SolidityProbeDeclaration } from "../solidity-probe-inputs";
+import type { SoliditySequence } from "../solidity-sequence";
 import {
   controllerVerifiedLocalHtmlReview,
   type ControllerReviewGrounds,
 } from "../controller-review-boundary";
 import type { EntryReviewObservation } from "../entry-review-evidence";
 import type { ReviewEvidence } from "../review-evidence-chain";
-import { buildProgramFactsGraph, type ProgramFact } from "./program-facts";
-import type { LeadAnalysisInput } from "./hypothesis-engine";
+import {
+  buildProgramFactsGraph,
+  createHostFactsAdapters,
+  type ProgramFact,
+  type ProgramFactsGraph,
+} from "./program-facts";
+import type { LeadAnalysisDecision, LeadAnalysisInput } from "./hypothesis-engine";
 import {
   runClosedLoopLeadAnalysis,
   type ClosedLoopLeadResult,
@@ -91,8 +104,36 @@ export interface DeterministicAuditTurnInput {
   maxEscalations?: number;
   /** Optional repository root for isolated bubblewrap probes. */
   repositoryDir?: string;
+  /** Optional pre-built ProgramFactsGraph reused across leads within the same audit. */
+  graph?: ProgramFactsGraph;
+  /** Optional git commit hash for offline Solidity experiment construction. */
+  repositoryCommit?: string;
+  /** Optional Solidity probe declarations for the active lead's source file. */
+  declarations?: readonly SolidityProbeDeclaration[];
+  /** Optional set of already-queued experiment IDs or sequence fingerprints to avoid duplicates. */
+  existingExperimentIds?: ReadonlySet<string>;
   /** Optional observer called with closed-loop escalation telemetry (kept off the wire action JSON). */
   onEscalation?: (result: ClosedLoopLeadResult) => void;
+  /** Optional observer called with structured analysis + prepared experiment candidates. */
+  onAnalysisResult?: (result: DeterministicAnalysisResult) => void;
+}
+
+export interface PreparedExperimentCandidate {
+  id: string;
+  path: string;
+  selector: string;
+  hypothesis: string;
+  securityProperty: string;
+  sequence: SoliditySequence;
+  witnesses: PreparedSecurityExperiment["witnesses"];
+  prerequisites: PreparedSecurityExperiment["prerequisites"];
+}
+
+export interface DeterministicAnalysisResult {
+  decision: LeadAnalysisDecision;
+  experimentCandidates: PreparedExperimentCandidate[];
+  unresolvedReasons: string[];
+  closedLoop: ClosedLoopLeadResult;
 }
 
 export interface DeterministicAuditAction {
@@ -102,6 +143,7 @@ export interface DeterministicAuditAction {
   answer: string;
   leadId?: string;
   hypothesis?: string;
+  sequence?: SoliditySequence;
   offset?: number;
   result?: Record<string, unknown>;
 }
@@ -172,6 +214,109 @@ function buildDeterministicPositiveFinal(
   };
 }
 
+function runnerExperimentId(
+  path: string,
+  selector: string,
+  hypothesis: string,
+  sequence: SoliditySequence,
+): string {
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify([hypothesis.slice(0, 600), sequence]))
+    .digest("hex");
+  return JSON.stringify([path, selector, "solidity_sequence", fingerprint]);
+}
+
+/**
+ * Structured deterministic analysis for an active lead:
+ *   1. Reuse pre-built host-enriched ProgramFactsGraph (or build once if omitted)
+ *   2. Run closed-loop specialized analytical escalation & hypothesis evaluation
+ *   3. For assessed Solidity leads with declarations, invoke the 3-stage
+ *      offline experiment constructor and return PreparedExperimentCandidates
+ *      alongside explicit unresolved reasons when prerequisites are missing.
+ */
+export function evaluateDeterministicAnalysisTurn(
+  input: DeterministicAuditTurnInput,
+): DeterministicAnalysisResult | null {
+  if (!input.activeLead) return null;
+
+  const graph =
+    input.graph ??
+    buildProgramFactsGraph(
+      {
+        sources: input.sources,
+        staticLeads: input.staticLeads,
+      },
+      createHostFactsAdapters(),
+    );
+
+  const closedLoop = runClosedLoopLeadAnalysis({
+    graph,
+    lead: input.activeLead,
+    sources: input.sources,
+    cache: input.escalationCache,
+    hooks: input.escalationHooks,
+    enableSpecializedEscalation: input.enableSpecializedEscalation,
+    maxEscalations: input.maxEscalations,
+    repositoryDir: input.repositoryDir,
+  });
+
+  const decision = closedLoop.finalDecision;
+  const experimentCandidates: PreparedExperimentCandidate[] = [];
+  const unresolvedReasons: string[] = [];
+
+  for (const hyp of decision.matchedHypotheses) {
+    if (hyp.relational?.unresolvedPrerequisites?.length) {
+      for (const prereq of hyp.relational.unresolvedPrerequisites) {
+        if (!unresolvedReasons.includes(prereq)) {
+          unresolvedReasons.push(prereq);
+        }
+      }
+    }
+  }
+
+  if (
+    decision.action === "assess_lead" &&
+    input.activeLead.path.endsWith(".sol") &&
+    input.declarations &&
+    input.declarations.length > 0
+  ) {
+    const constructed = constructSolidityExperiments({
+      repositoryCommit: input.repositoryCommit || "",
+      targetPath: input.activeLead.path,
+      targetSelector: input.activeLead.selector,
+      sources: input.sources,
+      declarations: input.declarations,
+      skipLegacy: false,
+      staticLeads: input.staticLeads,
+    });
+    if (constructed.ok) {
+      for (const exp of constructed.experiments) {
+        const hypothesis = exp.hypothesis.slice(0, 600);
+        experimentCandidates.push({
+          id: exp.id,
+          path: exp.path,
+          selector: exp.selector,
+          hypothesis,
+          securityProperty: exp.securityProperty,
+          sequence: exp.sequence,
+          witnesses: exp.witnesses,
+          prerequisites: exp.prerequisites,
+        });
+      }
+    } else {
+      const cat = constructed.unresolvedCategory ? `(${constructed.unresolvedCategory})` : "";
+      unresolvedReasons.push(`${constructed.code}${cat}: ${constructed.detail}`);
+    }
+  }
+
+  return {
+    decision,
+    experimentCandidates,
+    unresolvedReasons,
+    closedLoop,
+  };
+}
+
 export function driveDeterministicAuditTurn(
   input: DeterministicAuditTurnInput,
 ): DeterministicAuditAction {
@@ -187,37 +332,66 @@ export function driveDeterministicAuditTurn(
   );
 
   // 1. ANALYZE stage: closed-loop deterministic evaluation (ProgramFactsGraph ->
-  //    initial hypothesis -> specialized analytical escalation -> fact merge -> reconsider).
+  //    initial hypothesis -> specialized analytical escalation -> fact merge ->
+  //    reconsider -> source-grounded experiment construction -> discover_experiment).
   if (input.stage === "ANALYZE" && input.analyzeModelPending) {
-    if (input.activeLead && (can("assess_lead") || can("defer_lead"))) {
-      const graph = buildProgramFactsGraph({
-        sources: input.sources,
-        staticLeads: input.staticLeads,
-      });
-      const closedLoop = runClosedLoopLeadAnalysis({
-        graph,
-        lead: input.activeLead,
-        sources: input.sources,
-        cache: input.escalationCache,
-        hooks: input.escalationHooks,
-        enableSpecializedEscalation: input.enableSpecializedEscalation,
-        maxEscalations: input.maxEscalations,
-        repositoryDir: input.repositoryDir,
-      });
-      input.onEscalation?.(closedLoop);
-      const decision = closedLoop.finalDecision;
+    if (
+      input.activeLead &&
+      (can("discover_experiment") || can("assess_lead") || can("defer_lead"))
+    ) {
+      const analysis = evaluateDeterministicAnalysisTurn(input)!;
+      input.onEscalation?.(analysis.closedLoop);
+      input.onAnalysisResult?.(analysis);
+
+      const decision = analysis.decision;
+      if (can("discover_experiment") && analysis.experimentCandidates.length > 0) {
+        const existing = input.existingExperimentIds;
+        const freshCandidate = analysis.experimentCandidates.find((cand) => {
+          if (!existing || existing.size === 0) return true;
+          const runnerId = runnerExperimentId(
+            cand.path,
+            cand.selector,
+            cand.hypothesis,
+            cand.sequence,
+          );
+          const seqKey = JSON.stringify([
+            cand.path,
+            cand.selector,
+            cand.hypothesis,
+            cand.sequence,
+          ]);
+          return !existing.has(cand.id) && !existing.has(runnerId) && !existing.has(seqKey);
+        });
+
+        if (freshCandidate) {
+          return {
+            action: "discover_experiment",
+            leadId: decision.leadId,
+            path: freshCandidate.path,
+            query: freshCandidate.selector,
+            hypothesis: freshCandidate.hypothesis.slice(0, 600),
+            answer: "solidity_sequence",
+            sequence: freshCandidate.sequence,
+          };
+        }
+      }
+
       const chosenAction = can(decision.action)
         ? decision.action
         : can("assess_lead")
           ? "assess_lead"
           : "defer_lead";
+      const unresolvedSuffix =
+        analysis.unresolvedReasons.length > 0 && chosenAction === "assess_lead"
+          ? ` [Unresolved experiment prerequisites: ${analysis.unresolvedReasons.slice(0, 2).join("; ")}]`
+          : "";
       return {
         action: chosenAction,
         leadId: decision.leadId,
         path: decision.path,
         query: decision.query,
-        hypothesis: decision.hypothesis,
-        answer: decision.answer,
+        hypothesis: decision.hypothesis?.slice(0, 600),
+        answer: `${decision.answer}${unresolvedSuffix}`.slice(0, 680),
       };
     }
     if (can("finalize_analysis")) {
