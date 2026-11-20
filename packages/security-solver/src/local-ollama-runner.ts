@@ -345,7 +345,7 @@ export async function runLocalAudit(
         sourceEvidence:cand.sourceEvidence,priority:cand.priority,
         staticLeadIds:cand.staticLeadIds,selectionReasons:cand.selectionReasons,
         batch:analysisProgressStore.processedBatches+1,
-      })+"\\n");
+      })+"\n");
     }
     analyzeModelPending=true;
     analyzeTurnsRemaining=Math.max(analysisTurnBudget,batch.length+6);
@@ -356,7 +356,7 @@ export async function runLocalAudit(
       batch:analysisProgressStore.processedBatches+1,
       admitted:batch.length,queuedRemaining:analysisProgressStore.remaining,
       turnsAvailable:analyzeTurnsRemaining,
-    })+"\\n");
+    })+"\n");
     return batch.length;
   };
   const closeAnalysis=async(status:'complete'|'partial',reason='')=>{
@@ -369,7 +369,7 @@ export async function runLocalAudit(
       await appendFile(logFile,"[ANALYSIS_SUSPENDED] "+JSON.stringify({
         reason,pendingIds:stageLock.analysisProgress.pendingIds,
         remainingInventory:analysisProgressStore.remaining,
-      })+"\\n");
+      })+"\n");
       throw new Error("ANALYSIS_INCOMPLETE_SUSPENDED: "+reason);
     }
     stageLock.completeAnalysisBatch();
@@ -395,7 +395,7 @@ export async function runLocalAudit(
       resolved:analysisProgressStore.assessed,
       inventoryTotal:analysisProgressStore.records.size,
       queuedRemaining:analysisProgressStore.remaining,
-    })+"\\n");
+    })+"\n");
     if(analysisProgressStore.remaining>0){
       const admitted=await admitNextAnalysisBatch();
       if(admitted===0)throw new Error("ANALYSIS_INVENTORY_STALLED: queued candidates could not be admitted");
@@ -414,7 +414,7 @@ export async function runLocalAudit(
       queuedRemaining:0,blockedCount:analysisInventoryMeta.blockedCount,
       candidates:stageLock.candidateCount,modelAdded:analyzeApprovedIds.size,
       processedBatches:analysisProgressStore.processedBatches,
-    })+"\\n");
+    })+"\n");
     await appendFile(logFile,"[STAGE_UNLOCK] ANALYZE -> EXPERIMENT\\n");
   };
   const hypotheses:Array<{turn:number;path:string;statement:string}>=[];
@@ -1069,10 +1069,6 @@ export async function runLocalAudit(
             unqueuedSelectors,
           });
         }
-        const envMaxLeads=Number(process.env.LOCAL_ANALYZE_MAX_LEADS??18);
-        const maxAdmittedLeads=Number.isSafeInteger(envMaxLeads)&&envMaxLeads>=1?Math.min(envMaxLeads,64):18;
-        const envMaxPerFile=Number(process.env.LOCAL_ANALYZE_MAX_PER_FILE??4);
-        const maxPerFileLeads=Number.isSafeInteger(envMaxPerFile)&&envMaxPerFile>=1?Math.min(envMaxPerFile,16):4;
         const candidateQueue=buildAnalysisCandidateQueue({
           items:candidateSourceItems,
           staticLeads:solLeads,
@@ -1080,9 +1076,6 @@ export async function runLocalAudit(
           maxAdmitted:maxAdmittedLeads,
           maxPerFile:maxPerFileLeads,
         });
-        for(const blocked of candidateQueue.blocked){
-          await appendFile(logFile,'[ANALYSIS_LEAD_BLOCKED] '+JSON.stringify(blocked)+'\n');
-        }
         analysisInventoryMeta={
           inventoryTotal:candidateQueue.inventory.length,
           admittedCount:0,
@@ -1109,7 +1102,7 @@ export async function runLocalAudit(
         const envAnalyzeTurns=Number(process.env.LOCAL_ANALYZE_MODEL_TURNS??24);
         analysisTurnBudget=Number.isSafeInteger(envAnalyzeTurns)&&envAnalyzeTurns>=1?Math.min(envAnalyzeTurns,200):24;
         for(const blocked of candidateQueue.blocked){
-          await appendFile(logFile,"[ANALYSIS_LEAD_BLOCKED] "+JSON.stringify(blocked)+"\\n");
+          await appendFile(logFile,"[ANALYSIS_LEAD_BLOCKED] "+JSON.stringify(blocked)+"\n");
         }
         try{
           await writeFile(logFile+".analysis-candidates.json",JSON.stringify({
@@ -1128,7 +1121,7 @@ export async function runLocalAudit(
           maxAdmittedLeads:analysisBatchSize,
           maxPerFileLeads:analysisPerFileCap,
           progressFile,
-        })+"\\n");
+        })+"\n");
         await admitNextAnalysisBatch();
         if(!analysisProgressStore?.remaining&&stageLock?.analysisProgress.pendingIds.length===0){
           await closeAnalysis("complete");
@@ -1137,7 +1130,7 @@ export async function runLocalAudit(
             maxAnalyzeTurns:analyzeTurnsRemaining,
             selectedModelLeads:stageLock.analysisProgress.selected,
             totalInventory:analysisProgressStore?.records.size,
-          })+"\\n");
+          })+"\n");
         }
         constraints=workflow?await workflow.constraints():constraints;
       }
@@ -1531,7 +1524,7 @@ export async function runLocalAudit(
       const onProgress=(progress:{contentCharacters:number;thinkingCharacters:number;toolCalls:number})=>{
         if(Date.now()-lastProgressLog<15000)return;
         lastProgressLog=Date.now();
-        void appendFile(logFile,"[MODEL_PROGRESS] "+JSON.stringify({turn:turn+1,elapsedMs:Date.now()-started,...progress})+"\\n").catch(()=>{});
+        void appendFile(logFile,"[MODEL_PROGRESS] "+JSON.stringify({turn:turn+1,elapsedMs:Date.now()-started,...progress})+"\n").catch(()=>{});
       };
       const requestMessages=profile.think
         ? assembled.requestMessages.map(m=>({...m,content:m.content.replaceAll('/no_think','')}))
@@ -1551,7 +1544,7 @@ export async function runLocalAudit(
           sourceEvidence:activeAnalysisPacket?.sourceEvidence||null,
           activeInstructionChars:activeAnalyzeInstruction.content.length,
           requestChars,messageBudget,context:settings.numCtx,
-          pending:stageLock?.analysisProgress.pendingIds.length})+'\\n');
+          pending:stageLock?.analysisProgress.pendingIds.length})+'\n');
       }
       // The graph has already specified the exact next read/verification.
       // Execute it rather than spending a Qwen turn asking for known arguments.
@@ -3463,7 +3456,7 @@ export async function runLocalAudit(
               output=fitted;
             } catch {
               output=fitOutput(JSON.stringify(await readSourcePage(full,offset,pageSize))).output;
-              await appendFile(logFile,'[PROBE_MENU_FIT_FALLBACK] '+JSON.stringify({path:relative(root,full),offset})+'\\n');
+              await appendFile(logFile,'[PROBE_MENU_FIT_FALLBACK] '+JSON.stringify({path:relative(root,full),offset})+'\n');
             }
           } else output=fitOutput(output).output;
           if(name==='read_file') {
