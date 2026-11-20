@@ -70,7 +70,7 @@ function validateSequence(s) {
         throw new Error('Unknown deployment reference '+step.account);
       continue;
     }
-    if(step?.operation==='call')object(step,['operation','function','args','expect'],['operation','deploymentId','function','args','expect','sender']);
+    if(step?.operation==='call')object(step,['operation','function','args','expect'],['operation','deploymentId','function','args','expect','sender','expectPath']);
     else if(step?.operation==='observe')object(step,['operation','function','args'],['operation','deploymentId','function','args','sender']);
     else if(step?.operation==='send')object(step,['operation','function','args'],['operation','deploymentId','function','args','sender','valueWei','expectRevert','requiredSetup']);
     else throw new Error('Unknown sequence operation');
@@ -79,7 +79,11 @@ function validateSequence(s) {
     if(typeof step.function!=='string'||step.function.length>200||!/^[A-Za-z_][A-Za-z0-9_]*(?:\([A-Za-z0-9_,()[\]]*\))?$/.test(step.function))throw new Error('Invalid ABI function selector');
     args(step.args);
     if(step.sender!==undefined && (!Number.isInteger(step.sender)||step.sender<0||step.sender>2))throw new Error('Invalid local sender');
-    if(step.operation==='call')value(step.expect);
+    if(step.operation==='call'){
+      value(step.expect);
+      if(step.expectPath!==undefined && (!Array.isArray(step.expectPath)||step.expectPath.length<1||step.expectPath.length>4||
+        step.expectPath.some(v=>!Number.isInteger(v)||v<0||v>31)))throw new Error('Invalid bounded ABI result field path');
+    }
     else {wei(step.valueWei);if(step.expectRevert!==undefined&&typeof step.expectRevert!=='boolean')throw new Error('Invalid revert expectation');
       if(step.requiredSetup!==undefined && (step.operation!=='send' || typeof step.requiredSetup!=='boolean' ||
          (step.requiredSetup && step.expectRevert===true)))throw new Error('Invalid required setup flag');}
@@ -279,12 +283,19 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       if(step.operation==='call' || step.operation==='observe') {
         if(!['view','pure'].includes(fragment.stateMutability))throw new Error('call requires a view/pure function');
         const result=await fn.staticCallResult(...args,{gasLimit:1000000});
-        const actual=normalize(fragment.outputs.length===1?result[0]:result);
+        const observed=normalize(fragment.outputs.length===1?result[0]:result);
+        let actual=observed;
+        if(step.operation==='call' && step.expectPath){
+          for(const pos of step.expectPath){
+            if(!Array.isArray(actual)||pos>=actual.length)throw new Error('Observed ABI tuple/array field not present');
+            actual=actual[pos];
+          }
+        }
         if(step.operation==='call') {
           const expected=normalize(resolve(step.expect));
           steps.push({operation:'call',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,
-            actual,expected,passed:JSON.stringify(actual)===JSON.stringify(expected)});
-        } else steps.push({operation:'observe',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,actual});
+            actual,expected,...(step.expectPath?{expectPath:step.expectPath}:{}),passed:JSON.stringify(actual)===JSON.stringify(expected)});
+        } else steps.push({operation:'observe',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,actual:observed});
       } else {
         if(!['nonpayable','payable'].includes(fragment.stateMutability))throw new Error('send requires a state-changing function');
         if(fragment.stateMutability!=='payable' && BigInt(step.valueWei||'0')!==0n)throw new Error('Nonpayable function cannot receive value');
