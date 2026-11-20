@@ -962,12 +962,15 @@ contract SiblingPool${n} {
         persistedQueue.totalCandidates > 6,
         `Expected >6 candidates persisted in inventory, got ${persistedQueue.totalCandidates}`,
       );
-      assert.equal(persistedQueue.admittedCount, 6, "Bounded admission must cap admitted batch at 6");
-      assert.equal(
-        persistedQueue.queuedCount,
-        persistedQueue.totalCandidates - persistedQueue.admittedCount,
-        "Unadmitted candidates must remain preserved in queued inventory",
-      );
+      const startedBatches = auditLog.split("\\n").filter(line=>line.startsWith("[ANALYSIS_BATCH_STARTED] "))
+        .map(line=>JSON.parse(line.slice("[ANALYSIS_BATCH_STARTED] ".length)) as {admitted:number});
+      assert.ok(startedBatches.length>=2, "More than six eligible functions require multiple analysis batches");
+      assert.ok(startedBatches.every(batch=>batch.admitted>0&&batch.admitted<=6),
+        "Every ANALYZE batch must preserve the configured six-candidate bound");
+      assert.equal(persistedQueue.queuedCount,0,
+        "Round 3 must process the entire inventory, not stop at the first batch");
+      assert.equal(persistedQueue.admittedCount,persistedQueue.totalCandidates,
+        "The persisted cumulative record must account for every eligible candidate");
     } finally {
       await rm(auditDir, { recursive: true, force: true });
     }
