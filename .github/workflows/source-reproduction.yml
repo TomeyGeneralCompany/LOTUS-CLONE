@@ -11,8 +11,7 @@ on:
 jobs:
   isolated-language-probes:
     runs-on: ubuntu-latest
-    # The Qwen3:4b independent-review step alone permits 20 minutes.
-    # Include setup, model download, and all preceding reproduction checks.
+    # Include isolated language runtimes and full controller evidence checks.
     timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
@@ -49,29 +48,12 @@ jobs:
       - name: Replay 2000-file Python and Java entry-to-sink routes in isolated runtimes
         timeout-minutes: 15
         run: node --import tsx scripts/test-controller-indexed-entry-replay.ts
-      - name: Qualify 2000-file Solidity consumer findings through independent review
+      - name: Qualify 2000-file Solidity consumer evidence through deterministic independent review
         timeout-minutes: 300
         env:
-          OLLAMA_HOST: http://127.0.0.1:11434
-        run: |
-          docker run -d --name lotus-review-ollama \
-            -e OLLAMA_NUM_PARALLEL=1 -e OLLAMA_MAX_LOADED_MODELS=1 \
-            -e OLLAMA_KEEP_ALIVE=0 -p 127.0.0.1:11434:11434 ollama/ollama:latest
-          trap 'docker logs --tail 120 lotus-review-ollama || true; docker inspect lotus-review-ollama --format "OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}" || true; docker rm -f lotus-review-ollama >/dev/null 2>&1 || true' EXIT
-          for i in $(seq 1 90); do curl -fsS http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 2; done
-          docker exec lotus-review-ollama ollama pull qwen3:4b
-          # Surface controller progress and evidence counts rather than only Ollama internals.
-          ( while sleep 120; do
-              echo "=== LOTUS controller audit progress $(date -u +%FT%TZ) ==="
-              find data/logs -name 'local-hunt-*.log' -type f -print 2>/dev/null | while IFS= read -r audit; do
-                echo "Audit: $audit"
-                grep -E '^\\[(SOURCE_MAP|CONTROLLER_INDEXED_ENTRY_SUMMARY|CONTROLLER_INDEXED_PROOF_CANDIDATE|CONTROLLER_INDEXED_REVIEW_HANDOFF|PROBE_RESULT|AUDIT_|FINAL_|REVIEW_)' "$audit" | tail -n 12 || true
-                echo "Recorded probe results: $(grep -c '^\\[PROBE_RESULT\\]' "$audit" || true)"
-              done
-            done ) &
-          progress_pid=$!
-          trap 'kill "$progress_pid" 2>/dev/null || true; docker logs --tail 120 lotus-review-ollama || true; docker inspect lotus-review-ollama --format "OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}" || true; docker rm -f lotus-review-ollama >/dev/null 2>&1 || true' EXIT
-          node --import tsx scripts/test-indexed-solidity-independent-review.ts
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+        run: node --import tsx scripts/test-indexed-solidity-independent-review.ts
       - name: Preserve full Solidity investigation and controller activity logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -182,16 +164,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
-      LOCAL_OLLAMA_MODEL: qwen3:4b
-      LOCAL_MODEL_ADAPTER: ollama
-      LOCAL_OLLAMA_TOOL_PROTOCOL: json
+      LOCAL_MODEL_ADAPTER: deterministic
       LOCAL_HUNT_DYNAMIC_ALLOWANCE: 'true'
       LOCAL_CONTROLLER_FULL_SOURCE_INDEX: 'true'
       LOCAL_HUNT_NUM_PREDICT: '2048'
       SECURITY_AUTO_SUBMIT: 'false'
       SECURITY_AUTO_HUNT_ENABLED: 'false'
       SECURITY_SOURCE_CODE_TIMEOUT_MINUTES: '180'
-      AUTOHACK_OLLAMA_URL: http://127.0.0.1:11434/api/chat
+      AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -212,16 +192,6 @@ jobs:
       - name: Provision pinned offline scanner dependencies for Level 6
         timeout-minutes: 20
         run: bash scripts/install-static-analysis.sh
-      - name: Start local Qwen3 4B model on CPU
-        timeout-minutes: 45
-        run: |
-          docker run -d --name lotus-crucible-ollama -p 127.0.0.1:11434:11434 ollama/ollama:latest
-          for n in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
-          docker exec lotus-crucible-ollama ollama pull qwen3:4b
       - name: Run actual Level 6 production investigation
         timeout-minutes: 230
         env:
@@ -245,9 +215,6 @@ jobs:
             data/crucible/live-terminal.log
           if-no-files-found: warn
           retention-days: 30
-      - name: Stop local Qwen model
-        if: always()
-        run: docker rm -f lotus-crucible-ollama || true
   crucible-independent-runtime-oracle:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[run-crucible]'))
     name: Crucible independent ${{ matrix.language }} runtime oracle
