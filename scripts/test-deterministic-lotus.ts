@@ -962,7 +962,7 @@ contract SiblingPool${n} {
         persistedQueue.totalCandidates > 6,
         `Expected >6 candidates persisted in inventory, got ${persistedQueue.totalCandidates}`,
       );
-      const startedBatches = auditLog.split("\\n").filter(line=>line.startsWith("[ANALYSIS_BATCH_STARTED] "))
+      const startedBatches = auditLog.split("\n").filter(line=>line.startsWith("[ANALYSIS_BATCH_STARTED] "))
         .map(line=>JSON.parse(line.slice("[ANALYSIS_BATCH_STARTED] ".length)) as {admitted:number});
       assert.ok(startedBatches.length>=2, "More than six eligible functions require multiple analysis batches");
       assert.ok(startedBatches.every(batch=>batch.admitted>0&&batch.admitted<=6),
