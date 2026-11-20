@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildAnalysisCandidateQueue,
+  isTestOrMockContractPath,
+  isExternalAdapterOrMarketPath,
   buildProgramFactsGraph,
   detectAvailableAdapters,
   driveDeterministicAuditTurn,
@@ -1160,6 +1162,454 @@ contract SiblingPool${n} {
       );
       assert.deepEqual(fixedReplay, fixedRun, "Independent deterministic EVM replay must match exactly");
       console.log("LIVE_EVM_BUGGY_VS_FIXED_ACCOUNTING_VAULT_PASSED");
+
+      // Also execute acquired-source ERC20 Buggy vs Fixed Vault live on EVM!
+      const liveMockErc20 = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract ERC20Mock {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "bal");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "bal");
+        require(allowance[from][msg.sender] >= amount, "allow");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}`;
+      const liveBuggyErc20Vault = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+contract BuggyERC20Vault {
+    IERC20 public stablecoin;
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+    constructor(address _stablecoin) { stablecoin = IERC20(_stablecoin); }
+    function deposit(uint256 amount) external {
+        require(stablecoin.transferFrom(msg.sender, address(this), amount), "tf");
+        balances[msg.sender] += amount;
+        totalDeposits += amount;
+    }
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "low");
+        balances[msg.sender] -= amount;
+        require(stablecoin.transfer(msg.sender, amount), "t");
+    }
+}`;
+      const liveFixedErc20Vault = liveBuggyErc20Vault
+        .replace(/BuggyERC20Vault/g, "FixedERC20Vault")
+        .replace(
+          'balances[msg.sender] -= amount;',
+          'balances[msg.sender] -= amount;\n        totalDeposits -= amount;',
+        );
+      const mockPath = "contracts/mocks/ERC20Mock.sol";
+      const mockSnap = { path: mockPath, sha256: sha(liveMockErc20), content: liveMockErc20 };
+      const buggyErc20Path = "contracts/BuggyERC20Vault.sol";
+      const buggyErc20Snap = { path: buggyErc20Path, sha256: sha(liveBuggyErc20Vault), content: liveBuggyErc20Vault };
+      const fixedErc20Path = "contracts/FixedERC20Vault.sol";
+      const fixedErc20Snap = { path: fixedErc20Path, sha256: sha(liveFixedErc20Vault), content: liveFixedErc20Vault };
+      const makeErc20Decls = (name: string) => [
+        { selector: `${name}.deposit`, operation: "send" as const, inputs: ["uint256"] },
+        { selector: `${name}.withdraw`, operation: "send" as const, inputs: ["uint256"] },
+        { selector: `${name}.totalDeposits`, operation: "call" as const, inputs: [] },
+        { selector: `${name}.balances`, operation: "call" as const, inputs: ["address"] },
+      ];
+      const buggyErc20Plan = constructSolidityExperiments({
+        repositoryCommit: commitSha,
+        targetPath: buggyErc20Path,
+        targetSelector: "BuggyERC20Vault.withdraw",
+        sources: [buggyErc20Snap, mockSnap],
+        declarations: makeErc20Decls("BuggyERC20Vault"),
+      });
+      assert.equal(buggyErc20Plan.ok, true, "Controller must construct ERC20 accounting experiment for BuggyERC20Vault");
+      const fixedErc20Plan = constructSolidityExperiments({
+        repositoryCommit: commitSha,
+        targetPath: fixedErc20Path,
+        targetSelector: "FixedERC20Vault.withdraw",
+        sources: [fixedErc20Snap, mockSnap],
+        declarations: makeErc20Decls("FixedERC20Vault"),
+      });
+      assert.equal(fixedErc20Plan.ok, true, "Controller must construct ERC20 accounting experiment for FixedERC20Vault");
+      const runMultiContractOnEvm = async (
+        vaultFile: string,
+        vaultContract: string,
+        vaultSrc: string,
+        seq: any,
+      ) => {
+        const compiled = JSON.parse(
+          solc.compile(
+            JSON.stringify({
+              language: "Solidity",
+              sources: {
+                [mockPath]: { content: liveMockErc20 },
+                [vaultFile]: { content: vaultSrc },
+              },
+              settings: { outputSelection: { "*": { "*": ["abi", "evm.bytecode"] } } },
+            }),
+          ),
+        );
+        const errs = (compiled.errors || []).filter((e: any) => e.severity === "error");
+        assert.deepEqual(errs, [], `solc compile errors for ${vaultContract}: ${JSON.stringify(errs)}`);
+        const artifact = compiled.contracts[vaultFile][vaultContract];
+        const prepArtifacts = {
+          [mockPath]: { ERC20Mock: compiled.contracts[mockPath].ERC20Mock },
+        };
+        const provider = ganache.provider({
+          logging: { quiet: true },
+          wallet: { deterministic: true, totalAccounts: 3 },
+          chain: { hardfork: "shanghai", chainId: 1337, time: new Date("2020-01-01T00:00:00Z") },
+          miner: { blockGasLimit: 12000000, timestampIncrement: 1 },
+        });
+        try {
+          return await runSequence(artifact, seq, provider, prepArtifacts);
+        } finally {
+          await provider.disconnect();
+        }
+      };
+      const buggyErc20Run = await runMultiContractOnEvm(
+        buggyErc20Path,
+        "BuggyERC20Vault",
+        liveBuggyErc20Vault,
+        (buggyErc20Plan as any).experiments[0].sequence,
+      );
+      const buggyErc20Total = buggyErc20Run.steps.find(
+        (s: any) => s.operation === "call" && s.function === "totalDeposits()" && String(s.expected) === "600",
+      );
+      assert.ok(buggyErc20Total && buggyErc20Total.passed === false && String(buggyErc20Total.actual) === "1000",
+        `BuggyERC20Vault must observe stale totalDeposits == 1000 on live EVM: ${JSON.stringify(buggyErc20Run.steps)}`);
+      const fixedErc20Run = await runMultiContractOnEvm(
+        fixedErc20Path,
+        "FixedERC20Vault",
+        liveFixedErc20Vault,
+        (fixedErc20Plan as any).experiments[0].sequence,
+      );
+      assert.ok(
+        fixedErc20Run.steps.every((s: any) => (s.operation === "call" ? s.passed === true : s.reverted === false)),
+        `FixedERC20Vault must pass every step on live EVM: ${JSON.stringify(fixedErc20Run.steps)}`,
+      );
+      console.log("LIVE_EVM_BUGGY_VS_FIXED_ERC20_VAULT_PASSED");
+    }
+  }
+
+  // 12. Repository-level 88mph-style regression suite (Round 2 architectural repairs)
+  {
+    const commitSha = "b".repeat(40);
+    const echidnaTestSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract EchidnaDepositWithdrawTest {
+    uint256 public totalDeposits;
+    function deposit(uint256 amount) external { totalDeposits += amount; }
+    function withdraw(uint256 amount) external { totalDeposits -= amount; }
+}`;
+    const benqiMarketSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+interface IERC20 { function safeTransferFrom(address f, address t, uint256 a) external; function safeTransfer(address t, uint256 a) external; }
+interface ICERC20 { function mint(uint256 a) external returns (uint256); function redeemUnderlying(uint256 a) external returns (uint256); }
+interface IComptroller { function claimComp(address holder) external; }
+contract BenqiERC20Market {
+    IERC20 public stablecoin;
+    ICERC20 public cToken;
+    IComptroller public comptroller;
+    function deposit(uint256 amount) external {
+        stablecoin.safeTransferFrom(msg.sender, address(this), amount);
+        cToken.mint(amount);
+    }
+    function withdraw(uint256 amount) external {
+        cToken.redeemUnderlying(amount);
+        comptroller.claimComp(address(this));
+        stablecoin.safeTransfer(msg.sender, amount);
+    }
+}`;
+    const harvestMarketSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+interface IERC20 { function safeTransfer(address t, uint256 a) external; }
+contract HarvestMarket {
+    IERC20 public stablecoin;
+    function initialize(address _stablecoin) external {
+        stablecoin = IERC20(_stablecoin);
+    }
+    function withdraw(uint256 amount) external {
+        stablecoin.safeTransfer(msg.sender, amount);
+    }
+}`;
+    const dInterestSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract DInterest {
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+    function deposit(uint256 amount) external {
+        balances[msg.sender] += amount;
+        totalDeposits += amount;
+    }
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "low");
+        balances[msg.sender] -= amount;
+        totalDeposits -= amount;
+    }
+    function topupDeposit(uint256 amount) external {
+        balances[msg.sender] += amount;
+        totalDeposits += amount;
+    }
+}`;
+    const mphMinterSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import "../DInterest.sol";
+contract MPHMinter {
+    uint256 public totalSupply;
+    mapping(address => uint256) public balances;
+    function mintVested(address to, uint256 amount) external {
+        balances[to] += amount;
+        totalSupply += amount;
+    }
+    function takeBackDepositedAmount(address from, uint256 amount) external {
+        balances[from] -= amount;
+        totalSupply -= amount;
+    }
+}`;
+
+    const paths = {
+      echidna: "contracts/echidna/EchidnaDepositWithdrawTest.sol",
+      benqi: "contracts/models/moneymarket/benqi/BenqiERC20Market.sol",
+      harvest: "contracts/models/moneymarket/harvest/HarvestMarket.sol",
+      dInterest: "contracts/DInterest.sol",
+      mphMinter: "contracts/rewards/MPHMinter.sol",
+    };
+
+    // 12a. Consistent test-harness classification
+    assert.equal(isTestOrMockContractPath(paths.echidna), true);
+    assert.equal(isTestOrMockContractPath("contracts/EchidnaDepositWithdrawTest.sol"), true);
+    assert.equal(isTestOrMockContractPath("contracts/VaultTest.sol"), true);
+    assert.equal(isTestOrMockContractPath(paths.dInterest), false);
+    assert.equal(isTestOrMockContractPath(paths.mphMinter), false);
+    assert.equal(isExternalAdapterOrMarketPath(paths.benqi), true);
+    assert.equal(isExternalAdapterOrMarketPath(paths.harvest), true);
+    assert.equal(isExternalAdapterOrMarketPath(paths.dInterest), false);
+
+    const repoSources = [
+      { path: paths.echidna, sha256: sha(echidnaTestSrc), content: echidnaTestSrc },
+      { path: paths.benqi, sha256: sha(benqiMarketSrc), content: benqiMarketSrc },
+      { path: paths.harvest, sha256: sha(harvestMarketSrc), content: harvestMarketSrc },
+      { path: paths.dInterest, sha256: sha(dInterestSrc), content: dInterestSrc },
+      { path: paths.mphMinter, sha256: sha(mphMinterSrc), content: mphMinterSrc },
+    ];
+    const repoGraph = buildProgramFactsGraph({ sources: repoSources });
+
+    // 12b. Candidate queue excludes Echidna test harness & prioritizes DInterest/MPHMinter above Benqi/Harvest adapters
+    const queue = buildAnalysisCandidateQueue({
+      items: [
+        { path: paths.echidna, sourceCommit: commitSha, sourceContent: echidnaTestSrc, unqueuedSelectors: ["EchidnaDepositWithdrawTest.deposit", "EchidnaDepositWithdrawTest.withdraw"] },
+        { path: paths.benqi, sourceCommit: commitSha, sourceContent: benqiMarketSrc, unqueuedSelectors: ["BenqiERC20Market.deposit", "BenqiERC20Market.withdraw"] },
+        { path: paths.harvest, sourceCommit: commitSha, sourceContent: harvestMarketSrc, unqueuedSelectors: ["HarvestMarket.initialize", "HarvestMarket.withdraw"] },
+        { path: paths.dInterest, sourceCommit: commitSha, sourceContent: dInterestSrc, unqueuedSelectors: ["DInterest.deposit", "DInterest.withdraw", "DInterest.topupDeposit"] },
+        { path: paths.mphMinter, sourceCommit: commitSha, sourceContent: mphMinterSrc, unqueuedSelectors: ["MPHMinter.mintVested", "MPHMinter.takeBackDepositedAmount"] },
+      ],
+      graph: repoGraph,
+      maxAdmitted: 4,
+      maxPerFile: 2,
+    });
+    assert.ok(
+      queue.blocked.some((b) => b.path === paths.echidna && b.reason === "test_or_mock_contract"),
+      "Echidna test contract must be blocked as test_or_mock_contract",
+    );
+    assert.ok(
+      !queue.inventory.some((c) => c.path === paths.echidna),
+      "Echidna test contract must never enter the production candidate inventory",
+    );
+    assert.ok(
+      queue.admitted.every((c) => c.path === paths.dInterest || c.path === paths.mphMinter),
+      `Top-4 admitted candidates must prioritize core protocol (DInterest & MPHMinter) ahead of thin adapters, got: ${queue.admitted.map((c) => c.selector).join(", ")}`,
+    );
+
+    // 12c. HarvestMarket.initialize + withdraw sharing `stablecoin` config pointer must NOT become a conservation invariant
+    const repoRelHyps = generateRelationalHypotheses(repoGraph);
+    assert.ok(
+      !repoRelHyps.some((r) => r.file === paths.harvest && (r.propertyKind === "conservation" || r.stateDependencies.some((s) => /stablecoin/i.test(s)))),
+      `HarvestMarket.initialize + withdraw sharing stablecoin must not emit a conservation invariant: ${JSON.stringify(repoRelHyps.filter((r) => r.file === paths.harvest))}`,
+    );
+    const dInterestRel = repoRelHyps.find((r) => r.file === paths.dInterest && r.propertyKind === "conservation");
+    assert.ok(dInterestRel, "DInterest deposit/withdraw must still emit a real conservation hypothesis");
+    assert.deepEqual(dInterestRel!.propertyRequiredPrerequisites, []);
+
+    // 12d. Decoupled analytical disposition vs construction feasibility & Z3 SMT refutation gate
+    // MixedProtocolVault shares a private `rewards` variable (causing the top interest-accrual
+    // relational hypothesis to defer with missing_public_getter) while ALSO exposing public
+    // `balances` and `totalDeposits` for a valid conservation experiment. Commit 3 ensures
+    // construction feasibility is evaluated independently of the deferred relational disposition.
+    const mixedSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract MixedProtocolVault {
+    address public owner;
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+    uint256 private rewards;
+    constructor() { owner = msg.sender; }
+    function deposit(uint256 amount) external {
+        require(msg.sender == owner, "only owner");
+        balances[msg.sender] += amount;
+        totalDeposits += amount;
+        rewards += 1;
+    }
+    function withdraw(uint256 amount) external {
+        require(msg.sender == owner, "only owner");
+        require(balances[msg.sender] >= amount, "low");
+        balances[msg.sender] -= amount;
+        totalDeposits -= amount;
+        rewards += 1;
+    }
+}`;
+    const mixedPath = "contracts/MixedProtocolVault.sol";
+    const mixedSnap = { path: mixedPath, sha256: sha(mixedSrc), content: mixedSrc };
+    const mixedDecls = [
+      { selector: "MixedProtocolVault.deposit", operation: "send" as const, inputs: ["uint256"] },
+      { selector: "MixedProtocolVault.withdraw", operation: "send" as const, inputs: ["uint256"] },
+      { selector: "MixedProtocolVault.totalDeposits", operation: "call" as const, inputs: [] },
+      { selector: "MixedProtocolVault.balances", operation: "call" as const, inputs: ["address"] },
+    ];
+    const mixedAnalysis = evaluateDeterministicAnalysisTurn({
+      stage: "ANALYZE",
+      analyzeModelPending: true,
+      activeLead: {
+        leadId: sha("mixed-lead"),
+        path: mixedPath,
+        selector: "MixedProtocolVault.withdraw",
+        sourceEvidence: `${mixedPath}:0-200:${mixedSnap.sha256}`,
+      },
+      sources: [mixedSnap],
+      repositoryCommit: commitSha,
+      declarations: mixedDecls,
+      enableSpecializedEscalation: false,
+    });
+    assert.ok(mixedAnalysis, "evaluateDeterministicAnalysisTurn must return structured result");
+    assert.equal(mixedAnalysis!.analyticalDisposition.action, "defer_lead", "Private rewards getter must defer top relational hypothesis");
+    assert.equal(mixedAnalysis!.analyticalDisposition.status, "uncertain");
+    assert.equal(mixedAnalysis!.analyticalDisposition.smtRefuted, false);
+    assert.equal(mixedAnalysis!.constructionFeasibility.attempted, true, "Deferred non-SMT-refuted lead must still check construction feasibility");
+    assert.equal(mixedAnalysis!.constructionFeasibility.feasible, true, "Alternative supported conservation property must still construct");
+    assert.ok(mixedAnalysis!.experimentCandidates.length >= 1);
+
+    const mixedAction = driveDeterministicAuditTurn({
+      stage: "ANALYZE",
+      analyzeModelPending: true,
+      activeLead: {
+        leadId: sha("mixed-lead"),
+        path: mixedPath,
+        selector: "MixedProtocolVault.withdraw",
+        sourceEvidence: `${mixedPath}:0-200:${mixedSnap.sha256}`,
+      },
+      sources: [mixedSnap],
+      repositoryCommit: commitSha,
+      declarations: mixedDecls,
+      constraints: { action: ["discover_experiment", "assess_lead", "defer_lead"] },
+      enableSpecializedEscalation: false,
+    });
+    assert.equal(
+      mixedAction.action,
+      "discover_experiment",
+      "Driver must propose discover_experiment for constructible property even when a companion relational hypothesis was deferred",
+    );
+
+    // When Z3 proves smt_unsat_guard on the same lead, construction MUST be skipped
+    const refutedGraph = buildProgramFactsGraph({ sources: [mixedSnap] });
+    refutedGraph.byFile.get(mixedPath)!.facts.push({
+      id: sha("z3-unsat-fact"),
+      adapter: "z3",
+      language: "solidity",
+      kind: "smt_unsat_guard",
+      file: mixedPath,
+      line: 12,
+      symbol: "MixedProtocolVault.withdraw",
+      detail: "Guard proved unsatisfiable by Z3",
+      severity: "info",
+    });
+    const refutedAnalysis = evaluateDeterministicAnalysisTurn({
+      stage: "ANALYZE",
+      analyzeModelPending: true,
+      activeLead: {
+        leadId: sha("mixed-lead-refuted"),
+        path: mixedPath,
+        selector: "MixedProtocolVault.withdraw",
+        sourceEvidence: `${mixedPath}:0-200:${mixedSnap.sha256}`,
+      },
+      sources: [mixedSnap],
+      graph: refutedGraph,
+      repositoryCommit: commitSha,
+      declarations: mixedDecls,
+      enableSpecializedEscalation: false,
+    });
+    assert.equal(refutedAnalysis!.analyticalDisposition.status, "contradicted");
+    assert.equal(refutedAnalysis!.analyticalDisposition.smtRefuted, true);
+    assert.equal(refutedAnalysis!.constructionFeasibility.attempted, false);
+    assert.equal(refutedAnalysis!.constructionFeasibility.skippedReason, "smt_unsat_guard");
+
+    // 12e. Upfront host capability logging + batch-vs-inventory coverage in live runLocalAudit
+    const covAuditDir = await mkdtemp(join(tmpdir(), "lotus-cov-"));
+    try {
+      const covRepoDir = join(covAuditDir, "source-0");
+      await mkdir(join(covRepoDir, "contracts"), { recursive: true });
+      await writeFile(join(covRepoDir, "contracts/DInterest.sol"), dInterestSrc, "utf8");
+      execFileSync("git", ["init", "-q"], { cwd: covRepoDir });
+      execFileSync("git", ["config", "user.email", "test@lotus.local"], { cwd: covRepoDir });
+      execFileSync("git", ["config", "user.name", "LOTUS Test"], { cwd: covRepoDir });
+      execFileSync("git", ["add", "."], { cwd: covRepoDir });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: covRepoDir });
+      const covLog = join(covAuditDir, "audit.log");
+      const prevMaxLeads = process.env.LOCAL_ANALYZE_MAX_LEADS;
+      process.env.LOCAL_ANALYZE_MAX_LEADS = "1";
+      try {
+        await runLocalAudit(
+          "Audit DInterest.sol deterministically.",
+          covLog,
+          30_000,
+          covAuditDir,
+          "deterministic",
+          undefined,
+          {
+            maxTurns: 25,
+            numPredict: 512,
+            numCtx: 8192,
+            productionWorkflow: true,
+            verifyPython: true,
+            controllerIndex: true,
+            initialSourcePaths: ["source-0/contracts/DInterest.sol"],
+            validateFinal: () => null,
+            verifySource: async () =>
+              JSON.stringify({ status: "not_observed", behavior_observed: false, note: "stubbed_local_verifier" }),
+          },
+        );
+      } finally {
+        if (prevMaxLeads === undefined) delete process.env.LOCAL_ANALYZE_MAX_LEADS;
+        else process.env.LOCAL_ANALYZE_MAX_LEADS = prevMaxLeads;
+      }
+      const covLogText = await readFile(covLog, "utf8");
+      const capsIdx = covLogText.indexOf("[DETERMINISTIC_HOST_CAPABILITIES]");
+      const winIdx = covLogText.indexOf("[ANALYSIS_MODEL_WINDOW_STARTED]");
+      assert.ok(capsIdx >= 0, "Audit log must emit [DETERMINISTIC_HOST_CAPABILITIES] upfront");
+      assert.ok(winIdx < 0 || capsIdx < winIdx, "[DETERMINISTIC_HOST_CAPABILITIES] must precede ANALYZE window");
+      const completeMatch = covLogText.match(/\[ANALYSIS_COMPLETE\]\s+(\{[^\n]+\})/);
+      assert.ok(completeMatch, "Audit log must record [ANALYSIS_COMPLETE]");
+      const completePayload = JSON.parse(completeMatch![1]);
+      assert.equal(completePayload.batchCoverage, "complete");
+      assert.ok(completePayload.inventoryTotal >= 2, `Expected >=2 total candidates, got ${completePayload.inventoryTotal}`);
+      assert.equal(completePayload.admittedCount, 1);
+      assert.ok(completePayload.queuedRemaining >= 1, "Expected remaining queued candidates when bounded to 1");
+      assert.equal(completePayload.inventoryCoverage, "partial_bounded_batch");
+    } finally {
+      await rm(covAuditDir, { recursive: true, force: true });
     }
   }
 

@@ -604,4 +604,181 @@ if (!oracleVaultRes.ok) {
   );
 }
 
+// 6. Acquired-source ERC20 vault multi-contract fixture construction (erc20_deposit_withdraw)
+const mockErc20Src = `pragma solidity ^0.8.20;
+contract ERC20Mock {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "bal");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "bal");
+        require(allowance[from][msg.sender] >= amount, "allow");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}`;
+const erc20VaultSrc = `pragma solidity ^0.8.20;
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+contract CoreERC20Vault {
+    IERC20 public stablecoin;
+    mapping(address => uint256) public balances;
+    uint256 public totalDeposits;
+    constructor(address _stablecoin) { stablecoin = IERC20(_stablecoin); }
+    function deposit(uint256 amount) external {
+        require(stablecoin.transferFrom(msg.sender, address(this), amount), "tf");
+        balances[msg.sender] += amount;
+        totalDeposits += amount;
+    }
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "low");
+        balances[msg.sender] -= amount;
+        // Intentional accounting bug: totalDeposits not decremented!
+        require(stablecoin.transfer(msg.sender, amount), "t");
+    }
+}`;
+const mockErc20Snap = {
+  path: 'contracts/mocks/ERC20Mock.sol',
+  sha256: createHash('sha256').update(mockErc20Src).digest('hex'),
+  content: mockErc20Src,
+};
+const erc20VaultSnap = {
+  path: 'contracts/CoreERC20Vault.sol',
+  sha256: createHash('sha256').update(erc20VaultSrc).digest('hex'),
+  content: erc20VaultSrc,
+};
+const erc20VaultRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: erc20VaultSnap.path,
+  targetSelector: 'CoreERC20Vault.withdraw',
+  sources: [erc20VaultSnap, mockErc20Snap],
+  declarations: [
+    {selector: 'CoreERC20Vault.deposit', operation: 'send', inputs: ['uint256']},
+    {selector: 'CoreERC20Vault.withdraw', operation: 'send', inputs: ['uint256']},
+    {selector: 'CoreERC20Vault.totalDeposits', operation: 'call', inputs: []},
+    {selector: 'CoreERC20Vault.balances', operation: 'call', inputs: ['address']},
+  ],
+});
+assert.equal(erc20VaultRes.ok, true, 'Acquired-source ERC20 vault with MockERC20 must construct multi-contract fixture');
+if (erc20VaultRes.ok) {
+  const exp = erc20VaultRes.experiments.find((e) => e.securityProperty.includes('conservation'));
+  assert.ok(exp, 'Expected conservation invariant experiment for CoreERC20Vault');
+  assert.equal(exp!.sequence.preparation?.deployments?.[0]?.id, 'token');
+  assert.equal(exp!.sequence.preparation?.deployments?.[0]?.file, mockErc20Snap.path);
+  assert.deepEqual(exp!.sequence.constructorArgs, ['$deployment:token']);
+  assert.ok(
+    exp!.sequence.steps.some((s: any) => s.deploymentId === 'token' && s.function === 'mint(address,uint256)'),
+    'ERC20 fixture must mint tokens on $deployment:token',
+  );
+  assert.ok(
+    exp!.sequence.steps.some((s: any) => s.deploymentId === 'token' && s.function === 'approve(address,uint256)'),
+    'ERC20 fixture must approve $contract on $deployment:token',
+  );
+  assert.ok(
+    exp!.sequence.steps.some((s: any) => s.operation === 'call' && s.function === 'totalDeposits()' && s.expect === '600'),
+    'ERC20 conservation experiment must assert post-withdraw totalDeposits == 600',
+  );
+}
+
+// 7. Off-repo external market adapter (BenqiERC20Market) MUST still refuse even when ERC20Mock is present
+const benqiSrc = `pragma solidity ^0.8.20;
+interface IERC20 { function transferFrom(address f, address t, uint256 a) external returns (bool); function transfer(address t, uint256 a) external returns (bool); }
+interface ICERC20 { function mint(uint256 a) external returns (uint256); function redeemUnderlying(uint256 a) external returns (uint256); }
+interface IComptroller { function claimComp(address holder) external; }
+contract BenqiERC20Market {
+    IERC20 public stablecoin;
+    ICERC20 public cToken;
+    IComptroller public comptroller;
+    uint256 public totalDeposits;
+    constructor(address _stablecoin, address _cToken, address _comptroller) {
+        stablecoin = IERC20(_stablecoin);
+        cToken = ICERC20(_cToken);
+        comptroller = IComptroller(_comptroller);
+    }
+    function deposit(uint256 amount) external {
+        stablecoin.transferFrom(msg.sender, address(this), amount);
+        cToken.mint(amount);
+        totalDeposits += amount;
+    }
+    function withdraw(uint256 amount) external {
+        cToken.redeemUnderlying(amount);
+        comptroller.claimComp(address(this));
+        stablecoin.transfer(msg.sender, amount);
+        totalDeposits -= amount;
+    }
+}`;
+const benqiSnap = {
+  path: 'contracts/models/moneymarket/benqi/BenqiERC20Market.sol',
+  sha256: createHash('sha256').update(benqiSrc).digest('hex'),
+  content: benqiSrc,
+};
+const benqiRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: benqiSnap.path,
+  targetSelector: 'BenqiERC20Market.deposit',
+  sources: [benqiSnap, mockErc20Snap],
+  declarations: [
+    {selector: 'BenqiERC20Market.deposit', operation: 'send', inputs: ['uint256']},
+    {selector: 'BenqiERC20Market.withdraw', operation: 'send', inputs: ['uint256']},
+    {selector: 'BenqiERC20Market.totalDeposits', operation: 'call', inputs: []},
+  ],
+});
+assert.equal(benqiRes.ok, false, 'External Benqi market adapter with ICERC20/IComptroller must refuse');
+if (!benqiRes.ok) {
+  assert.equal(benqiRes.code, 'UNKNOWN_ASSERTION');
+  assert.equal(benqiRes.unresolvedCategory, 'unresolved_dependency');
+}
+
+// 8. Abstract contract with acquired concrete subclass reports subclass hint cleanly
+const abstractMarketSrc = `pragma solidity ^0.8.20;
+abstract contract YVaultMarket {
+    uint256 public totalDeposits;
+    function deposit(uint256 amount) external virtual;
+    function withdraw(uint256 amount) external { totalDeposits -= amount; }
+}`;
+const concreteMarketSrc = `pragma solidity ^0.8.20;
+contract YVaultMarketV2 is YVaultMarket {
+    function deposit(uint256 amount) external override { totalDeposits += amount; }
+}`;
+const abstractSnap = {
+  path: 'contracts/models/moneymarket/yvault/YVaultMarket.sol',
+  sha256: createHash('sha256').update(abstractMarketSrc).digest('hex'),
+  content: abstractMarketSrc,
+};
+const concreteSnap = {
+  path: 'contracts/models/moneymarket/yvault/YVaultMarketV2.sol',
+  sha256: createHash('sha256').update(concreteMarketSrc).digest('hex'),
+  content: concreteMarketSrc,
+};
+const abstractRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: abstractSnap.path,
+  targetSelector: 'YVaultMarket.withdraw',
+  sources: [abstractSnap, concreteSnap],
+  declarations: [
+    {selector: 'YVaultMarket.withdraw', operation: 'send', inputs: ['uint256']},
+    {selector: 'YVaultMarket.totalDeposits', operation: 'call', inputs: []},
+  ],
+});
+assert.equal(abstractRes.ok, false, 'Abstract contract must refuse direct instantiation');
+if (!abstractRes.ok) {
+  assert.equal(abstractRes.code, 'UNKNOWN_ASSERTION');
+  assert.equal(abstractRes.unresolvedCategory, 'missing_fixture');
+  assert.match(abstractRes.detail, /YVaultMarketV2/, 'Abstract contract refusal must report acquired concrete subclass');
+}
+
 console.log('Standalone experiment construction passed');
