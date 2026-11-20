@@ -3,9 +3,6 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -19,9 +16,6 @@ concurrency:
 
 jobs:
   laptop:
-    # Run PR laptop acceptance only for this authorized Round 3 branch,
-    # and never execute untrusted fork PR code on the personal laptop.
-    if: ${{ github.event_name != 'pull_request' || (github.head_ref == 'repair/round3-exhaustive-deterministic-laptop' && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: [self-hosted, linux, x64]
     # Self-hosted GitHub Actions allows up to five days; this is the external
     # platform ceiling, not a LOTUS investigation deadline. A truly stalled
