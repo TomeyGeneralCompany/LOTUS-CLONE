@@ -2,12 +2,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer } from "node:http";
 import { readSourcePage, searchSourcePage, listSourcePage, SourceReads } from "../packages/security-solver/src/source-inspection";
 import { selectSourceBatch, incompleteProbeCoverage } from "../packages/security-solver/src/inspection-coverage";
 import { runLocalAudit, activeLocalAuditCount } from "../packages/security-solver/src/local-ollama-runner";
+import { driveDeterministicAuditTurn } from "../packages/security-solver/src/deterministic";
 const root=await mkdtemp(join(tmpdir(),"inspection-regression-"));
-const server=createServer();
 try {
   const filtered=join(root,"filtered");await mkdir(filtered);
   for(const name of ["node_modules","vendor","dist","build",".git","__pycache__"]) {
@@ -70,29 +69,33 @@ try {
   assert.equal(incompleteProbeCoverage({failedProbes:0,unsupportedProbes:0}),"failed");
   assert.equal(incompleteProbeCoverage({failedProbes:0,unsupportedProbes:1}),"unsupported");
   assert.equal(incompleteProbeCoverage({failedProbes:1,unsupportedProbes:1}),"failed");
-  // Exercise paging through both model protocols, not only the read helper.
-  for(const protocol of ["json","native"]) {
-    process.env.LOCAL_OLLAMA_TOOL_PROTOCOL=protocol;
-    let calls=0;
-    server.removeAllListeners("request");
-    server.on("request",async(req,res)=>{
-      let raw="";for await(const chunk of req)raw+=chunk;
-      const request=JSON.parse(raw);calls++;
-      if(calls===2)assert.ok(request.messages.at(-1).content.includes("renderer.render(input)"));
-      const action={action:calls===1?"read_file":"final",path:"large.js",query:"",answer:"DONE",offset:40000};
-      res.end(JSON.stringify({message:protocol==="json"?{role:"assistant",content:JSON.stringify(action)}:
-        calls===1?{role:"assistant",content:"",tool_calls:[{function:{name:"read_file",arguments:{path:"large.js",offset:40000}}}]}:{role:"assistant",content:"DONE"}}));
-    });
-    if(!server.listening)await new Promise<void>(r=>server.listen(0,"127.0.0.1",r));
-    const addr=server.address();assert.ok(addr&&typeof addr!=="string");
-    process.env.AUTOHACK_OLLAMA_URL=`http://127.0.0.1:${addr.port}/api/chat`;
-    const actual=new SourceReads();
-    assert.equal(await runLocalAudit("Read caller",join(root,protocol+".log"),10000,root,"fixture",undefined,
-      {onRead:(p,s)=>actual.add(p,s),validateFinal:()=>actual.sawLine("large.js",text,5001)?null:"Caller not seen"}),"DONE");
-    assert.equal(calls,2);
+  // Deterministic controller must select authorized source; byte coverage comes
+  // from real filesystem paging, not a mock inference response.
+  const action=driveDeterministicAuditTurn({
+    initialSourcePaths:['large.js'],readPaths:[],sources:[],
+    constraints:{action:['read_file','final']},
+  });
+  assert.equal(action.action,'read_file');
+  assert.equal(action.path,'large.js');
+  const inspected=new SourceReads();
+  let pageOffset=0;
+  while(true){
+    const page=await readSourcePage(join(root,action.path),pageOffset);
+    inspected.add(action.path,page);
+    if(page.nextOffset===null)break;
+    assert.ok(page.nextOffset>pageOffset);
+    pageOffset=page.nextOffset;
   }
+  assert.ok(inspected.sawLine('large.js',text,5001),'Deterministic pagination must cover caller');
+  const completed=driveDeterministicAuditTurn({
+    stage:'REPORT',initialSourcePaths:['large.js'],readPaths:['large.js'],
+    sources:[{path:'large.js',content:text,sha256:'a'.repeat(64)}],
+    constraints:{action:['final']},
+  });
+  assert.equal(completed.action,'final');
+  assert.equal(JSON.parse(completed.answer).outcome,'no_testable_candidate');
   // EISDIR during checkpoint loading must also clean up timers and controller state.
   await assert.rejects(runLocalAudit("unused",join(root,"error.log"),10000,root,"fixture",undefined,{checkpointPath:root}));
   assert.equal(activeLocalAuditCount(),0);
   console.log("Paginated reads, caller spans, scoped/deep/mjs/cjs searches, repository rotation, failure classification and checkpoint cleanup: PASSED");
-} finally {server.closeAllConnections();server.close();await rm(root,{recursive:true,force:true});}
+} finally {await rm(root,{recursive:true,force:true});}
