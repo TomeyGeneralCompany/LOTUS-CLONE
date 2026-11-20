@@ -23,8 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
-      LOCAL_OLLAMA_MODEL: qwen3:4b
-      LOCAL_MODEL_ADAPTER: ollama
+      LOCAL_MODEL_ADAPTER: deterministic
       LOCAL_OLLAMA_TOOL_PROTOCOL: json
       LOCAL_HUNT_DYNAMIC_ALLOWANCE: 'true'
       LOCAL_HUNT_MAX_TURNS: '80'
@@ -32,7 +31,7 @@ jobs:
       SECURITY_AUTO_SUBMIT: 'false'
       SECURITY_AUTO_HUNT_ENABLED: 'false'
       SECURITY_SOURCE_CODE_TIMEOUT_MINUTES: '180'
-      AUTOHACK_OLLAMA_URL: http://127.0.0.1:11434/api/chat
+      AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -55,16 +54,6 @@ jobs:
           sudo apt-get install -y bubblewrap default-jdk-headless
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           timeout 2100 bash scripts/install-reproduction-runtime.sh
-      - name: Start local Qwen3 model
-        timeout-minutes: 45
-        run: |
-          docker run -d --name lotus-gauntlet-ollama -p 127.0.0.1:11434:11434 ollama/ollama:latest
-          for n in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
-          docker exec lotus-gauntlet-ollama ollama pull qwen3:4b
       - name: Run production investigation
         timeout-minutes: 230
         run: |
@@ -84,6 +73,3 @@ jobs:
             data/gauntlet/live-terminal.log
           retention-days: 14
           if-no-files-found: warn
-      - name: Stop model
-        if: always()
-        run: docker rm -f lotus-gauntlet-ollama || true
