@@ -23,4 +23,6 @@ export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-32768}"
 # Keep the orchestrator as the supervised PID. npm adds a shell/process layer
 # which can survive when only the launcher PID receives SIGTERM.
+export LOCAL_MODEL_ADAPTER=deterministic
+unset LOCAL_OLLAMA_MODEL LOCAL_MODEL_PROFILE
 exec node --import tsx "$ROOT/orchestrator.ts"
