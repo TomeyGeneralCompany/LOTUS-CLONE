@@ -33,7 +33,6 @@ jobs:
       AUTOHACK_GUIDED_SOURCE_PROBES: 'true'
       LOCAL_HUNT_DYNAMIC_ALLOWANCE: 'true'
       LOCAL_CONTROLLER_FULL_SOURCE_INDEX: 'true'
-      JAVAPARSER_JAR: /tmp/lotus-tools/javaparser-core.jar
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,11 +47,18 @@ jobs:
           mkdir -p data/repair-feedback
           bash scripts/install-static-analysis.sh
           echo "Installed local static analyzers (semgrep, slither, solc-0.8.30)" | tee -a data/repair-feedback/setup.log
-          # Best-effort provision MIT Python specialists (Z3, LibCST, Tree-sitter) and JavaParser jar on laptop host
-          python3 -c "import z3, libcst, tree_sitter" 2>/dev/null || python3 -m pip install --user --quiet libcst z3-solver tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-java 2>/dev/null || true
-          mkdir -p /tmp/lotus-tools
-          [[ -f /tmp/lotus-tools/javaparser-core.jar ]] || curl -fsSL https://repo1.maven.org/maven2/com/github/javaparser/javaparser-core/3.26.3/javaparser-core-3.26.3.jar -o /tmp/lotus-tools/javaparser-core.jar 2>/dev/null || true
-          npx tsx -e 'import { detectAvailableAdapters } from "./packages/security-solver/src/deterministic"; const caps = detectAvailableAdapters(); console.log(JSON.stringify({ available: caps.filter(c => c.availableOnHost).map(c => c.name), unavailable: caps.filter(c => !c.availableOnHost).map(c => c.name), adapters: caps }, null, 2));' | tee data/repair-feedback/host-capabilities.json | tee -a data/repair-feedback/setup.log || true
+          # Round 3: provision pinned, smoke-tested specialists on the actual laptop.
+          # Keep the tool root isolated from the installed LOTUS and record failures.
+          export LOTUS_SPECIALIST_ROOT="${LOTUS_SPECIALIST_ROOT:-$HOME/.lotus-tools}"
+          if bash scripts/install-deterministic-specialists.sh > data/repair-feedback/specialist-install.log 2>&1; then
+            echo "SPECIALIST_SETUP_OK" | tee -a data/repair-feedback/setup.log
+          else
+            echo "SPECIALIST_SETUP_FAILED: see specialist-install.log" | tee -a data/repair-feedback/setup.log
+            cat data/repair-feedback/specialist-install.log
+            exit 1
+          fi
+          source "$LOTUS_SPECIALIST_ROOT/env.sh"
+          npx tsx -e 'import { detectAvailableAdapters } from "./packages/security-solver/src/deterministic"; const caps = detectAvailableAdapters(); console.log(JSON.stringify({ available: caps.filter(c => c.availableOnHost).map(c => c.name), unavailable: caps.filter(c => !c.availableOnHost).map(c => c.name), adapters: caps }, null, 2));' | tee data/repair-feedback/host-capabilities.json | tee -a data/repair-feedback/setup.log
 
           # Preserve the actual setup failure instead of reporting a fabricated test exit code.
           # The runner is a systemd service: do not assume the interactive shell's
@@ -88,6 +94,12 @@ jobs:
           fi
 
           echo "SETUP_OK: dependencies and installed state available; deterministic engine selected (no Ollama required)" | tee -a data/repair-feedback/setup.log
+
+      - name: Verify Round 3 full-inventory lifecycle before laptop hunt
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npx tsx scripts/test-deterministic-full-inventory.ts | tee data/repair-feedback/full-inventory-test.log
 
       - name: Run authorized real-world investigation
         id: hunt
