@@ -9,7 +9,7 @@ export function describeHuntFailure(detail:unknown) {
     .replace(/(https?:\/\/)[^/\s@]+:[^/\s@]+@/gi,"$1[redacted]@") : "";
   const stage=/context budget|configured context|context allowance/i.test(reason)?"Analysis context":
     /reproduction|probe|solc|sandbox/i.test(reason)?"Source reproduction":
-    /ollama|model|inference|JSON action|inspection limit/i.test(reason)?"Source analysis":
+    /deterministic|controller analysis|source analysis|ollama|model|inference|JSON action|inspection limit/i.test(reason)?"Source analysis":
     /acquir|clone|git |repository was acquired/i.test(reason)?"Source download":"Hunt attempt";
   return {stage,reason:reason || "The original failure reason was not retained for this attempt."};
 }
