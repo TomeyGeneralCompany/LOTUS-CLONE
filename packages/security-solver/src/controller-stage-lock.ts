@@ -127,6 +127,11 @@ export class ControllerStageLock {
     if(ids.some(id=>!id)||new Set(ids).size!==ids.length)throw new Error('INVALID_ANALYSIS_INVENTORY');
     this.inventoryIds=new Set(ids);
   }
+  restoreResolvedAnalysisCandidate(id:string){
+    if(this.stage!=="ANALYZE"||!this.inventoryIds?.has(id)||this.leads.has(id))
+      throw new Error("ANALYSIS_RESTORE_CANDIDATE_INVALID: "+id);
+    this.inventoriedResolved.add(id);
+  }
   get analysisInventoryProgress(){
     const total=this.inventoryIds?.size||0;
     return {total,resolved:this.inventoriedResolved.size,remaining:total-this.inventoriedResolved.size};
