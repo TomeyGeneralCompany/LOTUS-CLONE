@@ -23,7 +23,7 @@ import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequi
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { postOllamaChat } from "../../core/src/ollama-chat";
-import { buildAnalysisCandidateQueue, driveDeterministicAuditTurn, resolveLocalModelAdapter, type ClosedLoopLeadResult, type EscalationCache } from "./deterministic";
+import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, driveDeterministicAuditTurn, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
@@ -280,6 +280,9 @@ export async function runLocalAudit(
   type AnalysisPacket={id:string;path:string;selector:string;sourceEvidence:string;sourceSha256:string;sourceCommit:string;sourceExcerpt:string;excerptStart:number;truncated:boolean};
   const analysisPackets=new Map<string,AnalysisPacket>();
   const deterministicEscalationCache:EscalationCache=new Map();
+  let deterministicProgramGraph:ProgramFactsGraph|null=null;
+  let deterministicSourceSnapshots:SourceSnapshot[]=[];
+  const deterministicDeclarationsCache=new Map<string,SolidityProbeDeclaration[]>();
   const nextAnalysisPacket=()=>stageLock?.analysisLeads.find(x=>x.state.kind==='pending');
   // Current controller instruction is reconstructed from stage-owned state for
   // every inference, not carried as disposable conversational history.
@@ -802,6 +805,7 @@ export async function runLocalAudit(
             const full=await safePath(path),source=await readFile(full,'utf8');
             if(path.endsWith('.sol')){
               const menu=await solidityIndex.probeMenu(full,256);
+              deterministicDeclarationsCache.set(path,menu);
               const queuedSelectorsForPath=new Set<string>();
               for(const {selector,probe} of await groundedControllerOptions(path,source,menu)){
                 const plan={action:'plan_probe' as const,path,query:selector,
@@ -918,9 +922,30 @@ export async function runLocalAudit(
         const maxAdmittedLeads=Number.isSafeInteger(envMaxLeads)&&envMaxLeads>=1?Math.min(envMaxLeads,64):18;
         const envMaxPerFile=Number(process.env.LOCAL_ANALYZE_MAX_PER_FILE??4);
         const maxPerFileLeads=Number.isSafeInteger(envMaxPerFile)&&envMaxPerFile>=1?Math.min(envMaxPerFile,16):4;
+        // Build the host-enriched ProgramFactsGraph ONCE per investigation and reuse
+        // it across both candidate prioritization and every deterministic ANALYZE turn.
+        deterministicSourceSnapshots=[...accessibleSoliditySources.entries()].map(([p,content])=>({
+          path:p,
+          sha256:createHash('sha256').update(content).digest('hex'),
+          content,
+        }));
+        if(!deterministicProgramGraph && deterministicSourceSnapshots.length>0){
+          deterministicProgramGraph=buildProgramFactsGraph(
+            {sources:deterministicSourceSnapshots,staticLeads:limits.staticLeads||[]},
+            createHostFactsAdapters(),
+          );
+          await appendFile(logFile,'[DETERMINISTIC_FACTS_GRAPH_BUILT] '+JSON.stringify({
+            files:deterministicProgramGraph.byFile.size,
+            symbols:deterministicProgramGraph.symbols.length,
+            facts:deterministicProgramGraph.facts.length,
+            edges:deterministicProgramGraph.edges.length,
+            adapters:deterministicProgramGraph.adaptersUsed,
+          })+'\n');
+        }
         const candidateQueue=buildAnalysisCandidateQueue({
           items:candidateSourceItems,
           staticLeads:solLeads,
+          graph:deterministicProgramGraph||undefined,
           maxAdmitted:maxAdmittedLeads,
           maxPerFile:maxPerFileLeads,
         });
@@ -970,7 +995,8 @@ export async function runLocalAudit(
         const enableAnalyzeModel=structured && !!workflow &&
           process.env.LOCAL_MODEL_SOLIDITY_ANALYZE!=='false' && maxAnalyzeTurns>0 &&
           (process.env.LOCAL_MODEL_SOLIDITY_ANALYZE==='true' || solLeads.length>0 ||
-           (nonMockSolSummaries.length>=2 && totalUnqueuedNonSetters>=2));
+           (nonMockSolSummaries.length>=2 && totalUnqueuedNonSetters>=2) ||
+           (adapter==='deterministic' && candidateQueue.admitted.length>0));
         if(enableAnalyzeModel){
           analyzeModelPending=true;
           analyzeTurnsRemaining=maxAnalyzeTurns;
@@ -1838,18 +1864,48 @@ export async function runLocalAudit(
         await (async () => {
           const activeLeadMeta=stageLock?.currentStage==='ANALYZE' && analyzeModelPending ? nextAnalysisPacket() : undefined;
           const activePacket=activeLeadMeta ? analysisPackets.get(activeLeadMeta.id) : undefined;
-          const snapshots:Array<{path:string;sha256:string;content:string}>=[];
           const completedReadPaths=[...new Set([...(workflow?.snapshot().readPaths || []), ...terminalReadPages.keys()])];
-          const snapshotPaths=new Set<string>();
-          if(activePacket?.path)snapshotPaths.add(activePacket.path);
-          for(const rp of completedReadPaths.slice(-12))snapshotPaths.add(rp);
-          for(const sp of snapshotPaths){
+          const snapshotMap=new Map<string,SourceSnapshot>();
+          for(const snap of deterministicSourceSnapshots)snapshotMap.set(snap.path,snap);
+          const extraPaths=new Set<string>();
+          if(activePacket?.path && !snapshotMap.has(activePacket.path))extraPaths.add(activePacket.path);
+          for(const rp of completedReadPaths.slice(-12)){
+            if(!snapshotMap.has(rp))extraPaths.add(rp);
+          }
+          for(const sp of extraPaths){
             try {
               const full=await safePath(sp);
               const content=await readFile(full,'utf8');
-              snapshots.push({path:sp,sha256:createHash('sha256').update(content).digest('hex'),content});
+              snapshotMap.set(sp,{path:sp,sha256:createHash('sha256').update(content).digest('hex'),content});
             }catch{}
           }
+          const snapshots=[...snapshotMap.values()];
+          if(!deterministicProgramGraph && snapshots.length>0){
+            deterministicProgramGraph=buildProgramFactsGraph(
+              {sources:snapshots,staticLeads:limits.staticLeads||[]},
+              createHostFactsAdapters(),
+            );
+          }
+          let activeDeclarations:SolidityProbeDeclaration[]|undefined;
+          if(activePacket?.path?.endsWith('.sol')){
+            activeDeclarations=deterministicDeclarationsCache.get(activePacket.path);
+            if(!activeDeclarations){
+              try {
+                const full=await safePath(activePacket.path);
+                activeDeclarations=await solidityIndex.probeMenu(full,256);
+                deterministicDeclarationsCache.set(activePacket.path,activeDeclarations);
+              }catch{}
+            }
+          }
+          const existingExperimentIds=new Set<string>();
+          for(const entry of stagedPlans){
+            existingExperimentIds.add(entry.id);
+            existingExperimentIds.add(JSON.stringify([
+              entry.plan.path,entry.plan.query,entry.plan.hypothesis,entry.plan.sequence,
+            ]));
+          }
+          const activeRepoCommit=activePacket?.sourceCommit ||
+            (activePacket?.path ? sourceRevision(activePacket.path) || '' : '');
           const observedCases=(workflow?.snapshot().observations || [])
             .filter(o=>o.status==='behavior_observed' && typeof o.caseId==='string' && /^[a-f0-9]{64}$/.test(o.caseId))
             .map(o=>({caseId:o.caseId!,path:o.path,selector:o.function,kind:o.kind}));
@@ -1857,6 +1913,7 @@ export async function runLocalAudit(
             (constraints?.action?.length===1 && constraints.action[0]==='final')) && limits.recoverFinal
             ? await limits.recoverFinal() : null;
           let lastEscalation:ClosedLoopLeadResult|null=null;
+          let lastAnalysisResult:DeterministicAnalysisResult|null=null;
           const detAction=driveDeterministicAuditTurn({
             stage:stageLock?.currentStage,
             analyzeModelPending,
@@ -1869,6 +1926,10 @@ export async function runLocalAudit(
             } : null,
             pendingLeadIds:stageLock?.analysisProgress.pendingIds || [],
             sources:snapshots,
+            graph:deterministicProgramGraph||undefined,
+            repositoryCommit:activeRepoCommit,
+            declarations:activeDeclarations,
+            existingExperimentIds,
             staticLeads:limits.staticLeads || [],
             constraints,
             requestSchema,
@@ -1880,7 +1941,16 @@ export async function runLocalAudit(
             escalationCache:deterministicEscalationCache,
             repositoryDir:cwd,
             onEscalation:(res)=>{lastEscalation=res;},
+            onAnalysisResult:(res)=>{lastAnalysisResult=res;},
           });
+          if(lastAnalysisResult && (lastAnalysisResult as DeterministicAnalysisResult).unresolvedReasons.length>0){
+            const ar=lastAnalysisResult as DeterministicAnalysisResult;
+            await appendFile(logFile,'[DETERMINISTIC_EXPERIMENT_UNRESOLVED] '+JSON.stringify({
+              turn:turn+1,leadId:detAction.leadId,path:detAction.path,query:detAction.query,
+              candidateCount:ar.experimentCandidates.length,
+              unresolvedReasons:ar.unresolvedReasons.slice(0,4),
+            })+'\n');
+          }
           if(lastEscalation && ((lastEscalation as ClosedLoopLeadResult).escalatedAdapters.length>0 || (lastEscalation as ClosedLoopLeadResult).reconsidered)) {
             const esc=lastEscalation as ClosedLoopLeadResult;
             await appendFile(logFile,'[DETERMINISTIC_ESCALATION] '+JSON.stringify({
