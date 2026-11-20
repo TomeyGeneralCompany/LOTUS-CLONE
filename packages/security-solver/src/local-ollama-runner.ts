@@ -1061,8 +1061,8 @@ export async function runLocalAudit(
           items:candidateSourceItems,
           staticLeads:solLeads,
           graph:deterministicProgramGraph||undefined,
-          maxAdmitted:maxAdmittedLeads,
-          maxPerFile:maxPerFileLeads,
+          maxAdmitted:analysisBatchSize,
+          maxPerFile:analysisPerFileCap,
         });
         analysisInventoryMeta={
           inventoryTotal:candidateQueue.inventory.length,
