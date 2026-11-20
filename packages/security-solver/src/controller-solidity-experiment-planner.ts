@@ -32,7 +32,8 @@ export type InvariantUnresolvedCategory =
   | 'no_supported_property';
 
 export interface SourceInvariantTransitionPlan {
-  mode: 'eth_deposit_withdraw' | 'internal_deposit_withdraw' | 'mint_burn_supply';
+  mode: 'eth_deposit_withdraw' | 'internal_deposit_withdraw' | 'erc20_deposit_withdraw' | 'mint_burn_supply';
+  usesMockToken?: boolean;
   inflowMethod: string;
   inflowSig: string;
   inflowArgs: string[];
@@ -1373,8 +1374,11 @@ function privilegedPrimitiveGuardExperiment(
 
 
 function isTestOrMockPath(path:string):boolean {
-  return /(?:^|\/)?(?:mocks?|tests?|__tests__|fixtures|interfaces)(?:\/|$)/i.test(path) ||
-    /(?:Mock|Test)\.sol$/i.test(path) || /\/(?:Dummy|Echidna)[A-Za-z0-9_]*\.sol$/i.test(path);
+  const norm = path.replace(/\\/g, '/');
+  return /(?:^|\/)(?:mocks?|tests?|__tests__|fixtures?|interfaces|echidna|fuzz|harness)(?:\/|$)/i.test(norm) ||
+    /(?:^|\/)(?:Dummy|Echidna|Mock|Test|Fuzz|Harness)[A-Z_][A-Za-z0-9_]*\.sol$/.test(norm) ||
+    /(?:Mock|Mocks|Test|Tests|Echidna|Fuzz|Harness|Spec)\.sol$/.test(norm) ||
+    /\.t\.sol$/i.test(norm);
 }
 
 function isAbstractContractNode(contract:any,chain:readonly ContractEntry[]=[]):boolean {
@@ -1409,7 +1413,7 @@ function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAccount?:
   const t=abiType.trim();
   const name=paramName||'';
   if(t==='address'||t==='address payable'){
-    if(options.tokenRef && /(?:token|mph|asset|underlying|stake|currency|erc20|want|collateral|reward|base|quote)/i.test(name))
+    if(options.tokenRef && /(?:token|stablecoin|coin|mph|asset|underlying|stake|currency|erc20|want|collateral|reward|base|quote)/i.test(name))
       return options.tokenRef;
     if(options.ownerAccount && /(?:owner|admin|gov|controller|guardian|minter|operator|distributor|beneficiary|treasury|manager|authority|feeTo|recipient|to|user|account|spender)/i.test(name))
       return options.ownerAccount;
@@ -1788,10 +1792,27 @@ export function extractSourceInvariantDescriptor(
   }
   const { chain } = resolveInheritance(snapshot, contract, sources);
   if (isAbstractContractNode(contract, chain)) {
+    const concreteSubclasses: string[] = [];
+    for (const s of sources.values()) {
+      if (!s.path.endsWith('.sol') || isTestOrMockPath(s.path)) continue;
+      let sAst: any;
+      try { sAst = parseAstCached(s); } catch { continue; }
+      for (const node of (sAst.children || []).filter((n: any) => n.type === 'ContractDefinition')) {
+        const bases = (node.baseContracts || []).map((b: any) => b.baseName?.namePath || '');
+        if (!bases.includes(contract.name)) continue;
+        const subChain = resolveInheritance(s, node, sources).chain;
+        if (!isAbstractContractNode(node, subChain)) {
+          concreteSubclasses.push(`${s.path}:${node.name}`);
+        }
+      }
+    }
+    const subclassHint = concreteSubclasses.length
+      ? `; acquired concrete subclass(es): ${concreteSubclasses.sort().slice(0, 3).join(', ')}`
+      : '';
     return {
       ok: false,
       category: 'missing_fixture',
-      reason: `Contract ${contract.name} is abstract and cannot be instantiated directly`,
+      reason: `Contract ${contract.name} is abstract and cannot be instantiated directly${subclassHint}`,
     };
   }
 
@@ -1849,7 +1870,11 @@ export function extractSourceInvariantDescriptor(
     witness(snapshot, outflowFn, `${contract.name}.${outflowFn.name}`),
   ];
 
-  // Refuse when an unresolved external contract/interface/token call is executed inside the pair
+  // Classify external contract/interface/token calls inside the inflow/outflow pair.
+  // Acquired-source ERC20 token fixtures can be deployed locally; all other external
+  // protocol interfaces (IComptroller, ILendingPool, IExternalBook, etc.) must refuse
+  // explicitly with unresolved_dependency.
+  const mockToken = findRepositoryMockToken(sources);
   const stateDeclsForExt = allNodes
     .filter((n: any) => n.type === 'StateVariableDeclaration')
     .flatMap((n: any) => n.variables || [])
@@ -1859,14 +1884,36 @@ export function extractSourceInvariantDescriptor(
       .filter((v: any) => v?.typeName?.type === 'UserDefinedTypeName')
       .map((v: any) => String(v.name)),
   );
+  const erc20TypeRe = /^(?:I?ERC20(?:Upgradeable|Detailed|Burnable|Mintable)?|ERC20Mock|MockERC20|MockToken|TestToken)$/i;
+  const erc20VarNameRe = /^(?:token|stablecoin|underlying|asset|stakingToken|depositToken|erc20|mph)$/i;
+  const erc20StateVars = new Set<string>(
+    stateDeclsForExt
+      .filter((v: any) => {
+        const tName = v?.typeName?.type === 'UserDefinedTypeName' ? String(v.typeName.namePath || '') : '';
+        return erc20TypeRe.test(tName) || (v?.typeName?.type === 'UserDefinedTypeName' && erc20VarNameRe.test(String(v.name)));
+      })
+      .map((v: any) => String(v.name)),
+  );
+  const erc20MethodsRe = /^(?:safeTransferFrom|transferFrom|safeTransfer|transfer|approve|safeApprove|safeIncreaseAllowance|safeDecreaseAllowance|balanceOf|allowance)$/;
   const unresolvedExt: string[] = [];
+  let usesErc20Transfer = false;
   const externalCallRe = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
-  const knownExternalMethods = /^(?:safeTransferFrom|transferFrom|safeTransfer|deposit|withdraw|mint|burn|accrue|borrow|repay|liquidate|swap|getPrice|latestRoundData|credit|debit|quote|notifyRewardAmount)$/;
+  const knownExternalMethods = /^(?:safeTransferFrom|transferFrom|safeTransfer|deposit|withdraw|mint|burn|accrue|borrow|repay|liquidate|swap|getPrice|latestRoundData|credit|debit|quote|notifyRewardAmount|claimComp|redeem|redeemUnderlying)$/;
   let extMatch: RegExpExecArray | null;
   while ((extMatch = externalCallRe.exec(combinedBody)) !== null) {
     const recv = extMatch[1];
     const fnCalled = extMatch[2];
-    if (['msg', 'abi', 'this', 'super', 'payable', 'block', 'tx', 'type', 'Math', 'SafeMath'].includes(recv)) {
+    if (['msg', 'abi', 'this', 'super', 'payable', 'block', 'tx', 'type', 'Math', 'SafeMath', 'SafeCast', 'Address'].includes(recv)) {
+      continue;
+    }
+    const isErc20Call =
+      erc20MethodsRe.test(fnCalled) &&
+      (erc20StateVars.has(recv) || erc20VarNameRe.test(recv) || /^(?:I?ERC20|SafeERC20)$/i.test(recv));
+    if (isErc20Call) {
+      usesErc20Transfer = true;
+      if (!mockToken) {
+        unresolvedExt.push(`${recv}.${fnCalled}`);
+      }
       continue;
     }
     if (externalContractVars.has(recv) || knownExternalMethods.test(fnCalled)) {
@@ -1931,13 +1978,21 @@ export function extractSourceInvariantDescriptor(
     };
   }
 
-  // Verify local fixture constructibility via existing resolveFlexibleSetup
-  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, null, '$account0');
+  // Verify local fixture constructibility via existing resolveFlexibleSetup (wiring acquired mockToken when present)
+  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0');
   if (!setup) {
     return {
       ok: false,
       category: 'missing_fixture',
       reason: `Constructor or initializer fixture for ${contract.name} cannot be instantiated with local accounts`,
+      witnesses: pairWitnesses,
+    };
+  }
+  if (usesErc20Transfer && (!mockToken || !setup.usesToken)) {
+    return {
+      ok: false,
+      category: 'missing_fixture',
+      reason: `ERC20 token transfer in ${contract.name}.${inflowFn.name}/${outflowFn.name} requires a configurable token fixture wired via constructor or initializer`,
       witnesses: pairWitnesses,
     };
   }
@@ -2007,14 +2062,14 @@ export function extractSourceInvariantDescriptor(
     }
     mode = 'mint_burn_supply';
   }
-  // Mode C: Internal accounting deposit(uint256)/stake(uint256) + withdraw(uint256)/unstake(uint256)
+  // Mode C/D: Internal or acquired-ERC20 deposit(uint256)/stake(uint256) + withdraw(uint256)/unstake(uint256)
   else if (
     inflowDecl.inputs.length === 1 &&
     isUintType(inflowDecl.inputs[0]) &&
     outflowDecl.inputs.length === 1 &&
     isUintType(outflowDecl.inputs[0])
   ) {
-    mode = 'internal_deposit_withdraw';
+    mode = usesErc20Transfer ? 'erc20_deposit_withdraw' : 'internal_deposit_withdraw';
     inflowArgs = [inflowAmount];
     outflowArgs = [outflowAmount];
   } else {
@@ -2064,6 +2119,7 @@ export function extractSourceInvariantDescriptor(
       witnesses: pairWitnesses,
       transitionPlan: {
         mode,
+        ...(mode === 'erc20_deposit_withdraw' ? { usesMockToken: true } : {}),
         inflowMethod: inflowFn.name,
         inflowSig,
         inflowArgs,
@@ -2127,8 +2183,26 @@ export function constructCoreInvariantExperiment(
   if (!admitted || admitted.sourceSha256 !== snapshot.sha256) return null;
   const tp = admitted.transitionPlan!;
   const { chain } = resolveInheritance(snapshot, contract, sources);
-  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, null, '$account0');
+  const mockToken = tp.usesMockToken || tp.mode === 'erc20_deposit_withdraw' ? findRepositoryMockToken(sources) : null;
+  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0');
   if (!setup) return null;
+  if (tp.mode === 'erc20_deposit_withdraw' && (!mockToken || !setup.usesToken)) return null;
+
+  const preparation =
+    setup.usesToken && mockToken
+      ? {
+          deployments: [
+            {
+              id: 'token',
+              file: mockToken.snapshot.path,
+              contract: mockToken.contractName,
+              constructorArgs: mockToken.constructorArgs,
+            },
+          ],
+          operations: [],
+          checks: [],
+        }
+      : undefined;
 
   const steps: SoliditySequence['steps'] = [];
   if (setup.initSignature) {
@@ -2136,6 +2210,36 @@ export function constructCoreInvariantExperiment(
       operation: 'send',
       function: setup.initSignature,
       args: setup.initArgs,
+      sender: 0,
+      requiredSetup: true,
+    });
+  }
+  if (tp.mode === 'erc20_deposit_withdraw' && mockToken) {
+    const mintAmount = '10000';
+    if (mockToken.mintHasRecipient) {
+      steps.push({
+        operation: 'send',
+        deploymentId: 'token',
+        function: mockToken.mintSig,
+        args: ['$account0', mintAmount],
+        sender: 0,
+        requiredSetup: true,
+      });
+    } else {
+      steps.push({
+        operation: 'send',
+        deploymentId: 'token',
+        function: mockToken.mintSig,
+        args: [mintAmount],
+        sender: 0,
+        requiredSetup: true,
+      });
+    }
+    steps.push({
+      operation: 'send',
+      deploymentId: 'token',
+      function: 'approve(address,uint256)',
+      args: ['$contract', mintAmount],
       sender: 0,
       requiredSetup: true,
     });
@@ -2183,6 +2287,7 @@ export function constructCoreInvariantExperiment(
     sequence: {
       constructorArgs: setup.constructorArgs,
       ...(setup.constructorValueWei ? { constructorValueWei: setup.constructorValueWei } : {}),
+      ...(preparation ? { preparation } : {}),
       steps,
     },
     witnesses: admitted.witnesses?.length ? admitted.witnesses : [witness(snapshot, contract, admitted.target)],
