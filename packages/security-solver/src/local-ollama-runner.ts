@@ -14,7 +14,6 @@ import { InvestigationWorkflow } from "./investigation-workflow";
 import {guidedProbeAcrossSourceChain,guidedSourceProbe} from './source-guided-probes';
 import {controllerPolyglotPlan,controllerPolyglotPlans,canonicalControllerPolyglotIntent} from './controller-polyglot-plan';
 import {declaredProbeTarget, sourceDeclarationHints, supportedJavaProbeHints, javaProbeSelectorCompatible, probeChoices} from './probe-target-validation';
-import { postQwenAgentJson } from "./qwen-agent-transport";
 import { AuditAllowance } from "./audit-allowance";
 import { AuditNavigation } from "./audit-navigation";
 import {controllerOwnedNextAction,canonicalSourceNavigationAction} from "./controller-next-action";
@@ -22,7 +21,6 @@ import { SoliditySourceIndex } from "./solidity-source-index";
 import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequiredTail, auditCheckpoint, fitAuditToolOutput, latestAuditExchangeStart } from "./audit-context";
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
-import { postOllamaChat } from "../../core/src/ollama-chat";
 import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
@@ -204,7 +202,6 @@ export async function runLocalAudit(
     throw new Error("Production workflow requires JSON protocol, source probes and no fixture constraints");
   const workflow=limits.productionWorkflow ? new InvestigationWorkflow() : undefined;
   const adapter=resolveLocalModelAdapter();
-  if(adapter==='qwen-agent'&&!structured)throw new Error('Qwen-Agent adapter requires JSON action protocol');
   let successfulReads = 0;
   let rejectedRequiredProbeFinals = 0;
   let controllerAutoReadCount = 0;
@@ -913,7 +910,7 @@ export async function runLocalAudit(
               const menu=await solidityIndex.probeMenu(full,256);
               deterministicDeclarationsCache.set(path,menu);
               const queuedSelectorsForPath=new Set<string>();
-              for(const {selector,probe} of await groundedControllerOptions(path,source,menu,{skipFinancialInvariants:adapter==='deterministic'})){
+              for(const {selector,probe} of await groundedControllerOptions(path,source,menu,{skipFinancialInvariants:true})){
                 const plan={action:'plan_probe' as const,path,query:selector,
                   answer:'solidity_sequence',hypothesis:probe.hypothesis,sequence:probe.sequence};
                 const id=JSON.stringify([path,selector,plan.answer]);
@@ -1981,7 +1978,6 @@ export async function runLocalAudit(
       }
       const result: {message?:Message;eval_count?:number;prompt_eval_count?:number;done_reason?:string;load_duration?:number;prompt_eval_duration?:number;eval_duration?:number;total_duration?:number;client_queue_ms?:number} = controllerAction ?
         {message:{role:'assistant',content:JSON.stringify(controllerAction)}} :
-        adapter==='deterministic' ?
         await (async () => {
           const activeLeadMeta=stageLock?.currentStage==='ANALYZE' && analyzeModelPending ? nextAnalysisPacket() : undefined;
           const activePacket=activeLeadMeta ? analysisPackets.get(activeLeadMeta.id) : undefined;
@@ -2096,62 +2092,7 @@ export async function runLocalAudit(
             turn:turn+1,stage:stageLock?.currentStage||'default',action:detAction.action,
             path:detAction.path,query:detAction.query,leadId:detAction.leadId})+'\n');
           return {message:{role:'assistant',content:JSON.stringify(detAction)},eval_count:0,prompt_eval_count:0,done_reason:'deterministic'};
-        })() :
-        await (async () => {
-          // A stalled Ollama request must not terminate a multi-hour investigation.
-          // Retry only the model generation; controller memory, read cursors,
-          // observations and completed probes remain unchanged.
-          const endpoint=process.env.AUTOHACK_OLLAMA_URL || "http://127.0.0.1:11434/api/chat";
-          const request={ model, stream: false, think: profile.think, messages:requestMessages,
-          ...(structured ? {format:sanitizeOllamaFormatSchema(requestSchema)} : {tools:availableTools}),
-          keep_alive:process.env.LOCAL_OLLAMA_KEEP_ALIVE||"30m",
-          options: { num_predict:turnGenerationLimit,
-            ...(limits.numCtx === undefined ? {} : {num_ctx:settings.numCtx}),
-            ...(limits.numThreads === undefined ? {} : {num_thread:settings.numThreads}), ...profile.options } };
-          for(let attempt=1;attempt<=5;attempt++) {
-            controller.signal.throwIfAborted();
-            const attemptController=new AbortController();
-            let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
-            const resetInactivity=()=>{
-              clearTimeout(inactivityTimer);
-              inactivityTimer=setTimeout(()=>attemptController.abort('model_request_stalled'),12*60*1000);
-            };
-            resetInactivity();
-            const progressHandler=(progress:any)=>{
-              resetInactivity();
-              onProgress?.(progress);
-            };
-            const signal=AbortSignal.any([controller.signal,attemptController.signal]);
-            try {
-              return await (adapter==='qwen-agent'?postQwenAgentJson:postOllamaChat)(
-                endpoint,request,signal,{onProgress:progressHandler});
-            } catch(error) {
-              if(controller.signal.aborted)throw error;
-              if(attempt===5){
-                if(stageLock?.currentStage==='ANALYZE' && analyzeModelPending){
-                  await appendFile(logFile,'[ANALYSIS_MODEL_UNAVAILABLE] '+JSON.stringify({
-                    turn:turn+1,attempts:attempt,reason:String(error).slice(0,200),
-                    pendingIds:stageLock.analysisProgress.pendingIds,retainedControllerMemory:true})+'\n');
-                  return {message:{role:'assistant',content:JSON.stringify({
-                    action:'analysis_unavailable',path:'',query:'',answer:'model_transport_retries_exhausted'})}};
-                }
-                if(stageLock?.currentStage==='REVIEW' && stageLock.candidateCount>0 && stageLock.outcomeCounts.observed===0){
-                  await appendFile(logFile,'[REVIEW_MODEL_UNAVAILABLE] '+JSON.stringify({
-                    turn:turn+1,attempts:attempt,reason:String(error).slice(0,200),
-                    outcomes:stageLock.outcomeCounts,retainedControllerMemory:true})+'\n');
-                  return {message:{role:'assistant',content:JSON.stringify({
-                    action:'final',path:'',query:'',answer:''})}};
-                }
-                throw error;
-              }
-              await appendFile(logFile,'[MODEL_REQUEST_RECOVERY] '+JSON.stringify({
-                turn:turn+1,attempt,reason:String(error).slice(0,200),
-                retainedControllerMemory:true})+'\n');
-              await new Promise(r => setTimeout(r, Math.min(attempt * 4000, 15000)));
-            } finally {clearTimeout(inactivityTimer);}
-          }
-          throw new Error('Model request retries exhausted');
-        })() as { message?: Message; eval_count?: number; prompt_eval_count?: number; done_reason?: string; load_duration?:number; prompt_eval_duration?:number; eval_duration?:number; total_duration?:number; client_queue_ms?:number };
+        })();
       if(!controllerAction)await recordToolActivity(logFile,{
         phase:'completed',tool:'model_generation',turn:turn+1,model,
         durationMs:Date.now()-started,origin:'model',
