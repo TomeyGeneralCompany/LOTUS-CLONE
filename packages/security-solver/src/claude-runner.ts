@@ -53,7 +53,7 @@ export function getActiveChildPid(): number | null {
 }
 
 export function killActiveSecurityProcess(): boolean {
-  if (process.env.LOCAL_OLLAMA_MODEL || activeLocalJobCount() || activeLocalAuditCount()) {
+  if (isDeterministicMode() || activeLocalJobCount() || activeLocalAuditCount()) {
     const cancelled = requestLocalJobCancellation();
     return abortLocalAudits() || cancelled;
   }
@@ -74,7 +74,7 @@ export function killActiveSecurityProcess(): boolean {
 function getClaudeEnv() {
   const config = getConfig();
   const env = { ...process.env };
-  if (process.env.LOCAL_OLLAMA_MODEL) {
+  if (isDeterministicMode()) {
     env.ANTHROPIC_BASE_URL = "http://127.0.0.1:11434";
     env.ANTHROPIC_AUTH_TOKEN = "ollama";
     env.ANTHROPIC_API_KEY = "ollama";
@@ -264,10 +264,10 @@ export async function spawnClaude(
   onMetrics?: (metrics: SpawnMetrics) => void,
   opts?: SpawnClaudeOpts,
 ): Promise<string> {
-  if (process.env.LOCAL_OLLAMA_MODEL) {
+  if (isDeterministicMode()) {
     const { runLocalAudit } = await import("./local-ollama-runner");
     return runLocalAudit(prompt, logFile, timeoutMs, opts?.cwd ?? "/tmp/security-audit",
-      process.env.LOCAL_OLLAMA_MODEL, opts?.systemPrompt);
+      "deterministic", opts?.systemPrompt);
   }
   // Use PTY runner for rich terminal output (opt-in via SECURITY_LIVE_OUTPUT=1)
   const usePty = process.env.SECURITY_LIVE_OUTPUT === "1";
@@ -289,7 +289,7 @@ export async function spawnClaude(
         "--verbose",
         "--dangerously-skip-permissions",
         "--model",
-        process.env.LOCAL_OLLAMA_MODEL || opts?.model || config.CLAUDE_MODEL,
+        opts?.model || config.CLAUDE_MODEL,
         "--max-turns", String(maxTurns),
         "--effort", opts?.effort || "high",
         ...(opts?.systemPrompt ? ["--system-prompt", opts.systemPrompt] : []),
@@ -304,7 +304,7 @@ export async function spawnClaude(
 
     activeChild = child;
 
-    child.stdin.write(process.env.LOCAL_OLLAMA_MODEL ? "/no_think\n" + prompt : prompt);
+    child.stdin.write(prompt);
     child.stdin.end();
 
     let textOutput = ""; // Accumulated text for parseFindings
@@ -1495,7 +1495,7 @@ Use this file to jot down investigation notes that should survive context window
   // The native CPU-only Ollama runner cannot inspect a repository that has
   // never been acquired. Fetch only public, explicitly eligible SOURCE_CODE
   // GitHub repositories into the isolated audit workspace, bounded to two.
-  if (process.env.LOCAL_OLLAMA_MODEL) {
+  if (isDeterministicMode()) {
     const candidates = authorizedSourceUrls(scopes).slice(0, 2);
     let acquired = 0;
     for (let i = 0; i < candidates.length; i++) {
@@ -1974,7 +1974,7 @@ ${reportBody}`;
 /** Source investigations always use the deterministic source controller. Model
  * configuration chooses inference, never whether reproduction/review gates exist. */
 export function usesDeterministicSourceController(program:Pick<SecurityProgram,'scopeSummary'>):boolean {
-  if(process.env.LOCAL_OLLAMA_MODEL || process.env.LOCAL_MODEL_ADAPTER?.trim()==='deterministic')return true;
+  if(isDeterministicMode())return true;
   try {
     const value=JSON.parse(program.scopeSummary||'{}');
     return authorizedSourceUrls(Array.isArray(value)?value:value.scopes).length>0;
