@@ -15,12 +15,62 @@ export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
   path:string;line:number;rule:string;message:string;severity?:string;engine?:string;
 }
+export type InvariantPropertyKind =
+  | 'authorization'
+  | 'conservation'
+  | 'supply-accounting'
+  | 'share-accounting'
+  | 'interest-accrual'
+  | 'reentrancy-guard'
+  | 'other';
+
+export type InvariantUnresolvedCategory =
+  | 'missing_fixture'
+  | 'missing_observable_state'
+  | 'unresolved_dependency'
+  | 'unavailable_replay_capability'
+  | 'no_supported_property';
+
+export interface SourceInvariantTransitionPlan {
+  mode: 'eth_deposit_withdraw' | 'internal_deposit_withdraw' | 'mint_burn_supply';
+  inflowMethod: string;
+  inflowSig: string;
+  inflowArgs: string[];
+  inflowValueWei?: string;
+  outflowMethod: string;
+  outflowSig: string;
+  outflowArgs: string[];
+  inflowAmount: string;
+  outflowAmount: string;
+  expectedRemainder: string;
+  balanceMappingGetter?: string;
+  totalScalarGetter?: string;
+}
+
+export interface SourceInvariant {
+  sourceSha256: string;
+  target: string;
+  companionTarget?: string;
+  propertyKind: InvariantPropertyKind;
+  predictedRelation: string;
+  falsifier: string;
+  preState: Array<{expression: string; readback: string}>;
+  postState: Array<{expression: string; readback: string}>;
+  witnesses?: SourceWitness[];
+  transitionPlan?: SourceInvariantTransitionPlan;
+}
+
+export type InvariantExtractionResult =
+  | {ok: true; invariant: SourceInvariant}
+  | {ok: false; category: InvariantUnresolvedCategory; reason: string; witnesses?: SourceWitness[]};
+
 export interface ConstructionInput {
   repositoryCommit:string;targetPath:string;targetSelector:string;
   sources:readonly SourceSnapshot[];
   declarations:readonly SolidityProbeDeclaration[];
   skipLegacy?:boolean;
   staticLeads?:readonly StaticLeadHint[];
+  invariants?:readonly SourceInvariant[];
 }
 export interface PreparedSecurityExperiment {
   version:1;id:string;language:'solidity';status:'constructed';
@@ -30,7 +80,7 @@ export interface PreparedSecurityExperiment {
 }
 export type ConstructionResult =
   | {ok:true;experiments:PreparedSecurityExperiment[]}
-  | {ok:false;code:string;detail:string};
+  | {ok:false;code:string;detail:string;unresolvedCategory?:InvariantUnresolvedCategory};
 
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
 const identifier=/^[A-Za-z_]\w*$/;
@@ -1709,45 +1759,419 @@ function unprotectedFundDrainOrMintExperiment(
   return null;
 }
 
-/** Source-only financial lead. A convenient getter or reverted transaction does
- * not establish a security invariant. The model may propose a separately
- * justified property and strict executable assertion during ANALYZE.
+const FINANCIAL_ENTRY_RE =
+  /^(?:deposit|withdraw|earlyWithdraw|topupDeposit|rolloverDeposit|mintVested|fund|claim|redeem|stake|unstake|borrow|repay|liquidate|swap|zap|rescue|skim|mint|burn)$/i;
+const INFLOW_METHOD_RE = /^(?:deposit|stake|supply|fund|mint|borrow)$/i;
+const OUTFLOW_METHOD_RE = /^(?:withdraw|unstake|redeem|claim|burn|repay)$/i;
+const TOTAL_SCALAR_RE = /^(?:totalDeposits|totalAssets|totalSupply|totalShares|totalStaked|totalBalance|totalLiquidity|totalDebt|reserves)$/i;
+const BALANCE_MAPPING_RE = /^(?:balances|balanceOf|deposits|shares|staked|stakes|deposited)$/i;
+
+/**
+ * Step 1: Extract a source-backed financial invariant descriptor (or an explicit
+ * unresolved reason distinguishing missing fixtures, missing observable state,
+ * unresolved external dependencies, or absence of a supported property).
  */
-type CoreProtocolLead={selector:string;sourceEvidence:SourceWitness[];unresolvedReason:string};
-function discoverCoreProtocolEntrypointLead(
-  snapshot:SourceSnapshot,contract:any,method:string,
-  sources:ReadonlyMap<string,SourceSnapshot>
-):CoreProtocolLead|null {
-  if(isTestOrMockPath(snapshot.path)||
-     !/^(?:deposit|withdraw|earlyWithdraw|topupDeposit|rolloverDeposit|mintVested|fund|claim|redeem|stake|unstake|borrow|repay|liquidate|swap|zap|rescue|skim)$/i.test(method))
-    return null;
-  const {chain}=resolveInheritance(snapshot,contract,sources);
-  if(isAbstractContractNode(contract,chain))return null;
-  const fn=(contract.subNodes||[]).find((n:any)=>n.type==='FunctionDefinition'&&
-    n.name===method&&['public','external'].includes(n.visibility)&&
-    !['view','pure'].includes(n.stateMutability||'')&&n.body);
-  if(!fn)return null;
-  return {selector:contract.name+'.'+method,
-    sourceEvidence:[witness(snapshot,fn,contract.name+'.'+method)],
-    unresolvedReason:'Financial entrypoint exists, but no source-derived prestate, valid fixture, predicted relation, and falsifier have been established'};
+export function extractSourceInvariantDescriptor(
+  snapshot: SourceSnapshot,
+  contract: any,
+  method: string,
+  declarations: readonly SolidityProbeDeclaration[],
+  sources: ReadonlyMap<string, SourceSnapshot>,
+): InvariantExtractionResult {
+  if (isTestOrMockPath(snapshot.path) || !FINANCIAL_ENTRY_RE.test(method)) {
+    return {
+      ok: false,
+      category: 'no_supported_property',
+      reason: `No supported financial accounting property for ${contract.name}.${method}`,
+    };
+  }
+  const { chain } = resolveInheritance(snapshot, contract, sources);
+  if (isAbstractContractNode(contract, chain)) {
+    return {
+      ok: false,
+      category: 'missing_fixture',
+      reason: `Contract ${contract.name} is abstract and cannot be instantiated directly`,
+    };
+  }
+
+  const allNodes: any[] = [contract, ...chain.map((c) => c.contract)].flatMap((c) => c.subNodes || []);
+  const fns = allNodes.filter(
+    (n: any) =>
+      n.type === 'FunctionDefinition' &&
+      !n.isConstructor &&
+      ['public', 'external'].includes(n.visibility) &&
+      !['view', 'pure'].includes(n.stateMutability || '') &&
+      n.body,
+  );
+  const targetFn = fns.find((n: any) => n.name === method);
+  if (!targetFn) {
+    return {
+      ok: false,
+      category: 'no_supported_property',
+      reason: `Target entrypoint ${contract.name}.${method} has no executable body`,
+    };
+  }
+
+  // Locate companion inflow/outflow pair in the same contract hierarchy
+  const targetIsInflow = INFLOW_METHOD_RE.test(method);
+  const targetIsOutflow = OUTFLOW_METHOD_RE.test(method);
+  if (!targetIsInflow && !targetIsOutflow) {
+    return {
+      ok: false,
+      category: 'no_supported_property',
+      reason: `Entrypoint ${contract.name}.${method} does not match a paired inflow/outflow accounting transition`,
+      witnesses: [witness(snapshot, targetFn, `${contract.name}.${method}`)],
+    };
+  }
+
+  const inflowFn = targetIsInflow
+    ? targetFn
+    : fns.find((n: any) => INFLOW_METHOD_RE.test(n.name || '') && n.name !== method);
+  const outflowFn = targetIsOutflow
+    ? targetFn
+    : fns.find((n: any) => OUTFLOW_METHOD_RE.test(n.name || '') && n.name !== method);
+
+  if (!inflowFn || !outflowFn) {
+    return {
+      ok: false,
+      category: 'no_supported_property',
+      reason: `Entrypoint ${contract.name}.${method} has no paired companion inflow/outflow entrypoint in ${contract.name}`,
+      witnesses: [witness(snapshot, targetFn, `${contract.name}.${method}`)],
+    };
+  }
+
+  const inflowBody = body(snapshot.content, inflowFn);
+  const outflowBody = body(snapshot.content, outflowFn);
+  const combinedBody = `${inflowBody}\n${outflowBody}`;
+  const pairWitnesses: SourceWitness[] = [
+    witness(snapshot, inflowFn, `${contract.name}.${inflowFn.name}`),
+    witness(snapshot, outflowFn, `${contract.name}.${outflowFn.name}`),
+  ];
+
+  // Refuse when an unresolved external contract/token call is executed inside the pair
+  const externalCallRe = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?:safeTransferFrom|transferFrom|safeTransfer|deposit|withdraw|mint|burn|accrue|borrow|repay|liquidate|swap|getPrice|latestRoundData)\s*\(/g;
+  const unresolvedExt: string[] = [];
+  let extMatch: RegExpExecArray | null;
+  while ((extMatch = externalCallRe.exec(combinedBody)) !== null) {
+    const recv = extMatch[1];
+    if (!['msg', 'abi', 'this', 'super', 'payable'].includes(recv)) {
+      unresolvedExt.push(`${recv}.${extMatch[0].split('.').pop()}`);
+    }
+  }
+  if (unresolvedExt.length > 0) {
+    return {
+      ok: false,
+      category: 'unresolved_dependency',
+      reason: `Unresolved external dependency (${unresolvedExt.slice(0, 3).join(', ')}) inside ${contract.name}.${inflowFn.name}/${outflowFn.name}`,
+      witnesses: pairWitnesses,
+    };
+  }
+
+  // Inspect declared accounting state variables and verify public observable getters exist
+  const stateDecls = allNodes
+    .filter((n: any) => n.type === 'StateVariableDeclaration')
+    .flatMap((n: any) => n.variables || [])
+    .filter((v: any) => v?.name);
+  const accountingStateVars = stateDecls.filter(
+    (v: any) => TOTAL_SCALAR_RE.test(v.name) || BALANCE_MAPPING_RE.test(v.name),
+  );
+
+  const totalGetterDecl = declarations.find(
+    (d) =>
+      d.operation === 'call' &&
+      d.inputs.length === 0 &&
+      d.selector.startsWith(`${contract.name}.`) &&
+      TOTAL_SCALAR_RE.test(d.selector.slice(contract.name.length + 1)),
+  );
+  const balanceGetterDecl = declarations.find(
+    (d) =>
+      d.operation === 'call' &&
+      d.inputs.length === 1 &&
+      d.inputs[0] === 'address' &&
+      d.selector.startsWith(`${contract.name}.`) &&
+      BALANCE_MAPPING_RE.test(d.selector.slice(contract.name.length + 1)),
+  );
+
+  if (!totalGetterDecl && !balanceGetterDecl) {
+    return {
+      ok: false,
+      category: 'missing_observable_state',
+      reason: accountingStateVars.length
+        ? `Accounting state (${accountingStateVars.map((v: any) => v.name).join(', ')}) has no public observable getter declared in ${contract.name}`
+        : `No observable public accounting state getter found in ${contract.name}`,
+      witnesses: pairWitnesses,
+    };
+  }
+
+  const totalVarName = totalGetterDecl ? totalGetterDecl.selector.slice(contract.name.length + 1) : '';
+  const balanceVarName = balanceGetterDecl ? balanceGetterDecl.selector.slice(contract.name.length + 1) : '';
+  const totalReferenced = !!totalVarName && new RegExp(`\\b${totalVarName}\\b`).test(combinedBody);
+  const balanceReferenced = !!balanceVarName && new RegExp(`\\b${balanceVarName}\\b`).test(combinedBody);
+  if (!totalReferenced && !balanceReferenced) {
+    return {
+      ok: false,
+      category: 'missing_observable_state',
+      reason: `Declared getters are not referenced by ${contract.name}.${inflowFn.name}/${outflowFn.name}`,
+      witnesses: pairWitnesses,
+    };
+  }
+
+  // Verify local fixture constructibility via existing resolveFlexibleSetup
+  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, null, '$account0');
+  if (!setup) {
+    return {
+      ok: false,
+      category: 'missing_fixture',
+      reason: `Constructor or initializer fixture for ${contract.name} cannot be instantiated with local accounts`,
+      witnesses: pairWitnesses,
+    };
+  }
+
+  const inflowDecl = declarations.find(
+    (d) => d.operation === 'send' && d.selector === `${contract.name}.${inflowFn.name}`,
+  );
+  const outflowDecl = declarations.find(
+    (d) => d.operation === 'send' && d.selector === `${contract.name}.${outflowFn.name}`,
+  );
+  if (!inflowDecl || !outflowDecl) {
+    return {
+      ok: false,
+      category: 'missing_fixture',
+      reason: `Missing ABI send declarations for ${contract.name}.${inflowFn.name} / ${outflowFn.name}`,
+      witnesses: pairWitnesses,
+    };
+  }
+
+  const isUintType = (t: string) => /^uint(?:[0-9]{1,3})?$/.test(t);
+  const inflowAmount = '1000';
+  const outflowAmount = '400';
+  const expectedRemainder = '600';
+
+  let mode: SourceInvariantTransitionPlan['mode'] | null = null;
+  let inflowArgs: string[] = [];
+  let inflowValueWei: string | undefined;
+  let outflowArgs: string[] = [];
+
+  // Mode A: Payable ETH deposit() + withdraw(uint256)
+  if (
+    inflowFn.stateMutability === 'payable' &&
+    inflowDecl.inputs.length === 0 &&
+    outflowDecl.inputs.length === 1 &&
+    isUintType(outflowDecl.inputs[0])
+  ) {
+    mode = 'eth_deposit_withdraw';
+    inflowArgs = [];
+    inflowValueWei = inflowAmount;
+    outflowArgs = [outflowAmount];
+  }
+  // Mode B: Mint/Burn supply accounting: mint(address,uint256) or mint(uint256) + burn(uint256) or burn(address,uint256)
+  else if (/^mint$/i.test(inflowFn.name) && /^burn$/i.test(outflowFn.name)) {
+    if (inflowDecl.inputs.length === 2 && inflowDecl.inputs[0] === 'address' && isUintType(inflowDecl.inputs[1])) {
+      inflowArgs = ['$account0', inflowAmount];
+    } else if (inflowDecl.inputs.length === 1 && isUintType(inflowDecl.inputs[0])) {
+      inflowArgs = [inflowAmount];
+    } else {
+      return {
+        ok: false,
+        category: 'missing_fixture',
+        reason: `Unsupported mint parameter signature (${inflowDecl.inputs.join(',')}) for ${contract.name}.mint`,
+        witnesses: pairWitnesses,
+      };
+    }
+    if (outflowDecl.inputs.length === 2 && outflowDecl.inputs[0] === 'address' && isUintType(outflowDecl.inputs[1])) {
+      outflowArgs = ['$account0', outflowAmount];
+    } else if (outflowDecl.inputs.length === 1 && isUintType(outflowDecl.inputs[0])) {
+      outflowArgs = [outflowAmount];
+    } else {
+      return {
+        ok: false,
+        category: 'missing_fixture',
+        reason: `Unsupported burn parameter signature (${outflowDecl.inputs.join(',')}) for ${contract.name}.burn`,
+        witnesses: pairWitnesses,
+      };
+    }
+    mode = 'mint_burn_supply';
+  }
+  // Mode C: Internal accounting deposit(uint256)/stake(uint256) + withdraw(uint256)/unstake(uint256)
+  else if (
+    inflowDecl.inputs.length === 1 &&
+    isUintType(inflowDecl.inputs[0]) &&
+    outflowDecl.inputs.length === 1 &&
+    isUintType(outflowDecl.inputs[0])
+  ) {
+    mode = 'internal_deposit_withdraw';
+    inflowArgs = [inflowAmount];
+    outflowArgs = [outflowAmount];
+  } else {
+    return {
+      ok: false,
+      category: 'missing_fixture',
+      reason: `Unsupported inflow/outflow signatures (${inflowFn.name}(${inflowDecl.inputs.join(',')}) / ${outflowFn.name}(${outflowDecl.inputs.join(',')}))`,
+      witnesses: pairWitnesses,
+    };
+  }
+
+  const totalGetterSig = totalReferenced ? `${totalVarName}()` : undefined;
+  const balanceGetterSig = balanceReferenced ? `${balanceVarName}(address)` : undefined;
+  const propertyKind: InvariantPropertyKind =
+    mode === 'mint_burn_supply' || /supply/i.test(totalVarName)
+      ? 'supply-accounting'
+      : /share/i.test(totalVarName) || /share/i.test(balanceVarName)
+        ? 'share-accounting'
+        : 'conservation';
+
+  const preState: Array<{ expression: string; readback: string }> = [];
+  const postState: Array<{ expression: string; readback: string }> = [];
+  if (totalGetterSig) {
+    preState.push({ expression: `${contract.name}.${totalVarName} == 0`, readback: totalGetterSig });
+    postState.push({ expression: `${contract.name}.${totalVarName} == ${expectedRemainder}`, readback: totalGetterSig });
+  }
+  if (balanceGetterSig) {
+    preState.push({ expression: `${contract.name}.${balanceVarName}[$account0] == 0`, readback: balanceGetterSig });
+    postState.push({ expression: `${contract.name}.${balanceVarName}[$account0] == ${expectedRemainder}`, readback: balanceGetterSig });
+  }
+
+  const inflowSig = `${inflowFn.name}(${inflowDecl.inputs.join(',')})`;
+  const outflowSig = `${outflowFn.name}(${outflowDecl.inputs.join(',')})`;
+  const obsList = [totalGetterSig, balanceGetterSig].filter(Boolean).join(' and ');
+
+  return {
+    ok: true,
+    invariant: {
+      sourceSha256: snapshot.sha256,
+      target: `${contract.name}.${method}`,
+      companionTarget: `${contract.name}.${method === inflowFn.name ? outflowFn.name : inflowFn.name}`,
+      propertyKind,
+      predictedRelation: `After ${inflowSig} (${inflowAmount}) followed by ${outflowSig} (${outflowAmount}) by $account0, ${obsList} must equal ${expectedRemainder}.`,
+      falsifier: `Execute ${inflowSig} (+${inflowAmount}) then ${outflowSig} (-${outflowAmount}) on a fresh local EVM; violation observed if ${obsList} diverges from ${expectedRemainder}.`,
+      preState,
+      postState,
+      witnesses: pairWitnesses,
+      transitionPlan: {
+        mode,
+        inflowMethod: inflowFn.name,
+        inflowSig,
+        inflowArgs,
+        inflowValueWei,
+        outflowMethod: outflowFn.name,
+        outflowSig,
+        outflowArgs,
+        inflowAmount,
+        outflowAmount,
+        expectedRemainder,
+        balanceMappingGetter: balanceGetterSig,
+        totalScalarGetter: totalGetterSig,
+      },
+    },
+  };
 }
-type SourceInvariant={
-  sourceSha256:string;target:string;propertyKind:
-    'authorization'|'conservation'|'supply-accounting'|'share-accounting'|
-    'interest-accrual'|'reentrancy-guard'|'other';
-  predictedRelation:string;falsifier:string;
-  preState:Array<{expression:string;readback:string}>;
-  postState:Array<{expression:string;readback:string}>;
-};
-/** Admission gate for later source-proven financial invariants. Until a
- * descriptor has a concrete executable assertion, retain the candidate only
- * as a lead rather than fabricate a security experiment.
+
+/**
+ * Step 2: Admission gate for source-proven financial invariants.
+ * Refuses to admit descriptors lacking cryptographic identity, observable pre/post
+ * state readbacks, or a mathematically consistent executable transition plan.
  */
-function constructCoreInvariantExperiment(invariant:SourceInvariant|null):SourceInvariant|null{
-  if(!invariant||!invariant.sourceSha256||!invariant.target||
-    !invariant.predictedRelation||!invariant.falsifier||
-    !invariant.preState.length||!invariant.postState.length)return null;
+export function admitSourceInvariantDescriptor(
+  invariant: SourceInvariant | null | undefined,
+): SourceInvariant | null {
+  if (
+    !invariant ||
+    !/^[a-f0-9]{64}$/.test(invariant.sourceSha256) ||
+    !invariant.target ||
+    !invariant.predictedRelation.trim() ||
+    !invariant.falsifier.trim() ||
+    !invariant.preState.length ||
+    !invariant.postState.length ||
+    !invariant.transitionPlan
+  ) {
+    return null;
+  }
+  const tp = invariant.transitionPlan;
+  if (!tp.totalScalarGetter && !tp.balanceMappingGetter) return null;
+  if (!/^[1-9][0-9]*$/.test(tp.inflowAmount) || !/^[1-9][0-9]*$/.test(tp.outflowAmount) || !/^(?:0|[1-9][0-9]*)$/.test(tp.expectedRemainder)) {
+    return null;
+  }
+  if (BigInt(tp.inflowAmount) - BigInt(tp.outflowAmount) !== BigInt(tp.expectedRemainder)) {
+    return null;
+  }
   return invariant;
+}
+
+/**
+ * Step 3: Convert an admitted source-backed financial invariant descriptor into
+ * a strict, schema-valid local SoliditySequence experiment.
+ */
+export function constructCoreInvariantExperiment(
+  invariant: SourceInvariant | null,
+  snapshot: SourceSnapshot,
+  contract: any,
+  declarations: readonly SolidityProbeDeclaration[],
+  sources: ReadonlyMap<string, SourceSnapshot>,
+): { hypothesis: string; property: string; sequence: SoliditySequence; witnesses: SourceWitness[] } | null {
+  const admitted = admitSourceInvariantDescriptor(invariant);
+  if (!admitted || admitted.sourceSha256 !== snapshot.sha256) return null;
+  const tp = admitted.transitionPlan!;
+  const { chain } = resolveInheritance(snapshot, contract, sources);
+  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, null, '$account0');
+  if (!setup) return null;
+
+  const steps: SoliditySequence['steps'] = [];
+  if (setup.initSignature) {
+    steps.push({
+      operation: 'send',
+      function: setup.initSignature,
+      args: setup.initArgs,
+      sender: 0,
+      requiredSetup: true,
+    });
+  }
+  // 1. Pre-state baseline readbacks
+  if (tp.totalScalarGetter) {
+    steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: '0' });
+  }
+  if (tp.balanceMappingGetter) {
+    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: '0' });
+  }
+  // 2. Inflow operation (+inflowAmount)
+  steps.push({
+    operation: 'send',
+    function: tp.inflowSig,
+    args: tp.inflowArgs,
+    sender: 0,
+    ...(tp.inflowValueWei ? { valueWei: tp.inflowValueWei } : {}),
+  });
+  // 3. Intermediate accounting check (+inflowAmount)
+  if (tp.totalScalarGetter) {
+    steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: tp.inflowAmount });
+  }
+  if (tp.balanceMappingGetter) {
+    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: tp.inflowAmount });
+  }
+  // 4. Outflow operation (-outflowAmount)
+  steps.push({
+    operation: 'send',
+    function: tp.outflowSig,
+    args: tp.outflowArgs,
+    sender: 0,
+  });
+  // 5. Post-state conservation / supply-accounting assertions (== expectedRemainder)
+  if (tp.totalScalarGetter) {
+    steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: tp.expectedRemainder });
+  }
+  if (tp.balanceMappingGetter) {
+    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: tp.expectedRemainder });
+  }
+
+  return {
+    hypothesis: admitted.predictedRelation,
+    property: `financial ${admitted.propertyKind} invariant (${tp.inflowMethod}->${tp.outflowMethod})`,
+    sequence: {
+      constructorArgs: setup.constructorArgs,
+      ...(setup.constructorValueWei ? { constructorValueWei: setup.constructorValueWei } : {}),
+      steps,
+    },
+    witnesses: admitted.witnesses?.length ? admitted.witnesses : [witness(snapshot, contract, admitted.target)],
+  };
 }
 
 export function constructSolidityExperiments(input:ConstructionInput):ConstructionResult {
@@ -1810,15 +2234,52 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     const drainOrMintExp=unprotectedFundDrainOrMintExperiment(target,contract,method,indexed,input.declarations);
     if(drainOrMintExp)choices.push(drainOrMintExp);
   }
-  // The financial declaration remains a lead, not an executable security
-  // experiment until a validated, source-backed invariant is supplied.
-  const financialLead=!choices.length
-    ? discoverCoreProtocolEntrypointLead(target,contract,method,indexed):null;
-  void constructCoreInvariantExperiment;
-  if(!choices.length)return {ok:false,code:'UNKNOWN_ASSERTION',
-    detail:financialLead
-      ? financialLead.unresolvedReason+' for '+financialLead.selector
-      : 'No source-grounded security setup and falsifiable assertion for '+input.targetSelector};
+  // 3-stage financial-invariant pipeline: extract -> admit -> construct.
+  // Runs alongside authorization probes because accounting conservation is a
+  // distinct security property; refuses to fabricate when prerequisites fail.
+  let invariantUnresolved: {category: InvariantUnresolvedCategory; reason: string} | null = null;
+  const suppliedInvariant = (input.invariants || []).find(
+    (inv) => inv.target === input.targetSelector && inv.sourceSha256 === target.sha256,
+  );
+  if (suppliedInvariant) {
+    const built = constructCoreInvariantExperiment(suppliedInvariant, target, contract, input.declarations, indexed);
+    if (built) {
+      choices.push(built);
+    } else {
+      invariantUnresolved = {
+        category: 'missing_fixture',
+        reason: `Supplied invariant for ${input.targetSelector} failed admission or fixture construction`,
+      };
+    }
+  } else {
+    const extracted = extractSourceInvariantDescriptor(target, contract, method, input.declarations, indexed);
+    if (extracted.ok) {
+      const built = constructCoreInvariantExperiment(extracted.invariant, target, contract, input.declarations, indexed);
+      if (built) {
+        choices.push(built);
+      } else {
+        invariantUnresolved = {
+          category: 'missing_fixture',
+          reason: `Extracted invariant for ${input.targetSelector} failed admission or fixture construction`,
+        };
+      }
+    } else {
+      invariantUnresolved = { category: extracted.category, reason: extracted.reason };
+    }
+  }
+
+  if (!choices.length) {
+    const unresolvedCategory: InvariantUnresolvedCategory =
+      invariantUnresolved?.category || 'no_supported_property';
+    return {
+      ok: false,
+      code: 'UNKNOWN_ASSERTION',
+      unresolvedCategory,
+      detail: invariantUnresolved
+        ? `[${unresolvedCategory}] ${invariantUnresolved.reason}`
+        : `No source-grounded security setup and falsifiable assertion for ${input.targetSelector}`,
+    };
+  }
   const seen=new Set<string>(),out:PreparedSecurityExperiment[]=[];
   for(const c of choices) {
     const prereqs:PreparationPrerequisite[]=[];
