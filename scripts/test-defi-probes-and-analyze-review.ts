@@ -324,7 +324,10 @@ contract PlainVault {
       return;
     }
 
-    if (enumActions.includes("discover_experiment")) {
+    // Action availability alone does not imply an active ANALYZE lead.
+    // Later stage schemas may still list discovery, but no immutable lead is
+    // pinned. Only answer an analysis packet when the controller sent one.
+    if (enumActions.includes("discover_experiment") && lastContent.includes("CURRENT ANALYZE TASK")) {
       sawAnalyzeActionPrompt = true;
       const fmtJson = JSON.stringify(payload.format || {});
       assert.doesNotMatch(fmtJson, /"(?:minLength|maxLength|pattern)"/, "ANALYZE format must strip GBNF-exploding constraints");
