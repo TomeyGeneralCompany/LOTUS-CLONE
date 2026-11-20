@@ -41,10 +41,14 @@ jobs:
           mkdir -p /tmp/lotus-tools
           curl -fsSL https://repo1.maven.org/maven2/com/github/javaparser/javaparser-core/3.26.3/javaparser-core-3.26.3.jar -o /tmp/lotus-tools/javaparser-core.jar
           java -version
+      - name: Enforce no Qwen or Ollama in production runtime and workflows
+        run: npx tsx scripts/test-no-model-runtime.ts
       - name: TypeScript typecheck
         run: npx tsc --noEmit --project tsconfig.json
       - name: Run Solidity financial-invariant planner suite
         run: npx tsx scripts/test-controller-solidity-experiment-planner.ts
+      - name: Verify Round 3 exhaustive 244-candidate lifecycle and durable recovery
+        run: npx tsx scripts/test-deterministic-full-inventory.ts
       - name: Run zero-Qwen end-to-end deterministic core suite (including live EVM Buggy vs Fixed Vault)
         env:
           LOCAL_MODEL_ADAPTER: deterministic

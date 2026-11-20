@@ -7,6 +7,7 @@
  * without invoking any LLM.
  */
 import { createHash } from "node:crypto";
+import {summarizeEntrypointEffects} from "./entrypoint-effects";
 import type {
   FactLanguage,
   ProgramFact,
@@ -292,29 +293,35 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
       effectiveReads.set(r.fn, s);
     }
   }
-  for (const [caller, callees] of resolvedInternalCalls) {
-    for (const c of callees) {
-      for (const sv of effectiveWrites.get(c.to) || []) {
-        const s = effectiveWrites.get(caller) || new Set<string>();
-        s.add(sv);
-        effectiveWrites.set(caller, s);
-        const list = stateWriters.get(sv) || [];
-        if (!list.some((x) => x.fn === caller)) {
-          list.push({ fn: caller, file: c.file, line: c.line });
-          stateWriters.set(sv, list);
-        }
-      }
-      for (const sv of effectiveReads.get(c.to) || []) {
-        const s = effectiveReads.get(caller) || new Set<string>();
-        s.add(sv);
-        effectiveReads.set(caller, s);
-        const list = stateReaders.get(sv) || [];
-        if (!list.some((x) => x.fn === caller)) {
-          list.push({ fn: caller, file: c.file, line: c.line });
-          stateReaders.set(sv, list);
-        }
+  // A single pass misses deposit -> _deposit -> _depositRecordData.
+  // Traverse the complete resolved call graph, retaining original state witnesses.
+  for (const entrypoint of entrypoints) {
+    const summary=summarizeEntrypointEffects(graph,entrypoint);
+    effectiveWrites.set(entrypoint,new Set(summary.stateWrites));
+    effectiveReads.set(entrypoint,new Set(summary.stateReads));
+    for(const sv of summary.stateWrites) {
+      const list=stateWriters.get(sv)||[];
+      if(!list.some(x=>x.fn===entrypoint)) {
+        const sourceEdge=graph.edges.find(e=>e.kind==="writes_state"&&e.to===sv&&summary.reachableFunctions.includes(e.from));
+        list.push({fn:entrypoint,file:sourceEdge?.file||"",line:sourceEdge?.line||1});
+        stateWriters.set(sv,list);
       }
     }
+    for(const sv of summary.stateReads) {
+      const list=stateReaders.get(sv)||[];
+      if(!list.some(x=>x.fn===entrypoint)){
+        const sourceEdge=graph.edges.find(e=>e.kind==="reads_state"&&e.to===sv&&summary.reachableFunctions.includes(e.from));
+        list.push({fn:entrypoint,file:sourceEdge?.file||"",line:sourceEdge?.line||1});
+        stateReaders.set(sv,list);
+      }
+    }
+    if(summary.valueTransfers.length)valueFlowFns.add(entrypoint);
+    const unresolved=unresolvedByFn.get(entrypoint)||[];
+    for(const edge of summary.unresolvedCalls){
+      const desc=`${edge.resolution||"unresolved"}_call:${edge.to}`;
+      if(!unresolved.includes(desc))unresolved.push(desc);
+    }
+    if(unresolved.length)unresolvedByFn.set(entrypoint,unresolved);
   }
 
   const buildWitnessForFn = (fn: string, factKind: ProgramFact["kind"], detail: string): HypothesisWitness => {
@@ -855,7 +862,11 @@ export function evaluateAnalysisLead(
   graph: ProgramFactsGraph,
   lead: LeadAnalysisInput,
 ): LeadAnalysisDecision {
+  const effects=summarizeEntrypointEffects(graph,lead.selector);
   const fileFacts = graph.byFile.get(lead.path)?.facts || [];
+  // Reachable facts keep their original locations. Guard resolution still
+  // operates on the entrypoint itself; only investigative effect evidence grows.
+  const reachableFacts=effects.facts;
   const symbolFacts = fileFacts.filter(
     (f) =>
       !f.symbol ||
@@ -937,10 +948,12 @@ export function evaluateAnalysisLead(
   // Fallback: inspect symbol/file facts directly so every lead receives factual disposition
   const authGuards = symbolFacts.filter((f) => f.kind === "auth_guard" || f.kind === "constraint_guard");
   const stateWrites = symbolFacts.filter((f) => f.kind === "state_write" || f.kind === "unguarded_mutation");
-  const sinks = symbolFacts.filter((f) => f.kind.startsWith("sink_") || f.kind === "value_transfer" || f.kind === "mint_or_burn");
+  const reachableWrites=reachableFacts.filter(f=>f.kind==="state_write"||f.kind==="unguarded_mutation");
+  const reachableSinks=reachableFacts.filter(f=>f.kind.startsWith("sink_")||f.kind==="value_transfer"||f.kind==="mint_or_burn");
+  const sinks = [...symbolFacts.filter((f) => f.kind.startsWith("sink_") || f.kind === "value_transfer" || f.kind === "mint_or_burn"),...reachableSinks];
 
-  if (sinks.length > 0 || stateWrites.length > 0) {
-    const primary = sinks[0] || stateWrites[0];
+  if (sinks.length > 0 || stateWrites.length > 0 || reachableWrites.length > 0) {
+    const primary = sinks[0] || stateWrites[0] || reachableWrites[0];
     return {
       action: "assess_lead",
       leadId: lead.leadId,

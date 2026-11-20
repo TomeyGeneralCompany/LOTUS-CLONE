@@ -1,6 +1,7 @@
 import "dotenv/config";
 // Defaults follow dotenv so the operator's selected model is honored.
-process.env.LOCAL_OLLAMA_MODEL ??= "qwen3:4b";
+process.env.LOCAL_MODEL_ADAPTER = "deterministic";
+delete process.env.LOCAL_OLLAMA_MODEL;
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
@@ -254,7 +255,7 @@ function main() {
 
         // Run adversarial review on report_ready findings from this hunt
         try {
-          await processAdversarialQueue(process.env.LOCAL_OLLAMA_MODEL ? undefined : program.id);
+          await processAdversarialQueue(undefined);
         } catch (err) {
           log.error({ err }, "Post-hunt adversarial review error");
         }
@@ -282,10 +283,8 @@ function main() {
       .catch(error => log.error({error}, "Pending review recovery interrupted"))
       .finally(() => { reviewRecoveryRunning = false; });
   }
-  if (process.env.LOCAL_OLLAMA_MODEL) {
-    cron.schedule("*/1 * * * *", recoverPendingReviews);
-    recoverPendingReviews();
-  }
+  cron.schedule("*/1 * * * *", recoverPendingReviews);
+  recoverPendingReviews();
 
   // Check every 1 minute if auto-hunt should start (lightweight config check)
   cron.schedule("*/1 * * * *", () => {

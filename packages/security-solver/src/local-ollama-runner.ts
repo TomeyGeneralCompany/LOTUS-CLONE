@@ -14,7 +14,6 @@ import { InvestigationWorkflow } from "./investigation-workflow";
 import {guidedProbeAcrossSourceChain,guidedSourceProbe} from './source-guided-probes';
 import {controllerPolyglotPlan,controllerPolyglotPlans,canonicalControllerPolyglotIntent} from './controller-polyglot-plan';
 import {declaredProbeTarget, sourceDeclarationHints, supportedJavaProbeHints, javaProbeSelectorCompatible, probeChoices} from './probe-target-validation';
-import { postQwenAgentJson } from "./qwen-agent-transport";
 import { AuditAllowance } from "./audit-allowance";
 import { AuditNavigation } from "./audit-navigation";
 import {controllerOwnedNextAction,canonicalSourceNavigationAction} from "./controller-next-action";
@@ -22,13 +21,14 @@ import { SoliditySourceIndex } from "./solidity-source-index";
 import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequiredTail, auditCheckpoint, fitAuditToolOutput, latestAuditExchangeStart } from "./audit-context";
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
-import { postOllamaChat } from "../../core/src/ollama-chat";
 import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
+import {homedir} from "node:os";
+import {AnalysisProgressStore} from "./deterministic/analysis-progress-store";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
 async function recordToolActivity(logFile:string,event:Record<string,unknown>):Promise<void> {
@@ -148,22 +148,10 @@ export function prioritizeSolidityStagedPlans<T extends {id:string;plan:{path:st
     else if(entry.base>=40)tiers.tier3++;
     else tiers.tier4++;
   }
-  const tier4PerPath=new Map<string,number>();
-  const capTier4=scored.length>16;
-  const selected:T[]=[];
-  let droppedTier4Count=0;
-  for(const entry of scored){
-    if(capTier4 && entry.base<=10){
-      const count=tier4PerPath.get(entry.item.plan.path)||0;
-      if(count>=3){
-        droppedTier4Count++;
-        continue;
-      }
-      tier4PerPath.set(entry.item.plan.path,count+1);
-    }
-    selected.push(entry.item);
-  }
-  return {selected,droppedTier4Count,tiers};
+  // Priority controls order, not total eligibility. Previously the per-file
+  // Tier 4 cap silently discarded valid source-grounded experiments.
+  const selected=scored.map(entry=>entry.item);
+  return {selected,droppedTier4Count:0,tiers};
 }
 
 export function controllerGroundedSolidityOptions(
@@ -214,7 +202,6 @@ export async function runLocalAudit(
     throw new Error("Production workflow requires JSON protocol, source probes and no fixture constraints");
   const workflow=limits.productionWorkflow ? new InvestigationWorkflow() : undefined;
   const adapter=resolveLocalModelAdapter();
-  if(adapter==='qwen-agent'&&!structured)throw new Error('Qwen-Agent adapter requires JSON action protocol');
   let successfulReads = 0;
   let rejectedRequiredProbeFinals = 0;
   let controllerAutoReadCount = 0;
@@ -286,6 +273,11 @@ export async function runLocalAudit(
   let deterministicSourceSnapshots:SourceSnapshot[]=[];
   const deterministicDeclarationsCache=new Map<string,SolidityProbeDeclaration[]>();
   let analysisInventoryMeta={inventoryTotal:0,admittedCount:0,queuedRemaining:0,blockedCount:0};
+  let analysisProgressStore:AnalysisProgressStore|null=null;
+  let analysisBatchSize=18;
+  let analysisPerFileCap=4;
+  let analysisTurnBudget=24;
+  const analysisResults=new Map<string,DeterministicAnalysisResult>();
   const nextAnalysisPacket=()=>stageLock?.analysisLeads.find(x=>x.state.kind==='pending');
   // Current controller instruction is reconstructed from stage-owned state for
   // every inference, not carried as disposable conversational history.
@@ -316,29 +308,115 @@ export async function runLocalAudit(
       'Do not finalize_analysis while any lead remains pending. '+
       'This excerpt is source evidence, not proof of exploitability. /no_think';
   };
+  const admitNextAnalysisBatch=async():Promise<number>=>{
+    if(!analysisProgressStore||!stageLock||stageLock.currentStage!=="ANALYZE")
+      throw new Error("ANALYSIS_BATCH_CONTROLLER_NOT_READY");
+    const batch=analysisProgressStore.nextBatch(analysisBatchSize,analysisPerFileCap);
+    if(!batch.length)return 0;
+    for(const cand of batch){
+      stageLock.registerAnalysisLead({
+        id:cand.id,sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
+        path:cand.path,selector:cand.selector,
+      });
+      analysisPackets.set(cand.id,{
+        id:cand.id,path:cand.path,selector:cand.selector,
+        sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
+        sourceEvidence:cand.sourceEvidence,sourceExcerpt:cand.sourceExcerpt,
+        excerptStart:cand.excerptStart,truncated:cand.truncated,
+      });
+      await appendFile(logFile,"[ANALYSIS_LEAD_SELECTED] "+JSON.stringify({
+        id:cand.id,path:cand.path,selector:cand.selector,
+        sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
+        sourceEvidence:cand.sourceEvidence,priority:cand.priority,
+        staticLeadIds:cand.staticLeadIds,selectionReasons:cand.selectionReasons,
+        batch:analysisProgressStore.processedBatches+1,
+      })+"\n");
+    }
+    analyzeModelPending=true;
+    analyzeTurnsRemaining=Math.max(analysisTurnBudget,batch.length+6);
+    analysisInventoryMeta.admittedCount+=batch.length;
+    analysisInventoryMeta.queuedRemaining=analysisProgressStore.remaining;
+    await analysisProgressStore.save();
+    await appendFile(logFile,"[ANALYSIS_BATCH_STARTED] "+JSON.stringify({
+      batch:analysisProgressStore.processedBatches+1,
+      admitted:batch.length,queuedRemaining:analysisProgressStore.remaining,
+      turnsAvailable:analyzeTurnsRemaining,
+    })+"\n");
+    return batch.length;
+  };
   const closeAnalysis=async(status:'complete'|'partial',reason='')=>{
     if(!stageLock||stageLock.currentStage!=='ANALYZE')return;
+    if(!analysisProgressStore)throw new Error("ANALYSIS_PROGRESS_STORE_MISSING");
+    // An exhausted turn budget or missing analytical evidence is a suspended
+    // investigation, never a successful REPORT with abandoned candidates.
+    if(status!=="complete"){
+      await analysisProgressStore.save();
+      await appendFile(logFile,"[ANALYSIS_SUSPENDED] "+JSON.stringify({
+        reason,pendingIds:stageLock.analysisProgress.pendingIds,
+        remainingInventory:analysisProgressStore.remaining,
+      })+"\n");
+      throw new Error("ANALYSIS_INCOMPLETE_SUSPENDED: "+reason);
+    }
+    stageLock.completeAnalysisBatch();
+    for(const lead of stageLock.analysisLeads){
+      const record=analysisProgressStore.records.get(lead.id);
+      if(!record||record.lifecycle==="queued")continue;
+      if(["analysis_exhausted","dependencies_pending","experiment_pending","experiment_completed","blocked"].includes(record.lifecycle))continue;
+      const detail=analysisResults.get(lead.id);
+      analysisProgressStore.recordAssessment(
+        lead.id,
+        detail?.decision.matchedHypotheses.map(x=>x.id)||[],
+        detail?.unresolvedReasons||[],
+        detail?.experimentCandidates.map(x=>x.id)||[],
+      );
+      analysisProgressStore.markTerminalAssessment(lead.id,
+        lead.state.kind==="assessed" ? lead.state.reason : undefined);
+    }
+    analysisProgressStore.processedBatches++;
+    analysisInventoryMeta.queuedRemaining=analysisProgressStore.remaining;
+    await analysisProgressStore.save();
+    // Update the human-readable inventory artifact after every batch. The
+    // initial snapshot alone would misleadingly report zero processed forever.
+    const inventorySnapshot={
+      totalCandidates:analysisProgressStore.records.size,
+      admittedCount:analysisProgressStore.assessed,
+      queuedCount:analysisProgressStore.remaining,
+      blockedCount:analysisInventoryMeta.blockedCount,
+      processedBatches:analysisProgressStore.processedBatches,
+      candidates:analysisProgressStore.candidates.map(({sourceExcerpt:_excerpt,...candidate})=>({
+        ...candidate,lifecycle:analysisProgressStore!.records.get(candidate.id)?.lifecycle,
+      })),
+    };
+    const inventoryDestination=logFile+".analysis-candidates.json";
+    const inventoryTemporary=inventoryDestination+"."+process.pid+".tmp";
+    await writeFile(inventoryTemporary,JSON.stringify(inventorySnapshot,null,2),{mode:0o600});
+    await rename(inventoryTemporary,inventoryDestination);
+    await appendFile(logFile,"[ANALYSIS_BATCH_COMPLETE] "+JSON.stringify({
+      batch:analysisProgressStore.processedBatches,
+      resolved:analysisProgressStore.assessed,
+      inventoryTotal:analysisProgressStore.records.size,
+      queuedRemaining:analysisProgressStore.remaining,
+    })+"\n");
+    if(analysisProgressStore.remaining>0){
+      const admitted=await admitNextAnalysisBatch();
+      if(admitted===0)throw new Error("ANALYSIS_INVENTORY_STALLED: queued candidates could not be admitted");
+      return;
+    }
+    stageLock.assertAnalysisInventoryExhausted();
     const cert=stageLock.analysisClosureCertificate(status,reason);
     stageLock.completeAnalysis(status,reason);
     limits.onAnalysisCertificate?.(cert);
     analyzeModelPending=false;analyzeTurnsRemaining=0;
-    const batchCoverage=status;
-    const inventoryCoverage=status==='complete'
-      ? (analysisInventoryMeta.queuedRemaining>0 ? 'partial_bounded_batch' : 'complete')
-      : 'partial';
-    await appendFile(logFile,'['+(status==='complete'?'ANALYSIS_COMPLETE':'ANALYSIS_INCOMPLETE')+'] '+
-      JSON.stringify({
-        ...cert,
-        batchCoverage,
-        inventoryCoverage,
-        inventoryTotal:analysisInventoryMeta.inventoryTotal,
-        admittedCount:analysisInventoryMeta.admittedCount,
-        queuedRemaining:analysisInventoryMeta.queuedRemaining,
-        blockedCount:analysisInventoryMeta.blockedCount,
-        candidates:stageLock.candidateCount,
-        modelAdded:analyzeApprovedIds.size,
-      })+'\n');
-    await appendFile(logFile,'[STAGE_UNLOCK] ANALYZE -> EXPERIMENT\n');
+    analysisInventoryMeta.queuedRemaining=0;
+    await appendFile(logFile,"[ANALYSIS_COMPLETE] "+JSON.stringify({
+      ...cert,batchCoverage:"complete",inventoryCoverage:"complete",
+      inventoryTotal:analysisProgressStore.records.size,
+      admittedCount:analysisProgressStore.records.size,
+      queuedRemaining:0,blockedCount:analysisInventoryMeta.blockedCount,
+      candidates:stageLock.candidateCount,modelAdded:analyzeApprovedIds.size,
+      processedBatches:analysisProgressStore.processedBatches,
+    })+"\n");
+    await appendFile(logFile,"[STAGE_UNLOCK] ANALYZE -> EXPERIMENT\\n");
   };
   const hypotheses:Array<{turn:number;path:string;statement:string}>=[];
   const renew=async(turn:number)=>{
@@ -832,7 +910,7 @@ export async function runLocalAudit(
               const menu=await solidityIndex.probeMenu(full,256);
               deterministicDeclarationsCache.set(path,menu);
               const queuedSelectorsForPath=new Set<string>();
-              for(const {selector,probe} of await groundedControllerOptions(path,source,menu,{skipFinancialInvariants:adapter==='deterministic'})){
+              for(const {selector,probe} of await groundedControllerOptions(path,source,menu,{skipFinancialInvariants:true})){
                 const plan={action:'plan_probe' as const,path,query:selector,
                   answer:'solidity_sequence',hypothesis:probe.hypothesis,sequence:probe.sequence};
                 const id=JSON.stringify([path,selector,plan.answer]);
@@ -992,90 +1070,68 @@ export async function runLocalAudit(
             unqueuedSelectors,
           });
         }
-        const envMaxLeads=Number(process.env.LOCAL_ANALYZE_MAX_LEADS??18);
-        const maxAdmittedLeads=Number.isSafeInteger(envMaxLeads)&&envMaxLeads>=1?Math.min(envMaxLeads,64):18;
-        const envMaxPerFile=Number(process.env.LOCAL_ANALYZE_MAX_PER_FILE??4);
-        const maxPerFileLeads=Number.isSafeInteger(envMaxPerFile)&&envMaxPerFile>=1?Math.min(envMaxPerFile,16):4;
         const candidateQueue=buildAnalysisCandidateQueue({
           items:candidateSourceItems,
           staticLeads:solLeads,
           graph:deterministicProgramGraph||undefined,
-          maxAdmitted:maxAdmittedLeads,
-          maxPerFile:maxPerFileLeads,
+          maxAdmitted:analysisBatchSize,
+          maxPerFile:analysisPerFileCap,
         });
-        for(const blocked of candidateQueue.blocked){
-          await appendFile(logFile,'[ANALYSIS_LEAD_BLOCKED] '+JSON.stringify(blocked)+'\n');
-        }
         analysisInventoryMeta={
           inventoryTotal:candidateQueue.inventory.length,
-          admittedCount:candidateQueue.admitted.length,
-          queuedRemaining:candidateQueue.queued.length,
+          admittedCount:0,
+          queuedRemaining:candidateQueue.inventory.length,
           blockedCount:candidateQueue.blocked.length,
         };
-        try {
-          await writeFile(logFile+'.analysis-candidates.json',JSON.stringify({
+        // The source fingerprint and path are stable across self-hosted runner
+        // workspaces. The checkpoint stays on the laptop outside git-clean.
+        const inventoryFingerprint=createHash("sha256").update(JSON.stringify(
+          candidateQueue.inventory.map(c=>[c.id,c.sourceCommit,c.sourceSha256]).sort()
+        )).digest("hex");
+        const progressRoot=process.env.LOTUS_ANALYSIS_CHECKPOINT_ROOT||
+          join(homedir(),".lotus-clone-analysis");
+        const progressFile=join(progressRoot,inventoryFingerprint+".json");
+        analysisProgressStore=await AnalysisProgressStore.open(progressFile,candidateQueue.inventory);
+        stageLock.registerAnalysisInventory(candidateQueue.inventory.map(c=>c.id));
+        for(const record of analysisProgressStore.records.values()){
+          if(record.lifecycle!=="queued")stageLock.restoreResolvedAnalysisCandidate(record.id);
+        }
+        const envMaxLeads=Number(process.env.LOCAL_ANALYZE_MAX_LEADS??18);
+        analysisBatchSize=Number.isSafeInteger(envMaxLeads)&&envMaxLeads>=1?Math.min(envMaxLeads,64):18;
+        const envMaxPerFile=Number(process.env.LOCAL_ANALYZE_MAX_PER_FILE??4);
+        analysisPerFileCap=Number.isSafeInteger(envMaxPerFile)&&envMaxPerFile>=1?Math.min(envMaxPerFile,16):4;
+        const envAnalyzeTurns=Number(process.env.LOCAL_ANALYZE_MODEL_TURNS??24);
+        analysisTurnBudget=Number.isSafeInteger(envAnalyzeTurns)&&envAnalyzeTurns>=1?Math.min(envAnalyzeTurns,200):24;
+        for(const blocked of candidateQueue.blocked){
+          await appendFile(logFile,"[ANALYSIS_LEAD_BLOCKED] "+JSON.stringify(blocked)+"\n");
+        }
+        try{
+          await writeFile(logFile+".analysis-candidates.json",JSON.stringify({
             totalCandidates:candidateQueue.inventory.length,
-            admittedCount:candidateQueue.admitted.length,
-            queuedCount:candidateQueue.queued.length,
+            admittedCount:analysisProgressStore.assessed,
+            queuedCount:analysisProgressStore.remaining,
             blockedCount:candidateQueue.blocked.length,
-            inventoryCoverage:candidateQueue.queued.length>0?'partial_bounded_batch':'complete',
-            blocked:candidateQueue.blocked,
             candidates:candidateQueue.inventory.map(({sourceExcerpt:_ex,...rest})=>rest),
           },null,2),{mode:0o600});
         }catch{}
-        await appendFile(logFile,'[ANALYSIS_CANDIDATE_INVENTORY] '+JSON.stringify({
+        await appendFile(logFile,"[ANALYSIS_CANDIDATE_INVENTORY] "+JSON.stringify({
           totalCandidates:candidateQueue.inventory.length,
-          admittedCount:candidateQueue.admitted.length,
-          queuedCount:candidateQueue.queued.length,
+          queuedCount:analysisProgressStore.remaining,
+          resumedProcessed:analysisProgressStore.assessed,
           blockedCount:candidateQueue.blocked.length,
-          maxAdmittedLeads,
-          maxPerFileLeads,
-        })+'\n');
-        for(const cand of candidateQueue.admitted){
-          stageLock.registerAnalysisLead({
-            id:cand.id,sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
-            path:cand.path,selector:cand.selector,
-          });
-          analysisPackets.set(cand.id,{
-            id:cand.id,path:cand.path,selector:cand.selector,
-            sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
-            sourceEvidence:cand.sourceEvidence,sourceExcerpt:cand.sourceExcerpt,
-            excerptStart:cand.excerptStart,truncated:cand.truncated,
-          });
-          await appendFile(logFile,'[ANALYSIS_LEAD_SELECTED] '+JSON.stringify({
-            id:cand.id,path:cand.path,selector:cand.selector,
-            sourceCommit:cand.sourceCommit,sourceSha256:cand.sourceSha256,
-            sourceEvidence:cand.sourceEvidence,priority:cand.priority,
-            staticLeadIds:cand.staticLeadIds,selectionReasons:cand.selectionReasons,
-          })+'\n');
-        }
-        // Four Qwen turns were insufficient to correct even one rejected
-        // sequence. Preserve a configurable bounded window without treating
-        // an invalid schema attempt as a successful experiment.
-        const envAnalyzeTurns=Number(process.env.LOCAL_ANALYZE_MODEL_TURNS??24);
-        const maxAnalyzeTurns=Number.isSafeInteger(envAnalyzeTurns)&&envAnalyzeTurns>=0?Math.min(envAnalyzeTurns,200):24;
-        const enableAnalyzeModel=structured && !!workflow &&
-          process.env.LOCAL_MODEL_SOLIDITY_ANALYZE!=='false' && maxAnalyzeTurns>0 &&
-          (process.env.LOCAL_MODEL_SOLIDITY_ANALYZE==='true' || solLeads.length>0 ||
-           (nonMockSolSummaries.length>=2 && totalUnqueuedNonSetters>=2) ||
-           (adapter==='deterministic' && candidateQueue.admitted.length>0));
-        if(enableAnalyzeModel){
-          analyzeModelPending=true;
-          analyzeTurnsRemaining=maxAnalyzeTurns;
-          await appendFile(logFile,'[ANALYSIS_MODEL_WINDOW_STARTED] '+JSON.stringify({
-            maxAnalyzeTurns,solLeads:solLeads.length,nonMockSolFiles:nonMockSolSummaries.length,
-            totalUnqueuedNonSetters,selectedModelLeads:stageLock.analysisProgress.selected})+'\n');
-          // Historical stage overview is advisory/evictable. The authoritative
-          // current lead and source excerpt are delivered anew with every call.
-          messages.push({role:'user',content:'ANALYZE STAGE: You have '+maxAnalyzeTurns+
-            ' bounded model turns. Assess or defer the controller-selected pending lead, '+
-            'using its immutable leadId, exact selector, verified source and a specific reason. '+
-            'Propose discover_experiment only with a source-grounded invariant and a valid '+
-            'solidity_sequence. Do not finalize while any selected lead is pending. '+
-            'The next pending lead and its bounded evidence appear in the current controller task. /no_think'});
-        } else {
-          await closeAnalysis(stageLock.analysisProgress.pendingIds.length?'partial':'complete',
-            stageLock.analysisProgress.pendingIds.length?'model_analysis_disabled':'');
+          maxAdmittedLeads:analysisBatchSize,
+          maxPerFileLeads:analysisPerFileCap,
+          progressFile,
+        })+"\n");
+        await admitNextAnalysisBatch();
+        if(!analysisProgressStore?.remaining&&stageLock?.analysisProgress.pendingIds.length===0){
+          await closeAnalysis("complete");
+        } else if(analyzeModelPending){
+          await appendFile(logFile,"[ANALYSIS_MODEL_WINDOW_STARTED] "+JSON.stringify({
+            maxAnalyzeTurns:analyzeTurnsRemaining,
+            selectedModelLeads:stageLock.analysisProgress.selected,
+            totalInventory:analysisProgressStore?.records.size,
+          })+"\n");
         }
         constraints=workflow?await workflow.constraints():constraints;
       }
@@ -1469,7 +1525,7 @@ export async function runLocalAudit(
       const onProgress=(progress:{contentCharacters:number;thinkingCharacters:number;toolCalls:number})=>{
         if(Date.now()-lastProgressLog<15000)return;
         lastProgressLog=Date.now();
-        void appendFile(logFile,"[MODEL_PROGRESS] "+JSON.stringify({turn:turn+1,elapsedMs:Date.now()-started,...progress})+"\\n").catch(()=>{});
+        void appendFile(logFile,"[MODEL_PROGRESS] "+JSON.stringify({turn:turn+1,elapsedMs:Date.now()-started,...progress})+"\n").catch(()=>{});
       };
       const requestMessages=profile.think
         ? assembled.requestMessages.map(m=>({...m,content:m.content.replaceAll('/no_think','')}))
@@ -1489,7 +1545,7 @@ export async function runLocalAudit(
           sourceEvidence:activeAnalysisPacket?.sourceEvidence||null,
           activeInstructionChars:activeAnalyzeInstruction.content.length,
           requestChars,messageBudget,context:settings.numCtx,
-          pending:stageLock?.analysisProgress.pendingIds.length})+'\\n');
+          pending:stageLock?.analysisProgress.pendingIds.length})+'\n');
       }
       // The graph has already specified the exact next read/verification.
       // Execute it rather than spending a Qwen turn asking for known arguments.
@@ -1922,7 +1978,6 @@ export async function runLocalAudit(
       }
       const result: {message?:Message;eval_count?:number;prompt_eval_count?:number;done_reason?:string;load_duration?:number;prompt_eval_duration?:number;eval_duration?:number;total_duration?:number;client_queue_ms?:number} = controllerAction ?
         {message:{role:'assistant',content:JSON.stringify(controllerAction)}} :
-        adapter==='deterministic' ?
         await (async () => {
           const activeLeadMeta=stageLock?.currentStage==='ANALYZE' && analyzeModelPending ? nextAnalysisPacket() : undefined;
           const activePacket=activeLeadMeta ? analysisPackets.get(activeLeadMeta.id) : undefined;
@@ -2003,7 +2058,7 @@ export async function runLocalAudit(
             escalationCache:deterministicEscalationCache,
             repositoryDir:cwd,
             onEscalation:(res)=>{lastEscalation=res;},
-            onAnalysisResult:(res)=>{lastAnalysisResult=res;},
+            onAnalysisResult:(res)=>{lastAnalysisResult=res; if(activePacket)analysisResults.set(activePacket.id,res);},
           });
           if(lastAnalysisResult && ((lastAnalysisResult as DeterministicAnalysisResult).unresolvedReasons.length>0 || (lastAnalysisResult as DeterministicAnalysisResult).constructionFeasibility.attempted)){
             const ar=lastAnalysisResult as DeterministicAnalysisResult;
@@ -2037,62 +2092,7 @@ export async function runLocalAudit(
             turn:turn+1,stage:stageLock?.currentStage||'default',action:detAction.action,
             path:detAction.path,query:detAction.query,leadId:detAction.leadId})+'\n');
           return {message:{role:'assistant',content:JSON.stringify(detAction)},eval_count:0,prompt_eval_count:0,done_reason:'deterministic'};
-        })() :
-        await (async () => {
-          // A stalled Ollama request must not terminate a multi-hour investigation.
-          // Retry only the model generation; controller memory, read cursors,
-          // observations and completed probes remain unchanged.
-          const endpoint=process.env.AUTOHACK_OLLAMA_URL || "http://127.0.0.1:11434/api/chat";
-          const request={ model, stream: false, think: profile.think, messages:requestMessages,
-          ...(structured ? {format:sanitizeOllamaFormatSchema(requestSchema)} : {tools:availableTools}),
-          keep_alive:process.env.LOCAL_OLLAMA_KEEP_ALIVE||"30m",
-          options: { num_predict:turnGenerationLimit,
-            ...(limits.numCtx === undefined ? {} : {num_ctx:settings.numCtx}),
-            ...(limits.numThreads === undefined ? {} : {num_thread:settings.numThreads}), ...profile.options } };
-          for(let attempt=1;attempt<=5;attempt++) {
-            controller.signal.throwIfAborted();
-            const attemptController=new AbortController();
-            let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
-            const resetInactivity=()=>{
-              clearTimeout(inactivityTimer);
-              inactivityTimer=setTimeout(()=>attemptController.abort('model_request_stalled'),12*60*1000);
-            };
-            resetInactivity();
-            const progressHandler=(progress:any)=>{
-              resetInactivity();
-              onProgress?.(progress);
-            };
-            const signal=AbortSignal.any([controller.signal,attemptController.signal]);
-            try {
-              return await (adapter==='qwen-agent'?postQwenAgentJson:postOllamaChat)(
-                endpoint,request,signal,{onProgress:progressHandler});
-            } catch(error) {
-              if(controller.signal.aborted)throw error;
-              if(attempt===5){
-                if(stageLock?.currentStage==='ANALYZE' && analyzeModelPending){
-                  await appendFile(logFile,'[ANALYSIS_MODEL_UNAVAILABLE] '+JSON.stringify({
-                    turn:turn+1,attempts:attempt,reason:String(error).slice(0,200),
-                    pendingIds:stageLock.analysisProgress.pendingIds,retainedControllerMemory:true})+'\n');
-                  return {message:{role:'assistant',content:JSON.stringify({
-                    action:'analysis_unavailable',path:'',query:'',answer:'model_transport_retries_exhausted'})}};
-                }
-                if(stageLock?.currentStage==='REVIEW' && stageLock.candidateCount>0 && stageLock.outcomeCounts.observed===0){
-                  await appendFile(logFile,'[REVIEW_MODEL_UNAVAILABLE] '+JSON.stringify({
-                    turn:turn+1,attempts:attempt,reason:String(error).slice(0,200),
-                    outcomes:stageLock.outcomeCounts,retainedControllerMemory:true})+'\n');
-                  return {message:{role:'assistant',content:JSON.stringify({
-                    action:'final',path:'',query:'',answer:''})}};
-                }
-                throw error;
-              }
-              await appendFile(logFile,'[MODEL_REQUEST_RECOVERY] '+JSON.stringify({
-                turn:turn+1,attempt,reason:String(error).slice(0,200),
-                retainedControllerMemory:true})+'\n');
-              await new Promise(r => setTimeout(r, Math.min(attempt * 4000, 15000)));
-            } finally {clearTimeout(inactivityTimer);}
-          }
-          throw new Error('Model request retries exhausted');
-        })() as { message?: Message; eval_count?: number; prompt_eval_count?: number; done_reason?: string; load_duration?:number; prompt_eval_duration?:number; eval_duration?:number; total_duration?:number; client_queue_ms?:number };
+        })();
       if(!controllerAction)await recordToolActivity(logFile,{
         phase:'completed',tool:'model_generation',turn:turn+1,model,
         durationMs:Date.now()-started,origin:'model',
@@ -3401,7 +3401,7 @@ export async function runLocalAudit(
               output=fitted;
             } catch {
               output=fitOutput(JSON.stringify(await readSourcePage(full,offset,pageSize))).output;
-              await appendFile(logFile,'[PROBE_MENU_FIT_FALLBACK] '+JSON.stringify({path:relative(root,full),offset})+'\\n');
+              await appendFile(logFile,'[PROBE_MENU_FIT_FALLBACK] '+JSON.stringify({path:relative(root,full),offset})+'\n');
             }
           } else output=fitOutput(output).output;
           if(name==='read_file') {

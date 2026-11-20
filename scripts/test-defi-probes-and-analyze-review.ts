@@ -251,8 +251,11 @@ contract PlainVault {
   const prioritized = prioritizeSolidityStagedPlans(items, leads);
   assert.equal(prioritized.selected[0].id, "eth-extract", "Tier 1 extraction probe must be first");
   assert.equal(prioritized.selected[1].id, "defi-deposit", "Tier 2 core DeFi probe must precede setters");
-  assert.equal(prioritized.droppedTier4Count, 13, "Tier-4 setters per file should be capped to 3 when >16 total");
-  assert.equal(prioritized.selected.length, 5);
+  assert.equal(prioritized.droppedTier4Count, 0, "Round 3 must not discard valid low-priority experiments");
+  assert.equal(prioritized.selected.length, items.length,
+    "Priority must order all valid options without discarding any");
+  assert.equal(new Set(prioritized.selected.map(item=>item.id)).size, items.length,
+    "Each valid option must be retained exactly once");
 }
 
 // 4. Protocol decodeAuditAction in ANALYZE stage
@@ -285,211 +288,15 @@ contract PlainVault {
   assert.deepEqual(targets, ["contracts/DInterest.sol", "contracts/MPHMinter.sol"]);
 }
 
-// 6. keep_alive in runEvidenceOnlyReview + End-to-End runLocalAudit ANALYZE -> EXPERIMENT -> REVIEW
+// 6. A legacy model endpoint cannot reactivate Qwen in LOTUS-CLONE.
+// End-to-end deterministic ANALYZE, EXPERIMENT, REVIEW and source inventory
+// are exercised by scripts/test-deterministic-lotus.ts and
+// scripts/test-deterministic-full-inventory.ts, without any model server.
 {
-  const tmp = await mkdtemp(join(tmpdir(), "autohack-analyze-review-"));
-  const prevUrl = process.env.AUTOHACK_OLLAMA_URL;
-  const prevKeepAlive = process.env.LOCAL_OLLAMA_KEEP_ALIVE;
-  const seenKeepAlives: string[] = [];
-  let sawAnalyzeActionPrompt = false;
-  let sawMultiContractSummary = false;
-  let reviewCalls = 0;
-
-  const finalSchema = {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      findings: { type: "array", items: { type: "object" } },
-      outcome: { type: "string" },
-      reason: { type: "string" },
-    },
-    required: ["findings", "outcome", "reason"],
-  };
-
-  const server = createServer(async (req, res) => {
-    let body = "";
-    for await (const c of req) body += c.toString();
-    const payload = JSON.parse(body);
-    if (typeof payload.keep_alive === "string") seenKeepAlives.push(payload.keep_alive);
-    res.setHeader("content-type", "application/json");
-    const lastContent = String(payload.messages?.at(-1)?.content || "");
-    const enumActions: string[] = payload.format?.properties?.action?.enum || [];
-
-    // Evidence-only review check
-    if (enumActions.length === 0 && payload.format?.properties?.verdict) {
-      res.end(JSON.stringify({ message: { role: "assistant", content: JSON.stringify({ verdict: "approve", recommendation: "dont_submit" }) } }));
-      return;
-    }
-
-    if (enumActions.includes("discover_experiment")) {
-      sawAnalyzeActionPrompt = true;
-      const fmtJson = JSON.stringify(payload.format || {});
-      assert.doesNotMatch(fmtJson, /"(?:minLength|maxLength|pattern)"/, "ANALYZE format must strip GBNF-exploding constraints");
-      assert.equal(payload.format?.properties?.result, undefined, "ANALYZE format must omit final result schema");
-      assert.ok(Array.isArray(payload.format?.properties?.leadId?.enum) && payload.format.properties.leadId.enum.length === 1,
-        "ANALYZE format must pin leadId to exact pending enum instead of 64-char regex");
-      const packetText=payload.messages.map((m:any)=>String(m.content||'')).join('\n');
-      const leadIdMatch=packetText.match(/"id":"([a-f0-9]{64})","path":"(source-[^"]+\.sol)","selector":"([^"]+)"/);
-      assert.ok(leadIdMatch,'A model action must be scoped to a source-hashed lead packet');
-      const [,leadId,leadPath,selector]=leadIdMatch;
-      const method=selector.split('.').at(-1);
-      res.end(JSON.stringify({
-        message: {
-          role: "assistant",
-          content: JSON.stringify({
-            action: "discover_experiment",
-            leadId,
-            path: leadPath,
-            query: selector,
-            answer: "solidity_sequence",
-            hypothesis: "An unauthorized sender must be rejected by the inspected owner guard.",
-            sequence: {
-              constructorArgs: [],
-              steps: [
-                { operation: "observe", function: "owner()", args: [] },
-                { operation: "send", function: method+"(uint256)", args: ["10"], sender: 1, expectRevert: true },
-              ],
-            },
-          }),
-        },
-      }));
-      return;
-    }
-
-    if (enumActions.length === 1 && enumActions[0] === "final") {
-      reviewCalls++;
-      const fmtJson = JSON.stringify(payload.format || {});
-      assert.doesNotMatch(fmtJson, /"(?:minLength|maxLength|pattern)"/, "REVIEW format must strip GBNF-exploding constraints");
-      assert.equal(payload.format?.properties?.leadId, undefined, "REVIEW final-only format must omit leadId");
-      if (payload.messages.some((m: any) => String(m.content || "").includes("Controller multi-contract experiment summary"))) {
-        sawMultiContractSummary = true;
-      }
-      res.end(JSON.stringify({
-        message: {
-          role: "assistant",
-          content: JSON.stringify({
-            action: "final",
-            path: "",
-            query: "",
-            answer: "",
-            result: {
-              findings: [],
-              outcome: "no_testable_candidate",
-              reason: "All executed probes were negative or observation_only across VaultA and VaultB.",
-            },
-          }),
-        },
-      }));
-      return;
-    }
-
-    res.end(JSON.stringify({
-      message: {
-        role: "assistant",
-        content: JSON.stringify({
-          action: "finalize_analysis",
-          path: "",
-          query: "",
-          answer: "",
-        }),
-      },
-    }));
-  });
-
-  try {
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const addr = server.address();
-    assert.ok(addr && typeof addr !== "string");
-    process.env.AUTOHACK_OLLAMA_URL = `http://127.0.0.1:${addr.port}/api/chat`;
-    process.env.LOCAL_OLLAMA_KEEP_ALIVE = "45m";
-
-    const reviewLog = join(tmp, "review.log");
-    await writeFile(reviewLog, "");
-    await runEvidenceOnlyReview({
-      prompt: "Review",
-      schema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] },
-      model: "mock",
-      signal: new AbortController().signal,
-      logFile: reviewLog,
-      numCtx: 2048,
-      numPredict: 128,
-      validate: () => null,
-    });
-    assert.equal(seenKeepAlives[0], "45m", "runEvidenceOnlyReview must respect LOCAL_OLLAMA_KEEP_ALIVE");
-
-    const repoDir = join(tmp, "source-1");
-    await mkdir(join(repoDir, "contracts"), { recursive: true });
-    await writeFile(
-      join(repoDir, "contracts", "VaultA.sol"),
-      "pragma solidity 0.8.4;\ncontract VaultA {\n  address public owner;\n  constructor(){ owner = msg.sender; }\n  function deposit(uint256 a) external {require(msg.sender == owner, \"owner\");}\n  function withdraw(uint256 a) external {}\n  function customSwap(uint256 a) external {}\n}\n",
-    );
-    await writeFile(
-      join(repoDir, "contracts", "VaultB.sol"),
-      "pragma solidity 0.8.4;\ncontract VaultB {\n  address public owner;\n  constructor(){ owner = msg.sender; }\n  function stake(uint256 a) external {}\n}\n",
-    );
-    execFileSync("git", ["init", "-q", repoDir]);
-    execFileSync("git", ["-C", repoDir, "config", "user.email", "ci@example.com"]);
-    execFileSync("git", ["-C", repoDir, "config", "user.name", "CI"]);
-    execFileSync("git", ["-C", repoDir, "add", "."]);
-    execFileSync("git", ["-C", repoDir, "commit", "-q", "-m", "init"]);
-
-    process.env.LOCAL_ANALYZE_MODEL_TURNS = "1";
-    const auditLog = join(tmp, "audit.log");
-    const answer = await runLocalAudit(
-      "Audit DeFi contracts",
-      auditLog,
-      20000,
-      tmp,
-      "mock",
-      "Offline audit",
-      {
-        maxTurns: 30,
-        numCtx: 16384,
-        numPredict: 512,
-        numThreads: 4,
-        productionWorkflow: true,
-        controllerIndex: true,
-        finalSchema,
-        initialSourcePaths: ["source-1/contracts/VaultA.sol", "source-1/contracts/VaultB.sol"],
-        staticLeads: [
-          { path: "source-1/contracts/VaultA.sol", line: 4, rule: "solidity-eth-transfer", message: "Check", severity: "WARNING" },
-        ],
-        verifyPython: async (_path, fnName) =>
-          JSON.stringify({
-            status: "observation_only",
-            behavior_observed: false,
-            kind: "solidity_sequence",
-            observations: { function: fnName, steps: [{ operation: "send", reverted: false, passed: true }] },
-            limitation: "Observation only.",
-          }),
-        validateFinal: raw => {
-          const parsed = JSON.parse(raw);
-          return Array.isArray(parsed.findings) && parsed.findings.length === 0 ? null : "Expected findings=[]";
-        },
-      },
-    );
-
-    const parsedAnswer = JSON.parse(answer);
-    assert.equal(parsedAnswer.findings.length, 0);
-    assert.ok(sawAnalyzeActionPrompt, "Bounded ANALYZE window must invoke model with discover_experiment");
-    assert.ok(reviewCalls >= 1, "REVIEW stage must invoke the final-result model");
-    assert.ok(sawMultiContractSummary, "REVIEW must receive the controller evidence summary even with one executable experiment");
-    const transcript = await readFile(auditLog, "utf8");
-    assert.match(transcript, /\[ANALYSIS_MODEL_WINDOW_STARTED\]/);
-    assert.match(transcript, /\[ANALYSIS_MODEL_EXPERIMENT_ADDED\]/);
-    assert.match(transcript, /\[MODEL_ANALYZE_SCENARIO_DISPATCHED\]/);
-    assert.ok(seenKeepAlives.every(k => k === "45m"));
-  } finally {
-    server.close();
-    if (prevUrl === undefined) delete process.env.AUTOHACK_OLLAMA_URL;
-    else process.env.AUTOHACK_OLLAMA_URL = prevUrl;
-    if (prevKeepAlive === undefined) delete process.env.LOCAL_OLLAMA_KEEP_ALIVE;
-    else process.env.LOCAL_OLLAMA_KEEP_ALIVE = prevKeepAlive;
-    delete process.env.LOCAL_ANALYZE_MODEL_TURNS;
-    await rm(tmp, { recursive: true, force: true });
-  }
+  const { resolveLocalModelAdapter } = await import("../packages/security-solver/src/deterministic");
+  assert.equal(resolveLocalModelAdapter({AUTOHACK_OLLAMA_URL:"http://127.0.0.1:11434/api/chat"}),"deterministic");
+  assert.throws(() => resolveLocalModelAdapter({LOCAL_MODEL_ADAPTER:"qwen-agent"}),/LOTUS_MODEL_REMOVED/);
 }
-
 
 // 7. Regression tests for #232: GBNF schema sanitization, hypothesis priority tiers, .isContract() binding, Echidna/Dummy exclusions
 {

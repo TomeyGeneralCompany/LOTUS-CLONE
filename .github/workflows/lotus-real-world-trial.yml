@@ -23,10 +23,8 @@ jobs:
       PROJECT_ROOT: ${{ github.workspace }}
       GITHUB_TOKEN: ${{ github.token }}
       TRIAL_PROGRAM_ID: ${{ inputs.program_id }}
-      LOCAL_OLLAMA_MODEL: qwen3:4b
-      LOCAL_MODEL_ADAPTER: ollama
-      LOCAL_OLLAMA_TOOL_PROTOCOL: json
-      AUTOHACK_OLLAMA_URL: http://127.0.0.1:11434/api/chat
+      LOCAL_MODEL_ADAPTER: deterministic
+      AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
       LOCAL_HUNT_DYNAMIC_ALLOWANCE: 'true'
       LOCAL_HUNT_MAX_TURNS: '80'
       LOCAL_HUNT_NUM_PREDICT: '2048'
@@ -98,16 +96,6 @@ jobs:
           print('Loaded original assessed program:',program)
           PY
 
-      - name: Start local CPU-only Ollama Qwen3 4B
-        run: |
-          docker run -d --name lotus-trial-model -p 127.0.0.1:11434:11434 ollama/ollama:latest
-          for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
-          docker exec lotus-trial-model ollama pull qwen3:4b
-
       - name: Run the existing four acceptance stages, ending with real bounty
         run: |
           set -uo pipefail
@@ -116,10 +104,10 @@ jobs:
           {
             echo '1/4 Source workflow regression tests'
             node --import tsx scripts/test-source-workflow.ts || exit $?
-            echo '2/4 Real Qwen3 production controller and isolated reproduction'
-            node --import tsx scripts/test-production-workflow.ts --real-model --prefetch || exit $?
-            echo '3/4 Real Qwen3 scoped synthetic hunt and independent review'
-            node --import tsx scripts/test-real-program-hunt.ts || exit $?
+            echo '2/4 Deterministic production controller and source-evidence progression'
+            node --import tsx scripts/test-deterministic-lotus.ts || exit $?
+            echo '3/4 Exhaustive inventory and durable state gates'
+            node --import tsx scripts/test-deterministic-full-inventory.ts || exit $?
             echo '4/4 One authorized live bounty investigation (NO automatic submission)'
             bash scripts/run-one-bounty.sh --program "$TRIAL_PROGRAM_ID" --timeout-min 35
           } 2>&1 | tee data/lotus-acceptance/github-live.log
@@ -213,6 +201,3 @@ jobs:
           done
           echo "::warning::Private mirror upload failed; Actions artifact retained."
 
-      - name: Stop Ollama
-        if: always()
-        run: docker rm -f lotus-trial-model || true

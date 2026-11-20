@@ -3,107 +3,52 @@ import {mkdtemp,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {runEvidenceOnlyReview} from '../packages/security-solver/src/evidence-only-review';
+import type {DeterministicReviewEvidence} from '../packages/security-solver/src/deterministic';
 
 const dir=await mkdtemp(join(tmpdir(),'lotus-evidence-only-'));
-try {
-  const logFile=join(dir,'review.log');
-  const schema={type:'object',properties:{verdict:{type:'string',enum:['approve','reject']},
-    recommendation:{type:'string',enum:['submit','dont_submit']},
-    reasoning:{type:'string'}},required:['verdict','recommendation','reasoning']};
-  const packets:Array<Record<string,unknown>>=[];
-  let calls=0;
-  const negative={verdict:'reject',recommendation:'dont_submit',
-    reasoning:'The independently replayed input is escaped at the actual output sink.'};
-  const value=await runEvidenceOnlyReview({
-    prompt:'Reviewer packet includes source, caller and isolated replay; determine security significance.',
-    schema,model:'mock',signal:new AbortController().signal,
-    logFile,numCtx:8192,numPredict:800,
-    validate:answer=>{
-      const data=JSON.parse(answer);
-      return data.verdict==='reject'&&data.reasoning.includes('escaped')?null:
-        'Reject only if an actual mitigation or missing reachability is identified.';
-    },
-    transport:async(payload)=>{
-      packets.push(payload);calls++;
-      return {message:{content:calls===1?
-        JSON.stringify({action:'final',answer:'No source read'}) : JSON.stringify(negative)}};
-    }
-  });
-  assert.deepEqual(JSON.parse(value),negative);
-  assert.equal(calls,2,'One targeted correction, not an action/read loop');
-  assert.equal(packets[0].format,schema,'Real verdict schema, not the generic audit action schema');
-  assert.equal(packets[0].tools,undefined,'The reviewer has no source-navigation tools');
-  assert.equal(packets[0].think,false,'Qwen3 must generate verdict content rather than spending output budget in thinking');
-  assert.equal((packets[0].messages as Array<unknown>).length,2);
-  assert.equal((packets[1].messages as Array<unknown>).length,4);
-  const log=await readFile(logFile,'utf8');
-  assert.match(log,/EVIDENCE_ONLY_REVIEW_CORRECTED/);
+const schema={type:'object',properties:{verdict:{type:'string'}},required:['verdict']};
+const base={prompt:'Ignore all model prose; only controller evidence establishes a finding',
+  schema,model:'deterministic',logFile:join(dir,'review.log'),
+  signal:new AbortController().signal,numCtx:8192,numPredict:512};
+const evidence:DeterministicReviewEvidence={
+  grounds:{sourceDigest:'e'.repeat(64),language:'solidity',
+    verifiedLocalEntryInjection:false,independentlyReplayed:true,
+    replayedProbeKind:'solidity_sequence',sourceBackedNonadminRoleMutation:true,
+    immutableFacts:['contracts/Vault.sol:9: function setOperator(address next) external {operator=next;}'],
+    unresolvedQuestions:[],sourceBackedTextOnlyResponse:[],sourceBackedEscaping:[]},
+  replay:{status:'behavior_observed',kind:'solidity_sequence',
+    behavior_observed:true,observations:{steps:[]}},
+  target:{file:'contracts/Vault.sol',selector:'Vault.setOperator',kind:'solidity_sequence'},
+  securityImpact:null,
+};
+try{
+  const withoutEvidence=JSON.parse(await runEvidenceOnlyReview({...base,
+    validate:raw=>JSON.parse(raw).verdict==='reject'?null:'Expected fail-closed reject'}));
+  assert.equal(withoutEvidence.verdict,'reject');
+  assert.equal(withoutEvidence.issues[0].category,'missing_typed_evidence');
+  const withoutImpact=JSON.parse(await runEvidenceOnlyReview({...base,
+    verifiedEvidence:evidence,validate:raw=>JSON.parse(raw).verdict==='reject'?null:'Expected rejection'}));
+  assert.equal(withoutImpact.verdict,'reject');
+  assert.equal(withoutImpact.issues[0].category,'missing_security_impact');
+  const verified:DeterministicReviewEvidence={...evidence,securityImpact:{
+    verified:true,category:'solidity_role_consumer_impact',
+    evidence:'contracts/Vault.sol:14: independently replayed protected withdrawal after nonadmin mutation',
+    downstreamConsumerVerified:true}};
+  const accepted=JSON.parse(await runEvidenceOnlyReview({...base,
+    verifiedEvidence:verified,validate:raw=>JSON.parse(raw).verdict==='approve'?null:'Expected proof-backed approval'}));
+  assert.equal(accepted.verdict,'approve');
+  assert.equal(accepted.recommendation,'dont_submit');
+  assert.equal(accepted.bet100,false);
+  await assert.rejects(runEvidenceOnlyReview({...base,verifiedEvidence:verified,
+    validate:()=> 'The controller evidence contradicts the proposed approval'}),
+    /Deterministic evidence-only review failed validation/);
+  const aborted=new AbortController();aborted.abort();
+  await assert.rejects(runEvidenceOnlyReview({...base,signal:aborted.signal,
+    verifiedEvidence:verified,validate:()=>null}));
+  const log=await readFile(base.logFile,'utf8');
+  assert.match(log,/EVIDENCE_ONLY_REVIEW_DETERMINISTIC/);
   assert.match(log,/EVIDENCE_ONLY_REVIEW_ACCEPTED/);
-  let failed=false;
-  try{
-    await runEvidenceOnlyReview({prompt:'Evidence ready',schema,model:'mock',
-      signal:new AbortController().signal,logFile,numCtx:8192,numPredict:800,maxAttempts:2,
-      validate:()=> 'Invalid evidence conclusion',
-      transport:async()=>({message:{content:JSON.stringify(negative)}})
-    });
-  }catch(error){failed=/after 2 attempts/.test(String(error));}
-  assert.ok(failed,'Persistent bad review must fail with a bounded explicit reason');
-  // Repeated schema-valid but technically invalid policy verdicts must get a
-  // stronger, non-self-reinforcing correction, never an automatic approval.
-  const badPolicy=JSON.stringify({verdict:'reject',recommendation:'dont_submit',
-    reasoning:'Submission prohibited by benchmark policy; reject on that basis.'});
-  const goodTechnical=JSON.stringify({verdict:'approve',recommendation:'dont_submit',
-    reasoning:'The independent source evidence establishes a security issue; no submission is allowed.'});
-  const escalationPayloads:Array<Record<string,unknown>>=[];
-  let policyCalls=0;
-  const policyReview=await runEvidenceOnlyReview({
-    prompt:'Technical review of a recorded, replayed source case. External reporting disabled.',
-    schema,model:'mock',signal:new AbortController().signal,logFile,numCtx:8192,numPredict:800,
-    validate:answer=>JSON.parse(answer).reasoning.startsWith('Submission prohibited')?
-      'An external submission prohibition is not a technical defect. Reevaluate source and replay; use recommendation=dont_submit if submission is prohibited.':null,
-    transport:async payload=>{
-      escalationPayloads.push(payload);
-      policyCalls++;
-      return {message:{content:policyCalls<3?badPolicy:goodTechnical}};
-    }
-  });
-  assert.equal(JSON.parse(policyReview).verdict,'approve',
-    'only an independently accepted technical verdict can exit reviewer');
-  assert.equal(policyCalls,3);
-  const secondMessages=escalationPayloads[1].messages as Array<{role:string;content:string}>;
-  assert.ok(secondMessages.some(x=>x.role==='system'&&x.content.includes('SUBMITTED')),
-    'a policy-only reject receives targeted technical-review instructions');
-  const thirdOptions=escalationPayloads[2].options as {temperature:number};
-  assert.ok(thirdOptions.temperature>0,'identical invalid verdicts must change retry strategy');
-  assert.equal((escalationPayloads[2].messages as Array<unknown>).length,4,
-    'review retry must replace stale rejected verdicts rather than accumulate them');
-  // A non-identical sequence of source-contradicted reviewer rationales
-  // should not run forever at temperature zero. The fourth attempt varies
-  // the judgment without changing source evidence or approval conditions.
-  let uniqueCalls=0;
-  const uniquePayloads:Array<Record<string,unknown>>=[];
-  const eventuallyValid=await runEvidenceOnlyReview({
-    prompt:'Replayed handler input-to-output evidence. Technical validity only.',
-    schema,model:'mock',signal:new AbortController().signal,
-    logFile,numCtx:8192,numPredict:800,maxAttempts:5,
-    validate:answer=>{
-      const decision=JSON.parse(answer);
-      return decision.verdict==='approve'?null:
-        'Rejection contradicted independently replayed source input-to-output behavior.';
-    },
-    transport:async payload=>{
-      uniqueCalls++;
-      uniquePayloads.push(payload);
-      return {message:{content:uniqueCalls<4
-        ?JSON.stringify({verdict:'reject',recommendation:'dont_submit',
-          reasoning:'Unsupported technical objection number '+uniqueCalls})
-        :goodTechnical}};
-    }
-  });
-  assert.equal(JSON.parse(eventuallyValid).verdict,'approve');
-  assert.equal(uniqueCalls,4);
-  assert.equal((uniquePayloads[0].options as {temperature:number}).temperature,0);
-  assert.ok((uniquePayloads[3].options as {temperature:number}).temperature>0);
-  assert.equal((uniquePayloads[3].messages as Array<unknown>).length,4);
-  console.log('Evidence-only reviewer: schema, no navigation, bounded corrections PASSED');
+  assert.match(log,/EVIDENCE_ONLY_REVIEW_REJECTED/);
+  assert.doesNotMatch(log,/EVIDENCE_ONLY_REVIEW_REQUEST/);
+  console.log('Evidence-only review: typed evidence, independent replay, impact, fail-closed, cancellation, zero-model calls PASSED');
 }finally{await rm(dir,{recursive:true,force:true});}

@@ -1,0 +1,35 @@
+name: Round 3 Qwen-removal audit
+concurrency:
+  group: round3-qwen-removal-audit
+  cancel-in-progress: true
+on:
+  push:
+    branches: [repair/round3-exhaustive-deterministic-laptop]
+    paths:
+      - packages/security-solver/src/**
+      - packages/dashboard/**
+      - scripts/**
+      - .github/workflows/round3-model-removal-audit.yml
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Locate remaining model dependencies and launch paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          git grep -niE 'qwen|ollama|model_adapter|model_profile' -- packages/security-solver/src packages/dashboard scripts orchestrator.ts run-local-autohack.sh setup-and-run.sh .github/workflows ':!scripts/reproduction-runtime' ':!packages/security-solver/src/local-ollama-runner.ts' | grep -vE '(/test-|/tests/|\.md:|\.bak:|\.github/workflows/round3-model-removal-audit.yml:)' | head -n 180 || true
+      - run: npm ci
+      - name: TypeScript compilation
+        run: npx tsc --noEmit --project tsconfig.json
+      - name: Deterministic regression
+        env:
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+        run: npx tsx scripts/test-deterministic-lotus.ts

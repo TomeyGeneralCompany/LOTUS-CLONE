@@ -18,8 +18,8 @@ try {
   assert.equal(rewriting.success,false);assert.deepEqual(rewriting.findings,[]);
   assert.match(rewriting.error||'',/controller-owned reproduction/);
  }
- assert.equal(usesDeterministicSourceController({scopeSummary:'{}'}),false);
- assert.equal(usesDeterministicSourceController({scopeSummary:'invalid'}),false);
+ assert.equal(usesDeterministicSourceController({scopeSummary:'{}'}),true,'Empty scopes must never reactivate legacy routing');
+ assert.equal(usesDeterministicSourceController({scopeSummary:'invalid'}),true,'Malformed scopes must never reactivate legacy routing');
  await mkdir(join(root,'bin'));const git=join(root,'bin','git');
  await writeFile(git,'#!/bin/sh\nexit 42\n');await chmod(git,0o700);process.env.PATH=join(root,'bin')+':'+saved.path;
  const source:any={id:'source-without-model-env',provider:'fixture',name:'Owned source without environment override',scopeSummary:JSON.stringify({

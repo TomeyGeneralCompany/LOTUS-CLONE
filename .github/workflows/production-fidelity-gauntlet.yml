@@ -58,22 +58,13 @@ jobs:
       - run: npm ci
       - name: Production-fidelity controller corpus (four languages)
         run: node --import tsx scripts/test-production-fidelity-gauntlet.ts
-      - name: Production workflow with isolated Python probes
-        run: node --import tsx scripts/test-production-workflow.ts
-      - name: Premature-final recovery on production runner
-        run: node --import tsx scripts/test-production-workflow.ts --premature-final
-      - name: Duplicate-probe recovery on production runner
-        run: node --import tsx scripts/test-production-workflow.ts --mock-probes --prefetch --duplicate-probe-plan
-      - name: Empty-final recovery on production runner
-        run: node --import tsx scripts/test-production-workflow.ts --empty-final-recovery
-      - name: Malformed probe sequence rejection
-        run: node --import tsx scripts/test-production-workflow.ts --empty-sequence
-      - name: Production model-context compaction and checkpoint
-        run: node --import tsx scripts/test-production-workflow.ts --large-context
-      - name: Escaped source negative case
-        run: node --import tsx scripts/test-production-workflow.ts --variant=1
-      - name: Alternate source syntax
-        run: node --import tsx scripts/test-production-workflow.ts --variant=2
+      - name: Production deterministic controller and evidence review across four languages
+        env:
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
+        run: npx tsx scripts/test-deterministic-lotus.ts
+      - name: Full inventory, checkpoint, stage gates and stale-source rejection
+        run: npx tsx scripts/test-deterministic-full-inventory.ts
       - name: Four-language source tracing and deterministic probe plans
         run: node --import tsx scripts/test-controller-next-action.ts
 
@@ -139,12 +130,14 @@ jobs:
         run: node --import tsx scripts/test-controller-next-action.ts
       - name: Verify full controller source inventory and evidence packets
         run: node --import tsx scripts/test-controller-full-source-index.ts
-      - name: Run production workflow with real isolated reproduction
-        run: node --import tsx scripts/test-production-workflow.ts
-      - name: Run source audit with full controller indexing
+      - name: Validate isolated deterministic source-to-experiment-to-review sequence
         env:
+          LOCAL_MODEL_ADAPTER: deterministic
+          AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
           LOCAL_CONTROLLER_FULL_SOURCE_INDEX: 'true'
-        run: node --import tsx scripts/test-source-workflow.ts
+        run: |
+          npx tsx scripts/test-deterministic-lotus.ts
+          npx tsx scripts/test-controller-review-boundary.ts
       - name: Preserve failure evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -156,119 +149,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  real-qwen-production:
+  deterministic-production:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      LOCAL_MODEL_ADAPTER: deterministic
+      LOCAL_MODEL_PROFILE: deterministic
+      AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
     steps:
-      - name: Checkout LOTUS revision under test
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install production dependencies and Ollama
-        run: |
-          npm ci
-          npm install --prefix scripts/reproduction-runtime --ignore-scripts --no-audit --no-fund
-          curl -fsSL https://ollama.com/install.sh | sh
-          ollama serve > "$RUNNER_TEMP/ollama-server.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/ollama-server.pid"
-          for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
-          ollama pull qwen3:4b
-      - name: Actual production controller with Qwen and isolated Python reproduction
-        env:
-          AUTOHACK_OLLAMA_URL: http://127.0.0.1:11434/api/chat
-          LOCAL_OLLAMA_MODEL: qwen3:4b
-          LOCAL_CONTROLLER_OWNED_ACTIONS: 'true'
-        run: node --import tsx scripts/test-production-workflow.ts --real-model --host-timeout --prefetch
-      - name: Preserve production evidence even on failure
+      - run: npm ci
+      - name: Deterministic production controller with four-language facts and evidence
+        run: npx tsx scripts/test-deterministic-lotus.ts
+      - name: Exhaustive 244-candidate lifecycle, stage locks and resume
+        run: npx tsx scripts/test-deterministic-full-inventory.ts
+      - name: Preserve deterministic controller evidence even on failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: real-qwen-production-${{ github.run_id }}-${{ github.run_attempt }}
+          name: deterministic-production-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             data/production-workflow-tests/**
             data/logs/**
-          if-no-files-found: warn
-          retention-days: 14
-
-  real-qwen-polyglot:
-    # Each real-Qwen source investigation owns its own Ollama process, model
-    # budget, watchdog and evidence. No language can starve the others for 90m.
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [javascript, java, solidity]
-    runs-on: ubuntu-latest
-    timeout-minutes: 350
-    steps:
-      - name: Checkout LOTUS revision under test
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.sha }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - name: Install real isolated execution infrastructure and Ollama
-        run: |
-          npm ci
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          npm install --prefix scripts/reproduction-runtime --ignore-scripts --no-audit --no-fund
-          curl -fsSL https://ollama.com/install.sh | sh
-          ollama serve > "$RUNNER_TEMP/ollama-server.log" 2>&1 &
-          for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
-          ollama pull qwen3:4b
-      - name: Real Qwen source investigation and independent reproduction
-        env:
-          AUTOHACK_OLLAMA_URL: http://127.0.0.1:11434/api/chat
-          LOCAL_OLLAMA_MODEL: qwen3:4b
-          LOCAL_CONTROLLER_OWNED_ACTIONS: 'true'
-          LOTUS_REAL_QWEN_LANGUAGE: ${{ matrix.language }}
-        run: |
-          set -Eeuo pipefail
-          echo "Real Qwen language: $LOTUS_REAL_QWEN_LANGUAGE"
-          # The shell also archives the live log when timeout kills Node before
-          # its JavaScript finally block can run.
-          trap 'mkdir -p "data/real-qwen-tests/$LOTUS_REAL_QWEN_LANGUAGE/logs"; for logs in /tmp/tomey-workflow-*/data/logs; do if [ -d "$logs" ]; then cp -a "$logs"/. "data/real-qwen-tests/$LOTUS_REAL_QWEN_LANGUAGE/logs/" || true; fi; done' EXIT
-          # Do not impose a wall-clock deadline on a progressing investigation.
-          # The controller's own progress/inactivity policy governs its run.
-          if node --import tsx scripts/test-source-workflow.ts --real-model-polyglot; then
-            echo "Completed real Qwen $LOTUS_REAL_QWEN_LANGUAGE"
-          else
-            status=$?
-            echo "::error::Real Qwen $LOTUS_REAL_QWEN_LANGUAGE failed (exit $status). Inspect real-qwen-tests/${LOTUS_REAL_QWEN_LANGUAGE}/logs and the last controller heartbeat."
-            exit "$status"
-          fi
-      - name: Preserve real-model source evidence even on failure
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: real-qwen-${{ matrix.language }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            data/real-qwen-tests/**
-            data/production-workflow-tests/**
-          if-no-files-found: warn
+          if-no-files-found: ignore
           retention-days: 14

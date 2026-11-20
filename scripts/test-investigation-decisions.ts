@@ -87,11 +87,18 @@ assert.equal(callerRecovery.snapshot().observations.length,0);
 assert.equal(decodeAuditAction(JSON.stringify({...action,action:'final',result:{findings:[]}})).answer,'{"findings":[]}');
 assert.throws(()=>decodeAuditAction(JSON.stringify({...action,result:{findings:[]}})));
 const original=process.env.LOCAL_MODEL_PROFILE;
-delete process.env.LOCAL_MODEL_PROFILE;assert.equal(modelProfile().name,'qwen');
-assert.equal(modelProfile().options.presence_penalty,1.5);
-process.env.LOCAL_MODEL_PROFILE='qwen';assert.equal(modelProfile().options.temperature,0.7);
-process.env.LOCAL_MODEL_PROFILE='qwen-planner';assert.equal(modelProfile('inspect').think,false);assert.equal(modelProfile('hypothesize').think,true);assert.equal(modelProfile('review').think,true);
-if(original===undefined)delete process.env.LOCAL_MODEL_PROFILE;else process.env.LOCAL_MODEL_PROFILE=original;
+delete process.env.LOCAL_MODEL_PROFILE;
+assert.equal(modelProfile().name,'deterministic');
+assert.equal(modelProfile().think,false);
+assert.equal(modelProfile().options.temperature,0);
+for(const legacy of ['qwen','qwen-planner','ollama']){
+  process.env.LOCAL_MODEL_PROFILE=legacy;
+  assert.equal(modelProfile('hypothesize').name,'deterministic',
+    'Legacy model profile must not select inference');
+  assert.equal(modelProfile('review').think,false);
+}
+if(original===undefined)delete process.env.LOCAL_MODEL_PROFILE;
+else process.env.LOCAL_MODEL_PROFILE=original;
 const dir=await mkdtemp(join(tmpdir(),'source-map-test-'));
 try {
  await writeFile(join(dir,'example.py'),'def render(value):\n    return "<p>"+value+"</p>"\ndef caller(v):\n    return render(v)\n');

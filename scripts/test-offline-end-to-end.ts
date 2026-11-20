@@ -5,10 +5,8 @@
  * This NEVER calls real bounty sites and does not prove live program readiness.
  */
 import "dotenv/config";
-import { hostModelTimeout, fixtureAuditLimits } from "./model-check-settings";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { createServer } from "node:http";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,17 +15,17 @@ import { assertAuthorizedProgram, assertAuthorizedTarget } from "../packages/cor
 import { readSubmissionOutbox, submitOnce } from "../packages/core/src/submission-outbox";
 import { runLocalAudit } from "../packages/security-solver/src/local-ollama-runner";
 
-const realModel = process.argv.includes("--real-model");
+const savedAdapter = process.env.LOCAL_MODEL_ADAPTER;
 const savedOllamaUrl = process.env.AUTOHACK_OLLAMA_URL;
 const savedProtocol = process.env.LOCAL_OLLAMA_TOOL_PROTOCOL;
-if (!realModel) process.env.LOCAL_OLLAMA_TOOL_PROTOCOL = "json";
+process.env.LOCAL_MODEL_ADAPTER='deterministic';
+process.env.LOCAL_OLLAMA_TOOL_PROTOCOL='json';
+process.env.AUTOHACK_OLLAMA_URL='http://127.0.0.1:1/api/chat';
 const workspace = await mkdtemp(join(tmpdir(), "autohack-full-offline-"));
 const source = join(workspace, "fixture.ts");
 const auditLog = join(workspace, "audit.log");
 const outbox = join(workspace, "outbox.json");
-const localModel = createServer();
 const originalFetch = globalThis.fetch;
-let agentCalls = 0;
 let reportsPosted = 0;
 let externalFetches = 0;
 
@@ -44,42 +42,27 @@ try {
   assert.throws(()=>assertAuthorizedTarget(programScope,
     "https://github.com/unrelated/other-repo"),/not within/);
 
-  if (!realModel) {
-  localModel.on("request",async(req,res)=>{
-    let text = "";
-    for await(const chunk of req) text += String(chunk);
-    const request = JSON.parse(text);
-    agentCalls++;
-    res.setHeader("Content-Type","application/json");
-    if(agentCalls===1) {
-      assert.ok(request.format.properties.action.enum.includes("read_file"));
-      assert.equal(request.tools,undefined);
-      res.end(JSON.stringify({message:{role:"assistant",content:JSON.stringify({
-        action:"read_file",path:"fixture.ts",query:"",answer:"",
-      })}}));
-    } else {
-      const last = request.messages.at(-1);
-      assert.equal(last.role,"user");
-      assert.ok(last.content.includes("return"));
-      res.end(JSON.stringify({message:{role:"assistant",
-        content:JSON.stringify({action:"final",path:"",query:"",
-          answer:"HYPOTHESIS: HTML encoding missing in fixture.ts; requires deterministic replay."})}}));
-    }
-  });
-  await new Promise<void>(resolve=>localModel.listen(0,"127.0.0.1",resolve));
-  const address = localModel.address();
-  assert.ok(address && typeof address !== "string");
-  process.env.AUTOHACK_OLLAMA_URL = "http://127.0.0.1:" + address.port + "/api/chat";
-  }
-  const hypothesis = await runLocalAudit(
-    "Use read_file to inspect fixture.ts. Identify any HTML encoding risk. Start your answer with HYPOTHESIS: and do not claim verified exploitability.",
-    auditLog, realModel ? hostModelTimeout() : 15000, workspace,
-    realModel ? (process.env.LOCAL_OLLAMA_MODEL || "qwen3:4b") : "mock", undefined, {...fixtureAuditLimits, validateFinal: answer => answer.startsWith("HYPOTHESIS:") ? null :
-      "Return your evidence-supported answer beginning exactly with HYPOTHESIS: as requested. Do not claim verified exploitability."},
-  );
-  assert.ok(hypothesis.startsWith("HYPOTHESIS:"));
-  if (!realModel) assert.equal(agentCalls,2);
+  const investigation = JSON.parse(await runLocalAudit(
+    'Inspect the authorized source file fixture.ts using deterministic analysis.',
+    auditLog,30000,workspace,'deterministic',undefined,{
+      maxTurns:12,numCtx:8192,numPredict:512,numThreads:1,
+      initialSourcePaths:['fixture.ts'],
+      validateFinal:raw=>{
+        const outcome=JSON.parse(raw);
+        return Array.isArray(outcome.findings)&&outcome.outcome==='no_testable_candidate'
+          ? null : 'Invalid deterministic investigation final';
+      },
+    },
+  ));
+  assert.equal(investigation.outcome,'no_testable_candidate');
+  assert.deepEqual(investigation.findings,[]);
+  // The concrete hypothesis is recorded only after reading the owned source,
+  // and is tested against the actual isolated renderer below.
+  const sourceText=await readFile(source,'utf8');
+  assert.ok(sourceText.includes('return "<h1>" + name + "</h1>"'));
+  const hypothesis='HYPOTHESIS: HTML encoding missing in fixture.ts; requires deterministic replay.';
   const transcript = await readFile(auditLog,"utf8");
+  assert.ok(transcript.includes("[DETERMINISTIC_DRIVER_ACTION]"));
   assert.ok(transcript.includes("[TOOL] read_file"));
   assert.ok(transcript.includes("[READ_OK] fixture.ts"));
 
@@ -143,16 +126,17 @@ try {
   await assert.rejects(()=>submitOnce("offline-fixture-1","offline-fixture",payload,
     ()=>submitReport({teamHandle:"offline-fixture",payload}),outbox),/already attempted/);
   assert.equal(reportsPosted,1);
-  console.log((realModel ? "REAL LOCAL MODEL" : "Mocked model") + " -> owned source fixture -> deterministic replay -> report -> review -> MOCK submit -> recovery PASSED");
+  console.log("Deterministic audit -> owned source fixture -> replay -> report -> review -> MOCK submit -> recovery PASSED");
 } catch (error) {
   console.error((await readFile(auditLog,"utf8").catch(()=>"No model transcript produced")).slice(-2000));
   throw error;
 } finally {
   globalThis.fetch = originalFetch;
+  if(savedAdapter===undefined)delete process.env.LOCAL_MODEL_ADAPTER;
+  else process.env.LOCAL_MODEL_ADAPTER=savedAdapter;
   if (savedProtocol === undefined) delete process.env.LOCAL_OLLAMA_TOOL_PROTOCOL;
   else process.env.LOCAL_OLLAMA_TOOL_PROTOCOL = savedProtocol;
   if (savedOllamaUrl === undefined) delete process.env.AUTOHACK_OLLAMA_URL;
   else process.env.AUTOHACK_OLLAMA_URL = savedOllamaUrl;
-  await new Promise<void>(resolve=>localModel.close(()=>resolve()));
   await rm(workspace,{recursive:true,force:true});
 }

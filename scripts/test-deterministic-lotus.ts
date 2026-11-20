@@ -47,7 +47,9 @@ process.env.AUTOHACK_OLLAMA_URL = "http://127.0.0.1:1/api/chat"; // guaranteed u
 try {
   // 1. Adapter resolution rules
   assert.equal(resolveLocalModelAdapter({}), "deterministic", "Default with no env must be deterministic");
-  assert.equal(resolveLocalModelAdapter({ AUTOHACK_OLLAMA_URL: "http://127.0.0.1:11434/api/chat" }), "ollama", "Explicit AUTOHACK_OLLAMA_URL without adapter keeps Ollama compatibility");
+  assert.equal(resolveLocalModelAdapter({ AUTOHACK_OLLAMA_URL: "http://127.0.0.1:11434/api/chat" }), "deterministic", "Legacy model URL must not reactivate Ollama");
+  assert.throws(() => resolveLocalModelAdapter({ LOCAL_MODEL_ADAPTER: "ollama" }), /LOTUS_MODEL_REMOVED/);
+  assert.throws(() => resolveLocalModelAdapter({ LOCAL_MODEL_ADAPTER: "qwen-agent" }), /LOTUS_MODEL_REMOVED/);
   assert.equal(resolveLocalModelAdapter({ LOCAL_MODEL_ADAPTER: "deterministic", AUTOHACK_OLLAMA_URL: "http://127.0.0.1:11434/api/chat" }), "deterministic");
   assert.equal(isDeterministicMode(), true);
 
@@ -177,9 +179,21 @@ contract GuardedVault is Ownable {
   function setFee(uint256 nextFee) external onlyOwner {
     fee = nextFee;
   }
+  // An eligible, non-setter entrypoint keeps ANALYZE non-empty so this
+  // integration case proves the deterministic driver actually executes.
+  function recordNothing(uint256 amount) external {
+    require(amount == 0, "no state change");
+  }
 }
 `;
     await writeFile(join(repoDir, "GuardedVault.sol"), vaultSource, "utf8");
+    // Real candidate admission requires an acquired, versioned source revision.
+    // Commit the test fixture instead of bypassing source-identity validation.
+    execFileSync("git", ["init", "-q"], { cwd: repoDir });
+    execFileSync("git", ["-c", "user.name=LOTUS Fixture", "-c", "user.email=fixture@localhost",
+      "add", "GuardedVault.sol"], { cwd: repoDir });
+    execFileSync("git", ["-c", "user.name=LOTUS Fixture", "-c", "user.email=fixture@localhost",
+      "-c", "core.hooksPath=/dev/null", "commit", "-qm", "Versioned source fixture"], { cwd: repoDir });
     const logFile = join(tmp, "audit.log");
     const finalSchema = {
       type: "object",
@@ -950,12 +964,15 @@ contract SiblingPool${n} {
         persistedQueue.totalCandidates > 6,
         `Expected >6 candidates persisted in inventory, got ${persistedQueue.totalCandidates}`,
       );
-      assert.equal(persistedQueue.admittedCount, 6, "Bounded admission must cap admitted batch at 6");
-      assert.equal(
-        persistedQueue.queuedCount,
-        persistedQueue.totalCandidates - persistedQueue.admittedCount,
-        "Unadmitted candidates must remain preserved in queued inventory",
-      );
+      const startedBatches = auditLog.split("\n").filter(line=>line.startsWith("[ANALYSIS_BATCH_STARTED] "))
+        .map(line=>JSON.parse(line.slice("[ANALYSIS_BATCH_STARTED] ".length)) as {admitted:number});
+      assert.ok(startedBatches.length>=2, "More than six eligible functions require multiple analysis batches");
+      assert.ok(startedBatches.every(batch=>batch.admitted>0&&batch.admitted<=6),
+        "Every ANALYZE batch must preserve the configured six-candidate bound");
+      assert.equal(persistedQueue.queuedCount,0,
+        "Round 3 must process the entire inventory, not stop at the first batch");
+      assert.equal(persistedQueue.admittedCount,persistedQueue.totalCandidates,
+        "The persisted cumulative record must account for every eligible candidate");
     } finally {
       await rm(auditDir, { recursive: true, force: true });
     }
@@ -1606,9 +1623,15 @@ contract MixedProtocolVault {
       const completePayload = JSON.parse(completeMatch![1]);
       assert.equal(completePayload.batchCoverage, "complete");
       assert.ok(completePayload.inventoryTotal >= 2, `Expected >=2 total candidates, got ${completePayload.inventoryTotal}`);
-      assert.equal(completePayload.admittedCount, 1);
-      assert.ok(completePayload.queuedRemaining >= 1, "Expected remaining queued candidates when bounded to 1");
-      assert.equal(completePayload.inventoryCoverage, "partial_bounded_batch");
+      const coverageBatches = covLogText.split("\n")
+        .filter(line=>line.startsWith("[ANALYSIS_BATCH_STARTED] "))
+        .map(line=>JSON.parse(line.slice("[ANALYSIS_BATCH_STARTED] ".length)) as {admitted:number});
+      assert.ok(coverageBatches.length>=2, "Batch size one must process multiple batches");
+      assert.ok(coverageBatches.every(batch=>batch.admitted===1), "Every batch must obey the one-candidate bound");
+      assert.equal(completePayload.admittedCount, completePayload.inventoryTotal,
+        "Every eligible candidate must be accounted for before ANALYZE closes");
+      assert.equal(completePayload.queuedRemaining,0);
+      assert.equal(completePayload.inventoryCoverage,"complete");
     } finally {
       await rm(covAuditDir, { recursive: true, force: true });
     }

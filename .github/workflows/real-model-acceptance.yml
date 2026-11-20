@@ -1,4 +1,4 @@
-name: Actual local-model production-controller acceptance
+name: Deterministic production-controller acceptance
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -7,65 +7,27 @@ on:
     paths:
       - '.github/workflows/real-model-acceptance.yml'
       - '.github/workflows/laptop-real-world-feedback.yml'
-      - 'scripts/test-production-workflow.ts'
-      - 'scripts/test-real-program-hunt.ts'
+      - 'scripts/test-deterministic-lotus.ts'
+      - 'scripts/test-deterministic-full-inventory.ts'
       - 'packages/security-solver/src/**'
-      - 'scripts/source-static.py'
-      - 'scripts/test-static-leads.py'
-      - 'tests/test_static_process_limits.py'
 jobs:
-  qwen3-production-controller:
+  deterministic-production-controller:
     runs-on: ubuntu-latest
     timeout-minutes: 55
+    env:
+      LOCAL_MODEL_ADAPTER: deterministic
+      LOCAL_MODEL_PROFILE: deterministic
+      AUTOHACK_OLLAMA_URL: http://127.0.0.1:1/api/chat
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - run: npm ci
-      - name: Start isolated Ollama and fetch actual Qwen3:4b
+      - name: Verify no model service is available to the controller
         run: |
-          docker run -d --name autohack-ollama -p 127.0.0.1:11434:11434 ollama/ollama:latest
-          for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:11434/api/tags
-          docker exec autohack-ollama ollama pull qwen3:4b
-      - name: Real Qwen3 production-controller run with actual sandbox probes
-        timeout-minutes: 35
-        env:
-          LOCAL_OLLAMA_MODEL: qwen3:4b
-          LOCAL_MODEL_ADAPTER: ollama
-          LOCAL_OLLAMA_TOOL_PROTOCOL: json
-          LOCAL_MODEL_PROFILE: deterministic
-          AUTOHACK_OLLAMA_URL: http://127.0.0.1:11434/api/chat
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          node --import tsx scripts/test-production-workflow.ts --real-model --prefetch
-      - name: Real Qwen3 one-program source hunt, verified finding and independent review
-        timeout-minutes: 40
-        env:
-          LOCAL_OLLAMA_MODEL: qwen3:4b
-          LOCAL_MODEL_ADAPTER: ollama
-          LOCAL_OLLAMA_TOOL_PROTOCOL: json
-          LOCAL_MODEL_PROFILE: deterministic
-          AUTOHACK_OLLAMA_URL: http://127.0.0.1:11434/api/chat
-          SECURITY_SOURCE_CODE_TIMEOUT_MINUTES: '25'
-          SECURITY_HUNT_TIMEOUT_MINUTES: '12'
-        run: node --import tsx scripts/test-real-program-hunt.ts
-      - name: Upload actual model transcript and observations
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: qwen3-real-controller-evidence
-          path: |
-            data/production-workflow-tests/
-            data/logs/local-review-*.log
-            data/logs/local-review-*.log.summary.json
-          if-no-files-found: warn
-      - name: Stop local model
-        if: always()
-        run: docker rm -f autohack-ollama || true
+          if curl -fsS --max-time 2 http://127.0.0.1:1/api/tags; then exit 1; fi
+      - name: Deterministic production investigation and evidence review
+        run: npx tsx scripts/test-deterministic-lotus.ts
+      - name: Exhaustive inventory, stage gates and resume
+        run: npx tsx scripts/test-deterministic-full-inventory.ts

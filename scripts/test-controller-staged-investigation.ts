@@ -12,6 +12,7 @@ async function test(){
  await stages.completeReading(async()=>content);
  assert.throws(()=>stages.assertActionAllowed('plan_probe'),/STAGE_LOCKED/);
  stages.noteSourcePreclassified('source-1/A.sol','indexed-options-built');
+ stages.registerAnalysisInventory([]);
  stages.completeAnalysis();stages.requireCandidate('first');
  stages.finishExperiment('first','unsupported');
  assert.throws(()=>stages.completeExperiments(),/EXPERIMENTS_INCOMPLETE/);

@@ -20,6 +20,7 @@ async function testCoverage(){
  await lock.completeReading(async()=> 'abcdef');
  assert.equal(lock.currentStage,'ANALYZE');
  for(const source of sources)lock.noteSourcePreclassified(source.path,'indexed-options-built');
+ lock.registerAnalysisInventory([]);
  lock.completeAnalysis();assert.equal(lock.currentStage,'EXPERIMENT');
  console.log('91/91 full-index byte range coverage PASSED');
 }

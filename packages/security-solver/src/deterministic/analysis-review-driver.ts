@@ -37,27 +37,22 @@ import {
   type SpecializedEscalationHooks,
 } from "./specialized-escalation";
 
-export type LocalModelAdapter = "deterministic" | "ollama" | "qwen-agent";
+export type LocalModelAdapter = "deterministic";
 
+/** The LOTUS-CLONE production runtime has one engine. A copied legacy .env
+ * cannot silently reactivate an Ollama/Qwen endpoint or Qwen-Agent bridge.
+ * Historical mock-transport tests must be migrated rather than enabling an
+ * alternate model in the application.
+ */
 export function resolveLocalModelAdapter(env: NodeJS.ProcessEnv = process.env): LocalModelAdapter {
-  const explicit = env.LOCAL_MODEL_ADAPTER?.trim();
-  if (explicit) {
-    if (explicit === "deterministic" || explicit === "ollama" || explicit === "qwen-agent") {
-      return explicit;
-    }
-    throw new Error("Unknown LOCAL_MODEL_ADAPTER");
-  }
-  if (env.LOTUS_DETERMINISTIC === "1" || env.LOTUS_DETERMINISTIC === "true") {
-    return "deterministic";
-  }
-  if (env.AUTOHACK_OLLAMA_URL?.trim()) {
-    return "ollama";
-  }
+  const explicit=env.LOCAL_MODEL_ADAPTER?.trim();
+  if(explicit && explicit!=="deterministic")
+    throw new Error("LOTUS_MODEL_REMOVED: only the deterministic engine is supported");
   return "deterministic";
 }
 
-export function isDeterministicMode(env: NodeJS.ProcessEnv = process.env): boolean {
-  return resolveLocalModelAdapter(env) === "deterministic";
+export function isDeterministicMode(_env: NodeJS.ProcessEnv = process.env): boolean {
+  return true;
 }
 
 export interface DeterministicOutcomeCounts {

@@ -7,9 +7,9 @@ export function describeHuntFailure(detail:unknown) {
   const reason=typeof detail==="string" ? detail.slice(0,2000)
     .replace(/(Bearer\s+)[^\s]+/gi,"$1[redacted]")
     .replace(/(https?:\/\/)[^/\s@]+:[^/\s@]+@/gi,"$1[redacted]@") : "";
-  const stage=/context budget|configured context|context allowance/i.test(reason)?"Model context":
+  const stage=/context budget|configured context|context allowance/i.test(reason)?"Analysis context":
     /reproduction|probe|solc|sandbox/i.test(reason)?"Source reproduction":
-    /ollama|model|inference|JSON action|inspection limit/i.test(reason)?"Model inspection":
+    /deterministic|controller analysis|source analysis|ollama|model|inference|JSON action|inspection limit/i.test(reason)?"Source analysis":
     /acquir|clone|git |repository was acquired/i.test(reason)?"Source download":"Hunt attempt";
   return {stage,reason:reason || "The original failure reason was not retained for this attempt."};
 }
@@ -20,7 +20,7 @@ export function parseWorkEvents(text:string) {
   const labels:Record<string,string>={read_file:"Read source file",read_solidity:"Read Solidity function",
     outline_solidity:"Outlined Solidity declarations",search_files:"Searched source",
     list_files:"Listed source files",verify_source:"Reproduction test",verify_python:"Reproduction test",
-    controller_action:"Controller selected action",model_generation:"Qwen generation",
+    controller_action:"Controller selected action",model_generation:"Deterministic analysis",
     probe_plan:"Probe planned"};
   const statuses:Record<string,string>={behavior_observed:"Behavior reproduced — requires review",
     behavior_not_observed:"Behavior not reproduced",
@@ -41,7 +41,7 @@ export function parseWorkEvents(text:string) {
         if(value.tool==="search_files")detail=JSON.stringify(query)+(value.phase==="completed"&&Number.isSafeInteger(value.count)?" · "+value.count+" matches":"");
         else if(value.tool.startsWith("verify_"))detail=[path,query,typeof value.kind==="string"?value.kind.slice(0,80):""].filter(Boolean).join(" · ");
         else if(value.tool==="probe_plan")detail=[
-          typeof value.origin==="string"?(value.origin==="controller"?"Controller-selected":"Qwen-proposed"):"",
+          typeof value.origin==="string"?(value.origin==="controller"?"Controller-selected":"Controller-proposed"):"",
           path,query,typeof value.kind==="string"?value.kind.slice(0,80):""
         ].filter(Boolean).join(" · ");
         else if(value.tool==="controller_action")detail=[
@@ -63,7 +63,7 @@ export function parseWorkEvents(text:string) {
         events.push({at:typeof value.at==="string"&&Number.isFinite(Date.parse(value.at))?value.at:null,
           tool:value.tool,phase:value.phase,
           title:value.tool==="controller_action"?"Controller → "+(typeof value.selectedAction==="string"?value.selectedAction:"operation"):
-            value.tool==="model_generation"?(value.phase==="started"?"Qwen generating":"Qwen responded"):
+            value.tool==="model_generation"?(value.phase==="started"?"Controller analyzing":"Controller assessed"):
             value.tool==="probe_plan"?"Accepted probe plan":
             (value.phase==="started"?"Started: ":value.phase==="failed"?"Failed: ":"")+labels[value.tool],
           detail,status:typeof value.status==="string"?(statuses[value.status] || "Test returned: "+value.status.slice(0,100)):undefined,
@@ -134,7 +134,7 @@ export async function readLocalActivity(dataDir:string,status:{active:boolean;st
         task=tool==="verify_source"||tool==="verify_python"?"Running isolated reproduction":
           tool==="read_file"?"Reading source":tool==="search_files"?"Searching source":
           tool==="list_files"?"Listing source files":"Inspecting source";
-      }else if(/^\[OLLAMA\].*request started/.test(line)){task="Waiting for local model";detail=line.match(/turn \d+\/\d+/)?.[0] || "";language=null;}
+      }else if(/^\[OLLAMA\].*request started/.test(line)){task="Analyzing source evidence";detail=line.match(/turn \d+\/\d+/)?.[0] || "";language=null;}
       else if(line.startsWith('[MODEL_PROGRESS] ')){
         try {
           const progress=JSON.parse(line.slice(17));
@@ -143,8 +143,8 @@ export async function readLocalActivity(dataDir:string,status:{active:boolean;st
           }
         }catch{}
       }
-      else if(/^\[OLLAMA\].*response received/.test(line)){task="Processing model response";detail=line.slice(0,300);}
-      else if(line.startsWith("[FINAL_REJECTED]")){task="Checking report evidence";detail="The model is revising an answer that did not meet the evidence checks.";}
+      else if(/^\[OLLAMA\].*response received/.test(line)){task="Processing controller assessment";detail=line.slice(0,300);}
+      else if(line.startsWith("[FINAL_REJECTED]")){task="Checking report evidence";detail="The controller is reassessing an answer that did not meet the evidence checks.";}
     }
     return {task,detail,lastProgressAt:latest.info.mtime.toISOString(),language,...parseWorkEvents(workText)};
   }catch{return fallback;}

@@ -15,7 +15,7 @@ const prepId=z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/);
 const send = z.object({operation:z.literal("send"),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional(),
   valueWei:wei.optional(),expectRevert:z.boolean().optional(),requiredSetup:z.boolean().optional()}).strict();
 const observe = z.object({operation:z.literal('observe'),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional()}).strict();
-const call = z.object({operation:z.literal("call"),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional(),expect:abiValue}).strict();
+const call = z.object({operation:z.literal("call"),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional(),expect:abiValue,expectPath:z.array(z.number().int().min(0).max(31)).min(1).max(4).optional()}).strict();
 const ethBalance = z.object({operation:z.literal("eth_balance"),
   account:z.string().regex(/^(?:\$account[012]|\$contract|\$deployment:[A-Za-z][A-Za-z0-9_-]{0,63})$/)}).strict();
 const prepDeployment=z.object({id:prepId,file:deployment.shape.file,contract:deployment.shape.contract,
@@ -65,7 +65,7 @@ export const soliditySequencePrompt = `For Solidity constructor arguments and st
 Set query to Contract.function for the primary function being tested. Sequence format:
 {"constructorArgs":["5"],"steps":[{"operation":"send","function":"set(uint256)","args":["7"],"sender":0},{"operation":"call","function":"value()","args":[],"expect":"7"}]}.
 Use decimal strings for ABI integers and wei, booleans for bools, arrays for ABI arrays/tuples. $account0, $account1 and $account2 resolve to three local test accounts; $contract resolves to this deployment after construction.
-Optional constructorValueWei and send valueWei transfer only local test currency. send expectRevert=true tests a required revert. At most 16 steps; include at least one call with an expected result. A single return is a scalar; multiple returns are an array. Calls must be view/pure; sends must be nonpayable/payable. Use full ABI signatures for overloads.
+Optional constructorValueWei and send valueWei transfer only local test currency. send expectRevert=true tests a required revert. At most 16 steps; include at least one call with an expected result. A single return is a scalar; multiple returns are an array. Calls must be view/pure; sends must be nonpayable/payable. Optional expectPath is a bounded array of numeric tuple/array field positions, so a structured ABI return can be checked against a typed expected field without arbitrary evaluation. Use full ABI signatures for overloads.
 For a prerequisite initializer send, requiredSetup=true means its transaction must succeed before any hypothesis test executes. Use operation=observe with a source-declared view/pure method to record actual state without fabricating expect; pair observations before and after a send to establish baseline and transition. Observe records what happened, not proof of a violated invariant. Use operation=call with expect when a source-derived property justifies an assertion. Each sequence starts from a fresh deterministic local EVM. Output records actual receipts and read/assertion results. An assertion mismatch is only a test discrepancy, not evidence that the expected value or a vulnerability claim is correct. Compiler remains solc 0.8.30; external-chain state, proxies requiring external deployments, and linked libraries are not supplied.`;
 
 const scalarJson = {anyOf:[{type:"string",maxLength:2048},{type:"boolean"}]};
@@ -77,7 +77,7 @@ export const soliditySequenceJsonSchema = {type:"object",additionalProperties:fa
   properties:{constructorArgs:argsJson,constructorValueWei:weiJson,
     deployment:{type:'object',additionalProperties:false,properties:{file:{type:'string',maxLength:512},contract:{type:'string',maxLength:100}},required:['file','contract']},steps:{type:"array",minItems:1,maxItems:16,items:{anyOf:[
     {type:"object",additionalProperties:false,properties:{operation:{const:"send"},...stepBase,valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"}},required:["operation","function","args"]},
-    {type:"object",additionalProperties:false,properties:{operation:{const:"call"},...stepBase,expect:valueJson},required:["operation","function","args","expect"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"call"},...stepBase,expect:valueJson,expectPath:{type:"array",minItems:1,maxItems:4,items:{type:"integer",minimum:0,maximum:31}}},required:["operation","function","args","expect"]},
     {type:"object",additionalProperties:false,properties:{operation:{const:"observe"},...stepBase},required:["operation","function","args"]},
     {type:"object",additionalProperties:false,properties:{operation:{const:"eth_balance"},account:{type:"string",maxLength:80}},required:["operation","account"]},
   ]}}},required:["constructorArgs","steps"]};

@@ -1,40 +1,30 @@
+/** Production progress regression without an inference service.
+ * Only novel observed source spans and probes earn controller extensions.
+ */
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
-import { mkdtemp,writeFile,readFile,rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { runLocalAudit } from '../packages/security-solver/src/local-ollama-runner';
-const root=await mkdtemp(join(tmpdir(),'progress-controller-'));
-let calls=0, mode='extend',offset=0;
-const server=createServer(async(req,res)=>{
- let raw='';for await(const part of req)raw+=part;
- const input=JSON.parse(raw);calls++;
- if(mode==='extend' && calls>1) {
-   const output=JSON.parse(JSON.parse(input.messages.at(-1).content.split('\n')[0].slice(12)).output);
-   offset=output.nextOffset;
- }
- let action:any={action:'read_file',path:'sample.py',query:'',answer:'',offset};
- if(mode==='extend' && calls===86)action={action:'final',path:'',query:'',answer:'DONE'};
- if(mode!=='extend' && calls>1)action={action:'final',path:'',query:'',answer:mode==='recover'&&calls===4?'DONE':''};
- res.end(JSON.stringify({message:{role:'assistant',content:JSON.stringify(action)}}));
-});
-try {
- await writeFile(join(root,'sample.py'),'value = 1\n'.repeat(30000));
- await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
- process.env.AUTOHACK_OLLAMA_URL=`http://127.0.0.1:${(server.address() as any).port}/api/chat`;
- process.env.LOCAL_OLLAMA_TOOL_PROTOCOL='json';
- const limits={maxTurns:80,numCtx:4096,numPredict:128,dynamicAllowance:true};
- assert.equal(await runLocalAudit('Read sample.py',join(root,'extended.log'),30000,root,'mock',undefined,limits),'DONE');
- assert.equal(calls,86);
- const summary=JSON.parse(await readFile(join(root,'extended.log.summary.json'),'utf8'));
- assert.equal(summary.turnAllowance,120);assert.equal(summary.turns,86);
- assert.match(await readFile(join(root,'extended.log'),'utf8'),/ALLOWANCE_EXTENDED/);
- mode='recover';calls=0;offset=0;
- assert.equal(await runLocalAudit('Read sample.py',join(root,'recover.log'),30000,root,'mock',undefined,limits),'DONE');
- assert.equal(calls,4);
- mode='empty';calls=0;
- await assert.rejects(runLocalAudit('Read sample.py',join(root,'empty.log'),30000,root,'mock',undefined,limits),/after two corrective retries/);
- assert.equal(calls,4);
- assert.match(JSON.parse(await readFile(join(root,'empty.log.summary.json'),'utf8')).stoppingReason,/empty final/);
- console.log('Actual controller extends beyond 80 turns; empty finals recover or fail explicitly PASSED');
-} finally {server.closeAllConnections();server.close();await rm(root,{recursive:true,force:true});}
+import {AuditAllowance} from '../packages/security-solver/src/audit-allowance';
+import {recoverEmptyUnprobedFinal} from '../packages/security-solver/src/inspection-coverage';
+
+const productive=new AuditAllowance(80,0,60_000,true,640,true);
+for(let turn=1;turn<=85;turn++){
+  productive.read('sample.py',(turn-1)*16,turn*16,turn);
+  if(turn===79){
+    const extended=productive.extend(turn,50_000);
+    assert.ok(extended,'Real novel source evidence must extend the controller');
+    assert.equal(productive.turns,120);
+  }
+}
+assert.equal(productive.snapshot().files[0].ranges[0][0],0);
+assert.equal(productive.snapshot().files[0].ranges[0][1],1360);
+const noProgress=new AuditAllowance(80,0,60_000,true,640,true);
+noProgress.read('sample.py',0,16,60);
+for(let turn=61;turn<80;turn++)assert.equal(noProgress.read('sample.py',0,16,turn),false);
+assert.equal(noProgress.extend(79,50_000),null,'Repeated model assertions are not source progress');
+const unchanged={findings:[],outcome:'inspected'};
+const exhausted=recoverEmptyUnprobedFinal(unchanged,0) as {findings:unknown[];outcome:string;reason:string};
+assert.equal(exhausted.outcome,'no_testable_candidate');
+assert.equal(exhausted.findings.length,0);
+assert.match(exhausted.reason,/No supported source probe/);
+assert.equal(recoverEmptyUnprobedFinal(unchanged,1),unchanged,
+  'Verified observation must never disappear through no-probe recovery');
+console.log('Evidence-backed controller progress and fail-closed empty-final recovery PASSED');

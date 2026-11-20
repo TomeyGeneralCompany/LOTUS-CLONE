@@ -85,7 +85,7 @@ export function programSelectionDecision(program: SecurityProgram, config: Confi
   return { reason: "eligible", score };
 }
 
-export function summarizeProgramSelection(programs: SecurityProgram[], config = getConfig(), localModel = !!process.env.LOCAL_OLLAMA_MODEL) {
+export function summarizeProgramSelection(programs: SecurityProgram[], config = getConfig(), localModel = true) {
   const counts: Record<string, number> = {};
   const providers: Record<string, Record<string, number>> = {};
   for (const program of programs) {

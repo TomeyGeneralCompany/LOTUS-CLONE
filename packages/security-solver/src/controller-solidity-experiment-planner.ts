@@ -10,6 +10,8 @@ import type {SolidityProbeDeclaration} from './solidity-probe-inputs';
 import type {SoliditySequence} from './solidity-sequence';
 import {sourceGroundedSolidityProbes} from './controller-solidity-security-probes';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
+import {extractAccountingObservations} from './deterministic/accounting-observations';
+import {resolveSourceFixtureDependencies, type PreparedDeployment} from './deterministic/fixture-dependency-planner';
 
 export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
@@ -46,6 +48,9 @@ export interface SourceInvariantTransitionPlan {
   expectedRemainder: string;
   balanceMappingGetter?: string;
   totalScalarGetter?: string;
+  typedObservation?: {getter:string;args:string[];expectPath?:number[];baseline:string;afterInflow:string;afterOutflow:string};
+  dependencyDeployments?:PreparedDeployment[];
+  dependencyBindings?:Record<string,string>;
 }
 
 export interface SourceInvariant {
@@ -1523,7 +1528,8 @@ function findAuthorityGetter(contract:any,chain:readonly ContractEntry[],menu:re
 function resolveFlexibleSetup(
   snapshot:SourceSnapshot,contract:any,chain:readonly ContractEntry[],
   sources:ReadonlyMap<string,SourceSnapshot>,menu:readonly SolidityProbeDeclaration[],
-  mockToken:MockTokenInfo|null,ownerAccount='$account0'
+  mockToken:MockTokenInfo|null,ownerAccount='$account0',
+  dependencyBindings:Readonly<Record<string,string>>={}
 ):{constructorArgs:SolidityArgValue[];constructorValueWei?:string;initSignature:string|null;initArgs:SolidityArgValue[];usesToken:boolean;tokenInitNeeded:boolean}|null {
   if(isAbstractContractNode(contract,chain))return null;
   const members:any[]=contract.subNodes||[];
@@ -1538,7 +1544,8 @@ function resolveFlexibleSetup(
       const abi=canonicalAbiType(cp.typeName);
       if(!abi)return null;
       const tokenRef=mockToken?'$deployment:token':undefined;
-      const arg=pickFlexibleArg(abi,cp.name||'',{ownerAccount,tokenRef});
+      const bound=dependencyBindings[cp.name||''];
+      const arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,cp.name||'',{ownerAccount,tokenRef});
       if(arg===null)return null;
       if(arg==='$deployment:token')usesToken=true;
       constructorArgs.push(arg);
@@ -1558,7 +1565,8 @@ function resolveFlexibleSetup(
         const abi=canonicalAbiType(ip.typeName);
         if(!abi){ok=false;break;}
         const tokenRef=mockToken?'$deployment:token':undefined;
-        const arg=pickFlexibleArg(abi,ip.name||'',{ownerAccount,tokenRef});
+        const bound=dependencyBindings[ip.name||''];
+        const arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,ip.name||'',{ownerAccount,tokenRef});
         if(arg===null){ok=false;break;}
         if(arg==='$deployment:token'){usesToken=true;tokenInitNeeded=true;}
         abiTypes.push(abi);
@@ -1920,11 +1928,17 @@ export function extractSourceInvariantDescriptor(
       unresolvedExt.push(`${recv}.${fnCalled}`);
     }
   }
-  if (unresolvedExt.length > 0) {
+  const dependencyPlan=resolveSourceFixtureDependencies(snapshot,contract.name,[...sources.values()]);
+  const unresolvedRemaining=unresolvedExt.filter(call=>{
+    if(dependencyPlan.status!=="resolved")return true;
+    const recv=call.split('.')[0];
+    return !Object.prototype.hasOwnProperty.call(dependencyPlan.substitutions,recv);
+  });
+  if (unresolvedRemaining.length > 0) {
     return {
       ok: false,
       category: 'unresolved_dependency',
-      reason: `Unresolved external dependency (${unresolvedExt.slice(0, 3).join(', ')}) inside ${contract.name}.${inflowFn.name}/${outflowFn.name}`,
+      reason: `Unresolved external dependency (${unresolvedRemaining.slice(0, 3).join(', ')}) inside ${contract.name}.${inflowFn.name}/${outflowFn.name}; acquired-source fixture: ${dependencyPlan.status==='unresolved'?dependencyPlan.missingDependencies.join(', '):'receiver not bound to concrete constructor parameter'}`,
       witnesses: pairWitnesses,
     };
   }
@@ -1954,7 +1968,29 @@ export function extractSourceInvariantDescriptor(
       BALANCE_MAPPING_RE.test(d.selector.slice(contract.name.length + 1)),
   );
 
-  if (!totalGetterDecl && !balanceGetterDecl) {
+  // Source-backed collection and struct-return observations are distinct from
+  // scalar balance getters. Admit only a directly witnessed transition.
+  const sourceObservations=extractAccountingObservations(snapshot,contract.name,declarations);
+  const findTypedObservation=():SourceInvariantTransitionPlan['typedObservation']|undefined=>{
+    for(const observation of sourceObservations){
+      const varName=observation.stateVariable.replace(/[.*+?^\${}()|[\]\\]/g,'\\$&');
+      const push=new RegExp('\\\\b'+varName+'\\\\s*\\\\.\\\\s*push\\\\s*\\\\(');
+      const pop=new RegExp('\\\\b'+varName+'\\\\s*\\\\.\\\\s*pop\\\\s*\\\\(');
+      if(observation.kind==='collection_length' && push.test(inflowBody) && pop.test(outflowBody))
+        return {getter:observation.getter,args:[],baseline:'0',afterInflow:'1',afterOutflow:'0'};
+      // A struct field check requires literal storage updates witnessed in both
+      // operations. A shared variable name or ABI compatibility is insufficient.
+      if(observation.kind==='struct_field' && observation.keyType.startsWith('uint') &&
+         push.test(inflowBody) &&
+         new RegExp('\\\\b'+varName+'\\\\s*\\\\[\\\\s*0\\\\s*\\\\]\\\\s*\\\\.\\\\s*'+observation.fieldName+'\\\\s*-=').test(outflowBody)){
+        return {getter:observation.getter,args:['0'],expectPath:[observation.fieldIndex],
+          baseline:'0',afterInflow:'1000',afterOutflow:'600'};
+      }
+    }
+    return undefined;
+  };
+  const typedObservation=(!totalGetterDecl&&!balanceGetterDecl)?findTypedObservation():undefined;
+  if (!totalGetterDecl && !balanceGetterDecl && !typedObservation) {
     return {
       ok: false,
       category: 'missing_observable_state',
@@ -1969,7 +2005,7 @@ export function extractSourceInvariantDescriptor(
   const balanceVarName = balanceGetterDecl ? balanceGetterDecl.selector.slice(contract.name.length + 1) : '';
   const totalReferenced = !!totalVarName && new RegExp(`\\b${totalVarName}\\b`).test(combinedBody);
   const balanceReferenced = !!balanceVarName && new RegExp(`\\b${balanceVarName}\\b`).test(combinedBody);
-  if (!totalReferenced && !balanceReferenced) {
+  if (!totalReferenced && !balanceReferenced && !typedObservation) {
     return {
       ok: false,
       category: 'missing_observable_state',
@@ -1979,7 +2015,8 @@ export function extractSourceInvariantDescriptor(
   }
 
   // Verify local fixture constructibility via existing resolveFlexibleSetup (wiring acquired mockToken when present)
-  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0');
+  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0',
+    dependencyPlan.status==='resolved'?dependencyPlan.substitutions:{});
   if (!setup) {
     return {
       ok: false,
@@ -2103,7 +2140,11 @@ export function extractSourceInvariantDescriptor(
 
   const inflowSig = `${inflowFn.name}(${inflowDecl.inputs.join(',')})`;
   const outflowSig = `${outflowFn.name}(${outflowDecl.inputs.join(',')})`;
-  const obsList = [totalGetterSig, balanceGetterSig].filter(Boolean).join(' and ');
+  const obsList = [totalGetterSig, balanceGetterSig, typedObservation?.getter].filter(Boolean).join(' and ');
+  if(typedObservation){
+    preState.push({expression:`${contract.name}.${typedObservation.getter} == ${typedObservation.baseline}`,readback:typedObservation.getter});
+    postState.push({expression:`${contract.name}.${typedObservation.getter} == ${typedObservation.afterOutflow}`,readback:typedObservation.getter});
+  }
 
   return {
     ok: true,
@@ -2132,6 +2173,11 @@ export function extractSourceInvariantDescriptor(
         expectedRemainder,
         balanceMappingGetter: balanceGetterSig,
         totalScalarGetter: totalGetterSig,
+        typedObservation,
+        ...(dependencyPlan.status==='resolved'&&dependencyPlan.deployments.length?{
+          dependencyDeployments:dependencyPlan.deployments,
+          dependencyBindings:dependencyPlan.substitutions,
+        }:{}),
       },
     },
   };
@@ -2158,7 +2204,9 @@ export function admitSourceInvariantDescriptor(
     return null;
   }
   const tp = invariant.transitionPlan;
-  if (!tp.totalScalarGetter && !tp.balanceMappingGetter) return null;
+  if (!tp.totalScalarGetter && !tp.balanceMappingGetter && !tp.typedObservation) return null;
+  if(tp.typedObservation && (!tp.typedObservation.getter||
+    ![tp.typedObservation.baseline,tp.typedObservation.afterInflow,tp.typedObservation.afterOutflow].every(v=>/^(?:0|[1-9][0-9]*)$/.test(v))))return null;
   if (!/^[1-9][0-9]*$/.test(tp.inflowAmount) || !/^[1-9][0-9]*$/.test(tp.outflowAmount) || !/^(?:0|[1-9][0-9]*)$/.test(tp.expectedRemainder)) {
     return null;
   }
@@ -2184,25 +2232,27 @@ export function constructCoreInvariantExperiment(
   const tp = admitted.transitionPlan!;
   const { chain } = resolveInheritance(snapshot, contract, sources);
   const mockToken = tp.usesMockToken || tp.mode === 'erc20_deposit_withdraw' ? findRepositoryMockToken(sources) : null;
-  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0');
+  const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0',tp.dependencyBindings||{});
   if (!setup) return null;
+  if(tp.typedObservation){
+    const observed=extractAccountingObservations(snapshot,contract.name,declarations);
+    const supported=observed.some(obs=>obs.getter===tp.typedObservation!.getter &&
+      (tp.typedObservation!.expectPath===undefined ||
+       (obs.kind==='struct_field'&&tp.typedObservation!.expectPath.length===1&&
+        tp.typedObservation!.expectPath[0]===obs.fieldIndex)));
+    if(!supported)return null;
+  }
   if (tp.mode === 'erc20_deposit_withdraw' && (!mockToken || !setup.usesToken)) return null;
 
-  const preparation =
-    setup.usesToken && mockToken
-      ? {
-          deployments: [
-            {
-              id: 'token',
-              file: mockToken.snapshot.path,
-              contract: mockToken.contractName,
-              constructorArgs: mockToken.constructorArgs,
-            },
-          ],
-          operations: [],
-          checks: [],
-        }
-      : undefined;
+  const deployments=[
+    ...(setup.usesToken&&mockToken?[{
+      id:'token',file:mockToken.snapshot.path,contract:mockToken.contractName,
+      constructorArgs:mockToken.constructorArgs,
+    }]:[]),
+    ...(tp.dependencyDeployments||[]),
+  ];
+  const preparation=deployments.length?{deployments,operations:[],checks:[]}:undefined;
+
 
   const steps: SoliditySequence['steps'] = [];
   if (setup.initSignature) {
@@ -2244,7 +2294,13 @@ export function constructCoreInvariantExperiment(
       requiredSetup: true,
     });
   }
+  const typedReadback=(expected:string):SoliditySequence['steps'][number]|null=>
+    tp.typedObservation?{operation:'call',function:tp.typedObservation.getter,
+      args:tp.typedObservation.args,expect:expected,
+      ...(tp.typedObservation.expectPath?{expectPath:tp.typedObservation.expectPath}:{})}:null;
   // 1. Pre-state baseline readbacks
+  const preTyped=typedReadback(tp.typedObservation?.baseline||'');
+  if(preTyped)steps.push(preTyped);
   if (tp.totalScalarGetter) {
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: '0' });
   }
@@ -2266,6 +2322,8 @@ export function constructCoreInvariantExperiment(
   if (tp.balanceMappingGetter) {
     steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: tp.inflowAmount });
   }
+  const midTyped=typedReadback(tp.typedObservation?.afterInflow||'');
+  if(midTyped)steps.push(midTyped);
   // 4. Outflow operation (-outflowAmount)
   steps.push({
     operation: 'send',
@@ -2273,6 +2331,8 @@ export function constructCoreInvariantExperiment(
     args: tp.outflowArgs,
     sender: 0,
   });
+  const postTyped=typedReadback(tp.typedObservation?.afterOutflow||'');
+  if(postTyped)steps.push(postTyped);
   // 5. Post-state conservation / supply-accounting assertions (== expectedRemainder)
   if (tp.totalScalarGetter) {
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: tp.expectedRemainder });
