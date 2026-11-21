@@ -65,6 +65,7 @@ export const huntSchema=z.object({findings:z.array(candidateSchema).max(8),
     ctx.addIssue({code:z.ZodIssueCode.custom,message:"No-testable-candidate outcome requires a reason and zero findings"});
 });
 export type HuntCoverageLedger={
+  candidateCoverage?: import("./deterministic/analysis-progress-store").CandidateCoverage;
   sourceIndexed:number;sourceRead:number;leadsSelected:number;leadsAssessedByModel:number;
   leadsDeferred:number;leadsBlocked:number;experimentsSelected:number;experimentsExecuted:number;
   supportedNegative:number;observationOnly:number;fixtureFailed:number;unsupported:number;
@@ -148,6 +149,7 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
   const investigationStartedAt=new Date().toISOString();
   let preparationFailure="Source preparation did not reach model inspection";
   let analysisCertificate:import('./controller-stage-lock').AnalysisCertificate|null=null;
+  let candidateCoverage:import('./deterministic/analysis-progress-store').CandidateCoverage|null=null;
   let experimentLedger:{selected:number;resolved:number;outcomes:{
     observed:number;observation_only:number;not_observed:number;unsupported:number;incomplete:number;rejected:number;pending:number
   }}|null=null;
@@ -278,8 +280,11 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
       const actualTotal=counts?Object.values(counts).reduce((a,b)=>a+b,0):experimentsSelected;
       const consistent=actualTotal===experimentsSelected;
       const sourceComplete=!!fullSourceIndex?.complete&&read===eligiblePaths.length;
+      const candidatesResolved=!!candidateCoverage && candidateCoverage.unresolvedIds.length===0 &&
+        candidateCoverage.total===candidateCoverage.experimentsCompleted+
+          candidateCoverage.terminalExhausted+candidateCoverage.blocked;
       const experimentComplete=sourceComplete&&consistent&&fixtureFailed===0&&unsupported===0&&
-        observationOnly===0&&unresolved===0;
+        observationOnly===0&&unresolved===0&&candidatesResolved;
       return {sourceIndexed:eligiblePaths.length,sourceRead:read,
         leadsSelected:analysisCertificate?.selected??0,
         leadsAssessedByModel:analysisCertificate?.modelAssessed??0,
@@ -287,7 +292,9 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
         leadsBlocked:analysisCertificate?.blocked??0,
         experimentsSelected,experimentsExecuted:supportedNegative+observationOnly+positiveObserved,
         supportedNegative,observationOnly,fixtureFailed,unsupported,positiveObserved,
-        verifiedFindings:0,unresolved:unresolved+(consistent?0:Math.abs(actualTotal-experimentsSelected)),
+        verifiedFindings:0,unresolved:unresolved+(consistent?0:Math.abs(actualTotal-experimentsSelected))+
+          (candidateCoverage?.unresolvedIds.length||0),
+        ...(candidateCoverage?{candidateCoverage}:{}),
         sourceCoverage:sourceComplete?'complete':'partial',
         analysisCoverage:analysisCertificate?.status==='complete'?'complete':'partial',
         experimentCoverage:experimentComplete?'complete':'partial'};
@@ -680,6 +687,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
           stage:"hunting",startedAt:statusStartedAt,timeoutMinutes:(deadline-Date.parse(statusStartedAt))/60000,pid:process.pid}),
         signal,maxTurns,controllerIndex,
          onAnalysisCertificate:certificate=>{analysisCertificate=certificate;},
+         onCandidateCoverage:coverage=>{candidateCoverage=coverage;},
          onExperimentLedger:ledger=>{experimentLedger=ledger;},
          finalSchema:z.toJSONSchema(huntSchema),productionWorkflow:true,dynamicAllowance:process.env.LOCAL_HUNT_DYNAMIC_ALLOWANCE !== "false",initialSourcePaths:["audit-policy.txt",...new Set([...sourceHints,...(fullSourceIndex?.rankedPaths||[]),...eligiblePaths])],initialSourceLocations:selection.locations,checkpointPath:join(checkpointDirectory,checkpointKey+".json"),numCtx:8192,numThreads:4,numPredict:getConfig().LOCAL_HUNT_NUM_PREDICT,onRead:(path,span)=>reads.add(path,span),
         staticLeads:staticLeads.leads,
@@ -1399,11 +1407,13 @@ Do not claim production testing, JavaScript execution, file access or other effe
       validatedCoverage.positiveObserved+validatedCoverage.unresolved;
     await appendFile(logFile,'[FINAL_COVERAGE_LEDGER] '+JSON.stringify({
       ...validatedCoverage,coverageReconciled,
-      analysisCertificate,experimentLedger})+'\\n');
+      analysisCertificate,experimentLedger,candidateCoverage})+'\\n');
     const factualCoverageDetail=
       validatedCoverage.sourceRead+'/'+validatedCoverage.sourceIndexed+' source files read; '+
       validatedCoverage.leadsAssessedByModel+'/'+validatedCoverage.leadsSelected+
-      ' model leads assessed; '+validatedCoverage.experimentsSelected+' experiments selected: '+
+      ' model leads assessed; '+
+      (candidateCoverage?candidateCoverage.unresolvedIds.length+' candidate properties unresolved; ':'')+
+      validatedCoverage.experimentsSelected+' experiments selected: '+
       validatedCoverage.supportedNegative+' supported negatives, '+
       validatedCoverage.observationOnly+' observation-only, '+
       validatedCoverage.fixtureFailed+' incomplete/failed, '+
