@@ -2267,6 +2267,28 @@ export function extractSourceInvariantDescriptor(
     };
   }
 
+  // Numeric 1000/400/600 assertions apply only when the acquired source
+  // proves direct matching updates without fees, exchange rates or accrual.
+  // Contracts with dynamic economics require a separate measured property.
+  const accountingTarget=totalReferenced?totalVarName:balanceReferenced?balanceVarName:'';
+  const inflowParameter=String((inflowFn.parameters||[])[0]?.name||'');
+  const outflowParameter=String((outflowFn.parameters||[])[0]?.name||'');
+  const inflowEffects=reachableAccountingSource(snapshot,contract,inflowFn);
+  const outflowEffects=reachableAccountingSource(snapshot,contract,outflowFn);
+  const directlyProven=accountingTarget&&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(accountingTarget)&&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(inflowParameter)&&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(outflowParameter)&&
+    new RegExp("\\b"+accountingTarget+"\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
+    new RegExp("\\b"+accountingTarget+"\\s*-="+ "\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
+    !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
+  if(!directlyProven){
+    return {ok:false,category:'no_supported_property',
+      reason:'Fixed-value conservation was not source-proven for '+contract.name+'.'+
+        inflowFn.name+'/'+outflowFn.name+'; requires a property-specific measured scenario.',
+      witnesses:pairWitnesses};
+  }
+
   const totalGetterSig = totalReferenced ? `${totalVarName}()` : undefined;
   const balanceGetterSig = balanceReferenced ? `${balanceVarName}(address)` : undefined;
   const propertyKind: InvariantPropertyKind =
