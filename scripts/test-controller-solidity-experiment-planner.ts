@@ -933,4 +933,43 @@ const externalLedger=constructSolidityExperiments({
 assert.equal(externalLedger.ok,false,
   'An unknown external state transition cannot be treated as verified local conservation');
 
+// Factory clone must be sourced from the acquired factory itself, and an
+// initializer may be moved into that factory only when every ABI argument and
+// explicit source call matches the target implementation.
+const cloneTargetSource=\`pragma solidity ^0.8.20;
+contract Market {
+  address public owner; uint256 public count;
+  function initialize(address firstOwner) external { owner=firstOwner; }
+  function accrue(uint256 amount) external { count += amount; }
+}\`;
+const cloneFactorySource=\`pragma solidity ^0.8.20;
+contract Factory {
+  function createMarket(address template, bytes32 salt, address firstOwner)
+    external returns(Market) {
+      Market clone = Market(template.cloneDeterministic(salt));
+      clone.initialize(firstOwner);
+      return clone;
+  }
+}\`;
+const cloneTarget={path:'contracts/Market.sol',content:cloneTargetSource,
+  sha256:createHash('sha256').update(cloneTargetSource).digest('hex')};
+const cloneFactory={path:'contracts/Factory.sol',content:cloneFactorySource,
+  sha256:createHash('sha256').update(cloneFactorySource).digest('hex')};
+const clonedProperty=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:cloneTarget.path,
+  targetSelector:'Market.accrue',sources:[cloneTarget,cloneFactory],
+  declarations:[{selector:'Market.accrue',operation:'send',inputs:['uint256']},
+    {selector:'Market.count',operation:'call',inputs:[]}],
+});
+assert.equal(clonedProperty.ok,true,JSON.stringify(clonedProperty));
+if(clonedProperty.ok){
+  const plan=clonedProperty.experiments.find(e=>e.sequence.sourceProperty?.kind==='scalar_delta');
+  assert.ok(plan,'Source-defined increment property must survive factory construction');
+  assert.equal(plan!.sequence.factoryClone?.function,'createMarket(address,bytes32,address)');
+  assert.equal(plan!.sequence.preparation?.deployments.at(-1)?.file,cloneFactory.path);
+  assert.ok(plan!.witnesses.some(w=>w.path===cloneFactory.path));
+  assert.equal(plan!.sequence.steps.some(step=>step.operation==='send'&&
+    step.function==='initialize(address)'),false,'Factory already initialized the clone');
+}
+
 console.log('Standalone experiment construction passed');
