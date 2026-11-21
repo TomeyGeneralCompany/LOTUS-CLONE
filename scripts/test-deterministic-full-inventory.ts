@@ -10,6 +10,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
+import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 
@@ -39,6 +40,27 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // Regression from the first PR-branch 88mph cloud trial. An ordinary
+    // staged source experiment must NEVER remove the originally queued
+    // BenqiERC20Market.claimRewards lead from the frozen source inventory.
+    const benqiPath='source-1/contracts/moneymarkets/benqi/BenqiERC20Market.sol';
+    const originalManifest=new Map<string,ReadonlySet<string>>([
+      [benqiPath,new Set(['BenqiERC20Market.deposit',
+        'BenqiERC20Market.claimRewards'])]]);
+    const scheduled=[{plan:{path:benqiPath,
+      query:'BenqiERC20Market.claimRewards',answer:'solidity_sequence'}}];
+    const menu=new Map([[benqiPath,[
+      {selector:'BenqiERC20Market.deposit',operation:'send'},
+      {selector:'BenqiERC20Market.claimRewards',operation:'send'}]]]);
+    const reconciled=reconcileStagedLeadSelectors(originalManifest,scheduled,menu);
+    assert.deepEqual([...reconciled.get(benqiPath)!].sort(),
+      ['BenqiERC20Market.claimRewards','BenqiERC20Market.deposit'].sort());
+    assert.equal(originalManifest.get(benqiPath)!.size,2,
+      'The original lead identity must never be mutated by experiment selection');
+    assert.deepEqual([...reconcileStagedLeadSelectors(new Map([[benqiPath,
+      new Set(['BenqiERC20Market.deposit'])]]),scheduled,menu).get(benqiPath)!].sort(),
+      ['BenqiERC20Market.deposit','BenqiERC20Market.claimRewards'].sort(),
+      'A staged selector must be ADDED when previously absent from analyzed inventory');
     let store=await AnalysisProgressStore.open(file,candidates);
     let lock=await stage();
     assert.throws(()=>lock.completeAnalysis(),/ANALYSIS_INVENTORY_INCOMPLETE/);
