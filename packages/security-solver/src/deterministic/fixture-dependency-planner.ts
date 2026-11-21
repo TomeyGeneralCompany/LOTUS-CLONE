@@ -16,7 +16,7 @@ const parsedCache=new Map<string,any|null>();
 const astOf=(src:SourceSnapshot):any|null=>{
   if(parsedCache.has(src.sha256))return parsedCache.get(src.sha256)!;
   let result:any|null=null;
-  try{result=parse(src.content,{loc:true,tolerant:true}) as any;}catch{}
+  try{result=parse(src.content,{loc:true,range:true,tolerant:true}) as any;}catch{}
   if(parsedCache.size>=512)parsedCache.delete(parsedCache.keys().next().value!);
   parsedCache.set(src.sha256,result);
   return result;
