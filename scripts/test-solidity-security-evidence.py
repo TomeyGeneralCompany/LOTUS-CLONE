@@ -241,6 +241,87 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIsNone(cls)
 
+    def test_88mph_asserted_financial_and_vesting_negative_vs_observation(self):
+        """Preserve actual verification semantics for the three laptop observations."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            share = root / "contracts" / "rewards" / "xMPH.sol"
+            share.parent.mkdir(parents=True)
+            share.write_text(
+                "contract xMPH {\n"
+                " function deposit(uint256 amount) external {}\n"
+                " function withdraw(uint256 amount) external {}\n"
+                "}\n", encoding="utf8")
+            def call(fn, val, dep=None):
+                step={"operation":"call","function":fn,"sender":0,
+                      "actual":str(val),"expected":str(val),"passed":True}
+                if dep:step["deploymentId"]=dep
+                return step
+            steps=[
+                call("totalSupply()",1000000000),
+                call("balanceOf(address)",1000000000,"token"),
+                {"operation":"send","function":"deposit(uint256)","sender":0,
+                 "reverted":False,"passed":True},
+                call("totalSupply()",1000001000),
+                call("balanceOf(address)",1000001000,"token"),
+                {"operation":"send","function":"withdraw(uint256)","sender":0,
+                 "reverted":False,"passed":True},
+                call("totalSupply()",1000000600),
+                call("balanceOf(address)",1000000600,"token"),
+            ]
+            request=[{"operation":step["operation"],"function":step["function"],
+                      **({"deploymentId":step["deploymentId"]} if "deploymentId" in step else {}),
+                      **({"args":["$contract"]} if step["function"]=="balanceOf(address)" else {"args":[]}),
+                      **({"sender":step["sender"]} if step["operation"]=="send" else
+                         {"expect":step["expected"]})}
+                     for step in steps]
+            evidence={"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":steps}
+            for method in ("deposit","withdraw"):
+                result=security_experiment_disposition(root,share,"xMPH."+method,evidence,
+                                                        {"sequence":{"steps":request}})
+                self.assertEqual(result[0],"behavior_not_observed")
+                self.assertEqual(result[1],"share_accounting_negative")
+            incorrect=[dict(step) for step in steps]
+            incorrect[-1]["passed"]=False
+            neg=security_experiment_disposition(root,share,"xMPH.withdraw",
+                {**evidence,"steps":incorrect},{"sequence":{"steps":request}})
+            self.assertEqual(neg[0],"observation_only")
+            missing_setup=[dict(step) for step in steps]
+            missing_setup[1]["actual"]="invalid"
+            self.assertEqual(security_experiment_disposition(root,share,"xMPH.deposit",
+                {**evidence,"steps":missing_setup},{"sequence":{"steps":request}})[0],
+                "observation_only")
+            vest=root / "contracts" / "rewards" / "Vesting02.sol"
+            vest.write_text(
+                "contract Vesting02 {\n"
+                " function createVestForDeposit(address to,address pool,uint64 id,uint256 rate) external {}\n"
+                "}\n", encoding="utf8")
+            veststeps=[
+                call("numVests()",0),
+                {"operation":"send","function":"createVestForDeposit(address,address,uint64,uint256)",
+                 "sender":0,"reverted":True,"passed":True},
+                call("numVests()",0),
+                {"operation":"send","function":"createVestForDeposit(address,address,uint64,uint256)",
+                 "sender":1,"reverted":False,"passed":True},
+                call("numVests()",1),
+                call("depositIDToVestID(address,uint64)",1),
+                call("ownerOf(uint256)",ACCOUNTS[2]),
+            ]
+            vestreq=[{"operation":step["operation"],"function":step["function"],
+                      **({"sender":step["sender"],"expectRevert":step["reverted"]}
+                         if step["operation"]=="send" else {"expect":step["expected"]})}
+                     for step in veststeps]
+            vestout=security_experiment_disposition(root,vest,"Vesting02.createVestForDeposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":veststeps},
+                {"sequence":{"steps":vestreq}})
+            self.assertEqual(vestout[0],"behavior_not_observed")
+            self.assertEqual(vestout[1],"vest_creation_negative")
+            vestmissing=veststeps[:-1]
+            self.assertEqual(security_experiment_disposition(root,vest,
+                "Vesting02.createVestForDeposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":vestmissing},
+                {"sequence":{"steps":vestreq}})[0],"observation_only")
+
     def test_compile_cache_path_and_pragma_detection(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo"
