@@ -2723,7 +2723,8 @@ function sourceScalarDeltaExperiments(
       .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
     // Other contract calls create additional fixture prerequisites. Refuse until
     // their actual implementations and preconditions have been connected.
-    if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText))continue;
+    if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText)||
+      /\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText))continue;
     for(const state of publicCounters){
       if(constructor&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,constructor)))continue;
       if(setup.initSignature){
