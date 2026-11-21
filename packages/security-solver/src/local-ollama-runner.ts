@@ -445,6 +445,61 @@ export async function runLocalAudit(
       if(admitted===0)throw new Error("ANALYSIS_INVENTORY_STALLED: queued candidates could not be admitted");
       return;
     }
+    // A completed analytical inventory does not mean construction has been
+    // exhausted. Give every pending property a source-only full-graph repair
+    // attempt, without repeating an identical failed strategy across resumes.
+    const sourceRepairBatch=analysisProgressStore.nextRepairBatch(analysisProgressStore.records.size);
+    let repairAdded=0,repairBlocked=0;
+    for(const lead of sourceRepairBatch){
+      const strategy="full-source-typed-property-v1";
+      const record=analysisProgressStore.records.get(lead.id)!;
+      if(record.repairAttempts?.some(x=>x.strategy===strategy&&
+          x.sourceSha256===record.sourceSha256))continue;
+      const declarations=deterministicDeclarationsCache.get(lead.path)||[];
+      if(!declarations.length){
+        analysisProgressStore.noteRepairAttempt(lead.id,strategy,"missing_source_declarations");
+        repairBlocked++;
+        continue;
+      }
+      const constructed=constructSolidityExperiments({
+        repositoryCommit:lead.sourceCommit,targetPath:lead.path,
+        targetSelector:lead.selector,sources:deterministicSourceSnapshots,
+        declarations,staticLeads:limits.staticLeads||[],
+      });
+      if(!constructed.ok){
+        analysisProgressStore.noteRepairAttempt(lead.id,strategy,
+          constructed.code+":"+constructed.detail.slice(0,420));
+        repairBlocked++;
+        continue;
+      }
+      let added=0;
+      for(const exp of constructed.experiments){
+        const plan={action:"plan_probe" as const,path:exp.path,query:exp.selector,
+          answer:"solidity_sequence",hypothesis:exp.hypothesis,sequence:exp.sequence};
+        if(stagedPlans.some(x=>x.plan.path===plan.path &&
+          x.plan.query===plan.query && x.plan.hypothesis===plan.hypothesis &&
+          JSON.stringify(x.plan.sequence)===JSON.stringify(plan.sequence)))continue;
+        const witnesses=[lead.sourceEvidence,
+          ...exp.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(":"))];
+        const id=JSON.stringify([exp.path,exp.selector,plan.answer,"repair",exp.id]);
+        const propertyId=createHash("sha256").update(JSON.stringify([
+          lead.id,exp.securityProperty,witnesses])).digest("hex");
+        stageLock.discover(id);
+        stagedPlans.push({id,plan});
+        analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses);
+        added++;repairAdded++;
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
+          leadId:lead.id,experimentId:id,property:exp.securityProperty,
+          witnesses:witnesses.length})+"\n");
+      }
+      analysisProgressStore.noteRepairAttempt(lead.id,strategy,
+        added?("new_experiments:"+added):"no_distinct_sourced_experiment");
+      if(!added)repairBlocked++;
+    }
+    await analysisProgressStore.save();
+    await appendFile(logFile,"[EXPERIMENT_REPAIR_RECONCILIATION] "+JSON.stringify({
+      examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
+      unresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
     stageLock.assertAnalysisInventoryExhausted();
     limits.onCandidateCoverage?.(analysisProgressStore.counts);
     await appendFile(logFile,"[ANALYSIS_PROPERTY_PENDING] "+JSON.stringify(analysisProgressStore.counts)+"\n");
