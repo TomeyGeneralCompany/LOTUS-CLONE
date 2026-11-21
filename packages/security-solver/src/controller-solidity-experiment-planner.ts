@@ -1966,7 +1966,7 @@ export function extractSourceInvariantDescriptor(
   }
 
   const allNodes: any[] = [contract, ...chain.map((c) => c.contract)].flatMap((c) => c.subNodes || []);
-  const fns = allNodes.filter(
+  const fns = [...new Set(allNodes)].filter(
     (n: any) =>
       n.type === 'FunctionDefinition' &&
       !n.isConstructor &&
