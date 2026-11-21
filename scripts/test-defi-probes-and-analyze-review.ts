@@ -483,4 +483,32 @@ contract Vesting02 is ERC721URIStorageUpgradeable, BoringOwnable {
   if(vest.ok)assert.ok(vest.experiments.some(p=>p.securityProperty.includes('vest creation')));
 }
 
+// A source with two valid outflows must produce two separate financial
+// properties rather than a guessed first companion or a discarded lead.
+{
+  const multiSource=`pragma solidity ^0.8.0;
+contract Finance {
+ uint256 public totalDeposits;
+ function deposit(uint256 amount) external {totalDeposits += amount;}
+ function withdraw(uint256 amount) external {totalDeposits -= amount;}
+ function redeem(uint256 amount) external {totalDeposits -= amount;}
+}`;
+  const path='source-1/contracts/Finance.sol';
+  const multi=constructSolidityExperiments({
+    repositoryCommit:'a'.repeat(40),targetPath:path,targetSelector:'Finance.deposit',
+    sources:[{path,content:multiSource,sha256:sha(multiSource)}],
+    declarations:[
+      {selector:'Finance.totalDeposits',operation:'call',inputs:[]},
+      {selector:'Finance.deposit',operation:'send',inputs:['uint256']},
+      {selector:'Finance.withdraw',operation:'send',inputs:['uint256']},
+      {selector:'Finance.redeem',operation:'send',inputs:['uint256']}],
+  });
+  assert.equal(multi.ok,true,'Ambiguous source-backed companion set must remain constructible');
+  if(multi.ok){
+    const pairs=multi.experiments.filter(x=>x.securityProperty.startsWith('financial '));
+    assert.equal(pairs.length,2);
+    assert.equal(new Set(pairs.map(x=>x.id)).size,2,'Each distinct proven counterpart requires its own experiment ID');
+  }
+}
+
 console.log("DeFi probes, security classification, ANALYZE window & REVIEW anti-bias tests PASSED");
