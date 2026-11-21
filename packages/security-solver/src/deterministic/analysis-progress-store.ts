@@ -86,14 +86,29 @@ export class AnalysisProgressStore {
         throw new Error("ANALYSIS_CHECKPOINT_CORRUPT: "+r.id);
       // A process crash must never strand an admitted but unassessed candidate.
       if(r.lifecycle==="admitted"||r.lifecycle==="analyzing")r.lifecycle="queued";
-      // Older checkpoints contain completed IDs but no verifier evidence. Their
-      // records remain actionable until a source-identical replay is recorded.
-      if(r.lifecycle==="experiment_completed"&&!store.isConclusive(r))
+      // A legacy checkpoint may contain terminal dispositions and experiment IDs
+      // but no source-bound verifier evidence. Re-admit that candidate for
+      // deterministic source analysis instead of accepting its stale closure.
+      // Keep genuine source-bound evidence intact for reproducible continuation.
+      const legacyMissingEvidence=(r.experimentIds.length>0&&!r.experimentEvidence?.length)||
+        r.properties.some(p=>p.experimentIds.length>0&&!p.sourceWitnesses.length);
+      if(legacyMissingEvidence){
+        r.lifecycle="queued";
+        r.properties=[];
+        r.experimentIds=[];
+        r.repairAttempts=[];
+        r.inconclusiveAttempts=[];
+        r.lastError="checkpoint_requires_source_bound_replay";
+      } else if(!store.isConclusive(r)&&
+        ["experiment_completed","analysis_exhausted","blocked"].includes(r.lifecycle)){
         r.lifecycle="dependencies_pending";
+      }
       store.records.set(r.id,r);
     }
     store.processedBatches=parsed.processedBatches||0;
-    for(const id of parsed.completedExperimentIds||[])store.completedExperimentIds.add(id);
+    for(const id of parsed.completedExperimentIds||[])
+      if([...store.records.values()].some(r=>r.experimentIds.includes(id)&&
+        r.experimentEvidence?.some(e=>e.experimentId===id)))store.completedExperimentIds.add(id);
     return store;
   }
   get counts():CandidateCoverage {
