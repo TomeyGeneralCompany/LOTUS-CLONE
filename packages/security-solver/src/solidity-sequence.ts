@@ -81,6 +81,29 @@ const stepBase = {deploymentId:{type:"string",maxLength:64},function:{type:"stri
 const weiJson = {type:"string",pattern:"^(0|[1-9][0-9]{0,29})$"};
 export const soliditySequenceJsonSchema = {type:"object",additionalProperties:false,
   properties:{constructorArgs:argsJson,constructorValueWei:weiJson,
+    sourceProperty:{type:'object',additionalProperties:false,properties:{
+      kind:{const:'scalar_delta'},state:{type:'string',pattern:'^[A-Za-z_]\\w*{type:'object',additionalProperties:false,properties:{file:{type:'string',maxLength:512},contract:{type:'string',maxLength:100}},required:['file','contract']},steps:{type:"array",minItems:1,maxItems:16,items:{anyOf:[
+    {type:"object",additionalProperties:false,properties:{operation:{const:"send"},...stepBase,valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"}},required:["operation","function","args"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"call"},...stepBase,expect:valueJson,expectPath:{type:"array",minItems:1,maxItems:4,items:{type:"integer",minimum:0,maximum:31}}},required:["operation","function","args","expect"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"observe"},...stepBase},required:["operation","function","args"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"eth_balance"},account:{type:"string",maxLength:80}},required:["operation","account"]},
+  ]}}},required:["constructorArgs","steps"]};
+},
+      method:{type:'string',maxLength:200},parameter:{type:'string',pattern:'^[A-Za-z_]\\w*{type:'object',additionalProperties:false,properties:{file:{type:'string',maxLength:512},contract:{type:'string',maxLength:100}},required:['file','contract']},steps:{type:"array",minItems:1,maxItems:16,items:{anyOf:[
+    {type:"object",additionalProperties:false,properties:{operation:{const:"send"},...stepBase,valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"}},required:["operation","function","args"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"call"},...stepBase,expect:valueJson,expectPath:{type:"array",minItems:1,maxItems:4,items:{type:"integer",minimum:0,maximum:31}}},required:["operation","function","args","expect"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"observe"},...stepBase},required:["operation","function","args"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"eth_balance"},account:{type:"string",maxLength:80}},required:["operation","account"]},
+  ]}}},required:["constructorArgs","steps"]};
+},
+      amount:weiJson,direction:{const:'increase'},sourceSha256:{type:'string',pattern:'^[a-f0-9]{64}{type:'object',additionalProperties:false,properties:{file:{type:'string',maxLength:512},contract:{type:'string',maxLength:100}},required:['file','contract']},steps:{type:"array",minItems:1,maxItems:16,items:{anyOf:[
+    {type:"object",additionalProperties:false,properties:{operation:{const:"send"},...stepBase,valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"}},required:["operation","function","args"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"call"},...stepBase,expect:valueJson,expectPath:{type:"array",minItems:1,maxItems:4,items:{type:"integer",minimum:0,maximum:31}}},required:["operation","function","args","expect"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"observe"},...stepBase},required:["operation","function","args"]},
+    {type:"object",additionalProperties:false,properties:{operation:{const:"eth_balance"},account:{type:"string",maxLength:80}},required:["operation","account"]},
+  ]}}},required:["constructorArgs","steps"]};
+}},
+      required:['kind','state','method','parameter','amount','direction','sourceSha256']},
     deployment:{type:'object',additionalProperties:false,properties:{file:{type:'string',maxLength:512},contract:{type:'string',maxLength:100}},required:['file','contract']},steps:{type:"array",minItems:1,maxItems:16,items:{anyOf:[
     {type:"object",additionalProperties:false,properties:{operation:{const:"send"},...stepBase,valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"}},required:["operation","function","args"]},
     {type:"object",additionalProperties:false,properties:{operation:{const:"call"},...stepBase,expect:valueJson,expectPath:{type:"array",minItems:1,maxItems:4,items:{type:"integer",minimum:0,maximum:31}}},required:["operation","function","args","expect"]},
