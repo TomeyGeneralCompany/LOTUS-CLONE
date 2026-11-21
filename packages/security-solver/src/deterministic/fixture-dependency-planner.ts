@@ -9,7 +9,17 @@ export type FixtureResolution=
   | {status:"unresolved";missingDependencies:string[];attemptedResolvers:string[];witnesses:FixtureSourceWitness[];};
 export interface PreparedInitializerOperation {id:string;deploymentId:string;function:string;args:string[];sender:0;}
 type ContractEntry={source:SourceSnapshot;node:any};
-const astOf=(src:SourceSnapshot):any|null=>{try{return parse(src.content,{loc:true,tolerant:true}) as any;}catch{return null;}};
+// Source-revision cache avoids reparsing the complete 88mph inventory for
+// each assessed candidate. Immutable source hashes prevent stale reuse.
+const parsedCache=new Map<string,any|null>();
+const astOf=(src:SourceSnapshot):any|null=>{
+  if(parsedCache.has(src.sha256))return parsedCache.get(src.sha256)!;
+  let result:any|null=null;
+  try{result=parse(src.content,{loc:true,tolerant:true}) as any;}catch{}
+  if(parsedCache.size>=512)parsedCache.delete(parsedCache.keys().next().value!);
+  parsedCache.set(src.sha256,result);
+  return result;
+};
 const typeOf=(node:any):string=>node?.type==="UserDefinedTypeName"?String(node.namePath||""):
   node?.type==="ElementaryTypeName"?String(node.name||""):"";
 const ctorOf=(node:any)=>(node.subNodes||[]).find((x:any)=>x.type==="FunctionDefinition"&&x.isConstructor);
