@@ -29,7 +29,7 @@ export interface CandidateCoverage {
 }
 
 export interface AnalysisProgressSnapshot {
-  version:1; inventoryFingerprint:string;
+  version:1|2; inventoryFingerprint:string;
   candidateIds:string[]; records:CandidateProgress[];
   processedBatches:number; completedExperimentIds:string[];
 }
@@ -57,7 +57,9 @@ export class AnalysisProgressStore {
     try{raw=await readFile(path,"utf8");}
     catch(e){if((e as NodeJS.ErrnoException).code==="ENOENT")return store;throw e;}
     const parsed=JSON.parse(raw) as AnalysisProgressSnapshot;
-    if(parsed.version!==1||parsed.inventoryFingerprint!==store.inventoryFingerprint||
+    // V1 snapshots contain valid source identities but lack the V2 terminality contract.
+    // Preserve their candidate lifecycles and upgrade the schema on the next save.
+    if(![1,2].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
        JSON.stringify([...parsed.candidateIds].sort())!==JSON.stringify([...store.records.keys()].sort()))
       throw new Error("ANALYSIS_CHECKPOINT_SOURCE_MISMATCH: source inventory or revision changed");
     if(!Array.isArray(parsed.records)||parsed.records.length!==candidates.length||
@@ -147,7 +149,7 @@ export class AnalysisProgressStore {
     }
   }
   async save():Promise<void>{
-    const state:AnalysisProgressSnapshot={version:1,inventoryFingerprint:this.inventoryFingerprint,
+    const state:AnalysisProgressSnapshot={version:2,inventoryFingerprint:this.inventoryFingerprint,
       candidateIds:[...this.records.keys()],records:[...this.records.values()],
       processedBatches:this.processedBatches,completedExperimentIds:[...this.completedExperimentIds]};
     await mkdir(dirname(this.path),{recursive:true});
