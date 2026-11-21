@@ -1903,6 +1903,27 @@ export function accountingTransitionPatterns(variable: string, field: string): {
     fieldDecrement:new RegExp(prefix+'\\[\\s*0\\s*\\]\\s*\\.\\s*'+escape(field)+'\\s*-='),
   };
 }
+/** Cycle-safe intra-contract effect closure, from acquired source AST spans. */
+function reachableAccountingSource(snapshot:SourceSnapshot,contract:any,seed:any):string {
+  const functions=(contract.subNodes||[]).filter((fn:any)=>fn.type==="FunctionDefinition"&&fn.body&&fn.name);
+  const byName=new Map<string,any[]>();
+  for(const fn of functions){const items=byName.get(fn.name)||[];items.push(fn);byName.set(fn.name,items);}
+  const pending=[seed],visited=new Set<any>(),parts:string[]=[];
+  while(pending.length&&visited.size<48){
+    const fn=pending.shift()!;if(visited.has(fn))continue;visited.add(fn);
+    const text=body(snapshot.content,fn);parts.push(text);
+    for(const match of text.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g))
+      for(const next of byName.get(match[1])||[])if(!visited.has(next))pending.push(next);
+  }
+  return parts.join("\n");
+}
+function accountingDirections(text:string,state:string):{increase:boolean;decrease:boolean}{
+  // Solidity state-variable names are lexical identifiers, not arbitrary regex input.
+  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state))return {increase:false,decrease:false};
+  return {increase:new RegExp("\\b"+state+"\\s*\\+=").test(text),
+    decrease:new RegExp("\\b"+state+"\\s*-=").test(text)};
+}
+
 export function extractSourceInvariantDescriptor(
   snapshot: SourceSnapshot,
   contract: any,
@@ -1910,13 +1931,9 @@ export function extractSourceInvariantDescriptor(
   declarations: readonly SolidityProbeDeclaration[],
   sources: ReadonlyMap<string, SourceSnapshot>,
 ): InvariantExtractionResult {
-  if (isTestOrMockPath(snapshot.path) || !FINANCIAL_ENTRY_RE.test(method)) {
-    return {
-      ok: false,
-      category: 'no_supported_property',
-      reason: `No supported financial accounting property for ${contract.name}.${method}`,
-    };
-  }
+  if(isTestOrMockPath(snapshot.path))
+    return {ok:false,category:'no_supported_property',
+      reason:'Mock source is not an eligible financial property'};
   const { chain } = resolveInheritance(snapshot, contract, sources);
   if (isAbstractContractNode(contract, chain)) {
     const concreteSubclasses: string[] = [];
@@ -1952,6 +1969,9 @@ export function extractSourceInvariantDescriptor(
       !['view', 'pure'].includes(n.stateMutability || '') &&
       n.body,
   );
+  const accountingStates=allNodes.filter((n:any)=>n.type==='StateVariableDeclaration')
+    .flatMap((n:any)=>n.variables||[]).map((v:any)=>String(v.name||''))
+    .filter(name=>/^(?:total|balance|deposit|share|reserve|principal|stake|asset|debt)/i.test(name));
   const targetFn = fns.find((n: any) => n.name === method);
   if (!targetFn) {
     return {
@@ -1961,24 +1981,36 @@ export function extractSourceInvariantDescriptor(
     };
   }
 
-  // Locate companion inflow/outflow pair in the same contract hierarchy
-  const targetIsInflow = INFLOW_METHOD_RE.test(method);
-  const targetIsOutflow = OUTFLOW_METHOD_RE.test(method);
-  if (!targetIsInflow && !targetIsOutflow) {
-    return {
-      ok: false,
-      category: 'no_supported_property',
-      reason: `Entrypoint ${contract.name}.${method} does not match a paired inflow/outflow accounting transition`,
-      witnesses: [witness(snapshot, targetFn, `${contract.name}.${method}`)],
-    };
+  // A shared, source-witnessed accounting mutation determines pair admission.
+  // Do not choose the first function simply because of its name.
+  const effects=new Map<any,{plus:string[];minus:string[]}>();
+  for(const fn of fns){
+    const text=reachableAccountingSource(snapshot,contract,fn);
+    const plus:string[]=[],minus:string[]=[];
+    for(const state of accountingStates){
+      const direction=accountingDirections(text,state);
+      if(direction.increase)plus.push(state);
+      if(direction.decrease)minus.push(state);
+    }
+    effects.set(fn,{plus,minus});
   }
-
-  const inflowFn = targetIsInflow
-    ? targetFn
-    : fns.find((n: any) => INFLOW_METHOD_RE.test(n.name || '') && n.name !== method);
-  const outflowFn = targetIsOutflow
-    ? targetFn
-    : fns.find((n: any) => OUTFLOW_METHOD_RE.test(n.name || '') && n.name !== method);
+  const targetEffect=effects.get(targetFn)!;
+  const counterparts=fns.filter(fn=>fn!==targetFn).flatMap(fn=>{
+    const effect=effects.get(fn)!;
+    const forward=targetEffect.plus.some(state=>effect.minus.includes(state));
+    const reverse=targetEffect.minus.some(state=>effect.plus.includes(state));
+    return forward!==reverse?[{fn,forward,reverse}]:[];
+  });
+  if(counterparts.length!==1){
+    return {ok:false,category:'no_supported_property',
+      reason:'Source-backed accounting companion '+
+        (counterparts.length?'ambiguous: ':'not established for ')+
+        contract.name+'.'+method+': '+counterparts.map(x=>x.fn.name).join(', '),
+      witnesses:[witness(snapshot,targetFn,contract.name+'.'+method)]};
+  }
+  const counterpart=counterparts[0];
+  const inflowFn=counterpart.forward?targetFn:counterpart.fn;
+  const outflowFn=counterpart.reverse?targetFn:counterpart.fn;
 
   if (!inflowFn || !outflowFn) {
     return {
