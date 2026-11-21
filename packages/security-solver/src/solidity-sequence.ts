@@ -49,13 +49,17 @@ const scalarDeltaProperty=z.object({kind:z.literal("scalar_delta"),
   amount:z.string().regex(/^(0|[1-9][0-9]{0,29})$/),
   direction:z.literal("increase"),sourceSha256:z.string().regex(/^[a-f0-9]{64}$/)
 }).strict();
-export const soliditySequenceSchema = z.object({constructorArgs:args,constructorValueWei:wei.optional(),deployment:deployment.optional(),preparation:solidityPreparationSchema.optional(),sourceProperty:scalarDeltaProperty.optional(),
+const factoryCloneSchema=z.object({deploymentId:prepId,function:signature,args,sender}).strict();
+export const soliditySequenceSchema = z.object({constructorArgs:args,constructorValueWei:wei.optional(),deployment:deployment.optional(),preparation:solidityPreparationSchema.optional(),factoryClone:factoryCloneSchema.optional(),sourceProperty:scalarDeltaProperty.optional(),
   steps:z.array(z.discriminatedUnion("operation",[send,call,observe,ethBalance])).min(1).max(16)}).strict()
   .superRefine((s,ctx)=>{
     for(const step of s.steps)
       if(step.operation==="send" && step.requiredSetup && step.expectRevert)
         ctx.addIssue({code:z.ZodIssueCode.custom,message:"A required successful setup cannot also expect a revert"});
     const deployed=new Set((s.preparation?.deployments||[]).map(d=>d.id));
+    if(s.factoryClone && !deployed.has(s.factoryClone.deploymentId))
+      ctx.addIssue({code:z.ZodIssueCode.custom,
+        message:"Unknown source factory deployment "+s.factoryClone.deploymentId});
     for(const step of s.steps){
       if("deploymentId" in step && step.deploymentId && !deployed.has(step.deploymentId))
         ctx.addIssue({code:z.ZodIssueCode.custom,message:"Unknown step deploymentId "+step.deploymentId});
@@ -104,6 +108,10 @@ export const soliditySequenceJsonSchema = {type:"object",additionalProperties:fa
   ]}}},required:["constructorArgs","steps"]};
 }},
       required:['kind','state','method','parameter','amount','direction','sourceSha256']},
+    factoryClone:{type:'object',additionalProperties:false,properties:{
+      deploymentId:{type:'string',maxLength:64},function:{type:'string',maxLength:200},
+      args:argsJson,sender:{type:'integer',minimum:0,maximum:2}},
+      required:['deploymentId','function','args','sender']},
     deployment:{type:'object',additionalProperties:false,properties:{file:{type:'string',maxLength:512},contract:{type:'string',maxLength:100}},required:['file','contract']},steps:{type:"array",minItems:1,maxItems:16,items:{anyOf:[
     {type:"object",additionalProperties:false,properties:{operation:{const:"send"},...stepBase,valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"}},required:["operation","function","args"]},
     {type:"object",additionalProperties:false,properties:{operation:{const:"call"},...stepBase,expect:valueJson,expectPath:{type:"array",minItems:1,maxItems:4,items:{type:"integer",minimum:0,maximum:31}}},required:["operation","function","args","expect"]},
