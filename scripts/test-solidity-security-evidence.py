@@ -391,10 +391,10 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
             source=root/"contracts"/"Ledger.sol"
             source.parent.mkdir(parents=True)
             source.write_text(
-                "pragma solidity ^0.8.20; contract Ledger {\\n"
-                "uint256 public reserve;\\n"
-                "function accrue(uint256 amount) external { reserve += amount; }\\n"
-                "}\\n",encoding="utf8")
+                "pragma solidity ^0.8.20; contract Ledger {\n"
+                "uint256 public reserve;\n"
+                "function accrue(uint256 amount) external { reserve += amount; }\n"
+                "}\n",encoding="utf8")
             sha=hashlib.sha256(source.read_bytes()).hexdigest()
             before={"operation":"call","function":"reserve()",
                     "sender":0,"actual":"0","expected":"0","passed":True}
