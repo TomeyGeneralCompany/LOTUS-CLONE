@@ -277,6 +277,21 @@ async function run(){
     assert.equal(repairStore.records.get(repairTypes[0].id)!.lifecycle,'experiment_completed');
     assert.equal(repairStore.records.get(repairTypes[0].id)!.properties.length,1,
       'A proven implementation may supersede only its abstract deployment blocker');
+    const anotherProperty=hash('independent-property-same-experiment');
+    // Same source-revision and same verifier trace may support another
+    // separately witnessed obligation; its property must not be orphaned by
+    // the experiment scheduler's ID deduplication.
+    repairStore.addRepairExperiment(repairTypes[0].id,anotherProperty,concreteExperimentId,
+      [path+':'+sourceSha, 'source-1/contracts/Wallet.sol:'+hash('actual wallet')],true);
+    assert.equal(repairStore.records.get(repairTypes[0].id)!.properties.length,2);
+    assert.equal(repairStore.records.get(repairTypes[0].id)!.properties[1].state,'test_completed');
+    assert.equal(repairStore.experimentCertificate.conclusive,1,
+      'Verifier-backed duplicate can satisfy two distinct source-witnessed properties');
+    const futureProperty=hash('new-property-pending-verifier');
+    repairStore.addRepairExperiment(repairTypes[0].id,futureProperty,hash('new-not-yet-run'),
+      [path+':'+sourceSha],false);
+    assert.equal(repairStore.experimentCertificate.conclusive,0,
+      'A linked second property without verifier transcript must reopen the lead');
     // Abstract interfaces must resolve only to acquired concrete implementations
     // with an explicit import and direct inheritance of the target interface.
     // Unrelated names and guessed network contracts cannot supply test evidence.
