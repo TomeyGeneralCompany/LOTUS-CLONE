@@ -2286,7 +2286,22 @@ export function extractSourceInvariantDescriptor(
     new RegExp("\\b"+accountingTarget+"\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
     new RegExp("\\b"+accountingTarget+"\\s*-="+ "\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
     !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
-  if(!directlyProven){
+  // A payable deposit and ETH withdrawal can independently establish
+  // conservation from the caller balance and the actual transferred value.
+  // This detects a missing aggregate-ledger decrement (the BuggyVault case)
+  // instead of demanding the correct decrement already exist in the source.
+  const matchingBalance=balanceReferenced&&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(balanceVarName)&&
+    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*\\+=\\s*msg\\.value").test(inflowEffects)&&
+    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*-=\\s*"+outflowParameter+"\\b").test(outflowEffects);
+  const coupledPayableConservation=totalReferenced&&
+    inflowFn.stateMutability==='payable'&&inflowFn.parameters.length===0&&
+    outflowFn.parameters.length===1&&/^uint/.test(String(outflowFn.parameters[0]?.typeName?.name||''))&&
+    new RegExp("\\b"+totalVarName+"\\s*\\+=\\s*msg\\.value").test(inflowEffects)&&
+    matchingBalance&&
+    new RegExp("\\bvalue\\s*:\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
+    !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
+  if(!directlyProven&&!coupledPayableConservation){
     return {ok:false,category:'no_supported_property',
       reason:'Fixed-value conservation was not source-proven for '+contract.name+'.'+
         inflowFn.name+'/'+outflowFn.name+'; requires a property-specific measured scenario.',
