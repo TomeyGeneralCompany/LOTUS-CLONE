@@ -29,7 +29,7 @@ import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
-import {resolveAcquiredConcreteImplementations} from "./deterministic/fixture-dependency-planner";
+import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers} from "./deterministic/fixture-dependency-planner";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
 async function recordToolActivity(logFile:string,event:Record<string,unknown>):Promise<void> {
@@ -502,6 +502,43 @@ export async function runLocalAudit(
             leadId:lead.id,abstractSelector:lead.selector,
             candidates:concrete.map(x=>({selector:x.selector,path:x.path,sourceSha256:x.sourceSha256})),
             executable:successful.length,failures:altFailures})+"\n");
+        }
+      }
+      // Interface declarations carry no executable body. Follow an exact
+      // acquired import and source callsite into a concrete consumer, then
+      // test the consumer's own source-derived obligation. This is caller-side
+      // evidence, not an assertion about an unavailable external protocol.
+      if(!constructed.ok&&constructed.unresolvedCategory==="missing_fixture"&&
+        /abstract and cannot be instantiated/.test(constructed.detail)){
+        const source=deterministicSourceSnapshots.find(x=>
+          x.path===lead.path&&x.sha256===lead.sourceSha256);
+        if(source){
+          const cut=lead.selector.lastIndexOf(".");
+          const contractName=lead.selector.slice(0,cut);
+          const method=lead.selector.slice(cut+1);
+          const callers=resolveAcquiredInterfaceCallers(source,
+            contractName,method,deterministicSourceSnapshots);
+          for(const caller of callers.slice(0,16)){
+            const menu=deterministicDeclarationsCache.get(caller.path)||[];
+            if(!menu.some(d=>d.selector===caller.selector&&d.operation==="send")){
+              altFailures.push(caller.selector+":caller_send_declaration_missing");
+              continue;
+            }
+            const candidate=constructSolidityExperiments({
+              repositoryCommit:lead.sourceCommit,targetPath:caller.path,
+              targetSelector:caller.selector,sources:deterministicSourceSnapshots,
+              declarations:menu,staticLeads:limits.staticLeads||[],
+            });
+            if(candidate.ok)successful.push(candidate);
+            else altFailures.push(caller.selector+":"+candidate.code+":"+candidate.detail.slice(0,160));
+          }
+          if(callers.length)await appendFile(logFile,
+            "[EXPERIMENT_INTERFACE_CALLERS] "+JSON.stringify({
+              leadId:lead.id,interfaceSelector:lead.selector,
+              callers:callers.map(x=>({path:x.path,selector:x.selector,
+                receiver:x.receiver,sourceSha256:x.sourceSha256,
+                witness:x.witness})),
+              executable:successful.length})+"\n");
         }
       }
       if(!successful.length){
