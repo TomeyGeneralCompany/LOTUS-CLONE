@@ -324,6 +324,7 @@ def _asserted_financial_or_vesting_negative(
         ("xMPH", "deposit"): "share_accounting_negative",
         ("xMPH", "withdraw"): "share_accounting_negative",
         ("Vesting02", "createVestForDeposit"): "vest_creation_negative",
+        ("SettlementVault", "fund"): "bounded_credit_negative",
     }
     family = families.get((contract, method))
     if not family or not re.search(r"\bcontract\s+" + re.escape(contract) + r"\b", source):
@@ -347,6 +348,33 @@ def _asserted_financial_or_vesting_negative(
                 and req.get("function", "").split("(", 1)[0] == method
                 and got.get("reverted") is False and got.get("passed") is True]
     if not targeted:
+        return None
+    if family == "bounded_credit_negative":
+        clean = _strip_comments(source)
+        if not (re.search(r"mapping\s*\(\s*address\s*=>\s*uint256\s*\)\s*public\s+credit", clean)
+                and re.search(r"uint256\s+public\s+totalCredit", clean)
+                and re.search(r"credit\s*\[\s*recipient\s*\]\s*\+=\s*v", clean)
+                and re.search(r"totalCredit\s*\+=\s*v", clean)
+                and re.search(r"v\s*=\s*amount\.bounded\s*\(\s*type\s*\(\s*uint128\s*\)\.max\s*\)", clean)):
+            return None
+        index = targeted[0]
+        def nearest(call: str, before: bool):
+            segment = list(zip(requested_steps[:index], actual_steps[:index])) if before else list(zip(requested_steps[index+1:], actual_steps[index+1:]))
+            hits = [(r, step) for r, step in segment if r.get("operation") == "call"
+                    and r.get("function") == call and step.get("passed") is True
+                    and str(step.get("actual", "")).isdecimal()]
+            return hits[-1][1] if before and hits else hits[0][1] if hits else None
+        credit_before, credit_after = nearest("credit(address)", True), nearest("credit(address)", False)
+        total_before, total_after = nearest("totalCredit()", True), nearest("totalCredit()", False)
+        if None in (credit_before, credit_after, total_before, total_after):
+            return None
+        if (int(credit_after["actual"]) - int(credit_before["actual"]) == 1000 and
+                int(total_after["actual"]) - int(total_before["actual"]) == 1000):
+            return family, (
+                "The concrete in-range funding experiment credited 1000 units "
+                "to the recipient and aggregate ledger with all source-bound "
+                "assertions passing. Other values and protocol states remain untested."
+            )
         return None
     if family == "share_accounting_negative":
         for index in targeted:
