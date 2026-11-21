@@ -393,6 +393,18 @@ export async function runLocalAudit(
         scheduled.map(x=>x.id),
         detail?.closedLoop.steps.map(step=>({adapter:step.adapter,status:step.status,
           reason:step.reason,...(step.detail?{detail:step.detail}:{})}))||[],
+        scheduled.flatMap(entry=>{
+          const candidate=constructed.find(candidate=>
+            candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
+            candidate.hypothesis===entry.plan.hypothesis &&
+            JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence));
+          if(!candidate)return [];
+          const witnesses=candidate.witnesses.map(w=>
+            [w.path,w.sourceSha256,w.start,w.end,w.symbol].join(':'));
+          return [{id:createHash('sha256').update(JSON.stringify([
+              lead.id,candidate.securityProperty,witnesses])).digest('hex'),
+            experimentIds:[entry.id],sourceWitnesses:witnesses}];
+        }),
       );
       analysisProgressStore.markTerminalAssessment(lead.id,
         lead.state.kind==="assessed" ? lead.state.reason : undefined);
