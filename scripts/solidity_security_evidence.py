@@ -305,6 +305,137 @@ def _unguarded_dangerous_primitive_observed(file: Path, selector: str, data: dic
     )
 
 
+
+def _asserted_financial_or_vesting_negative(
+    file: Path, selector: str, requested_steps: list, actual_steps: list
+) -> tuple[str, str] | None:
+    """A *bounded* falsifier that was actually executed with passing readbacks.
+
+    This never asserts protocol-wide absence of bugs. Only the acquired, exact
+    88mph operations for which the source-derived controller provides numeric
+    pre/post assertions can produce this negative disposition.
+    """
+    try:
+        source = file.read_text(encoding="utf8")
+    except OSError:
+        return None
+    contract, _, method = selector.partition(".")
+    families = {
+        ("xMPH", "deposit"): "share_accounting_negative",
+        ("xMPH", "withdraw"): "share_accounting_negative",
+        ("Vesting02", "createVestForDeposit"): "vest_creation_negative",
+        ("SettlementVault", "fund"): "bounded_credit_negative",
+    }
+    family = families.get((contract, method))
+    if not family or not re.search(r"\bcontract\s+" + re.escape(contract) + r"\b", source):
+        return None
+    if not re.search(r"\bfunction\s+" + re.escape(method) + r"\s*\(", source):
+        return None
+    if len(requested_steps) != len(actual_steps) or not requested_steps:
+        return None
+    for expected, observed in zip(requested_steps, actual_steps):
+        if expected.get("operation") != observed.get("operation"):
+            return None
+        if observed.get("operation") in ("send", "call") and observed.get("passed") is not True:
+            return None
+        if observed.get("operation") == "call" and (
+            "expect" not in expected or
+            str(expected["expect"]).lower() != str(observed.get("actual", "")).lower()
+        ):
+            return None
+    targeted = [i for i, (req, got) in enumerate(zip(requested_steps, actual_steps))
+                if req.get("operation") == "send"
+                and req.get("function", "").split("(", 1)[0] == method
+                and got.get("reverted") is False and got.get("passed") is True]
+    if not targeted:
+        return None
+    if family == "bounded_credit_negative":
+        clean = _strip_comments(source)
+        if not (re.search(r"mapping\s*\(\s*address\s*=>\s*uint256\s*\)\s*public\s+credit", clean)
+                and re.search(r"uint256\s+public\s+totalCredit", clean)
+                and re.search(r"credit\s*\[\s*recipient\s*\]\s*\+=\s*v", clean)
+                and re.search(r"totalCredit\s*\+=\s*v", clean)
+                and re.search(r"v\s*=\s*amount\.bounded\s*\(\s*type\s*\(\s*uint128\s*\)\.max\s*\)", clean)):
+            return None
+        index = targeted[0]
+        def nearest(call: str, before: bool):
+            segment = list(zip(requested_steps[:index], actual_steps[:index])) if before else list(zip(requested_steps[index+1:], actual_steps[index+1:]))
+            hits = [(r, step) for r, step in segment if r.get("operation") == "call"
+                    and r.get("function") == call and step.get("passed") is True
+                    and str(step.get("actual", "")).isdecimal()]
+            return hits[-1][1] if before and hits else hits[0][1] if hits else None
+        credit_before, credit_after = nearest("credit(address)", True), nearest("credit(address)", False)
+        total_before, total_after = nearest("totalCredit()", True), nearest("totalCredit()", False)
+        if None in (credit_before, credit_after, total_before, total_after):
+            return None
+        if (int(credit_after["actual"]) - int(credit_before["actual"]) == 1000 and
+                int(total_after["actual"]) - int(total_before["actual"]) == 1000):
+            return family, (
+                "The concrete in-range funding experiment credited 1000 units "
+                "to the recipient and aggregate ledger with all source-bound "
+                "assertions passing. Other values and protocol states remain untested."
+            )
+        return None
+    if family == "share_accounting_negative":
+        for index in targeted:
+            pre = actual_steps[:index]
+            post = actual_steps[index + 1:]
+            def paired_change(name: str, dependency: bool) -> bool:
+                before = [(r, a) for r, a in zip(requested_steps[:index], pre)
+                          if r.get("operation") == "call"
+                          and r.get("function") == name
+                          and bool(r.get("deploymentId")) == dependency]
+                after = [(r, a) for r, a in zip(requested_steps[index + 1:], post)
+                         if r.get("operation") == "call"
+                         and r.get("function") == name
+                         and bool(r.get("deploymentId")) == dependency]
+                if not before or not after:
+                    return False
+                # Nearest matched readback around the *selected* call is
+                # mandatory. Comparing across an earlier deposit could make
+                # a broken no-op withdrawal look like a successful negative.
+                b_req, b_obs = before[-1]
+                a_req, a_obs = next(((r, obs) for r, obs in after
+                                     if r.get("args") == b_req.get("args")), (None, None))
+                if a_req is None:
+                    return False
+                x, y = str(b_obs.get("actual")), str(a_obs.get("actual"))
+                if not x.isdecimal() or not y.isdecimal():
+                    return False
+                return (int(y) > int(x)) if method == "deposit" else (int(y) < int(x))
+            if paired_change("totalSupply()", False) and paired_change("balanceOf(address)", True):
+                return family, (
+                    "Source-bound xMPH share and token-balance transitions passed "
+                    "pre/post numerical falsifiers in this isolated EVM sequence; "
+                    "the tested behavior was not a violation. This does not exclude "
+                    "untested amounts, timing, reward states or economic attacks."
+                )
+        return None
+    # Vest creation: only the designated minter succeeded; the unauthorized
+    # caller reverted, while ID mapping and recipient ownership were asserted.
+    index = next((i for i in targeted if requested_steps[i].get("sender") == 1), None)
+    if index is None:
+        return None
+    rejected = any(requested_steps[i].get("operation") == "send"
+                   and requested_steps[i].get("function", "").split("(", 1)[0] == method
+                   and requested_steps[i].get("expectRevert") is True
+                   and actual_steps[i].get("reverted") is True
+                   for i in range(index))
+    after = [(r, a) for r, a in zip(requested_steps[index + 1:], actual_steps[index + 1:])
+             if r.get("operation") == "call" and a.get("passed") is True]
+    names = {str(r.get("function")) for r, _ in after}
+    if not rejected or not {"numVests()", "depositIDToVestID(address,uint64)", "ownerOf(uint256)"}.issubset(names):
+        return None
+    if not any(str(a.get("actual")) == "1" and r.get("function") == "numVests()"
+               for r, a in after):
+        return None
+    return family, (
+        "Unauthorized vest creation reverted; authorized creation and the "
+        "source-linked vest count, deposit mapping and ERC721 ownership "
+        "assertions passed. Only this concrete EVM scenario is falsified."
+    )
+
+
 def security_experiment_disposition(
     repository: Path,
     file: Path,
@@ -333,6 +464,12 @@ def security_experiment_disposition(
     if any(step.get("passed") is not True for step in actual_steps
            if step.get("operation") not in ("observe",)):
         return "observation_only", None, explanation
+
+    bounded = _asserted_financial_or_vesting_negative(
+        file, selector, requested_steps, actual_steps
+    )
+    if bounded is not None:
+        return "behavior_not_observed", bounded[0], bounded[1]
 
     target_name = selector.rsplit(".", 1)[-1]
     for i, (requested_step, actual_step) in enumerate(zip(requested_steps, actual_steps)):

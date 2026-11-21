@@ -26,13 +26,13 @@ const candidates:AnalysisCandidate[]=Array.from({length:244},(_,i)=>({
   excerptStart:0,truncated:false,lineStart:1,lineEnd:1,
 }));
 
-async function stage():Promise<ControllerStageLock>{
+async function stage(inventory:readonly AnalysisCandidate[]=candidates):Promise<ControllerStageLock>{
   const lock=new ControllerStageLock();
   lock.completeIndex([{path,characters:content.length,sha256:sourceSha}]);
   lock.recordRead({path,start:0,end:content.length,totalCharacters:content.length,text:content});
   await lock.completeReading(async()=>content);
   lock.noteSourcePreclassified(path,'indexed-options-built');
-  lock.registerAnalysisInventory(candidates.map(c=>c.id));
+  lock.registerAnalysisInventory(inventory.map(c=>c.id));
   return lock;
 }
 async function run(){
@@ -98,13 +98,12 @@ async function run(){
     await store.save();
     assert.equal(store.completedExperimentIds.size,64);
     assert.equal(store.counts.experimentsCompleted,64);
-    assert.equal(store.counts.unresolvedIds.length,0);
+    assert.equal(store.counts.unresolvedIds.length,244,
+      'The other 180 never-experimented leads and 64 unproven results remain unresolved');
     assert.equal(lock.completedCount,64);
-    lock.completeExperiments();
-    for(const id of experiments)lock.review(id);
-    lock.completeReviews();
-    lock.completeReport(true);
-    assert.equal(lock.currentStage,'COMPLETE');
+    assert.throws(()=>lock.completeExperiments(store.experimentCertificate),
+      /EXPERIMENT_LEAD_COVERAGE_INCOMPLETE/);
+    assert.equal(lock.currentStage,'EXPERIMENT');
     const resumed=await AnalysisProgressStore.open(file,candidates);
     assert.equal(resumed.completedExperimentIds.size,64);
     assert.equal(resumed.remaining,0);
@@ -127,12 +126,13 @@ async function run(){
       'A completed role test must not resolve an unrelated missing financial prerequisite');
     await pending.save();
     assert.equal(pending.counts.queued,1);
-    assert.equal(pending.counts.dependenciesPending,1);
+    assert.equal(pending.counts.dependenciesPending,2, 'Unexecutable properties are pending, not terminally exhausted');
     assert.equal(pending.counts.experimentsPending,1);
     assert.equal(pending.terminallyComplete,false);
     pending=await AnalysisProgressStore.open(pendingFile,pendingCandidates);
     assert.equal(pending.terminallyComplete,false,'checkpoint must preserve all three pending states');
-    assert.equal(pending.counts.unresolvedIds.length,3);
+    assert.equal(pending.counts.unresolvedIds.length,6,
+      'No unsupported, selected-only, or evidence-free completed candidate counts as proof');
     assert.throws(()=>pending.markExperimentCompleted(hash('unmatched')),
       /ANALYSIS_EXPERIMENT_ID_UNMATCHED/);
     // Source-typed, recursive fixture chain: Vault -> Adapter -> Token.
@@ -168,6 +168,59 @@ async function run(){
     assert.equal(cycle.status,'unresolved');
     if(cycle.status==='unresolved')
       assert.ok(cycle.missingDependencies.some(x=>x.includes('dependency_cycle')));
+    // All 241 distinct leads must have at least one evidence-backed obligation.
+    // 240/241 is forbidden even if every registered experiment has finished.
+    const all241=candidates.slice(0,241);
+    const proofFile=join(dir,'proof241.json');
+    const proofStore=await AnalysisProgressStore.open(proofFile,all241);
+    const proofLock=await stage(all241);
+    let position=0;
+    while(proofStore.remaining){
+      const batch=proofStore.nextBatch(18,18);
+      for(const lead of batch){
+        const exp=hash('real-experiment-for-'+lead.id);
+        proofLock.registerAnalysisLead({id:lead.id,path:lead.path,selector:lead.selector,
+          sourceCommit:lead.sourceCommit,sourceSha256:lead.sourceSha256});
+        proofLock.recordLeadAssessment(lead.id,{kind:'assessed',
+          sourceEvidence:[lead.sourceEvidence],hypothesis:'Independent source-verified obligation',
+          disposition:'test',reason:'Distinct lead must have an executable falsifier'},'controller');
+        proofStore.recordAssessment(lead.id,[hash('obligation-for-'+lead.id)],[],[exp],[],[
+          {id:hash('obligation-for-'+lead.id),experimentIds:[exp],
+            sourceWitnesses:[lead.path+':'+lead.sourceSha256+':0:'+content.length]}
+        ]);
+        proofLock.discover(exp);
+        position++;
+      }
+      proofLock.completeAnalysisBatch();
+    }
+    assert.equal(position,241);
+    proofLock.completeAnalysis();
+    let completed=0;
+    for(const lead of all241){
+      const id=hash('real-experiment-for-'+lead.id);
+      proofLock.requireCandidate(id);
+      proofLock.finishExperiment(id,'not_observed');
+      proofStore.markExperimentCompleted(id,{result:'not_observed',
+        evidenceId:hash('case:'+id),verifierDigest:hash('isolated-EVM-result:'+id)});
+      completed++;
+      if(completed===240){
+        assert.equal(proofStore.experimentCertificate.conclusive,240);
+        assert.throws(()=>proofLock.completeExperiments(proofStore.experimentCertificate),
+          /EXPERIMENTS_INCOMPLETE|EXPERIMENT_LEAD_COVERAGE_INCOMPLETE/);
+        assert.equal(proofLock.currentStage,'EXPERIMENT');
+      }
+    }
+    assert.equal(proofStore.experimentCertificate.total,241);
+    assert.equal(proofStore.experimentCertificate.conclusive,241);
+    assert.equal(proofStore.experimentCertificate.evidenceCount,241);
+    await proofStore.save();
+    const resumedProof=await AnalysisProgressStore.open(proofFile,all241);
+    assert.equal(resumedProof.experimentCertificate.conclusive,241);
+    proofLock.completeExperiments(resumedProof.experimentCertificate);
+    for(const lead of all241)proofLock.review(hash('real-experiment-for-'+lead.id));
+    proofLock.completeReviews();
+    proofLock.completeReport(true);
+    assert.equal(proofLock.currentStage,'COMPLETE');
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);

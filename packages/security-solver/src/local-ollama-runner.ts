@@ -367,10 +367,12 @@ export async function runLocalAudit(
       // Candidate experiment identity must match the actual stage-owned queue,
       // not the offline planner's separate SHA identifier.
       const constructed=detail?.experimentCandidates||[];
-      const scheduled=stagedPlans.filter(entry=>constructed.some(candidate=>
-        candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
-        candidate.hypothesis===entry.plan.hypothesis &&
-        JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence)));
+      // Some source-grounded plans are admitted during READ before detailed
+      // ANALYZE property construction. They still belong to the exact immutable
+      // lead selector; never orphan successful EVM proof merely because the
+      // later planner assigned a different hash to the same source operation.
+      const scheduled=stagedPlans.filter(entry=>
+        entry.plan.path===lead.path && entry.plan.query===lead.selector);
       const missing=constructed.filter(candidate=>!scheduled.some(entry=>
         candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
         candidate.hypothesis===entry.plan.hypothesis &&
@@ -393,6 +395,22 @@ export async function runLocalAudit(
         scheduled.map(x=>x.id),
         detail?.closedLoop.steps.map(step=>({adapter:step.adapter,status:step.status,
           reason:step.reason,...(step.detail?{detail:step.detail}:{})}))||[],
+        scheduled.flatMap(entry=>{
+          const candidate=constructed.find(candidate=>
+            candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
+            candidate.hypothesis===entry.plan.hypothesis &&
+            JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence));
+          const witnesses=candidate
+            ?candidate.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(':'))
+            :(inventoryEntry?[inventoryEntry.sourceEvidence]:[]);
+          // Source evidence for this selector, not evidence for an unrelated
+          // function, is required for pre-ANALYZE staged experiments.
+          if(!witnesses.length||witnesses.some(x=>!x.includes(lead.sourceSha256)))return [];
+          const property=candidate?.securityProperty||entry.plan.hypothesis;
+          return [{id:createHash('sha256').update(JSON.stringify([
+              lead.id,property,witnesses])).digest('hex'),
+            experimentIds:[entry.id],sourceWitnesses:witnesses}];
+        }),
       );
       analysisProgressStore.markTerminalAssessment(lead.id,
         lead.state.kind==="assessed" ? lead.state.reason : undefined);
@@ -427,6 +445,61 @@ export async function runLocalAudit(
       if(admitted===0)throw new Error("ANALYSIS_INVENTORY_STALLED: queued candidates could not be admitted");
       return;
     }
+    // A completed analytical inventory does not mean construction has been
+    // exhausted. Give every pending property a source-only full-graph repair
+    // attempt, without repeating an identical failed strategy across resumes.
+    const sourceRepairBatch=analysisProgressStore.nextRepairBatch(analysisProgressStore.records.size);
+    let repairAdded=0,repairBlocked=0;
+    for(const lead of sourceRepairBatch){
+      const strategy="full-source-typed-property-v1";
+      const record=analysisProgressStore.records.get(lead.id)!;
+      if(record.repairAttempts?.some(x=>x.strategy===strategy&&
+          x.sourceSha256===record.sourceSha256))continue;
+      const declarations=deterministicDeclarationsCache.get(lead.path)||[];
+      if(!declarations.length){
+        analysisProgressStore.noteRepairAttempt(lead.id,strategy,"missing_source_declarations");
+        repairBlocked++;
+        continue;
+      }
+      const constructed=constructSolidityExperiments({
+        repositoryCommit:lead.sourceCommit,targetPath:lead.path,
+        targetSelector:lead.selector,sources:deterministicSourceSnapshots,
+        declarations,staticLeads:limits.staticLeads||[],
+      });
+      if(!constructed.ok){
+        analysisProgressStore.noteRepairAttempt(lead.id,strategy,
+          constructed.code+":"+constructed.detail.slice(0,420));
+        repairBlocked++;
+        continue;
+      }
+      let added=0;
+      for(const exp of constructed.experiments){
+        const plan={action:"plan_probe" as const,path:exp.path,query:exp.selector,
+          answer:"solidity_sequence",hypothesis:exp.hypothesis,sequence:exp.sequence};
+        if(stagedPlans.some(x=>x.plan.path===plan.path &&
+          x.plan.query===plan.query && x.plan.hypothesis===plan.hypothesis &&
+          JSON.stringify(x.plan.sequence)===JSON.stringify(plan.sequence)))continue;
+        const witnesses=[lead.sourceEvidence,
+          ...exp.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(":"))];
+        const id=JSON.stringify([exp.path,exp.selector,plan.answer,"repair",exp.id]);
+        const propertyId=createHash("sha256").update(JSON.stringify([
+          lead.id,exp.securityProperty,witnesses])).digest("hex");
+        stageLock.discover(id);
+        stagedPlans.push({id,plan});
+        analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses);
+        added++;repairAdded++;
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
+          leadId:lead.id,experimentId:id,property:exp.securityProperty,
+          witnesses:witnesses.length})+"\n");
+      }
+      analysisProgressStore.noteRepairAttempt(lead.id,strategy,
+        added?("new_experiments:"+added):"no_distinct_sourced_experiment");
+      if(!added)repairBlocked++;
+    }
+    await analysisProgressStore.save();
+    await appendFile(logFile,"[EXPERIMENT_REPAIR_RECONCILIATION] "+JSON.stringify({
+      examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
+      unresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
     stageLock.assertAnalysisInventoryExhausted();
     limits.onCandidateCoverage?.(analysisProgressStore.counts);
     await appendFile(logFile,"[ANALYSIS_PROPERTY_PENDING] "+JSON.stringify(analysisProgressStore.counts)+"\n");
@@ -1180,7 +1253,27 @@ export async function runLocalAudit(
       if(stageLock?.currentStage==='EXPERIMENT' &&
         stageLock.completedCount===stageLock.candidateCount &&
         !workflow?.snapshot().pending){
-        stageLock.completeExperiments();
+        if(!analysisProgressStore)throw new Error("EXPERIMENT_CANDIDATE_STORE_MISSING");
+        const certificate=analysisProgressStore.experimentCertificate;
+        const inconclusive=stageLock.outcomeCounts;
+        if(certificate.unresolvedIds.length || inconclusive.observation_only ||
+          inconclusive.incomplete || inconclusive.unsupported || inconclusive.rejected){
+          await analysisProgressStore.save();
+          await appendFile(logFile,'[EXPERIMENT_GATE_BLOCKED] '+JSON.stringify({
+            required:certificate.total,conclusive:certificate.conclusive,
+            unresolved:certificate.unresolvedIds.length,
+            pendingLeadIds:certificate.unresolvedIds,
+            reasons:certificate.pendingReasons,
+            outcomes:inconclusive,
+            manifestDigest:certificate.manifestDigest,
+            evidenceDigest:certificate.evidenceDigest,
+            checkpoint:analysisProgressStore.path,
+          })+'\n');
+          throw new Error('EXPERIMENT_INCOMPLETE_SUSPENDED: '+
+            certificate.conclusive+'/'+certificate.total+' leads conclusively tested, '+
+            certificate.unresolvedIds.length+' unresolved; checkpoint '+analysisProgressStore.path);
+        }
+        stageLock.completeExperiments(certificate);
         limits.onExperimentLedger?.({selected:stageLock.candidateCount,
           resolved:stageLock.completedCount,outcomes:stageLock.outcomeCounts});
         await appendFile(logFile,'[EXPERIMENT_COMPLETE] '+
@@ -3507,9 +3600,24 @@ export async function runLocalAudit(
               status==='invalid_probe'?'rejected':'incomplete';
           }catch{}
           stageLock.finishExperiment(activeStageCandidate,outcome);
-          if(analysisProgressStore && (outcome==='observed'||outcome==='not_observed') &&
+          if(analysisProgressStore &&
             [...analysisProgressStore.records.values()].some(r=>r.experimentIds.includes(activeStageCandidate!))){
-            analysisProgressStore.markExperimentCompleted(activeStageCandidate);
+            const verifierDigest=createHash('sha256').update(output).digest('hex');
+            let caseId='';
+            let detail='';
+            try{
+              const parsed=JSON.parse(output) as {caseId?:string|null;detail?:string;reason?:string};
+              caseId=typeof parsed.caseId==='string'?parsed.caseId:'';
+              detail=String(parsed.detail||parsed.reason||'');
+            }catch{detail='unparseable_verifier_evidence';}
+            const evidenceId=createHash('sha256').update(JSON.stringify([
+              activeStageCandidate,caseId,verifierDigest])).digest('hex');
+            if(outcome==='observed'||outcome==='not_observed')
+              analysisProgressStore.markExperimentCompleted(activeStageCandidate,{
+                result:outcome,verifierDigest,evidenceId,
+              });
+            else analysisProgressStore.recordInconclusive(activeStageCandidate,
+              outcome,evidenceId,detail||'no_conclusive_falsifier');
             await analysisProgressStore.save();
             limits.onCandidateCoverage?.(analysisProgressStore.counts);
           }

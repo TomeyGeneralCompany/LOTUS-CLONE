@@ -259,6 +259,9 @@ contract GuardedVault is Ownable {
           },
         },
       );
+    } catch(error) {
+      if(!String(error).includes('EXPERIMENT_INCOMPLETE_SUSPENDED'))throw error;
+      answer=JSON.stringify({findings:[],outcome:'suspended',reason:String(error)});
     } finally {
       if (prevControllerOwned === undefined) delete process.env.LOCAL_CONTROLLER_OWNED_ACTIONS;
       else process.env.LOCAL_CONTROLLER_OWNED_ACTIONS = prevControllerOwned;
@@ -271,11 +274,14 @@ contract GuardedVault is Ownable {
     }
 
     const parsed = JSON.parse(answer);
-    assert.equal(parsed.outcome, "no_testable_candidate");
+    assert.equal(parsed.outcome, "suspended",
+      "An untested source function must not produce a completed report");
     assert.equal(parsed.findings.length, 0);
     const logText = await readFile(logFile, "utf8");
     assert.match(logText, /\[DETERMINISTIC_DRIVER_ACTION\]/, "Runner must invoke deterministic driver");
     assert.doesNotMatch(logText, /\[MODEL_REQUEST_RECOVERY\]/, "No Ollama retries may occur in deterministic mode");
+    assert.match(logText, /\[EXPERIMENT_GATE_BLOCKED\]/);
+    assert.doesNotMatch(logText, /\[STAGE_UNLOCK\] EXPERIMENT -> REVIEW/);
 
     // 5b. Standalone runLocalAudit (productionWorkflow: false) must track terminalReadPages without stalling
     const standaloneLog = join(tmp, "standalone-audit.log");
@@ -947,6 +953,8 @@ contract SiblingPool${n} {
               JSON.stringify({ status: "not_observed", behavior_observed: false, note: "stubbed_local_verifier" }),
           },
         );
+      } catch(error) {
+        if(!String(error).includes('EXPERIMENT_INCOMPLETE_SUSPENDED'))throw error;
       } finally {
         if (prevMaxLeads === undefined) delete process.env.LOCAL_ANALYZE_MAX_LEADS;
         else process.env.LOCAL_ANALYZE_MAX_LEADS = prevMaxLeads;
@@ -1621,6 +1629,8 @@ contract MixedProtocolVault {
               JSON.stringify({ status: "not_observed", behavior_observed: false, note: "stubbed_local_verifier" }),
           },
         );
+      } catch(error) {
+        if(!String(error).includes('EXPERIMENT_INCOMPLETE_SUSPENDED'))throw error;
       } finally {
         if (prevMaxLeads === undefined) delete process.env.LOCAL_ANALYZE_MAX_LEADS;
         else process.env.LOCAL_ANALYZE_MAX_LEADS = prevMaxLeads;

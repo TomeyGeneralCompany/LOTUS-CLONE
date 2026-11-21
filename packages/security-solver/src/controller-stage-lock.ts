@@ -205,9 +205,27 @@ export class ControllerStageLock {
    this.candidates.set(id,result);
    this.reviews.set(id,false);
  }
- completeExperiments(){
+ completeExperiments(certificate?:import('./deterministic/analysis-progress-store').LeadExperimentCertificate){
    if(this.stage!=='EXPERIMENT'||this.completedCount!==this.candidateCount)
      throw new Error('EXPERIMENTS_INCOMPLETE');
+   // A selected queue is a subset of the immutable source inventory.
+   // Reaching its end cannot discharge missing or inconclusive properties.
+   if(this.inventoryIds!==null&&this.inventoryIds.size>0){
+     const ids=[...this.inventoryIds].sort();
+     const digest=createHash('sha256').update(JSON.stringify(ids)).digest('hex');
+     if(!certificate||certificate.version!==1||certificate.manifestDigest!==digest||
+        certificate.total!==ids.length||certificate.conclusive!==ids.length||
+        certificate.unresolvedIds.length!==0||!(/^[a-f0-9]{64}$/).test(certificate.evidenceDigest)||
+        certificate.evidenceCount<ids.length)
+        throw new Error('EXPERIMENT_LEAD_COVERAGE_INCOMPLETE: '+
+          (certificate?certificate.conclusive+'/'+certificate.total+' evidence-backed leads; '+
+            certificate.unresolvedIds.length+' unresolved':'missing completion certificate'));
+     if(this.outcomeCounts.observation_only||this.outcomeCounts.incomplete||
+        this.outcomeCounts.unsupported||this.outcomeCounts.rejected||
+        this.outcomeCounts.pending)
+       throw new Error('EXPERIMENT_INCONCLUSIVE_DISPOSITIONS: '+
+          JSON.stringify(this.outcomeCounts));
+   }
    this.advance('EXPERIMENT','REVIEW');
  }
  review(id:string){
