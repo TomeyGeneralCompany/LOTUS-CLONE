@@ -2768,36 +2768,44 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       };
     }
   } else {
-    const extracted = extractSourceInvariantDescriptor(target, contract, method, input.declarations, indexed);
-    if (extracted.ok) {
-      const built = constructCoreInvariantExperiment(extracted.invariant, target, contract, input.declarations, indexed);
-      if (built) {
-        choices.push(built);
-      } else {
-        invariantUnresolved = {
-          category: 'missing_fixture',
-          reason: `Extracted invariant for ${input.targetSelector} failed admission or fixture construction`,
-        };
+    // Every overload is an independent ABI entrypoint. Enumerate candidate
+    // companion signatures, then admit only pairs with an actual source and
+    // executable typed fixture. No name-only ambiguity or arbitrary first pick.
+    const targetVariants=(contract.subNodes||[])
+      .filter((fn:any)=>fn.type==='FunctionDefinition'&&fn.name===method&&
+        fn.body&&['public','external'].includes(fn.visibility))
+      .map(canonicalFunctionIdentity);
+    const signatures=targetVariants.length?targetVariants:[undefined];
+    const issues:string[]=[];
+    for(const targetSignature of signatures){
+      const extracted=extractSourceInvariantDescriptor(target,contract,method,
+        input.declarations,indexed,undefined,targetSignature);
+      const variants=extracted.ok?[extracted]:
+        extracted.companionCandidates?.length?
+          extracted.companionCandidates.map(companion=>
+            extractSourceInvariantDescriptor(target,contract,method,
+              input.declarations,indexed,companion,targetSignature)):[extracted];
+      for(const candidate of variants){
+        if(!candidate.ok){
+          issues.push((targetSignature||method)+':'+candidate.category+':'+candidate.reason);
+          if(!invariantUnresolved)invariantUnresolved={
+            category:candidate.category,reason:candidate.reason};
+          continue;
+        }
+        const built=constructCoreInvariantExperiment(candidate.invariant,target,
+          contract,input.declarations,indexed);
+        if(built)choices.push(built);
+        else{
+          const reason='Source-witnessed invariant failed typed fixture construction for '+
+            (targetSignature||method);
+          issues.push(reason);
+          if(!invariantUnresolved)invariantUnresolved={
+            category:'missing_fixture',reason};
+        }
       }
-    } else if(extracted.companionCandidates && extracted.companionCandidates.length>1){
-      // Ambiguous counterparts represent separate source-derived properties,
-      // not permission to discard the lead or select an arbitrary first match.
-      let constructed=0;
-      const issues:string[]=[];
-      for(const companion of extracted.companionCandidates){
-        const candidate=extractSourceInvariantDescriptor(target,contract,method,
-          input.declarations,indexed,companion);
-        if(!candidate.ok){issues.push(companion+':'+candidate.reason);continue;}
-        const built=constructCoreInvariantExperiment(candidate.invariant,target,contract,
-          input.declarations,indexed);
-        if(built){choices.push(built);constructed++;}
-        else issues.push(companion+':fixture_construction_failed');
-      }
-      if(!constructed)invariantUnresolved={category:extracted.category,
-        reason:issues.join('; ').slice(0,900)};
-    } else {
-      invariantUnresolved = { category: extracted.category, reason: extracted.reason };
     }
+    if(invariantUnresolved&&!choices.length)
+      invariantUnresolved.reason=issues.slice(0,18).join('; ').slice(0,1500);
   }
 
   if (!choices.length) {
