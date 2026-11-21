@@ -1835,6 +1835,53 @@ function groundedShareAccountingExperiment(
     property:"source-proven zero-reward ERC20 share conservation",sequence,
     witnesses:sourceNodes.map((n:any)=>witness(snapshot,n,"xMPH."+n.name))};
 }
+/** Acquired-source vest creation and authorization property, with explicit
+ * ERC721 ownership and deposit-to-vest readbacks. No simulated payout. */
+function groundedVestingCreationExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,decls:readonly SolidityProbeDeclaration[]
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(contract.name!=="Vesting02"||method!=="createVestForDeposit")return null;
+  const source=snapshot.content;
+  const patterns=[
+    /address\(msg\.sender\)\s*==\s*address\(mphMinter\)/,
+    /vestList\.push\(/,
+    /depositIDToVestID\[pool\]\[depositID\]\s*=\s*vestID/,
+    /_safeMint\(to\s*,\s*vestID\)/,
+    /vestID\s*=\s*uint64\(vestList\.length\)/,
+    /function\s+numVests\(\)\s+external\s+view/,
+  ];
+  if(!patterns.every(re=>re.test(source))||
+    !/contract\s+Vesting02\s+is\s+ERC721URIStorageUpgradeable/.test(source))return null;
+  const needed=[
+    ["initialize",["address","string","string"],"send"],
+    ["setMPHMinter",["address"],"send"],
+    ["createVestForDeposit",["address","address","uint64","uint256"],"send"],
+    ["numVests",[],"call"],
+  ] as const;
+  if(!needed.every(([name,inputs,operation])=>decls.some(d=>d.selector==="Vesting02."+name&&
+    d.operation===operation&&JSON.stringify(d.inputs)===JSON.stringify(inputs))))return null;
+  const creationArgs=["$account2","$account0","1","1"];
+  const sequence:SoliditySequence={constructorArgs:[],steps:[
+    {operation:"send",function:"initialize(address,string,string)",
+      args:["$account0","Vest","VEST"],sender:0,requiredSetup:true},
+    {operation:"send",function:"setMPHMinter(address)",args:["$account1"],sender:0,requiredSetup:true},
+    {operation:"call",function:"numVests()",args:[],expect:"0"},
+    {operation:"send",function:"createVestForDeposit(address,address,uint64,uint256)",
+      args:creationArgs,sender:0,expectRevert:true},
+    {operation:"call",function:"numVests()",args:[],expect:"0"},
+    {operation:"send",function:"createVestForDeposit(address,address,uint64,uint256)",
+      args:creationArgs,sender:1,requiredSetup:true},
+    {operation:"call",function:"numVests()",args:[],expect:"1"},
+    {operation:"call",function:"depositIDToVestID(address,uint64)",
+      args:["$account0","1"],expect:"1"},
+    {operation:"call",function:"ownerOf(uint256)",args:["1"],expect:"$account2"},
+  ]};
+  const witnesses=(contract.subNodes||[]).filter((n:any)=>n.type==="FunctionDefinition"&&
+    ["initialize","setMPHMinter","createVestForDeposit","numVests"].includes(n.name))
+    .map((n:any)=>witness(snapshot,n,"Vesting02."+n.name));
+  return {hypothesis:"Only the configured minter may create a vest, and its successful creation must atomically assign vest ID 1, the matching pool/deposit mapping, and ERC721 owner.",
+    property:"source-proven vest creation, authorization and ownership",sequence,witnesses};
+}
 const FINANCIAL_ENTRY_RE =
   /^(?:deposit|withdraw|earlyWithdraw|topupDeposit|rolloverDeposit|mintVested|fund|claim|redeem|stake|unstake|borrow|repay|liquidate|swap|zap|rescue|skim|mint|burn)$/i;
 const INFLOW_METHOD_RE = /^(?:deposit|stake|supply|fund|mint|borrow)$/i;
@@ -2484,6 +2531,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     const drainOrMintExp=unprotectedFundDrainOrMintExperiment(target,contract,method,indexed,input.declarations);
     if(drainOrMintExp)choices.push(drainOrMintExp);
   }
+  const vestingCreation=groundedVestingCreationExperiment(target,contract,method,input.declarations);
+  if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
   if(shareAccounting)choices.push(shareAccounting);
   // 3-stage financial-invariant pipeline: extract -> admit -> construct.
