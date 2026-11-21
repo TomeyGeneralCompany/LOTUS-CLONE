@@ -1,5 +1,6 @@
 /** Deterministic, source-identified preparation graph. No guessed protocol behavior. */
 import {parse} from "@solidity-parser/parser";
+import {posix} from "node:path";
 import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
 export interface PreparedDeployment {id:string;file:string;contract:string;constructorArgs:string[];}
 export interface FixtureSourceWitness {file:string;line:number;contract:string;sourceSha256?:string;parameter?:string;stateVariable?:string;}
@@ -55,6 +56,53 @@ function initializerStateBindings(node:any):Array<{parameter:string;receiver:str
     }
   }
   return out;
+}
+export interface AcquiredConcreteImplementation {
+  path:string;contract:string;selector:string;sourceSha256:string;
+  witness:string;
+}
+/** Map an abstract/interface function into actual acquired source, never
+ * synthesize a behavior-bearing mock or assume an external dependency exists.
+ * Only a direct source-declared implementation and verifiable import/inheritance
+ * edge are eligible for isolated execution.
+ */
+export function resolveAcquiredConcreteImplementations(
+  abstractSource:SourceSnapshot,abstractContract:string,method:string,
+  sources:readonly SourceSnapshot[],
+):AcquiredConcreteImplementation[]{
+  const ast=astOf(abstractSource);
+  if(!(ast?.children||[]).some((x:any)=>x.type==="ContractDefinition"&&x.name===abstractContract))
+    return [];
+  const result:AcquiredConcreteImplementation[]=[];
+  for(const source of sources){
+    const parsed=astOf(source);if(!parsed)continue;
+    const sameFile=source.path===abstractSource.path;
+    const imports=(parsed.children||[]).filter((x:any)=>x.type==="ImportDirective"&&
+      typeof x.path==="string");
+    const imported=imports.some((x:any)=>{
+      const ref=String(x.path);
+      return ref.startsWith(".") &&
+        posix.normalize(posix.join(posix.dirname(source.path),ref))===abstractSource.path &&
+        (!Array.isArray(x.symbolAliases)||!x.symbolAliases.length||
+          x.symbolAliases.some(([name,alias]:[string,string|null])=>
+            name===abstractContract||(alias||name)===abstractContract));
+    });
+    if(!sameFile&&!imported)continue;
+    for(const node of (parsed.children||[]).filter((x:any)=>x.type==="ContractDefinition")){
+      if(!isConcrete(node)||node.name===abstractContract)continue;
+      const base=(node.baseContracts||[]).some((b:any)=>
+        b.baseName?.namePath===abstractContract);
+      if(!base)continue;
+      const fn=(node.subNodes||[]).find((x:any)=>x.type==="FunctionDefinition"&&
+        x.name===method&&x.body&&["external","public"].includes(x.visibility));
+      if(!fn)continue;
+      result.push({path:source.path,contract:node.name,
+        selector:node.name+"."+method,sourceSha256:source.sha256,
+        witness:source.path+":"+source.sha256+":"+
+          String(fn.loc?.start?.line||1)+":"+String(fn.loc?.end?.line||1)});
+    }
+  }
+  return result.sort((a,b)=>a.path.localeCompare(b.path)||a.contract.localeCompare(b.contract));
 }
 export function resolveSourceFixtureDependencies(
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
