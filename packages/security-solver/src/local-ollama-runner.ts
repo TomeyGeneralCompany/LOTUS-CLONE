@@ -530,7 +530,8 @@ export async function runLocalAudit(
           stageLock.discover(id);
           stagedPlans.push({id,plan});
         }
-        analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses);
+        analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses,
+          exp.path!==lead.path);
         added++;repairAdded++;
         await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
           leadId:lead.id,experimentId:id,property:exp.securityProperty,
