@@ -10,6 +10,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
+import {resolveSourceFixtureDependencies} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -131,6 +132,39 @@ async function run(){
     assert.equal(pending.counts.unresolvedIds.length,3);
     assert.throws(()=>pending.markExperimentCompleted(hash('unmatched')),
       /ANALYSIS_EXPERIMENT_ID_UNMATCHED/);
+    // Source-typed, recursive fixture chain: Vault -> Adapter -> Token.
+    const vaultSource='pragma solidity ^0.8.0; contract Vault { IAdapter public adapter; function initialize(address _adapter) external { adapter = IAdapter(_adapter); } }';
+    const adapterSource='pragma solidity ^0.8.0; contract Adapter is IAdapter { constructor(Token token) {} }';
+    const tokenSource='pragma solidity ^0.8.0; contract Token { }';
+    const fixtureSources=[
+      {path:'source-1/contracts/Vault.sol',sha256:hash(vaultSource),content:vaultSource},
+      {path:'source-1/contracts/Adapter.sol',sha256:hash(adapterSource),content:adapterSource},
+      {path:'source-1/contracts/Token.sol',sha256:hash(tokenSource),content:tokenSource},
+    ];
+    const fixture=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',fixtureSources);
+    assert.equal(fixture.status,'resolved');
+    if(fixture.status==='resolved'){
+      assert.equal(fixture.deployments.length,2);
+      assert.deepEqual(fixture.deployments.map(x=>x.contract),['Token','Adapter']);
+      assert.equal(fixture.substitutions._adapter,'$deployment:dependency2');
+      assert.equal(fixture.bindings[0].receiver,'adapter');
+      assert.ok(fixture.witnesses.some(x=>x.sourceSha256===fixtureSources[0].sha256));
+    }
+    const ambiguousSource='pragma solidity ^0.8.0; contract AdapterTwo is IAdapter {}';
+    const ambiguous=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
+      ...fixtureSources,{path:'source-1/contracts/AdapterTwo.sol',content:ambiguousSource,sha256:hash(ambiguousSource)}]);
+    assert.equal(ambiguous.status,'unresolved');
+    if(ambiguous.status==='unresolved')
+      assert.ok(ambiguous.missingDependencies.some(x=>x.includes('ambiguous_implementation')));
+    const cycA='pragma solidity ^0.8.0; contract CycA { constructor(CycB dependency) {} }';
+    const cycB='pragma solidity ^0.8.0; contract CycB { constructor(CycA dependency) {} }';
+    const cycleSources=[
+      {path:'source-1/contracts/CycA.sol',content:cycA,sha256:hash(cycA)},
+      {path:'source-1/contracts/CycB.sol',content:cycB,sha256:hash(cycB)}];
+    const cycle=resolveSourceFixtureDependencies(cycleSources[0],'CycA',cycleSources);
+    assert.equal(cycle.status,'unresolved');
+    if(cycle.status==='unresolved')
+      assert.ok(cycle.missingDependencies.some(x=>x.includes('dependency_cycle')));
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);
