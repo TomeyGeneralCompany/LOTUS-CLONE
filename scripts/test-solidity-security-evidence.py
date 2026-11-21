@@ -316,6 +316,39 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                 {"sequence":{"steps":vestreq}})
             self.assertEqual(vestout[0],"behavior_not_observed")
             self.assertEqual(vestout[1],"vest_creation_negative")
+            # Exact laptop evidence: the verifier resolved $account2 into the
+            # third EVM signer. A placeholder is not a failed ownership assertion.
+            vest_with_setup=[
+                {"operation":"send","function":"initialize(address,string,string)",
+                 "sender":0,"reverted":False,"passed":True},
+                {"operation":"send","function":"setMPHMinter(address)",
+                 "sender":0,"reverted":False,"passed":True},
+                *veststeps,
+            ]
+            vest_source_requests=[
+                {"operation":"send","function":"initialize(address,string,string)",
+                 "sender":0},
+                {"operation":"send","function":"setMPHMinter(address)",
+                 "sender":0},
+                *vestreq,
+            ]
+            vest_source_requests[-1]["expect"]="$account2"
+            observed=security_experiment_disposition(root,vest,
+                "Vesting02.createVestForDeposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":vest_with_setup},
+                {"sequence":{"steps":vest_source_requests}})
+            self.assertEqual(observed[0],"behavior_not_observed",
+                "The exact 9-step laptop trace had all nine asserted steps pass")
+            self.assertEqual(observed[1],"vest_creation_negative")
+            wrong_owner=[dict(x) for x in vest_with_setup]
+            wrong_owner[-1]["actual"]=ACCOUNTS[1]
+            wrong_owner[-1]["passed"]=False
+            wrong=security_experiment_disposition(root,vest,
+                "Vesting02.createVestForDeposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":wrong_owner},
+                {"sequence":{"steps":vest_source_requests}})
+            self.assertEqual(wrong[0],"observation_only",
+                "An actual failed ownership assertion must not certify a negative")
             vestmissing=veststeps[:-1]
             self.assertEqual(security_experiment_disposition(root,vest,
                 "Vesting02.createVestForDeposit",
