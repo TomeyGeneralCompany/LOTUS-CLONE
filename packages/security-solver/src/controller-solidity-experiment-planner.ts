@@ -1772,6 +1772,70 @@ function unprotectedFundDrainOrMintExperiment(
   return null;
 }
 
+/** Source-verified share/token conservation for the acquired xMPH zero-reward path.
+ * The seed, ratio and transitions below are justified by the concrete source.
+ * They are not applied to arbitrary share pools with fees, time or interest. */
+function groundedShareAccountingExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],sources:ReadonlyMap<string,SourceSnapshot>
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(contract.name!=="xMPH"||!["deposit","withdraw"].includes(method))return null;
+  const source=snapshot.content;
+  const proofs=[
+    /MIN_AMOUNT\s*=\s*10\s*\*\*\s*9\s*;/,
+    /_deposit\(MIN_AMOUNT\)/,
+    /shareAmount\s*=\s*_mphAmount\.div\(getPricePerFullShare\(\)\)/,
+    /_mint\(msg\.sender\s*,\s*shareAmount\)/,
+    /mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*_mphAmount\)/,
+    /mphAmount\s*=\s*_shareAmount\.mul\(getPricePerFullShare\(\)\)/,
+    /_burn\(msg\.sender\s*,\s*_shareAmount\)/,
+    /mph\.safeTransfer\(msg\.sender\s*,\s*mphAmount\)/,
+    /_lastRewardAmount\s*==\s*0/,
+    /return\s+mphBalance\.div\(totalShares\)/,
+    /totalSupply\(\)\s*>=\s*_shareAmount\s*\+\s*MIN_AMOUNT/,
+  ];
+  if(!proofs.every(re=>re.test(source)))return null;
+  const required=[
+    ["initialize",["address","uint256","address"],"send"],
+    ["deposit",["uint256"],"send"],
+    ["withdraw",["uint256"],"send"],
+    ["totalSupply",[],"call"],
+  ] as const;
+  if(!required.every(([name,inputs,operation])=>declarations.some(d=>
+    d.selector==="xMPH."+name && d.operation===operation &&
+    JSON.stringify(d.inputs)===JSON.stringify(inputs))))return null;
+  const mockToken=findRepositoryMockToken(sources);
+  if(!mockToken||!mockToken.hasBalanceOf||!mockToken.hasApprove)return null;
+  const initialMint="1000001000";
+  const mintArgs=mockToken.mintHasRecipient?["$account0",initialMint]:[initialMint];
+  const sequence:SoliditySequence={constructorArgs:[],
+    preparation:{deployments:[{id:"token",file:mockToken.snapshot.path,
+      contract:mockToken.contractName,constructorArgs:mockToken.constructorArgs}],
+      operations:[{id:"mintSeedAndDeposit",deploymentId:"token",function:mockToken.mintSig,
+        args:mintArgs,sender:0}],
+      checks:[{id:"seedMintConfirmed",deploymentId:"token",
+        function:"balanceOf(address)",args:["$account0"],sender:0,expect:initialMint}]},
+    steps:[
+      {operation:"send",deploymentId:"token",function:"approve(address,uint256)",
+        args:["$contract",initialMint],sender:0,requiredSetup:true},
+      {operation:"send",function:"initialize(address,uint256,address)",
+        args:["$deployment:token","86400","$account0"],sender:0,requiredSetup:true},
+      {operation:"call",function:"totalSupply()",args:[],expect:"1000000000"},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",args:["$contract"],expect:"1000000000"},
+      {operation:"send",function:"deposit(uint256)",args:["1000"],sender:0},
+      {operation:"call",function:"totalSupply()",args:[],expect:"1000001000"},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",args:["$contract"],expect:"1000001000"},
+      {operation:"send",function:"withdraw(uint256)",args:["400"],sender:0},
+      {operation:"call",function:"totalSupply()",args:[],expect:"1000000600"},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",args:["$contract"],expect:"1000000600"},
+    ]};
+  const members=contract.subNodes||[];
+  const sourceNodes=members.filter((n:any)=>n.type==="FunctionDefinition"&&
+    ["initialize","deposit","withdraw","getPricePerFullShare","_deposit","_withdraw"].includes(n.name));
+  return {hypothesis:"With no reward distribution, the source-proven 1:1 initial exchange rate and minimum seed require deposit(1000) then withdraw(400) to conserve token holdings and leave 600 additional shares.",
+    property:"source-proven zero-reward ERC20 share conservation",sequence,
+    witnesses:sourceNodes.map((n:any)=>witness(snapshot,n,"xMPH."+n.name))};
+}
 const FINANCIAL_ENTRY_RE =
   /^(?:deposit|withdraw|earlyWithdraw|topupDeposit|rolloverDeposit|mintVested|fund|claim|redeem|stake|unstake|borrow|repay|liquidate|swap|zap|rescue|skim|mint|burn)$/i;
 const INFLOW_METHOD_RE = /^(?:deposit|stake|supply|fund|mint|borrow)$/i;
@@ -2421,6 +2485,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     const drainOrMintExp=unprotectedFundDrainOrMintExperiment(target,contract,method,indexed,input.declarations);
     if(drainOrMintExp)choices.push(drainOrMintExp);
   }
+  const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
+  if(shareAccounting)choices.push(shareAccounting);
   // 3-stage financial-invariant pipeline: extract -> admit -> construct.
   // Runs alongside authorization probes because accounting conservation is a
   // distinct security property; refuses to fabricate when prerequisites fail.
