@@ -1391,7 +1391,7 @@ function isTestOrMockPath(path:string):boolean {
  * Public state variables generate Solidity getters even though there is no
  * FunctionDefinition AST body for them.
  */
-function canonicalAbiType(node:any):string {
+function canonicalShapeType(node:any):string {
   if(!node)return '';
   if(node.type==='ElementaryTypeName'){
     const name=String(node.name||'');
@@ -1399,16 +1399,16 @@ function canonicalAbiType(node:any):string {
   }
   if(node.type==='UserDefinedTypeName')return 'address';
   if(node.type==='ArrayTypeName'){
-    const base=canonicalAbiType(node.baseTypeName);
+    const base=canonicalShapeType(node.baseTypeName);
     const literal=node.length?.number;
     return base+'['+(literal===undefined?'':literal)+']';
   }
-  if(node.type==='Mapping')return canonicalAbiType(node.valueType);
+  if(node.type==='Mapping')return canonicalShapeType(node.valueType);
   return '';
 }
 function canonicalFunctionIdentity(fn:any):string {
   return String(fn.name||'')+'('+((fn.parameters||[]).map((p:any)=>
-    canonicalAbiType(p.typeName)).join(','))+')';
+    canonicalShapeType(p.typeName)).join(','))+')';
 }
 function publicGetterIdentities(variable:any):string[] {
   if(variable.visibility!=='public'||!variable.name)return [];
@@ -1416,7 +1416,7 @@ function publicGetterIdentities(variable:any):string[] {
   let type=variable.typeName;
   while(type?.type==='Mapping'||type?.type==='ArrayTypeName'){
     if(type.type==='Mapping'){
-      keys.push(canonicalAbiType(type.keyType));
+      keys.push(canonicalShapeType(type.keyType));
       type=type.valueType;
     } else {
       keys.push('uint256');type=type.baseTypeName;
