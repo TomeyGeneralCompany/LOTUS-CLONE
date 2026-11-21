@@ -12,7 +12,17 @@ function validateSequence(s) {
   };
   const args = a => {if(!Array.isArray(a)||a.length>32)throw new Error('Invalid ABI arguments');a.forEach(v=>value(v));};
   const wei = v => {if(v!==undefined && (typeof v!=='string'||!/^(0|[1-9][0-9]{0,29})$/.test(v)))throw new Error('Invalid wei amount');};
-  object(s,['constructorArgs','steps'],['constructorArgs','constructorValueWei','steps','deployment','preparation']);
+  object(s,['constructorArgs','steps'],['constructorArgs','constructorValueWei','steps','deployment','preparation','sourceProperty']);
+  if(s.sourceProperty!==undefined){
+    const p=s.sourceProperty;
+    object(p,['kind','state','method','parameter','amount','direction','sourceSha256']);
+    if(p.kind!=='scalar_delta'||p.direction!=='increase'||
+      !/^[A-Za-z_]\w*$/.test(p.state)||!/^[A-Za-z_]\w*$/.test(p.parameter)||
+      !/^[A-Za-z_]\w*\([A-Za-z0-9_,()[\]]*\)$/.test(p.method)||
+      !/^(0|[1-9][0-9]{0,29})$/.test(p.amount)||
+      !/^[a-f0-9]{64}$/.test(p.sourceSha256))
+      throw new Error('Invalid source-identified scalar obligation');
+  }
   if(s.deployment!==undefined) {
     object(s.deployment,['file','contract']);
     if(typeof s.deployment.file!=='string' || s.deployment.file.length>512 ||
