@@ -375,10 +375,17 @@ export async function runLocalAudit(
         candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
         candidate.hypothesis===entry.plan.hypothesis &&
         JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence)));
+      const inventoryEntry=analysisProgressStore.candidates.find(x=>x.id===lead.id);
+      const highRiskPending=!!inventoryEntry?.selectionReasons.some(x=>
+        x.startsWith("financial_entrypoint")||x.startsWith("shared_state_coupling"));
+      // A proven unsupported nonfinancial function is terminal; a financial
+      // lead without a constructible invariant remains actionable and pending.
+      const unresolvedAssessment=(detail?.unresolvedReasons||[]).filter(reason=>
+        highRiskPending||!reason.startsWith("UNKNOWN_ASSERTION(no_supported_property)"));
       analysisProgressStore.recordAssessment(
         lead.id,
         detail?.decision.matchedHypotheses.map(x=>x.id)||[],
-        [...(detail?.unresolvedReasons||[]),
+        [...unresolvedAssessment,
           ...(!detail?['analysis_result_missing']:[]),
           ...(detail?.constructionFeasibility.skippedReason==='missing_declarations'
             ?['source_abi_declarations_missing']:[]),
