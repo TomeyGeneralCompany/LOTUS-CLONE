@@ -2759,6 +2759,80 @@ function sourceScalarDeltaExperiments(
   return out;
 }
 
+
+/** Convert a verified initializer setup into the actual source-declared
+ * factory clone pathway when the acquired Factory implementation provides one.
+ * No inferred clone behavior, guessed parameter order, arbitrary initializer,
+ * or deployment from outside the source manifest is admissible.
+ */
+function sourceFactoryCloneExperiment(
+  candidate:{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]},
+  target:SourceSnapshot,contract:any,sources:ReadonlyMap<string,SourceSnapshot>
+):typeof candidate {
+  const sequence=candidate.sequence;
+  if(sequence.factoryClone)return candidate;
+  const setupIndex=sequence.steps.findIndex(step=>
+    step.operation==='send'&&step.requiredSetup===true&&
+    /^initialize\(/.test(step.function)&&!step.deploymentId);
+  if(setupIndex<0)return candidate;
+  const initStep=sequence.steps[setupIndex];
+  if(initStep.operation!=='send')return candidate;
+  const init=(contract.subNodes||[]).find((n:any)=>
+    n.type==='FunctionDefinition'&&n.name==='initialize'&&n.body&&
+    canonicalFunctionIdentity(n)===initStep.function);
+  if(!init)return candidate;
+  for(const factorySource of sources.values()){
+    if(!/(?:^|\/)Factory\.sol$/.test(factorySource.path)||isTestOrMockPath(factorySource.path))
+      continue;
+    let parsed:any;try{parsed=parseAstCached(factorySource);}catch{continue;}
+    const factory=(parsed.children||[]).find((n:any)=>
+      n.type==='ContractDefinition'&&n.name==='Factory'&&
+      n.kind!=='interface'&&n.kind!=='library');
+    if(!factory)continue;
+    const create=(factory.subNodes||[]).find((n:any)=>n.type==='FunctionDefinition'&&
+      n.name==='create'+contract.name&&n.body&&
+      ['external','public'].includes(n.visibility));
+    if(!create)continue;
+    const params:any[]=create.parameters||[];
+    const initParams:any[]=init.parameters||[];
+    if(params.length!==initParams.length+2||
+      params[0]?.name!=='template'||params[1]?.name!=='salt'||
+      canonicalAbiType(params[0]?.typeName)!=='address'||
+      canonicalAbiType(params[1]?.typeName)!=='bytes32')continue;
+    const factoryTypes=params.map(p=>canonicalAbiType(p.typeName));
+    if(factoryTypes.some(t=>!t))continue;
+    if(!initParams.every((p,i)=>p.name&&p.name===params[i+2].name&&
+      canonicalAbiType(p.typeName)===factoryTypes[i+2]))continue;
+    const factoryBody=body(factorySource.content,create);
+    // Explicit template.cloneDeterministic(salt) and the exact initializer
+    // argument vector must occur in the acquired source.
+    if(!/\btemplate\s*\.\s*cloneDeterministic\s*\(\s*salt\s*\)/.test(factoryBody))
+      continue;
+    const initMatch=factoryBody.match(/\bclone\s*\.\s*initialize\s*\(([\s\S]*?)\)\s*;/);
+    if(!initMatch)continue;
+    const specifiedArgs=initMatch[1].split(',').map(x=>x.trim());
+    if(JSON.stringify(specifiedArgs)!==JSON.stringify(initParams.map(p=>p.name)))
+      continue;
+    const preparation=sequence.preparation||{deployments:[],operations:[],checks:[]};
+    if(preparation.deployments.length>=8)continue;
+    const id='sourceFactory';
+    if(preparation.deployments.some(d=>d.id===id))continue;
+    const cloneMethod=create.name+'('+factoryTypes.join(',')+')';
+    const updated:SoliditySequence={
+      ...sequence,
+      preparation:{deployments:[...preparation.deployments,
+        {id,file:factorySource.path,contract:factory.name,constructorArgs:[]}],
+        operations:[...preparation.operations],checks:[...preparation.checks]},
+      factoryClone:{deploymentId:id,function:cloneMethod,
+        args:['$contract',ZERO_BYTES32,...initStep.args],sender:0},
+      steps:sequence.steps.filter((_,i)=>i!==setupIndex),
+    };
+    return {...candidate,sequence:updated,witnesses:[
+      ...candidate.witnesses,witness(factorySource,create,'Factory.'+cloneMethod)]};
+  }
+  return candidate;
+}
+
 export function constructSolidityExperiments(input:ConstructionInput):ConstructionResult {
   if(!/^[a-f0-9]{40}$/.test(input.repositoryCommit))
     return {ok:false,code:'INVALID_COMMIT',detail:'Expected a source commit SHA'};
@@ -2906,7 +2980,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     };
   }
   const seen=new Set<string>(),out:PreparedSecurityExperiment[]=[];
-  for(const c of choices) {
+  for(const original of choices) {
+    const c=sourceFactoryCloneExperiment(original,target,contract,indexed);
     const prereqs:PreparationPrerequisite[]=[];
     const graph=orderPreparation(prereqs);
     if(!graph.ok)return {ok:false,code:graph.code,detail:graph.detail};
