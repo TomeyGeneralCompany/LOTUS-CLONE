@@ -1387,22 +1387,59 @@ function isTestOrMockPath(path:string):boolean {
     /\.t\.sol$/i.test(norm);
 }
 
-function isAbstractContractNode(contract:any,chain:readonly ContractEntry[]=[]):boolean {
-  if(!contract||(contract.kind&&contract.kind!=='contract'))return true;
-  if((contract.subNodes||[]).some((n:any)=>n.type==='FunctionDefinition'&&!n.body))return true;
-  if(chain.length>1){
-    const implemented=new Set<string>();
-    for(const e of chain){
-      for(const n of e.contract.subNodes||[]){
-        if(n.type==='FunctionDefinition'&&n.body&&n.name)implemented.add(n.name);
-      }
-    }
-    for(const e of chain){
-      for(const n of e.contract.subNodes||[]){
-        if(n.type==='FunctionDefinition'&&!n.body&&n.name&&!implemented.has(n.name))return true;
-      }
+/** ABI argument identity is necessary for overload-safe abstract fulfillment.
+ * Public state variables generate Solidity getters even though there is no
+ * FunctionDefinition AST body for them.
+ */
+function canonicalAbiType(node:any):string {
+  if(!node)return '';
+  if(node.type==='ElementaryTypeName'){
+    const name=String(node.name||'');
+    return name==='uint'?'uint256':name==='int'?'int256':name==='address payable'?'address':name;
+  }
+  if(node.type==='UserDefinedTypeName')return 'address';
+  if(node.type==='ArrayTypeName'){
+    const base=canonicalAbiType(node.baseTypeName);
+    const literal=node.length?.number;
+    return base+'['+(literal===undefined?'':literal)+']';
+  }
+  if(node.type==='Mapping')return canonicalAbiType(node.valueType);
+  return '';
+}
+function canonicalFunctionIdentity(fn:any):string {
+  return String(fn.name||'')+'('+((fn.parameters||[]).map((p:any)=>
+    canonicalAbiType(p.typeName)).join(','))+')';
+}
+function publicGetterIdentities(variable:any):string[] {
+  if(variable.visibility!=='public'||!variable.name)return [];
+  const keys:string[]=[];
+  let type=variable.typeName;
+  while(type?.type==='Mapping'||type?.type==='ArrayTypeName'){
+    if(type.type==='Mapping'){
+      keys.push(canonicalAbiType(type.keyType));
+      type=type.valueType;
+    } else {
+      keys.push('uint256');type=type.baseTypeName;
     }
   }
+  return [variable.name+'('+keys.join(',')+')'];
+}
+function isAbstractContractNode(contract:any,chain:readonly ContractEntry[]=[]):boolean {
+  if(!contract||(contract.kind&&contract.kind!=='contract'))return true;
+  if(contract.abstract===true)return true;
+  const nodes=(chain.length?chain.map(e=>e.contract):[contract])
+    .flatMap((c:any)=>c.subNodes||[]);
+  const implemented=new Set<string>();
+  for(const n of nodes){
+    if(n.type==='FunctionDefinition'&&n.body&&n.name)
+      implemented.add(canonicalFunctionIdentity(n));
+    if(n.type==='StateVariableDeclaration')
+      for(const v of n.variables||[])
+        for(const id of publicGetterIdentities(v))implemented.add(id);
+  }
+  for(const n of nodes)
+    if(n.type==='FunctionDefinition'&&!n.body&&n.name&&
+      !implemented.has(canonicalFunctionIdentity(n)))return true;
   return false;
 }
 
