@@ -2680,6 +2680,85 @@ export function constructCoreInvariantExperiment(
   };
 }
 
+
+/** General source-defined public scalar increment, independent of function
+ * names. The isolated EVM will verify the actual prestate, transaction receipt
+ * and poststate, while the independent verifier checks the source predicate.
+ * Never infer security behavior from a mock or an external protocol call.
+ */
+function sourceScalarDeltaExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const publicCounters=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      v.visibility==='public'&&identifier.test(v.name||'')&&
+      v.typeName?.type==='ElementaryTypeName'&&
+      /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||'')&&!v.expression);
+  if(!publicCounters.length)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,
+    sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const constructor=nodes.find(n=>n.type==='FunctionDefinition'&&n.isConstructor);
+  const bodySource=snapshot.content;
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name===method&&
+    ['public','external'].includes(n.visibility))){
+    const inputs=(fn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
+    if(inputs.length!==1||!inputs[0]||!/^uint(?:[0-9]{1,3})?$/.test(inputs[0]))continue;
+    const param=fn.parameters[0];
+    if(!identifier.test(param.name||''))continue;
+    const signature=fn.name+'('+inputs[0]+')';
+    if(!declarations.some(d=>d.operation==='send'&&
+      d.selector===contract.name+'.'+method&&
+      JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
+    const modifiers=(fn.modifiers||[]).map((m:any)=>String(m.name||''));
+    if(modifiers.some((m:string)=>/(?:only|owner|admin|auth|role|minter|permission)/i.test(m)))continue;
+    const fnText=body(bodySource,fn)
+      .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
+    // Other contract calls create additional fixture prerequisites. Refuse until
+    // their actual implementations and preconditions have been connected.
+    if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText))continue;
+    for(const state of publicCounters){
+      if(constructor&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,constructor)))continue;
+      if(setup.initSignature){
+        const init=nodes.find(n=>n.type==='FunctionDefinition'&&
+          (n.name==='initialize'||n.name==='init')&&n.body);
+        if(init&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,init)))continue;
+      }
+      const statement=new RegExp('\\b'+state.name+'\\s*\\+=\\s*'+param.name+'\\s*;');
+      if(!statement.test(fnText))continue;
+      const getter=state.name+'()';
+      const width=Number(inputs[0].replace(/\D/g,''))||256;
+      const amount=width<=8?'100':'1000';
+      const steps:SoliditySequence['steps']=[];
+      if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
+        args:setup.initArgs,sender:0,requiredSetup:true});
+      steps.push({operation:'call',function:getter,args:[],expect:'0'});
+      steps.push({operation:'send',function:signature,args:[amount],sender:0});
+      steps.push({operation:'call',function:getter,args:[],expect:amount});
+      out.push({
+        hypothesis:'Source-declared increment of '+state.name+' by '+param.name+
+          ' must produce '+amount+' from an initial zero state for '+contract.name+'.'+signature,
+        property:'source-defined bounded scalar conservation '+contract.name+'.'+signature+':'+state.name,
+        sequence:{constructorArgs:setup.constructorArgs,
+          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+          sourceProperty:{kind:'scalar_delta',state:state.name,method:signature,
+            parameter:param.name,amount,direction:'increase',sourceSha256:snapshot.sha256},
+          steps},
+        witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
+          witness(snapshot,state,contract.name+'.'+state.name)],
+      });
+    }
+  }
+  return out;
+}
+
 export function constructSolidityExperiments(input:ConstructionInput):ConstructionResult {
   if(!/^[a-f0-9]{40}$/.test(input.repositoryCommit))
     return {ok:false,code:'INVALID_COMMIT',detail:'Expected a source commit SHA'};
@@ -2744,6 +2823,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     const drainOrMintExp=unprotectedFundDrainOrMintExperiment(target,contract,method,indexed,input.declarations);
     if(drainOrMintExp)choices.push(drainOrMintExp);
   }
+  for(const scalar of sourceScalarDeltaExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(scalar);
   const vestingCreation=groundedVestingCreationExperiment(target,contract,method,input.declarations);
   if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
