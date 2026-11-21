@@ -92,7 +92,7 @@ export class AnalysisProgressStore {
       // Keep genuine source-bound evidence intact for reproducible continuation.
       const legacyMissingEvidence=(r.experimentIds.length>0&&!r.experimentEvidence?.length)||
         r.properties.some(p=>p.experimentIds.length>0&&!p.sourceWitnesses.length);
-      if(legacyMissingEvidence || (parsed.version<4 &&
+      if((parsed.version<4 && legacyMissingEvidence) || (parsed.version<4 &&
         !store.isConclusive(r) && ["dependencies_pending","analysis_exhausted","blocked"].includes(r.lifecycle))){
         r.lifecycle="queued";
         r.properties=[];
