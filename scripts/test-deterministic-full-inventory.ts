@@ -118,10 +118,13 @@ async function run(){
     pending.recordAssessment(one[0].id,['negative'],[],[hash('done-negative')]);
     pending.recordAssessment(one[1].id,['positive'],[],[hash('done-positive')]);
     pending.recordAssessment(one[2].id,['unsupported'],[],[]);
-    pending.recordAssessment(one[3].id,['money-market'],['unresolved_money_market'],[]);
+    pending.recordAssessment(one[3].id,['money-market'],['unresolved_money_market'],[hash('completed-other')]);
     pending.recordAssessment(one[4].id,['withdraw'],[],[hash('unexecuted')]);
     pending.markExperimentCompleted(hash('done-negative'));
     pending.markExperimentCompleted(hash('done-positive'));
+    pending.markExperimentCompleted(hash('completed-other'));
+    assert.equal(pending.records.get(one[3].id)?.lifecycle,'dependencies_pending',
+      'A completed role test must not resolve an unrelated missing financial prerequisite');
     await pending.save();
     assert.equal(pending.counts.queued,1);
     assert.equal(pending.counts.dependenciesPending,1);
