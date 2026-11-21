@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - main
+      - repair/dossier-full-experiment-engine
   workflow_dispatch:
 
 permissions:
@@ -11,8 +12,8 @@ permissions:
   actions: read
 
 concurrency:
-  group: lotus-laptop-feedback
-  cancel-in-progress: false
+  group: lotus-laptop-feedback-${{ github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 jobs:
   laptop:
@@ -155,8 +156,19 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      - name: Enforce real-world PR laptop acceptance
+        if: always() && github.ref_name != 'main'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          code="$(cat data/repair-feedback/exit-code.txt 2>/dev/null || echo SETUP_FAILED)"
+          if [[ "$code" != "0" ]]; then
+            echo "PR_LAPTOP_REAL_WORLD_UNVERIFIED: exit=$code. Inspect uploaded complete evidence." >&2
+            exit 1
+          fi
+
       - name: Open actionable repair ticket on failure
-        if: always()
+        if: always() && github.ref_name == 'main'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
