@@ -1180,7 +1180,27 @@ export async function runLocalAudit(
       if(stageLock?.currentStage==='EXPERIMENT' &&
         stageLock.completedCount===stageLock.candidateCount &&
         !workflow?.snapshot().pending){
-        stageLock.completeExperiments();
+        if(!analysisProgressStore)throw new Error("EXPERIMENT_CANDIDATE_STORE_MISSING");
+        const certificate=analysisProgressStore.experimentCertificate;
+        const inconclusive=stageLock.outcomeCounts;
+        if(certificate.unresolvedIds.length || inconclusive.observation_only ||
+          inconclusive.incomplete || inconclusive.unsupported || inconclusive.rejected){
+          await analysisProgressStore.save();
+          await appendFile(logFile,'[EXPERIMENT_GATE_BLOCKED] '+JSON.stringify({
+            required:certificate.total,conclusive:certificate.conclusive,
+            unresolved:certificate.unresolvedIds.length,
+            pendingLeadIds:certificate.unresolvedIds,
+            reasons:certificate.pendingReasons,
+            outcomes:inconclusive,
+            manifestDigest:certificate.manifestDigest,
+            evidenceDigest:certificate.evidenceDigest,
+            checkpoint:analysisProgressStore.path,
+          })+'\n');
+          throw new Error('EXPERIMENT_INCOMPLETE_SUSPENDED: '+
+            certificate.conclusive+'/'+certificate.total+' leads conclusively tested, '+
+            certificate.unresolvedIds.length+' unresolved; checkpoint '+analysisProgressStore.path);
+        }
+        stageLock.completeExperiments(certificate);
         limits.onExperimentLedger?.({selected:stageLock.candidateCount,
           resolved:stageLock.completedCount,outcomes:stageLock.outcomeCounts});
         await appendFile(logFile,'[EXPERIMENT_COMPLETE] '+
@@ -3509,7 +3529,13 @@ export async function runLocalAudit(
           stageLock.finishExperiment(activeStageCandidate,outcome);
           if(analysisProgressStore && (outcome==='observed'||outcome==='not_observed') &&
             [...analysisProgressStore.records.values()].some(r=>r.experimentIds.includes(activeStageCandidate!))){
-            analysisProgressStore.markExperimentCompleted(activeStageCandidate);
+            const parsed=JSON.parse(output) as {status:string;caseId?:string|null};
+            const verifierDigest=createHash('sha256').update(output).digest('hex');
+            const evidenceId=(typeof parsed.caseId==='string'&&parsed.caseId.length>0)
+              ?parsed.caseId:verifierDigest;
+            analysisProgressStore.markExperimentCompleted(activeStageCandidate,{
+              result:outcome,verifierDigest,evidenceId,
+            });
             await analysisProgressStore.save();
             limits.onCandidateCoverage?.(analysisProgressStore.counts);
           }
