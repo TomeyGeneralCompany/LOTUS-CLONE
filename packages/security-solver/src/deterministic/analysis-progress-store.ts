@@ -22,6 +22,12 @@ export interface CandidateProgress {
   properties:CandidatePropertyProgress[];
   experimentIds:string[]; lastError?:string;
 }
+export interface CandidateCoverage {
+  total:number; queued:number; admitted:number; dependenciesPending:number;
+  experimentsPending:number; experimentsCompleted:number; terminalExhausted:number;
+  blocked:number; unresolvedIds:string[]; unresolvedPrerequisites:Record<string,string[]>;
+}
+
 export interface AnalysisProgressSnapshot {
   version:1; inventoryFingerprint:string;
   candidateIds:string[]; records:CandidateProgress[];
@@ -71,7 +77,25 @@ export class AnalysisProgressStore {
     for(const id of parsed.completedExperimentIds||[])store.completedExperimentIds.add(id);
     return store;
   }
-  get remaining(){return [...this.records.values()].filter(x=>x.lifecycle==="queued").length;}
+  get counts():CandidateCoverage {
+    const records=[...this.records.values()];
+    const count=(state:CandidateLifecycle)=>records.filter(r=>r.lifecycle===state).length;
+    const unresolved=records.filter(r=>["queued","admitted","analyzing","dependencies_pending","experiment_pending"].includes(r.lifecycle));
+    return {
+      total:records.length,queued:count("queued"),
+      admitted:count("admitted")+count("analyzing"),
+      dependenciesPending:count("dependencies_pending"),
+      experimentsPending:count("experiment_pending"),
+      experimentsCompleted:count("experiment_completed"),
+      terminalExhausted:count("analysis_exhausted"),blocked:count("blocked"),
+      unresolvedIds:unresolved.map(r=>r.id).sort(),
+      unresolvedPrerequisites:Object.fromEntries(unresolved
+        .filter(r=>r.properties.some(p=>p.unresolvedPrerequisites.length))
+        .map(r=>[r.id,[...new Set(r.properties.flatMap(p=>p.unresolvedPrerequisites))]])),
+    };
+  }
+  get terminallyComplete(){return this.counts.unresolvedIds.length===0;}
+  get remaining(){return this.counts.queued;}
   get assessed(){return this.records.size-this.remaining;}
   nextBatch(maxAdmitted:number,maxPerFile:number):AnalysisCandidate[]{
     const eligible=this.candidates.filter(c=>this.records.get(c.id)?.lifecycle==="queued");
@@ -111,7 +135,11 @@ export class AnalysisProgressStore {
       record.lifecycle="analysis_exhausted";
     if(reason)record.lastError=reason;
   }
+  // A verifier completion is the only source of truth for experiment terminality.
+  // Rejected, incomplete and unsupported sequences remain unresolved.
   markExperimentCompleted(id:string){
+    if(![...this.records.values()].some(r=>r.experimentIds.includes(id)))
+      throw new Error("ANALYSIS_EXPERIMENT_ID_UNMATCHED: "+id);
     this.completedExperimentIds.add(id);
     for(const r of this.records.values())if(r.experimentIds.includes(id)){
       for(const p of r.properties)if(p.experimentIds.includes(id))p.state="test_completed";
