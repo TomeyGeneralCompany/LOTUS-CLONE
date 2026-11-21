@@ -31,6 +31,7 @@ export interface CandidateProgress {
   properties:CandidatePropertyProgress[];
   experimentIds:string[]; lastError?:string;
   experimentEvidence?:ExperimentEvidence[];
+  inconclusiveAttempts?:Array<{experimentId:string;status:string;evidenceId:string;reason:string}>;
   specialistAttempts?:Array<{adapter:string;status:string;reason:string;detail?:string}>;
 }
 export interface CandidateCoverage {
@@ -177,13 +178,13 @@ export class AnalysisProgressStore {
     for(const [index,reason] of [...new Set(unresolved)].entries())
       properties.push({id:id+":unresolved:"+index,state:"prerequisites_pending",
         sourceWitnesses:[],unresolvedPrerequisites:[reason],experimentIds:[]});
-    if(!properties.length)properties.push({id:id+":unsupported",state:"unsupported",
-      sourceWitnesses:[],unresolvedPrerequisites:[],experimentIds:[]});
+    if(!properties.length)properties.push({id:id+":needs_property",state:"prerequisites_pending",
+      sourceWitnesses:[],unresolvedPrerequisites:["source_grounded_falsifier_missing"],experimentIds:[]});
     record.properties=properties;
     record.experimentIds=[...new Set([...record.experimentIds,...uniqueExperiments])];
     record.specialistAttempts=specialistAttempts.map(x=>({...x}));
-    record.lifecycle=unresolved.length?"dependencies_pending":
-      uniqueExperiments.length?"experiment_pending":"analysis_exhausted";
+    record.lifecycle=(unresolved.length||!uniqueExperiments.length)?"dependencies_pending":
+      "experiment_pending";
   }
   markTerminalAssessment(id:string,reason?:string){
     const record=this.records.get(id);
@@ -215,6 +216,33 @@ export class AnalysisProgressStore {
         !r.properties.some(p=>p.state==="prerequisites_pending"))
         r.lifecycle="experiment_completed";
     }
+  }
+  recordInconclusive(id:string,status:string,evidenceId:string,reason:string){
+    if(!this.records.size)throw new Error("EMPTY_ANALYSIS_INVENTORY");
+    let matched=false;
+    for(const record of this.records.values()){
+      if(!record.experimentIds.includes(id))continue;
+      matched=true;
+      record.inconclusiveAttempts||=[];
+      record.inconclusiveAttempts.push({experimentId:id,status,evidenceId,reason:reason.slice(0,500)});
+      for(const property of record.properties)if(property.experimentIds.includes(id)){
+        property.state="prerequisites_pending";
+        const blocker="experiment_"+status+":"+id+":"+reason.slice(0,120);
+        if(!property.unresolvedPrerequisites.includes(blocker))property.unresolvedPrerequisites.push(blocker);
+      }
+      record.lifecycle="dependencies_pending";
+    }
+    if(!matched)throw new Error("INCONCLUSIVE_EXPERIMENT_UNMAPPED: "+id);
+  }
+  // A blocked property remains durable and eligible for a genuinely different
+  // source-backed experiment. Identical failed scripts cannot be counted twice.
+  nextRepairBatch(max:number):AnalysisCandidate[]{
+    const eligible=this.candidates.filter(c=>{
+      const record=this.records.get(c.id);
+      return record?.lifecycle==="dependencies_pending"&&
+        !record.properties.every(p=>p.state==="test_completed");
+    });
+    return eligible.slice(0,max);
   }
   async save():Promise<void>{
     const state:AnalysisProgressSnapshot={version:3,inventoryFingerprint:this.inventoryFingerprint,
