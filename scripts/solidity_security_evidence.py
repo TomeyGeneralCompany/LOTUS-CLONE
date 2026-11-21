@@ -305,6 +305,98 @@ def _unguarded_dangerous_primitive_observed(file: Path, selector: str, data: dic
     )
 
 
+
+def _asserted_financial_or_vesting_negative(
+    file: Path, selector: str, requested_steps: list, actual_steps: list
+) -> tuple[str, str] | None:
+    """A *bounded* falsifier that was actually executed with passing readbacks.
+
+    This never asserts protocol-wide absence of bugs. Only the acquired, exact
+    88mph operations for which the source-derived controller provides numeric
+    pre/post assertions can produce this negative disposition.
+    """
+    try:
+        source = file.read_text(encoding="utf8")
+    except OSError:
+        return None
+    contract, _, method = selector.partition(".")
+    families = {
+        ("xMPH", "deposit"): "share_accounting_negative",
+        ("xMPH", "withdraw"): "share_accounting_negative",
+        ("Vesting02", "createVestForDeposit"): "vest_creation_negative",
+    }
+    family = families.get((contract, method))
+    if not family or not re.search(r"\bcontract\s+" + re.escape(contract) + r"\b", source):
+        return None
+    if not re.search(r"\bfunction\s+" + re.escape(method) + r"\s*\(", source):
+        return None
+    if len(requested_steps) != len(actual_steps) or not requested_steps:
+        return None
+    for expected, observed in zip(requested_steps, actual_steps):
+        if expected.get("operation") != observed.get("operation"):
+            return None
+        if observed.get("operation") in ("send", "call") and observed.get("passed") is not True:
+            return None
+        if observed.get("operation") == "call" and (
+            "expect" not in expected or
+            str(expected["expect"]).lower() != str(observed.get("actual", "")).lower()
+        ):
+            return None
+    targeted = [i for i, (req, got) in enumerate(zip(requested_steps, actual_steps))
+                if req.get("operation") == "send"
+                and req.get("function", "").split("(", 1)[0] == method
+                and got.get("reverted") is False and got.get("passed") is True]
+    if not targeted:
+        return None
+    if family == "share_accounting_negative":
+        for index in targeted:
+            pre = actual_steps[:index]
+            post = actual_steps[index + 1:]
+            def paired_change(name: str, dependency: bool) -> bool:
+                before = [(r, a) for r, a in zip(requested_steps[:index], pre)
+                          if r.get("operation") == "call"
+                          and r.get("function") == name
+                          and bool(r.get("deploymentId")) == dependency]
+                after = [(r, a) for r, a in zip(requested_steps[index + 1:], post)
+                         if r.get("operation") == "call"
+                         and r.get("function") == name
+                         and bool(r.get("deploymentId")) == dependency]
+                return any(b_req.get("args") == a_req.get("args") and
+                           str(b_obs.get("actual")) != str(a_obs.get("actual"))
+                           for b_req, b_obs in before for a_req, a_obs in after)
+            if paired_change("totalSupply()", False) and paired_change("balanceOf(address)", True):
+                return family, (
+                    "Source-bound xMPH share and token-balance transitions passed "
+                    "pre/post numerical falsifiers in this isolated EVM sequence; "
+                    "the tested behavior was not a violation. This does not exclude "
+                    "untested amounts, timing, reward states or economic attacks."
+                )
+        return None
+    # Vest creation: only the designated minter succeeded; the unauthorized
+    # caller reverted, while ID mapping and recipient ownership were asserted.
+    index = next((i for i in targeted if requested_steps[i].get("sender") == 1), None)
+    if index is None:
+        return None
+    rejected = any(requested_steps[i].get("operation") == "send"
+                   and requested_steps[i].get("function", "").split("(", 1)[0] == method
+                   and requested_steps[i].get("expectRevert") is True
+                   and actual_steps[i].get("reverted") is True
+                   for i in range(index))
+    after = [(r, a) for r, a in zip(requested_steps[index + 1:], actual_steps[index + 1:])
+             if r.get("operation") == "call" and a.get("passed") is True]
+    names = {str(r.get("function")) for r, _ in after}
+    if not rejected or not {"numVests()", "depositIDToVestID(address,uint64)", "ownerOf(uint256)"}.issubset(names):
+        return None
+    if not any(str(a.get("actual")) == "1" and r.get("function") == "numVests()"
+               for r, a in after):
+        return None
+    return family, (
+        "Unauthorized vest creation reverted; authorized creation and the "
+        "source-linked vest count, deposit mapping and ERC721 ownership "
+        "assertions passed. Only this concrete EVM scenario is falsified."
+    )
+
+
 def security_experiment_disposition(
     repository: Path,
     file: Path,
@@ -333,6 +425,12 @@ def security_experiment_disposition(
     if any(step.get("passed") is not True for step in actual_steps
            if step.get("operation") not in ("observe",)):
         return "observation_only", None, explanation
+
+    bounded = _asserted_financial_or_vesting_negative(
+        file, selector, requested_steps, actual_steps
+    )
+    if bounded is not None:
+        return "behavior_not_observed", bounded[0], bounded[1]
 
     target_name = selector.rsplit(".", 1)[-1]
     for i, (requested_step, actual_step) in enumerate(zip(requested_steps, actual_steps)):
