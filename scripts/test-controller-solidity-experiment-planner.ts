@@ -936,13 +936,13 @@ assert.equal(externalLedger.ok,false,
 // Factory clone must be sourced from the acquired factory itself, and an
 // initializer may be moved into that factory only when every ABI argument and
 // explicit source call matches the target implementation.
-const cloneTargetSource=\`pragma solidity ^0.8.20;
+const cloneTargetSource=`pragma solidity ^0.8.20;
 contract Market {
   address public owner; uint256 public count;
   function initialize(address firstOwner) external { owner=firstOwner; }
   function accrue(uint256 amount) external { count += amount; }
-}\`;
-const cloneFactorySource=\`pragma solidity ^0.8.20;
+}`;
+const cloneFactorySource=`pragma solidity ^0.8.20;
 contract Factory {
   function createMarket(address template, bytes32 salt, address firstOwner)
     external returns(Market) {
@@ -950,7 +950,7 @@ contract Factory {
       clone.initialize(firstOwner);
       return clone;
   }
-}\`;
+}`;
 const cloneTarget={path:'contracts/Market.sol',content:cloneTargetSource,
   sha256:createHash('sha256').update(cloneTargetSource).digest('hex')};
 const cloneFactory={path:'contracts/Factory.sol',content:cloneFactorySource,
