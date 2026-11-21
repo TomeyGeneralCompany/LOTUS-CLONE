@@ -30,6 +30,35 @@ CONTRACT_ADDR = "0x" + "44" * 20
 
 
 class SoliditySecurityEvidenceTests(unittest.TestCase):
+    def test_imported_inherited_method_requires_acquired_executable_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            src=root/"contracts"
+            src.mkdir()
+            abstract=src/"Rescuable.sol"
+            abstract.write_text(
+                "pragma solidity ^0.8.4; abstract contract Rescuable { "
+                "function rescue(uint256 amount) external virtual { require(amount>0); } }")
+            concrete=src/"Wallet.sol"
+            concrete.write_text(
+                'pragma solidity ^0.8.4; import "./Rescuable.sol"; '
+                'contract Wallet is Rescuable { }')
+            allowed,why=repro_mod.execution_capability(
+                root,"contracts/Wallet.sol","Wallet.rescue","solidity_sequence")
+            self.assertTrue(allowed,why)
+            interface=src/"IAccount.sol"
+            interface.write_text(
+                "pragma solidity ^0.8.4; interface IAccount { "
+                "function rescue(uint256 amount) external; }")
+            fake=src/"Fake.sol"
+            fake.write_text(
+                'pragma solidity ^0.8.4; import "./IAccount.sol"; '
+                'contract Fake is IAccount { }')
+            allowed,_=repro_mod.execution_capability(
+                root,"contracts/Fake.sol","Fake.rescue","solidity_sequence")
+            self.assertFalse(allowed,
+                "An imported ABI interface must not become an invented executable experiment")
+
     def test_reinit_takeover_positive_and_single_init_negative(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
