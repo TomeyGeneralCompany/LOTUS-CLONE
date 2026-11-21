@@ -107,9 +107,12 @@ export class AnalysisProgressStore {
       store.records.set(r.id,r);
     }
     store.processedBatches=parsed.processedBatches||0;
+    // Historical completion IDs remain audit history, not proof of a source-
+    // bound property; the certificate enforces the separate evidence contract.
     for(const id of parsed.completedExperimentIds||[])
-      if([...store.records.values()].some(r=>r.experimentIds.includes(id)&&
-        r.experimentEvidence?.some(e=>e.experimentId===id)))store.completedExperimentIds.add(id);
+      if(parsed.version>=4||[...store.records.values()].some(r=>
+        r.experimentIds.includes(id)&&r.experimentEvidence?.some(e=>e.experimentId===id)))
+        store.completedExperimentIds.add(id);
     return store;
   }
   get counts():CandidateCoverage {
