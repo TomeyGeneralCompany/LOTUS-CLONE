@@ -10,7 +10,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
-import {resolveSourceFixtureDependencies} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -263,6 +263,22 @@ async function run(){
       new Set(repairStore.nextRepairBatch(4).map(x=>x.id)),
       new Set(repairTypes.map(x=>x.id)),
       'All four unresolved lifecycles need construction repair or explicit blockers');
+    // Abstract interfaces must resolve only to acquired concrete implementations
+    // with an explicit import and direct inheritance of the target interface.
+    // Unrelated names and guessed network contracts cannot supply test evidence.
+    const abstractSource='pragma solidity ^0.8.0; interface IWallet { function withdraw(uint256 value) external; }';
+    const implSource='pragma solidity ^0.8.0; import "./IWallet.sol"; contract Wallet is IWallet { function withdraw(uint256 value) external override {} }';
+    const unrelatedSource='pragma solidity ^0.8.0; contract Other is IWallet { function withdraw(uint256 value) external {} }';
+    const targetInterface={path:'source-1/contracts/IWallet.sol',content:abstractSource,sha256:hash(abstractSource)};
+    const targetImpl={path:'source-1/contracts/Wallet.sol',content:implSource,sha256:hash(implSource)};
+    const unrelatedImpl={path:'source-1/contracts/Other.sol',content:unrelatedSource,sha256:hash(unrelatedSource)};
+    const available=resolveAcquiredConcreteImplementations(targetInterface,'IWallet','withdraw',
+      [targetInterface,targetImpl,unrelatedImpl]);
+    assert.equal(available.length,1,'An unrelated source with no verified import edge must not be substituted');
+    assert.equal(available[0].selector,'Wallet.withdraw');
+    assert.equal(available[0].sourceSha256,targetImpl.sha256);
+    assert.equal(resolveAcquiredConcreteImplementations(targetInterface,'IWallet','borrow',
+      [targetInterface,targetImpl]).length,0,'Do not invent an unimplemented method');
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);
