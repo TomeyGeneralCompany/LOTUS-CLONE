@@ -361,9 +361,20 @@ def _asserted_financial_or_vesting_negative(
                          if r.get("operation") == "call"
                          and r.get("function") == name
                          and bool(r.get("deploymentId")) == dependency]
-                return any(b_req.get("args") == a_req.get("args") and
-                           str(b_obs.get("actual")) != str(a_obs.get("actual"))
-                           for b_req, b_obs in before for a_req, a_obs in after)
+                if not before or not after:
+                    return False
+                # Nearest matched readback around the *selected* call is
+                # mandatory. Comparing across an earlier deposit could make
+                # a broken no-op withdrawal look like a successful negative.
+                b_req, b_obs = before[-1]
+                a_req, a_obs = next(((r, obs) for r, obs in after
+                                     if r.get("args") == b_req.get("args")), (None, None))
+                if a_req is None:
+                    return False
+                x, y = str(b_obs.get("actual")), str(a_obs.get("actual"))
+                if not x.isdecimal() or not y.isdecimal():
+                    return False
+                return (int(y) > int(x)) if method == "deposit" else (int(y) < int(x))
             if paired_change("totalSupply()", False) and paired_change("balanceOf(address)", True):
                 return family, (
                     "Source-bound xMPH share and token-balance transitions passed "
