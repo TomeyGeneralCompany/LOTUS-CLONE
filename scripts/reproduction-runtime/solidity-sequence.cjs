@@ -12,7 +12,7 @@ function validateSequence(s) {
   };
   const args = a => {if(!Array.isArray(a)||a.length>32)throw new Error('Invalid ABI arguments');a.forEach(v=>value(v));};
   const wei = v => {if(v!==undefined && (typeof v!=='string'||!/^(0|[1-9][0-9]{0,29})$/.test(v)))throw new Error('Invalid wei amount');};
-  object(s,['constructorArgs','steps'],['constructorArgs','constructorValueWei','steps','deployment','preparation','sourceProperty']);
+  object(s,['constructorArgs','steps'],['constructorArgs','constructorValueWei','steps','deployment','preparation','factoryClone','sourceProperty']);
   if(s.sourceProperty!==undefined){
     const p=s.sourceProperty;
     object(p,['kind','state','method','parameter','amount','direction','sourceSha256']);
@@ -67,6 +67,17 @@ function validateSequence(s) {
       else {wei(step.valueWei);if(step.expectRevert!==undefined&&typeof step.expectRevert!=='boolean')
         throw new Error('Invalid preparation revert expectation');}
     }
+  }
+  if(s.factoryClone!==undefined){
+    const clone=s.factoryClone;
+    object(clone,['deploymentId','function','args','sender']);
+    if(typeof clone.deploymentId!=='string'||
+       !(s.preparation?.deployments||[]).some(d=>d.id===clone.deploymentId)||
+       typeof clone.function!=='string'||
+       !/^[A-Za-z_]\\w*\\([A-Za-z0-9_,()[\\]]*\\)$/.test(clone.function)||
+       !Number.isInteger(clone.sender)||clone.sender<0||clone.sender>2)
+      throw new Error('Invalid source factory clone reference');
+    args(clone.args);
   }
   args(s.constructorArgs);wei(s.constructorValueWei);
   if(JSON.stringify(s).length>16000 || !Array.isArray(s.steps) || !s.steps.length || s.steps.length>16)throw new Error('Invalid sequence length');
