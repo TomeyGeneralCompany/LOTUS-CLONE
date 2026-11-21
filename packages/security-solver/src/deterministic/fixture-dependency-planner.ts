@@ -95,11 +95,20 @@ export function resolveAcquiredConcreteImplementations(
       if(!base)continue;
       const fn=(node.subNodes||[]).find((x:any)=>x.type==="FunctionDefinition"&&
         x.name===method&&x.body&&["external","public"].includes(x.visibility));
-      if(!fn)continue;
+      // A concrete deployed subclass also contains fully implemented methods
+      // inherited from an acquired abstract base. Test that actual inherited
+      // code, never an interface declaration or a synthetic stub.
+      const inherited=(ast?.children||[])
+        .find((x:any)=>x.type==="ContractDefinition"&&x.name===abstractContract)
+        ?.subNodes?.find((x:any)=>x.type==="FunctionDefinition"&&
+          x.name===method&&x.body&&["external","public"].includes(x.visibility));
+      if(!fn&&!inherited)continue;
+      const proof=fn||inherited;
+      const proofSource=fn?source:abstractSource;
       result.push({path:source.path,contract:node.name,
         selector:node.name+"."+method,sourceSha256:source.sha256,
-        witness:source.path+":"+source.sha256+":"+
-          String(fn.loc?.start?.line||1)+":"+String(fn.loc?.end?.line||1)});
+        witness:proofSource.path+":"+proofSource.sha256+":"+
+          String(proof.loc?.start?.line||1)+":"+String(proof.loc?.end?.line||1)});
     }
   }
   return result.sort((a,b)=>a.path.localeCompare(b.path)||a.contract.localeCompare(b.contract));
