@@ -69,7 +69,7 @@ export interface SourceInvariant {
 
 export type InvariantExtractionResult =
   | {ok: true; invariant: SourceInvariant}
-  | {ok: false; category: InvariantUnresolvedCategory; reason: string; witnesses?: SourceWitness[]};
+  | {ok: false; category: InvariantUnresolvedCategory; reason: string; witnesses?: SourceWitness[]; companionCandidates?:string[]};
 
 export interface ConstructionInput {
   repositoryCommit:string;targetPath:string;targetSelector:string;
@@ -1931,6 +1931,7 @@ export function extractSourceInvariantDescriptor(
   method: string,
   declarations: readonly SolidityProbeDeclaration[],
   sources: ReadonlyMap<string, SourceSnapshot>,
+  selectedCompanion?:string,
 ): InvariantExtractionResult {
   if(isTestOrMockPath(snapshot.path))
     return {ok:false,category:'no_supported_property',
@@ -2002,14 +2003,16 @@ export function extractSourceInvariantDescriptor(
     const reverse=targetEffect.minus.some(state=>effect.plus.includes(state));
     return forward!==reverse?[{fn,forward,reverse}]:[];
   });
-  if(counterparts.length!==1){
+  const selected=selectedCompanion?counterparts.filter(x=>x.fn.name===selectedCompanion):counterparts;
+  if(selected.length!==1){
     return {ok:false,category:'no_supported_property',
       reason:'Source-backed accounting companion '+
         (counterparts.length?'ambiguous: ':'not established for ')+
         contract.name+'.'+method+': '+counterparts.map(x=>x.fn.name).join(', '),
-      witnesses:[witness(snapshot,targetFn,contract.name+'.'+method)]};
+      witnesses:[witness(snapshot,targetFn,contract.name+'.'+method)],
+      companionCandidates:[...new Set(counterparts.map(x=>x.fn.name))]};
   }
-  const counterpart=counterparts[0];
+  const counterpart=selected[0];
   const inflowFn=counterpart.forward?targetFn:counterpart.fn;
   const outflowFn=counterpart.reverse?targetFn:counterpart.fn;
 
@@ -2623,6 +2626,22 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
           reason: `Extracted invariant for ${input.targetSelector} failed admission or fixture construction`,
         };
       }
+    } else if(extracted.companionCandidates && extracted.companionCandidates.length>1){
+      // Ambiguous counterparts represent separate source-derived properties,
+      // not permission to discard the lead or select an arbitrary first match.
+      let constructed=0;
+      const issues:string[]=[];
+      for(const companion of extracted.companionCandidates){
+        const candidate=extractSourceInvariantDescriptor(target,contract,method,
+          input.declarations,indexed,companion);
+        if(!candidate.ok){issues.push(companion+':'+candidate.reason);continue;}
+        const built=constructCoreInvariantExperiment(candidate.invariant,target,contract,
+          input.declarations,indexed);
+        if(built){choices.push(built);constructed++;}
+        else issues.push(companion+':fixture_construction_failed');
+      }
+      if(!constructed)invariantUnresolved={category:extracted.category,
+        reason:issues.join('; ').slice(0,900)};
     } else {
       invariantUnresolved = { category: extracted.category, reason: extracted.reason };
     }
