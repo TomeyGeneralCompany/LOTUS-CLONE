@@ -265,7 +265,7 @@ export class AnalysisProgressStore {
       result:result.slice(0,500)});
     return true;
   }
-  addRepairExperiment(leadId:string,propertyId:string,experimentId:string,witnesses:string[]){
+  addRepairExperiment(leadId:string,propertyId:string,experimentId:string,witnesses:string[],resolvedAbstractFixture=false){
     const record=this.records.get(leadId);
     if(!record||!experimentId||!witnesses.length||
       witnesses.some(x=>!x.includes(record.sourceSha256)))
@@ -279,7 +279,9 @@ export class AnalysisProgressStore {
       p.unresolvedPrerequisites.length>0 &&
       p.unresolvedPrerequisites.every(reason=>
         /UNKNOWN_ASSERTION\((?:no_supported_property|missing_observable_state)\)/.test(reason)||
-        reason==="source_grounded_falsifier_missing"))
+        reason==="source_grounded_falsifier_missing"||
+        (resolvedAbstractFixture&&/UNKNOWN_ASSERTION\(missing_fixture\)/.test(reason)&&
+          /abstract and cannot be instantiated directly/.test(reason))))
       p.supersededBy=propertyId;
     record.properties=record.properties.filter(p=>!p.id.endsWith(":needs_property"));
     record.properties.push({id:propertyId,state:"test_constructed",
