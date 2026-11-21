@@ -342,9 +342,9 @@ def _asserted_financial_or_vesting_negative(
         if observed.get("operation") == "call" and (
             "expect" not in expected or
             str(
-                (accounts[int(expected["expect"][8:])] 
+                (accounts[int(expected["expect"][8:])]
                  if isinstance(expected["expect"], str) and
-                    re.fullmatch(r"\\$account[0-2]", expected["expect"]) and
+                    re.fullmatch(r"\$account[0-2]", expected["expect"]) and
                     isinstance(accounts, list) and len(accounts) == 3
                  else contract_address
                  if expected["expect"] == "$contract" and isinstance(contract_address, str)
