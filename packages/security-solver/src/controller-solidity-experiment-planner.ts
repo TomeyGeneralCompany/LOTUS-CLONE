@@ -2278,8 +2278,10 @@ export function extractSourceInvariantDescriptor(
   // proves direct matching updates without fees, exchange rates or accrual.
   // Contracts with dynamic economics require a separate measured property.
   const accountingTarget=totalReferenced?totalVarName:balanceReferenced?balanceVarName:'';
-  const inflowParameter=String((inflowFn.parameters||[])[0]?.name||'');
-  const outflowParameter=String((outflowFn.parameters||[])[0]?.name||'');
+  const amountParameter=(fn:any)=>String((fn.parameters||[]).find((param:any)=>
+    /^uint(?:[0-9]+)?$/.test(String(param.typeName?.name||'')))?.name||'');
+  const inflowParameter=amountParameter(inflowFn);
+  const outflowParameter=amountParameter(outflowFn);
   const inflowEffects=reachableAccountingSource(snapshot,contract,inflowFn);
   const outflowEffects=reachableAccountingSource(snapshot,contract,outflowFn);
   const directlyProven=accountingTarget&&
