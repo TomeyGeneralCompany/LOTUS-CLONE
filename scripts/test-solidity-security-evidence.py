@@ -322,6 +322,39 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                 {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":vestmissing},
                 {"sequence":{"steps":vestreq}})[0],"observation_only")
 
+    def test_bounded_funding_source_and_state_negative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            src=root/"contracts"/"settlement"/"SettlementVault.sol"
+            src.parent.mkdir(parents=True)
+            source=("contract SettlementVault {\\n"
+                    "mapping(address=>uint256) public credit;\\n"
+                    "uint256 public totalCredit;\\n"
+                    "function fund(address recipient,uint256 amount) external {\\n"
+                    "uint256 v=amount.bounded(type(uint128).max);\\n"
+                    "credit[recipient]+=v;totalCredit+=v;}\\n}\\n")
+            src.write_text(source.replace("\\\\n","\\n"),encoding="utf8")
+            def read(fn,actual,args=None):
+                return {"operation":"call","function":fn,"sender":0,"actual":str(actual),
+                        "passed":True}
+            steps=[read("credit(address)",0),read("totalCredit()",0),
+                   {"operation":"send","function":"fund(address,uint256)",
+                    "sender":0,"reverted":False,"passed":True},
+                   read("credit(address)",1000),read("totalCredit()",1000)]
+            req=[{"operation":step["operation"],"function":step["function"],
+                  **({"expect":step["actual"]} if step["operation"]=="call" else {"sender":0})}
+                 for step in steps]
+            result=security_experiment_disposition(root,src,"SettlementVault.fund",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":steps},
+                {"sequence":{"steps":req}})
+            self.assertEqual(result[0],"behavior_not_observed")
+            self.assertEqual(result[1],"bounded_credit_negative")
+            wrong=[dict(step) for step in steps]
+            wrong[-1]["actual"]="999"
+            self.assertEqual(security_experiment_disposition(root,src,"SettlementVault.fund",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":wrong},
+                {"sequence":{"steps":req}})[0],"observation_only")
+
     def test_compile_cache_path_and_pragma_detection(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo"
