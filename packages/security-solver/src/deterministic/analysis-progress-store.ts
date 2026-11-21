@@ -111,7 +111,8 @@ export class AnalysisProgressStore {
   }
   private isConclusive(record:CandidateProgress):boolean {
     return record.properties.length>0 &&
-      record.properties.every(p=>p.state==="test_completed"&&p.experimentIds.length>0 &&
+      record.properties.every(p=>p.state==="test_completed"&&p.sourceWitnesses.length>0&&
+        p.experimentIds.length>0 &&
         p.experimentIds.every(id=>(record.experimentEvidence||[]).some(e=>
           e.experimentId===id&&e.leadId===record.id&&
           e.sourceCommit===record.sourceCommit&&e.sourceSha256===record.sourceSha256&&
@@ -162,7 +163,8 @@ export class AnalysisProgressStore {
     return admitted;
   }
   recordAssessment(id:string,propertyIds:readonly string[],unresolved:readonly string[],experimentIds:readonly string[],
-    specialistAttempts:ReadonlyArray<{adapter:string;status:string;reason:string;detail?:string}>=[]){
+    specialistAttempts:ReadonlyArray<{adapter:string;status:string;reason:string;detail?:string}>=[],
+    obligations:ReadonlyArray<{id:string;experimentIds:string[];sourceWitnesses:string[]}>=[]){
     const record=this.records.get(id);
     if(!record||!["admitted","analyzing","dependencies_pending"].includes(record.lifecycle))
       throw new Error("ANALYSIS_CANDIDATE_NOT_ACTIVE: "+id);
@@ -171,7 +173,16 @@ export class AnalysisProgressStore {
     // accounting prerequisite for the same source function.
     const properties:CandidatePropertyProgress[]=[];
     const uniqueExperiments=[...new Set(experimentIds)];
-    for(const pid of [...new Set(propertyIds)]){
+    if(obligations.length){
+      for(const obligation of obligations){
+        const linked=obligation.experimentIds.filter(id=>uniqueExperiments.includes(id));
+        if(!linked.length)throw new Error("PROPERTY_EXPERIMENT_ID_NOT_SCHEDULED: "+obligation.id);
+        if(!obligation.sourceWitnesses.length)throw new Error("PROPERTY_SOURCE_WITNESS_REQUIRED: "+obligation.id);
+        properties.push({id:obligation.id,state:"test_constructed",
+          sourceWitnesses:[...new Set(obligation.sourceWitnesses)],
+          unresolvedPrerequisites:[],experimentIds:linked});
+      }
+    } else for(const pid of [...new Set(propertyIds)]){
       if(uniqueExperiments.length)properties.push({id:pid,state:"test_constructed",
         sourceWitnesses:[],unresolvedPrerequisites:[],experimentIds:uniqueExperiments});
     }
