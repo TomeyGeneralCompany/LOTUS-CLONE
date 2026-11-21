@@ -11,7 +11,7 @@ import type {SoliditySequence} from './solidity-sequence';
 import {sourceGroundedSolidityProbes} from './controller-solidity-security-probes';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
 import {extractAccountingObservations} from './deterministic/accounting-observations';
-import {resolveSourceFixtureDependencies, type PreparedDeployment} from './deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
 
 export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
@@ -50,6 +50,7 @@ export interface SourceInvariantTransitionPlan {
   totalScalarGetter?: string;
   typedObservation?: {getter:string;args:string[];expectPath?:number[];baseline:string;afterInflow:string;afterOutflow:string};
   dependencyDeployments?:PreparedDeployment[];
+  dependencyInitializerOperations?:PreparedInitializerOperation[];
   dependencyBindings?:Record<string,string>;
 }
 
@@ -1539,7 +1540,7 @@ function resolveFlexibleSetup(
   let usesToken=false;
   if(ctor){
     const cParams:any[]=ctor.parameters||[];
-    if(cParams.length>6)return null;
+    if(cParams.length>12)return null;
     for(const cp of cParams){
       const abi=canonicalAbiType(cp.typeName);
       if(!abi)return null;
@@ -1558,7 +1559,7 @@ function resolveFlexibleSetup(
   let tokenInitNeeded=false;
   if(initFn){
     const iParams:any[]=initFn.parameters||[];
-    if(iParams.length<=6){
+    if(iParams.length<=12){
       const abiTypes:string[]=[];
       let ok=true;
       for(const ip of iParams){
@@ -2347,6 +2348,7 @@ export function extractSourceInvariantDescriptor(
         typedObservation,
         ...(dependencyPlan.status==='resolved'&&dependencyPlan.deployments.length?{
           dependencyDeployments:dependencyPlan.deployments,
+          dependencyInitializerOperations:dependencyPlan.initializerOperations,
           dependencyBindings:dependencyPlan.substitutions,
         }:{}),
       },
@@ -2422,7 +2424,8 @@ export function constructCoreInvariantExperiment(
     }]:[]),
     ...(tp.dependencyDeployments||[]),
   ];
-  const preparation=deployments.length?{deployments,operations:[],checks:[]}:undefined;
+  const preparation=deployments.length?{deployments,
+    operations:(tp.dependencyInitializerOperations||[]).map(x=>({...x})),checks:[]}:undefined;
 
 
   const steps: SoliditySequence['steps'] = [];
