@@ -834,4 +834,65 @@ if (!abstractRes.ok) {
   assert.match(abstractRes.detail, /YVaultMarketV2/, 'Abstract contract refusal must report acquired concrete subclass');
 }
 
+// Dossier regression: a public variable generates a Solidity getter satisfying
+// an inherited abstract signature. This is a real concrete contract, not an
+// abstract deployment requiring a fabricated subclass.
+const generatedGetterSource=`pragma solidity ^0.8.20;
+abstract contract Base {
+  function stablecoin() external view virtual returns (address);
+}
+contract LiveMarket is Base {
+  address public override stablecoin;
+  uint256 public totalDeposits;
+  function deposit(uint256 amount) external { totalDeposits += amount; }
+  function withdraw(uint256 amount) external { totalDeposits -= amount; }
+}`;
+const generatedGetterSnap={path:'contracts/LiveMarket.sol',
+  sha256:createHash('sha256').update(generatedGetterSource).digest('hex'),
+  content:generatedGetterSource};
+const generatedGetterResult=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:generatedGetterSnap.path,
+  targetSelector:'LiveMarket.deposit',sources:[generatedGetterSnap],
+  declarations:[
+    {selector:'LiveMarket.deposit',operation:'send',inputs:['uint256']},
+    {selector:'LiveMarket.withdraw',operation:'send',inputs:['uint256']},
+    {selector:'LiveMarket.totalDeposits',operation:'call',inputs:[]},
+    {selector:'LiveMarket.stablecoin',operation:'call',inputs:[]},
+  ],
+});
+assert.equal(generatedGetterResult.ok,true,JSON.stringify(generatedGetterResult));
+if(generatedGetterResult.ok)
+  assert.ok(generatedGetterResult.experiments.some(x=>x.securityProperty.includes('financial')),
+    'Inherited generated public getter must not make concrete money market abstract');
+
+// An overload is distinguished by its ABI signature before finding compatible
+// accounting companions; two differently typed functions cannot be conflated.
+const overloadedAccounting=`pragma solidity ^0.8.20;
+contract Accumulator {
+  uint256 public totalDeposits;
+  function mint(uint256 amount) external { totalDeposits += amount; }
+  function mint(uint256 amount, bool enabled) external {
+    if (enabled) totalDeposits += amount;
+  }
+  function burn(uint256 amount) external { totalDeposits -= amount; }
+}`;
+const overloadedSnap={path:'contracts/Accumulator.sol',
+  sha256:createHash('sha256').update(overloadedAccounting).digest('hex'),
+  content:overloadedAccounting};
+const overloadResult=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:overloadedSnap.path,
+  targetSelector:'Accumulator.burn',sources:[overloadedSnap],
+  declarations:[
+    {selector:'Accumulator.mint',operation:'send',inputs:['uint256']},
+    {selector:'Accumulator.mint',operation:'send',inputs:['uint256','bool']},
+    {selector:'Accumulator.burn',operation:'send',inputs:['uint256']},
+    {selector:'Accumulator.totalDeposits',operation:'call',inputs:[]},
+  ],
+});
+assert.equal(overloadResult.ok,true,JSON.stringify(overloadResult));
+if(overloadResult.ok)
+  assert.ok(overloadResult.experiments.some(x=>x.sequence.steps.some(step=>
+    step.operation==='send'&&step.function==='mint(uint256)')),
+    'Use exact mint(uint256) overload for conservation, never mint(uint256,bool)');
+
 console.log('Standalone experiment construction passed');
