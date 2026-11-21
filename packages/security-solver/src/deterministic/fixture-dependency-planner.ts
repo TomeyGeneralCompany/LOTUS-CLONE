@@ -127,6 +127,69 @@ export function resolveAcquiredConcreteImplementations(
   }
   return result.sort((a,b)=>a.path.localeCompare(b.path)||a.contract.localeCompare(b.contract));
 }
+export interface AcquiredInterfaceCaller {
+  path:string;selector:string;sourceSha256:string;interfaceName:string;
+  method:string;receiver:string;witness:string;
+}
+/** Interface-only leads have no executable bytecode. Find the acquired,
+ * directly-importing consumer and its actual call site; the experiment then
+ * exercises caller behavior with an explicit scope instead of pretending an
+ * interface declaration is a deployable security property.
+ */
+export function resolveAcquiredInterfaceCallers(
+  interfaceSource:SourceSnapshot,interfaceName:string,method:string,
+  sources:readonly SourceSnapshot[],
+):AcquiredInterfaceCaller[] {
+  const original=astOf(interfaceSource);
+  const iface=(original?.children||[]).find((x:any)=>
+    x.type==='ContractDefinition'&&x.name===interfaceName&&
+    (x.kind==='interface'||x.kind==='contract'));
+  if(!iface||!(iface.subNodes||[]).some((x:any)=>
+    x.type==='FunctionDefinition'&&x.name===method))return [];
+  const callers:AcquiredInterfaceCaller[]=[];
+  for(const source of sources){
+    if(source.path===interfaceSource.path||!source.path.endsWith('.sol')||
+      /(?:^|\\/)(?:mocks?|tests?|fixtures?|echidna)(?:\\/|$)/i.test(source.path))continue;
+    const ast=astOf(source);if(!ast)continue;
+    const importProof=(ast.children||[]).some((x:any)=>{
+      if(x.type!=='ImportDirective'||typeof x.path!=='string'||!x.path.startsWith('.'))
+        return false;
+      if(posix.normalize(posix.join(posix.dirname(source.path),x.path))!==interfaceSource.path)
+        return false;
+      return !Array.isArray(x.symbolAliases)||!x.symbolAliases.length||
+        x.symbolAliases.some(([original,alias]:[string,string|null])=>
+          original===interfaceName||(alias||original)===interfaceName);
+    });
+    if(!importProof)continue;
+    for(const contract of (ast.children||[]).filter((x:any)=>
+      x.type==='ContractDefinition'&&x.kind!=='interface'&&x.kind!=='library')){
+      const receivers=(contract.subNodes||[]).filter((x:any)=>
+        x.type==='StateVariableDeclaration').flatMap((x:any)=>x.variables||[])
+        .filter((v:any)=>v.typeName?.type==='UserDefinedTypeName'&&
+          v.typeName.namePath===interfaceName).map((v:any)=>String(v.name));
+      if(!receivers.length)continue;
+      for(const fn of (contract.subNodes||[]).filter((x:any)=>
+        x.type==='FunctionDefinition'&&x.body&&x.name&&
+        ['external','public'].includes(x.visibility))){
+        const bodyStart=fn.body?.range?.[0]??fn.range?.[0];
+        const bodyEnd=fn.body?.range?.[1]??fn.range?.[1];
+        if(!Number.isInteger(bodyStart)||!Number.isInteger(bodyEnd))continue;
+        const sourceBody=source.content.slice(bodyStart,bodyEnd+1);
+        for(const receiver of receivers){
+          const escaped=receiver.replace(/[.*+?^${}()|[\\]\\]/g,'\\export function resolveSourceFixtureDependencies(');
+          if(!new RegExp('\\\\b'+escaped+'\\\\s*\\\\.\\\\s*'+method+'\\\\s*\\\\\\(').test(sourceBody))
+            continue;
+          callers.push({path:source.path,selector:contract.name+'.'+fn.name,
+            sourceSha256:source.sha256,interfaceName,method,receiver,
+            witness:source.path+':'+source.sha256+':'+
+              String(fn.loc?.start?.line||1)+':'+String(fn.loc?.end?.line||1)});
+        }
+      }
+    }
+  }
+  return callers.sort((a,b)=>a.path.localeCompare(b.path)||
+    a.selector.localeCompare(b.selector)||a.receiver.localeCompare(b.receiver));
+}
 export function resolveSourceFixtureDependencies(
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
 ):FixtureResolution {
