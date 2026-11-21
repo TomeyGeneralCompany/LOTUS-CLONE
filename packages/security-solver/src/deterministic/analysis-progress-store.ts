@@ -16,11 +16,21 @@ export interface CandidatePropertyProgress {
   id:string; state:PropertyResolution; sourceWitnesses:string[];
   unresolvedPrerequisites:string[]; experimentIds:string[];
 }
+export interface ExperimentEvidence {
+  experimentId:string; leadId:string; sourceCommit:string; sourceSha256:string;
+  evidenceId:string; result:'observed'|'not_observed'; verifierDigest:string;
+}
+export interface LeadExperimentCertificate {
+  version:1; manifestDigest:string; evidenceDigest:string;
+  total:number; conclusive:number; unresolvedIds:string[];
+  pendingReasons:Record<string,string[]>; evidenceCount:number;
+}
 export interface CandidateProgress {
   id:string; sourceCommit:string; sourceSha256:string;
   lifecycle:CandidateLifecycle; attempts:number;
   properties:CandidatePropertyProgress[];
   experimentIds:string[]; lastError?:string;
+  experimentEvidence?:ExperimentEvidence[];
   specialistAttempts?:Array<{adapter:string;status:string;reason:string;detail?:string}>;
 }
 export interface CandidateCoverage {
@@ -30,7 +40,7 @@ export interface CandidateCoverage {
 }
 
 export interface AnalysisProgressSnapshot {
-  version:1|2; inventoryFingerprint:string;
+  version:1|2|3; inventoryFingerprint:string;
   candidateIds:string[]; records:CandidateProgress[];
   processedBatches:number; completedExperimentIds:string[];
 }
@@ -83,7 +93,8 @@ export class AnalysisProgressStore {
   get counts():CandidateCoverage {
     const records=[...this.records.values()];
     const count=(state:CandidateLifecycle)=>records.filter(r=>r.lifecycle===state).length;
-    const unresolved=records.filter(r=>["queued","admitted","analyzing","dependencies_pending","experiment_pending"].includes(r.lifecycle));
+    // Source-reading or an unsupported analytical disposition is not experiment proof.
+    const unresolved=records.filter(r=>!this.isConclusive(r));
     return {
       total:records.length,queued:count("queued"),
       admitted:count("admitted")+count("analyzing"),
@@ -97,7 +108,36 @@ export class AnalysisProgressStore {
         .map(r=>[r.id,[...new Set(r.properties.flatMap(p=>p.unresolvedPrerequisites))]])),
     };
   }
-  get terminallyComplete(){return this.counts.unresolvedIds.length===0;}
+  private isConclusive(record:CandidateProgress):boolean {
+    return record.properties.length>0 &&
+      record.properties.every(p=>p.state==="test_completed"&&p.experimentIds.length>0 &&
+        p.experimentIds.every(id=>(record.experimentEvidence||[]).some(e=>
+          e.experimentId===id&&e.leadId===record.id&&
+          e.sourceCommit===record.sourceCommit&&e.sourceSha256===record.sourceSha256&&
+          /^[a-f0-9]{64}$/.test(e.verifierDigest)&&e.evidenceId.length>0&&
+          (e.result==="observed"||e.result==="not_observed"))));
+  }
+  get experimentCertificate():LeadExperimentCertificate {
+    const entries=[...this.records.values()].sort((a,b)=>a.id.localeCompare(b.id));
+    const unresolved=entries.filter(e=>!this.isConclusive(e));
+    const evidence=entries.flatMap(e=>(e.experimentEvidence||[])
+      .map(x=>[x.experimentId,x.leadId,x.sourceSha256,x.evidenceId,x.verifierDigest,x.result]))
+      .sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    return {
+      version:1,
+      manifestDigest:createHash("sha256").update(JSON.stringify(entries.map(e=>e.id))).digest("hex"),
+      evidenceDigest:createHash("sha256").update(JSON.stringify(evidence)).digest("hex"),
+      total:entries.length,conclusive:entries.length-unresolved.length,
+      unresolvedIds:unresolved.map(e=>e.id),
+      pendingReasons:Object.fromEntries(unresolved.map(e=>[e.id,
+        e.properties.flatMap(p=>p.unresolvedPrerequisites).concat(
+          e.properties.filter(p=>p.state!=="test_completed").map(p=>p.state))
+          .concat(e.properties.length?[]:["no_executable_property"])
+          .filter((x,i,a)=>a.indexOf(x)===i)])),
+      evidenceCount:evidence.length,
+    };
+  }
+  get terminallyComplete(){return this.experimentCertificate.unresolvedIds.length===0;}
   get remaining(){return this.counts.queued;}
   get assessed(){return this.records.size-this.remaining;}
   nextBatch(maxAdmitted:number,maxPerFile:number):AnalysisCandidate[]{
@@ -154,19 +194,30 @@ export class AnalysisProgressStore {
   }
   // A verifier completion is the only source of truth for experiment terminality.
   // Rejected, incomplete and unsupported sequences remain unresolved.
-  markExperimentCompleted(id:string){
+  markExperimentCompleted(id:string,evidence?:Omit<ExperimentEvidence,"leadId"|"sourceCommit"|"sourceSha256"|"experimentId">){
     if(![...this.records.values()].some(r=>r.experimentIds.includes(id)))
       throw new Error("ANALYSIS_EXPERIMENT_ID_UNMATCHED: "+id);
     this.completedExperimentIds.add(id);
     for(const r of this.records.values())if(r.experimentIds.includes(id)){
-      for(const p of r.properties)if(p.experimentIds.includes(id))p.state="test_completed";
+      if(evidence){
+        if(!evidence.evidenceId||!(/^[a-f0-9]{64}$/).test(evidence.verifierDigest)||
+          !["observed","not_observed"].includes(evidence.result))
+          throw new Error("INVALID_EXPERIMENT_EVIDENCE: "+id);
+        r.experimentEvidence||=[];
+        if(!r.experimentEvidence.some(x=>x.experimentId===id))
+          r.experimentEvidence.push({experimentId:id,leadId:r.id,
+            sourceCommit:r.sourceCommit,sourceSha256:r.sourceSha256,...evidence});
+      }
+      for(const p of r.properties)if(p.experimentIds.includes(id)&&
+        (r.experimentEvidence||[]).some(e=>e.experimentId===id))
+        p.state="test_completed";
       if(r.experimentIds.every(x=>this.completedExperimentIds.has(x)) &&
         !r.properties.some(p=>p.state==="prerequisites_pending"))
         r.lifecycle="experiment_completed";
     }
   }
   async save():Promise<void>{
-    const state:AnalysisProgressSnapshot={version:2,inventoryFingerprint:this.inventoryFingerprint,
+    const state:AnalysisProgressSnapshot={version:3,inventoryFingerprint:this.inventoryFingerprint,
       candidateIds:[...this.records.keys()],records:[...this.records.values()],
       processedBatches:this.processedBatches,completedExperimentIds:[...this.completedExperimentIds]};
     await mkdir(dirname(this.path),{recursive:true});
