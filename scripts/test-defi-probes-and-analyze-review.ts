@@ -17,11 +17,25 @@ import {
 import { decodeAuditAction } from "../packages/security-solver/src/local-audit-protocol";
 import { runEvidenceOnlyReview } from "../packages/security-solver/src/evidence-only-review";
 import { rankSolidityStaticTargets } from "../packages/security-solver/src/local-static-leads";
-import { constructSolidityExperiments } from "../packages/security-solver/src/controller-solidity-experiment-planner";
+import { constructSolidityExperiments, accountingTransitionPatterns } from "../packages/security-solver/src/controller-solidity-experiment-planner";
 
 import {reconcileHuntReason,type HuntCoverageLedger} from '../packages/security-solver/src/local-program-flow';
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+// Real-world regression: dynamic Solidity accounting regexes must compile and
+// match real push/pop and struct field updates, including escaped identifiers.
+{
+  const patterns=accountingTransitionPatterns('deposits','amount');
+  assert.ok(patterns.push.test('deposits.push(value)'));
+  assert.ok(patterns.pop.test('deposits.pop()'));
+  assert.ok(patterns.fieldDecrement.test('deposits[0].amount -= 400'));
+  assert.equal(patterns.push.test('depositsXpush(value)'),false);
+  assert.equal(patterns.pop.test('other.pop()'),false);
+  const escaped=accountingTransitionPatterns('deposits$','amount+fee');
+  assert.ok(escaped.push.test('deposits$.push(value)'));
+  assert.ok(escaped.fieldDecrement.test('deposits$[0].amount+fee -= 1'));
+}
+
 // #227 field evidence: 31 guarded negatives, 13 observation-only, 12
 // incomplete/failed; 56 selected, no observed positive. A model's reversed
 // word-order blanket-negative claim must not change any ledger disposition.
