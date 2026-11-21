@@ -149,7 +149,7 @@ export function resolveAcquiredInterfaceCallers(
   const callers:AcquiredInterfaceCaller[]=[];
   for(const source of sources){
     if(source.path===interfaceSource.path||!source.path.endsWith('.sol')||
-      /(?:^|\\/)(?:mocks?|tests?|fixtures?|echidna)(?:\\/|$)/i.test(source.path))continue;
+      source.path.split('/').some(part=>/^(?:mocks?|tests?|fixtures?|echidna)$/i.test(part)))continue;
     const ast=astOf(source);if(!ast)continue;
     const importProof=(ast.children||[]).some((x:any)=>{
       if(x.type!=='ImportDirective'||typeof x.path!=='string'||!x.path.startsWith('.'))
