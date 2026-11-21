@@ -1794,12 +1794,11 @@ function groundedShareAccountingExperiment(
     /return\s+mphBalance\.div\(totalShares\)/,
     /totalSupply\(\)\s*>=\s*_shareAmount\s*\+\s*MIN_AMOUNT/,
   ];
-  if(!proofs.every(re=>re.test(source)))return null;
+  if(!proofs.every(re=>re.test(source))||!/contract\s+xMPH\s+is\s+ERC20Upgradeable/.test(source))return null;
   const required=[
     ["initialize",["address","uint256","address"],"send"],
     ["deposit",["uint256"],"send"],
     ["withdraw",["uint256"],"send"],
-    ["totalSupply",[],"call"],
   ] as const;
   if(!required.every(([name,inputs,operation])=>declarations.some(d=>
     d.selector==="xMPH."+name && d.operation===operation &&
