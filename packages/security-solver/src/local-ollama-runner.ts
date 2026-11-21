@@ -472,6 +472,7 @@ export async function runLocalAudit(
         declarations,staticLeads:limits.staticLeads||[],
       });
       const successful=constructed.ok?[constructed]:[];
+      const callerOnly=new Set<string>();
       const altFailures:string[]=[];
       if(!constructed.ok&&constructed.unresolvedCategory==="missing_fixture"&&
         /abstract and cannot be instantiated/.test(constructed.detail)){
@@ -529,8 +530,10 @@ export async function runLocalAudit(
               targetSelector:caller.selector,sources:deterministicSourceSnapshots,
               declarations:menu,staticLeads:limits.staticLeads||[],
             });
-            if(candidate.ok)successful.push(candidate);
-            else altFailures.push(caller.selector+":"+candidate.code+":"+candidate.detail.slice(0,160));
+            if(candidate.ok){
+              successful.push(candidate);
+              callerOnly.add(caller.path+":"+caller.selector);
+            }else altFailures.push(caller.selector+":"+candidate.code+":"+candidate.detail.slice(0,160));
           }
           if(callers.length)await appendFile(logFile,
             "[EXPERIMENT_INTERFACE_CALLERS] "+JSON.stringify({
@@ -562,8 +565,9 @@ export async function runLocalAudit(
         const witnesses=[lead.sourceEvidence,
           ...exp.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(":"))];
         const id=preexisting?.id||JSON.stringify([exp.path,exp.selector,plan.answer,"repair",exp.id]);
+        const limitedToCaller=callerOnly.has(exp.path+":"+exp.selector);
         const propertyId=createHash("sha256").update(JSON.stringify([
-          lead.id,exp.securityProperty,witnesses])).digest("hex");
+          lead.id,limitedToCaller?"caller_scope:"+exp.securityProperty:exp.securityProperty,witnesses])).digest("hex");
         const alreadyLinked=analysisProgressStore.records.get(lead.id)?.properties
           .some(p=>p.id===propertyId&&p.experimentIds.includes(id));
         if(alreadyLinked)continue;
@@ -571,14 +575,17 @@ export async function runLocalAudit(
           stageLock.discover(id);
           stagedPlans.push({id,plan});
         }
+        // Caller integration does not discharge the interface's missing
+        // production implementation. Only source-proven concrete inheritance
+        // may replace that missing-fixture obligation.
         analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses,
-          exp.path!==lead.path);
+          exp.path!==lead.path&&!limitedToCaller);
         added++;
         if(!preexisting)repairAdded++;
         await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
           leadId:lead.id,experimentId:id,property:exp.securityProperty,
-          reused:!!preexisting,sourceSha256:lead.sourceSha256,
-          witnesses:witnesses.length})+"\n");
+          reused:!!preexisting,scope:limitedToCaller?"caller_integration":"concrete_source",
+          sourceSha256:lead.sourceSha256,witnesses:witnesses.length})+"\n");
       }
       analysisProgressStore.noteRepairAttempt(lead.id,strategy,
         added?("new_experiments:"+added):"no_distinct_sourced_experiment");
