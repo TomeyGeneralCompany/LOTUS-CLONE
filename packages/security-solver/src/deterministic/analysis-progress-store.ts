@@ -32,6 +32,7 @@ export interface CandidateProgress {
   experimentIds:string[]; lastError?:string;
   experimentEvidence?:ExperimentEvidence[];
   inconclusiveAttempts?:Array<{experimentId:string;status:string;evidenceId:string;reason:string}>;
+  repairAttempts?:Array<{strategy:string;sourceSha256:string;result:string}>;
   specialistAttempts?:Array<{adapter:string;status:string;reason:string;detail?:string}>;
 }
 export interface CandidateCoverage {
@@ -85,6 +86,10 @@ export class AnalysisProgressStore {
         throw new Error("ANALYSIS_CHECKPOINT_CORRUPT: "+r.id);
       // A process crash must never strand an admitted but unassessed candidate.
       if(r.lifecycle==="admitted"||r.lifecycle==="analyzing")r.lifecycle="queued";
+      // Older checkpoints contain completed IDs but no verifier evidence. Their
+      // records remain actionable until a source-identical replay is recorded.
+      if(r.lifecycle==="experiment_completed"&&!store.isConclusive(r))
+        r.lifecycle="dependencies_pending";
       store.records.set(r.id,r);
     }
     store.processedBatches=parsed.processedBatches||0;
@@ -227,6 +232,28 @@ export class AnalysisProgressStore {
         !r.properties.some(p=>p.state==="prerequisites_pending"))
         r.lifecycle="experiment_completed";
     }
+  }
+  noteRepairAttempt(leadId:string,strategy:string,result:string):boolean {
+    const record=this.records.get(leadId);
+    if(!record)throw new Error("REPAIR_LEAD_NOT_FOUND: "+leadId);
+    record.repairAttempts||=[];
+    if(record.repairAttempts.some(a=>a.strategy===strategy&&
+      a.sourceSha256===record.sourceSha256))return false;
+    record.repairAttempts.push({strategy,sourceSha256:record.sourceSha256,
+      result:result.slice(0,500)});
+    return true;
+  }
+  addRepairExperiment(leadId:string,propertyId:string,experimentId:string,witnesses:string[]){
+    const record=this.records.get(leadId);
+    if(!record||!experimentId||!witnesses.length||
+      witnesses.some(x=>!x.includes(record.sourceSha256)))
+      throw new Error("REPAIR_EXPERIMENT_SOURCE_WITNESS_REQUIRED: "+leadId);
+    if(record.experimentIds.includes(experimentId))return;
+    record.experimentIds.push(experimentId);
+    record.properties=record.properties.filter(p=>!p.id.endsWith(":needs_property"));
+    record.properties.push({id:propertyId,state:"test_constructed",
+      sourceWitnesses:witnesses,unresolvedPrerequisites:[],experimentIds:[experimentId]});
+    record.lifecycle="experiment_pending";
   }
   recordInconclusive(id:string,status:string,evidenceId:string,reason:string){
     if(!this.records.size)throw new Error("EMPTY_ANALYSIS_INVENTORY");
