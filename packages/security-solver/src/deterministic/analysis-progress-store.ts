@@ -21,6 +21,7 @@ export interface CandidateProgress {
   lifecycle:CandidateLifecycle; attempts:number;
   properties:CandidatePropertyProgress[];
   experimentIds:string[]; lastError?:string;
+  specialistAttempts?:Array<{adapter:string;status:string;reason:string;detail?:string}>;
 }
 export interface CandidateCoverage {
   total:number; queued:number; admitted:number; dependenciesPending:number;
@@ -119,7 +120,8 @@ export class AnalysisProgressStore {
     }
     return admitted;
   }
-  recordAssessment(id:string,propertyIds:readonly string[],unresolved:readonly string[],experimentIds:readonly string[]){
+  recordAssessment(id:string,propertyIds:readonly string[],unresolved:readonly string[],experimentIds:readonly string[],
+    specialistAttempts:ReadonlyArray<{adapter:string;status:string;reason:string;detail?:string}>=[]){
     const record=this.records.get(id);
     if(!record||!["admitted","analyzing","dependencies_pending"].includes(record.lifecycle))
       throw new Error("ANALYSIS_CANDIDATE_NOT_ACTIVE: "+id);
@@ -128,6 +130,7 @@ export class AnalysisProgressStore {
       sourceWitnesses:[],unresolvedPrerequisites:[...unresolved],experimentIds:[...experimentIds],
     }));
     record.experimentIds=[...new Set([...record.experimentIds,...experimentIds])];
+    record.specialistAttempts=specialistAttempts.map(x=>({...x}));
     record.lifecycle=experimentIds.length?"experiment_pending":unresolved.length?"dependencies_pending":"analysis_exhausted";
   }
   markTerminalAssessment(id:string,reason?:string){
