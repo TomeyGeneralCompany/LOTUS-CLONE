@@ -1883,6 +1883,69 @@ function groundedVestingCreationExperiment(
   return {hypothesis:"Only the configured minter may create a vest, and its successful creation must atomically assign vest ID 1, the matching pool/deposit mapping, and ERC721 owner.",
     property:"source-proven vest creation, authorization and ownership",sequence,witnesses};
 }
+/**
+ * Proven administrator-only operator rotation in a concrete module.
+ * Negative proof uses a rejected non-administrator call and identical getter;
+ * then verifies the authorized rotation through the same getter.
+ */
+function guardedOperatorRotationExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(method!=="rotateOperator"||contract.kind!=="contract"||contract.abstract)return null;
+  const src=snapshot.content.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,"");
+  const fn=(contract.subNodes||[]).find((n:any)=>
+    n.type==="FunctionDefinition"&&n.name===method&&n.body);
+  if(!fn||!declarations.some(d=>d.selector===contract.name+".rotateOperator"&&
+    d.operation==="send"&&JSON.stringify(d.inputs)===JSON.stringify(["address"])))return null;
+  const bodyText=body(snapshot.content,fn).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,"");
+  if(!/\baddress\s+public\s+administrator\s*;/.test(src)||
+    !/\baddress\s+public\s+operator\s*;/.test(src)||
+    !/\bconstructor\s*\(\s*\)\s*\{\s*administrator\s*=\s*msg\.sender\s*;\s*operator\s*=\s*msg\.sender\s*;\s*\}/.test(src)||
+    !/\brequire\s*\(\s*msg\.sender\s*==\s*administrator\s*,/.test(bodyText)||
+    !/\boperator\s*=\s*next\s*;/.test(bodyText))return null;
+  const sequence:SoliditySequence={constructorArgs:[],steps:[
+    {operation:"call",function:"administrator()",args:[],expect:"$account0"},
+    {operation:"call",function:"operator()",args:[],expect:"$account0"},
+    {operation:"send",function:"rotateOperator(address)",args:["$account2"],sender:1,expectRevert:true},
+    {operation:"call",function:"operator()",args:[],expect:"$account0"},
+    {operation:"send",function:"rotateOperator(address)",args:["$account2"],sender:0},
+    {operation:"call",function:"operator()",args:[],expect:"$account2"},
+  ]};
+  return {hypothesis:"Non-administrator cannot rotate operator; authorized administrator succeeds and the source-backed operator getter changes only after authorized rotation.",
+    property:"source-proven operator rotation guard",sequence,
+    witnesses:[witness(snapshot,fn,contract.name+".rotateOperator")]};
+}
+
+/** A bounded, source-grounded direct-liability credit check. */
+function sourceBoundedFundingExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(method!=="fund"||contract.kind!=="contract"||contract.abstract)return null;
+  const src=snapshot.content.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,"");
+  const fn=(contract.subNodes||[]).find((n:any)=>
+    n.type==="FunctionDefinition"&&n.name===method&&n.body);
+  if(!fn||!declarations.some(d=>d.selector===contract.name+".fund"&&
+    d.operation==="send"&&JSON.stringify(d.inputs)===JSON.stringify(["address","uint256"])))return null;
+  const b=body(snapshot.content,fn).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,"");
+  if(!/mapping\s*\(\s*address\s*=>\s*uint256\s*\)\s*public\s+credit\s*;/.test(src)||
+    !/uint256\s+public\s+totalCredit\s*;/.test(src)||
+    !/v\s*=\s*amount\.bounded\s*\(\s*type\s*\(\s*uint128\s*\)\.max\s*\)/.test(b)||
+    !/credit\s*\[\s*recipient\s*\]\s*\+=\s*v\s*;/.test(b)||
+    !/totalCredit\s*\+=\s*v\s*;/.test(b))return null;
+  const sequence:SoliditySequence={constructorArgs:[],steps:[
+    {operation:"call",function:"credit(address)",args:["$account2"],expect:"0"},
+    {operation:"call",function:"totalCredit()",args:[],expect:"0"},
+    {operation:"send",function:"fund(address,uint256)",args:["$account2","1000"],sender:0},
+    {operation:"call",function:"credit(address)",args:["$account2"],expect:"1000"},
+    {operation:"call",function:"totalCredit()",args:[],expect:"1000"},
+  ]};
+  return {hypothesis:"An in-range 1000-unit funding transaction credits exactly 1000 units to the target and total pool; a mismatched credited amount falsifies the source-derived accounting relation.",
+    property:"source-proven bounded funding conservation",sequence,
+    witnesses:[witness(snapshot,fn,contract.name+".fund")]};
+}
+
 const FINANCIAL_ENTRY_RE =
   /^(?:deposit|withdraw|earlyWithdraw|topupDeposit|rolloverDeposit|mintVested|fund|claim|redeem|stake|unstake|borrow|repay|liquidate|swap|zap|rescue|skim|mint|burn)$/i;
 const INFLOW_METHOD_RE = /^(?:deposit|stake|supply|fund|mint|borrow)$/i;
@@ -2608,6 +2671,10 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       property:'source-proven role mutation',sequence:item.probe.sequence,
       witnesses:[witness(target,contract,input.targetSelector)]});
   }
+  const rotation=guardedOperatorRotationExperiment(target,contract,method,input.declarations);
+  if(rotation)choices.push(rotation);
+  const funding=sourceBoundedFundingExperiment(target,contract,method,input.declarations);
+  if(funding)choices.push(funding);
   const direct=directOwnerExperiment(target,contract,input.declarations,method);
   if(direct)choices.push(direct);
   const inherited=inheritedOwnerExperiment(target,contract,method,input.declarations,indexed);
