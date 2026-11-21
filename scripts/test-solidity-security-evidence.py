@@ -327,13 +327,14 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
             root=Path(tmp)
             src=root/"contracts"/"settlement"/"SettlementVault.sol"
             src.parent.mkdir(parents=True)
-            source=("contract SettlementVault {\\n"
-                    "mapping(address=>uint256) public credit;\\n"
-                    "uint256 public totalCredit;\\n"
-                    "function fund(address recipient,uint256 amount) external {\\n"
-                    "uint256 v=amount.bounded(type(uint128).max);\\n"
-                    "credit[recipient]+=v;totalCredit+=v;}\\n}\\n")
-            src.write_text(source.replace("\\\\n","\\n"),encoding="utf8")
+            src.write_text("""contract SettlementVault {
+mapping(address=>uint256) public credit;
+uint256 public totalCredit;
+function fund(address recipient,uint256 amount) external {
+uint256 v=amount.bounded(type(uint128).max);
+credit[recipient]+=v;totalCredit+=v;}
+}
+""",encoding="utf8")
             def read(fn,actual,args=None):
                 return {"operation":"call","function":fn,"sender":0,"actual":str(actual),
                         "passed":True}
