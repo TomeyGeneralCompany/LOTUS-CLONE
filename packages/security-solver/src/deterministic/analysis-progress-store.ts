@@ -125,13 +125,25 @@ export class AnalysisProgressStore {
     const record=this.records.get(id);
     if(!record||!["admitted","analyzing","dependencies_pending"].includes(record.lifecycle))
       throw new Error("ANALYSIS_CANDIDATE_NOT_ACTIVE: "+id);
-    record.properties=[...new Set(propertyIds)].map(pid=>({
-      id:pid,state:experimentIds.length?"test_constructed":unresolved.length?"prerequisites_pending":"unsupported",
-      sourceWitnesses:[],unresolvedPrerequisites:[...unresolved],experimentIds:[...experimentIds],
-    }));
-    record.experimentIds=[...new Set([...record.experimentIds,...experimentIds])];
+    // Multiple candidate properties must retain independent outcomes. A valid
+    // authorization experiment cannot discharge a separate unresolved
+    // accounting prerequisite for the same source function.
+    const properties:CandidatePropertyProgress[]=[];
+    const uniqueExperiments=[...new Set(experimentIds)];
+    for(const pid of [...new Set(propertyIds)]){
+      if(uniqueExperiments.length)properties.push({id:pid,state:"test_constructed",
+        sourceWitnesses:[],unresolvedPrerequisites:[],experimentIds:uniqueExperiments});
+    }
+    for(const [index,reason] of [...new Set(unresolved)].entries())
+      properties.push({id:id+":unresolved:"+index,state:"prerequisites_pending",
+        sourceWitnesses:[],unresolvedPrerequisites:[reason],experimentIds:[]});
+    if(!properties.length)properties.push({id:id+":unsupported",state:"unsupported",
+      sourceWitnesses:[],unresolvedPrerequisites:[],experimentIds:[]});
+    record.properties=properties;
+    record.experimentIds=[...new Set([...record.experimentIds,...uniqueExperiments])];
     record.specialistAttempts=specialistAttempts.map(x=>({...x}));
-    record.lifecycle=experimentIds.length?"experiment_pending":unresolved.length?"dependencies_pending":"analysis_exhausted";
+    record.lifecycle=unresolved.length?"dependencies_pending":
+      uniqueExperiments.length?"experiment_pending":"analysis_exhausted";
   }
   markTerminalAssessment(id:string,reason?:string){
     const record=this.records.get(id);
@@ -148,7 +160,9 @@ export class AnalysisProgressStore {
     this.completedExperimentIds.add(id);
     for(const r of this.records.values())if(r.experimentIds.includes(id)){
       for(const p of r.properties)if(p.experimentIds.includes(id))p.state="test_completed";
-      if(r.experimentIds.every(x=>this.completedExperimentIds.has(x)))r.lifecycle="experiment_completed";
+      if(r.experimentIds.every(x=>this.completedExperimentIds.has(x)) &&
+        !r.properties.some(p=>p.state==="prerequisites_pending"))
+        r.lifecycle="experiment_completed";
     }
   }
   async save():Promise<void>{
