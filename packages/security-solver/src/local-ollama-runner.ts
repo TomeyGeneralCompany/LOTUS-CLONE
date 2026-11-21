@@ -3527,15 +3527,24 @@ export async function runLocalAudit(
               status==='invalid_probe'?'rejected':'incomplete';
           }catch{}
           stageLock.finishExperiment(activeStageCandidate,outcome);
-          if(analysisProgressStore && (outcome==='observed'||outcome==='not_observed') &&
+          if(analysisProgressStore &&
             [...analysisProgressStore.records.values()].some(r=>r.experimentIds.includes(activeStageCandidate!))){
-            const parsed=JSON.parse(output) as {status:string;caseId?:string|null};
             const verifierDigest=createHash('sha256').update(output).digest('hex');
-            const evidenceId=(typeof parsed.caseId==='string'&&parsed.caseId.length>0)
-              ?parsed.caseId:verifierDigest;
-            analysisProgressStore.markExperimentCompleted(activeStageCandidate,{
-              result:outcome,verifierDigest,evidenceId,
-            });
+            let caseId='';
+            let detail='';
+            try{
+              const parsed=JSON.parse(output) as {caseId?:string|null;detail?:string;reason?:string};
+              caseId=typeof parsed.caseId==='string'?parsed.caseId:'';
+              detail=String(parsed.detail||parsed.reason||'');
+            }catch{detail='unparseable_verifier_evidence';}
+            const evidenceId=createHash('sha256').update(JSON.stringify([
+              activeStageCandidate,caseId,verifierDigest])).digest('hex');
+            if(outcome==='observed'||outcome==='not_observed')
+              analysisProgressStore.markExperimentCompleted(activeStageCandidate,{
+                result:outcome,verifierDigest,evidenceId,
+              });
+            else analysisProgressStore.recordInconclusive(activeStageCandidate,
+              outcome,evidenceId,detail||'no_conclusive_falsifier');
             await analysisProgressStore.save();
             limits.onCandidateCoverage?.(analysisProgressStore.counts);
           }
