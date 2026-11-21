@@ -450,9 +450,19 @@ export async function runLocalAudit(
     // exhausted. Give every pending property a source-only full-graph repair
     // attempt, without repeating an identical failed strategy across resumes.
     const sourceRepairBatch=analysisProgressStore.nextRepairBatch(analysisProgressStore.records.size);
+    // A completed repair attempt belongs to both the acquired source SHA and
+    // the controller implementation revision. After a code repair, the laptop
+    // must not skip 241 previously failed source-construction attempts merely
+    // because the old checkpoint recorded an identical source hash.
+    let implementationRevision=String(process.env.GITHUB_SHA||"").trim();
+    if(!/^[a-f0-9]{40}$/.test(implementationRevision)){
+      try{implementationRevision=execFileSync("git",["rev-parse","HEAD"],
+        {cwd:process.cwd(),encoding:"utf8",timeout:5000}).trim();}
+      catch{implementationRevision="unversioned";}
+    }
+    const strategy="source-fixture-property-engine-v2:"+implementationRevision;
     let repairAdded=0,repairBlocked=0;
     for(const lead of sourceRepairBatch){
-      const strategy="full-source-typed-property-v1";
       const record=analysisProgressStore.records.get(lead.id)!;
       if(record.repairAttempts?.some(x=>x.strategy===strategy&&
           x.sourceSha256===record.sourceSha256))continue;
@@ -599,7 +609,7 @@ export async function runLocalAudit(
     }
     await analysisProgressStore.save();
     await appendFile(logFile,"[EXPERIMENT_REPAIR_RECONCILIATION] "+JSON.stringify({
-      examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
+      strategy,examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
       unresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
     stageLock.assertAnalysisInventoryExhausted();
     limits.onCandidateCoverage?.(analysisProgressStore.counts);
@@ -1248,6 +1258,20 @@ export async function runLocalAudit(
               selectorsByPath.set(targetPath,set);
             }
           }
+        }
+        // A method must remain in the authoritative lead inventory even if
+        // the READ-stage controller already scheduled an executable test for it.
+        // Otherwise a newly constructible test silently deletes its original
+        // lead, as happened to BenqiERC20Market.claimRewards (241 -> 240).
+        for(const staged of stagedPlans){
+          const plan=staged.plan;
+          if(plan.answer!=="solidity_sequence"||
+            isTestOrMockContractPath(plan.path))continue;
+          const declaration=deterministicDeclarationsCache.get(plan.path)||[];
+          if(!declaration.some(d=>d.selector===plan.query&&d.operation==="send"))continue;
+          const set=selectorsByPath.get(plan.path)||new Set<string>();
+          set.add(plan.query);
+          selectorsByPath.set(plan.path,set);
         }
         const commitByDir=new Map<string,string>();
         const candidateSourceItems:Array<{path:string;sourceCommit:string;sourceContent:string;unqueuedSelectors:string[]}>=[];
