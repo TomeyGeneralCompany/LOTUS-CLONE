@@ -267,8 +267,12 @@ export class AnalysisProgressStore {
   }
   addRepairExperiment(leadId:string,propertyId:string,experimentId:string,witnesses:string[],resolvedAbstractFixture=false){
     const record=this.records.get(leadId);
+    // The lead's original source must be witnessed; the concrete imported
+    // implementation necessarily has a different SHA and must retain its
+    // own independent source-bound witness rather than inheriting the root hash.
     if(!record||!experimentId||!witnesses.length||
-      witnesses.some(x=>!x.includes(record.sourceSha256)))
+      !witnesses.some(x=>x.includes(record.sourceSha256))||
+      witnesses.some(x=>!/\b[a-f0-9]{64}\b/.test(x)))
       throw new Error("REPAIR_EXPERIMENT_SOURCE_WITNESS_REQUIRED: "+leadId);
     if(record.experimentIds.includes(experimentId))return;
     record.experimentIds.push(experimentId);
