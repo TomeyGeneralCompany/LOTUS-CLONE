@@ -2035,6 +2035,7 @@ export function extractSourceInvariantDescriptor(
   declarations: readonly SolidityProbeDeclaration[],
   sources: ReadonlyMap<string, SourceSnapshot>,
   selectedCompanion?:string,
+  selectedTargetSignature?:string,
 ): InvariantExtractionResult {
   if(isTestOrMockPath(snapshot.path))
     return {ok:false,category:'no_supported_property',
@@ -2077,7 +2078,8 @@ export function extractSourceInvariantDescriptor(
   const accountingStates=allNodes.filter((n:any)=>n.type==='StateVariableDeclaration')
     .flatMap((n:any)=>n.variables||[]).map((v:any)=>String(v.name||''))
     .filter(name=>/^(?:total|balance|deposit|share|reserve|principal|stake|asset|debt)/i.test(name));
-  const targetFn = fns.find((n: any) => n.name === method);
+  const targetFn = fns.find((n: any) => n.name === method &&
+    (!selectedTargetSignature || canonicalFunctionIdentity(n)===selectedTargetSignature));
   if (!targetFn) {
     return {
       ok: false,
@@ -2106,14 +2108,16 @@ export function extractSourceInvariantDescriptor(
     const reverse=targetEffect.minus.some(state=>effect.plus.includes(state));
     return forward!==reverse?[{fn,forward,reverse}]:[];
   });
-  const selected=selectedCompanion?counterparts.filter(x=>x.fn.name===selectedCompanion):counterparts;
+  const selected=selectedCompanion?counterparts.filter(x=>
+    canonicalFunctionIdentity(x.fn)===selectedCompanion):counterparts;
   if(selected.length!==1){
     return {ok:false,category:'no_supported_property',
       reason:'Source-backed accounting companion '+
         (counterparts.length?'ambiguous: ':'not established for ')+
-        contract.name+'.'+method+': '+counterparts.map(x=>x.fn.name).join(', '),
-      witnesses:[witness(snapshot,targetFn,contract.name+'.'+method)],
-      companionCandidates:[...new Set(counterparts.map(x=>x.fn.name))]};
+        contract.name+'.'+canonicalFunctionIdentity(targetFn)+': '+
+        counterparts.map(x=>canonicalFunctionIdentity(x.fn)).join(', '),
+      witnesses:[witness(snapshot,targetFn,contract.name+'.'+canonicalFunctionIdentity(targetFn))],
+      companionCandidates:[...new Set(counterparts.map(x=>canonicalFunctionIdentity(x.fn)))]};
   }
   const counterpart=selected[0];
   const inflowFn=counterpart.forward?targetFn:counterpart.fn;
@@ -2301,12 +2305,12 @@ export function extractSourceInvariantDescriptor(
     };
   }
 
-  const inflowDecl = declarations.find(
-    (d) => d.operation === 'send' && d.selector === `${contract.name}.${inflowFn.name}`,
-  );
-  const outflowDecl = declarations.find(
-    (d) => d.operation === 'send' && d.selector === `${contract.name}.${outflowFn.name}`,
-  );
+  const declarationFor=(fn:any)=>declarations.find(d=>d.operation==='send' &&
+    d.selector===contract.name+'.'+fn.name &&
+    JSON.stringify(d.inputs)===JSON.stringify((fn.parameters||[])
+      .map((p:any)=>canonicalAbiType(p.typeName))));
+  const inflowDecl = declarationFor(inflowFn);
+  const outflowDecl = declarationFor(outflowFn);
   if (!inflowDecl || !outflowDecl) {
     return {
       ok: false,
