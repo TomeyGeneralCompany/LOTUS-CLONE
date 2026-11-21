@@ -70,7 +70,7 @@ export class AnalysisProgressStore {
     const parsed=JSON.parse(raw) as AnalysisProgressSnapshot;
     // V1 snapshots contain valid source identities but lack the V2 terminality contract.
     // Preserve their candidate lifecycles and upgrade the schema on the next save.
-    if(![1,2].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
+    if(![1,2,3].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
        JSON.stringify([...parsed.candidateIds].sort())!==JSON.stringify([...store.records.keys()].sort()))
       throw new Error("ANALYSIS_CHECKPOINT_SOURCE_MISMATCH: source inventory or revision changed");
     if(!Array.isArray(parsed.records)||parsed.records.length!==candidates.length||
