@@ -32,6 +32,7 @@ import {
 import type { LeadAnalysisDecision, LeadAnalysisInput } from "./hypothesis-engine";
 import {
   runClosedLoopLeadAnalysis,
+  runPreparedFinancialFoundryProperty,
   type ClosedLoopLeadResult,
   type EscalationCache,
   type SpecializedEscalationHooks,
@@ -340,6 +341,19 @@ export function evaluateDeterministicAnalysisTurn(
     });
     if (constructed.ok) {
       for (const exp of constructed.experiments) {
+        if(exp.securityProperty.startsWith("financial ")){
+          const original=input.sources.find(source=>source.path===exp.path);
+          if(original){
+            const propertyProbe=runPreparedFinancialFoundryProperty(original,exp);
+            closedLoop.steps.push(propertyProbe.step);
+            if(propertyProbe.step.status==="executed"){
+              closedLoop.escalatedAdapters.push("foundry");
+              closedLoop.addedFacts.push(...propertyProbe.facts);
+            }
+            if(propertyProbe.step.status==="error")
+              unresolvedReasons.push("foundry_property_replay_error:"+String(propertyProbe.step.detail||"unknown").slice(0,120));
+          }
+        }
         const hypothesis = exp.hypothesis.slice(0, 600);
         experimentCandidates.push({
           id: exp.id,
