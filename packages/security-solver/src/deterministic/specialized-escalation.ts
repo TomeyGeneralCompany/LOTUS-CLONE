@@ -11,7 +11,7 @@
  *   4. Merge returned ProgramFacts and ProgramEdges into ProgramFactsGraph
  *   5. Re-evaluate the lead -> finalDecision (may flip assess_lead <-> defer_lead)
  */
-import type { SourceSnapshot } from "../controller-solidity-experiment-planner";
+import type { SourceSnapshot, PreparedSecurityExperiment } from "../controller-solidity-experiment-planner";
 import type {
   FactLanguage,
   ProgramEdge,
@@ -401,6 +401,76 @@ contract LotusClosedLoopFoundryTest {
 }
 `;
   return { contractFileName, testContractSource };
+}
+
+/**
+ * Source-bound Foundry fallback for already admitted financial experiments.
+ * This is deliberately narrower than the EVM reproduction runtime: contracts
+ * requiring tokens, roles, initialization or externally deployed fixtures
+ * remain in the EVM planner instead of receiving invented Foundry mocks.
+ */
+export function runPreparedFinancialFoundryProperty(
+  snapshot:SourceSnapshot,experiment:PreparedSecurityExperiment,
+):{step:EscalationStepRecord;facts:ProgramFact[]} {
+  const unsupported=(reason:string):{step:EscalationStepRecord;facts:ProgramFact[]}=>({
+    step:{adapter:"foundry",attempted:false,reason,status:"skipped",
+      factsAdded:0,edgesAdded:0,elapsedMs:0},facts:[],
+  });
+  if(!experiment.securityProperty.startsWith("financial "))return unsupported("not_financial_property");
+  if(experiment.path!==snapshot.path||
+    !experiment.witnesses.some(w=>w.file===snapshot.path&&w.sourceSha256===snapshot.sha256))
+    return unsupported("source_identity_not_proven");
+  const sequence=experiment.sequence;
+  if(sequence.preparation||sequence.constructorArgs.length||sequence.constructorValueWei)
+    return unsupported("property_requires_external_fixture");
+  const [contractName]=experiment.selector.split(".");
+  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(contractName)|| 
+    !new RegExp("\\bcontract\\s+"+contractName+"\\b").test(snapshot.content))
+    return unsupported("contract_source_not_proven");
+  if(/\bconstructor\s*\(/.test(snapshot.content))
+    return unsupported("nontrivial_constructor_fixture");
+  const actions:string[]=[];
+  for(const step of sequence.steps){
+    if(step.operation==="send"){
+      if(step.deploymentId||step.expectRevert||step.valueWei||(step.sender??0)!==0)
+        return unsupported("nontrivial_caller_or_transaction");
+      const fn=step.function.split("(")[0];
+      if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(fn)||
+        step.args.some(a=>typeof a!=="string"||!/^[0-9]+$/.test(a)))
+        return unsupported("nonliteral_financial_action");
+      actions.push("target."+fn+"("+step.args.join(",")+");");
+    }else if(step.operation==="call"){
+      if(step.deploymentId||step.expectPath||(step.sender??0)!==0 ||
+        step.args.length>0||typeof step.expect!=="string"||!/^[0-9]+$/.test(step.expect))
+        return unsupported("unsupported_readback_relation");
+      const fn=step.function.split("(")[0];
+      if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(fn))
+        return unsupported("invalid_readback_signature");
+      actions.push('require(target.'+fn+'() == '+step.expect+',"PROPERTY_READBACK_MISMATCH");');
+    }else return unsupported("unsupported_financial_step");
+  }
+  if(!actions.some(a=>a.startsWith("require("))||!actions.some(a=>a.startsWith("target.")))
+    return unsupported("missing_observable_financial_transition");
+  if(!isFoundryAvailable())return {step:{adapter:"foundry",attempted:false,
+    reason:"tool_unavailable",status:"unavailable",factsAdded:0,edgesAdded:0,elapsedMs:0},
+    facts:[]};
+  const basename=snapshot.path.split("/").pop()||"Source.sol";
+  const source="// SPDX-License-Identifier: MIT\npragma solidity >=0.6.0 <0.9.0;\n"+
+    'import "../src/'+basename+'";\n'+
+    "contract LotusPreparedFinancialProperty {\n"+
+    contractName+" target;\n"+
+    "function setUp() public { target=new "+contractName+"(); }\n"+
+    "function testSourceBoundFinancialProperty() public {\n"+
+    actions.map(a=>"  "+a).join("\n")+"\n}\n}\n";
+  const started=Date.now();
+  const result=runFoundrySolidityTest({file:snapshot.path,contractSource:snapshot.content,
+    contractFileName:basename,testContractSource:source,fuzzRuns:32,timeoutMs:45000});
+  return {step:{adapter:"foundry",attempted:result.status!=="unavailable",
+    reason:"source_proven_financial_property",
+    status:result.status==="completed"?"executed":result.status==="unavailable"?"unavailable":"error",
+    factsAdded:result.facts.length,edgesAdded:0,elapsedMs:Date.now()-started,
+    ...(result.error?{detail:result.error.slice(0,300)}:{})},
+    facts:result.facts};
 }
 
 /**
