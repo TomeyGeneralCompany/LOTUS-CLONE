@@ -43,7 +43,13 @@ export const solidityPreparationSchema=z.object({
   }
 });
 export type SolidityPreparation=z.infer<typeof solidityPreparationSchema>;
-export const soliditySequenceSchema = z.object({constructorArgs:args,constructorValueWei:wei.optional(),deployment:deployment.optional(),preparation:solidityPreparationSchema.optional(),
+const scalarDeltaProperty=z.object({kind:z.literal("scalar_delta"),
+  state:z.string().regex(/^[A-Za-z_]\\w*$/),method:signature,
+  parameter:z.string().regex(/^[A-Za-z_]\\w*$/),
+  amount:z.string().regex(/^(0|[1-9][0-9]{0,29})$/),
+  direction:z.literal("increase"),sourceSha256:z.string().regex(/^[a-f0-9]{64}$/)
+}).strict();
+export const soliditySequenceSchema = z.object({constructorArgs:args,constructorValueWei:wei.optional(),deployment:deployment.optional(),preparation:solidityPreparationSchema.optional(),sourceProperty:scalarDeltaProperty.optional(),
   steps:z.array(z.discriminatedUnion("operation",[send,call,observe,ethBalance])).min(1).max(16)}).strict()
   .superRefine((s,ctx)=>{
     for(const step of s.steps)
