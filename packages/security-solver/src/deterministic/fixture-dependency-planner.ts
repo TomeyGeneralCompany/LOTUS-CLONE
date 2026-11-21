@@ -176,9 +176,10 @@ export function resolveAcquiredInterfaceCallers(
         if(!Number.isInteger(bodyStart)||!Number.isInteger(bodyEnd))continue;
         const sourceBody=source.content.slice(bodyStart,bodyEnd+1);
         for(const receiver of receivers){
-          const escaped=receiver.replace(/[.*+?^${}()|[\\]\\]/g,'\\export function resolveSourceFixtureDependencies(');
-          if(!new RegExp('\\\\b'+escaped+'\\\\s*\\\\.\\\\s*'+method+'\\\\s*\\\\\\(').test(sourceBody))
-            continue;
+          if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(receiver))continue;
+          if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(method))continue;
+          const expression=new RegExp('\\b'+receiver+'\\s*\\.\\s*'+method+'\\s*\\(');
+          if(!expression.test(sourceBody))continue;
           callers.push({path:source.path,selector:contract.name+'.'+fn.name,
             sourceSha256:source.sha256,interfaceName,method,receiver,
             witness:source.path+':'+source.sha256+':'+
