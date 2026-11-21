@@ -527,16 +527,20 @@ export async function runLocalAudit(
         const id=preexisting?.id||JSON.stringify([exp.path,exp.selector,plan.answer,"repair",exp.id]);
         const propertyId=createHash("sha256").update(JSON.stringify([
           lead.id,exp.securityProperty,witnesses])).digest("hex");
-        if(analysisProgressStore.records.get(lead.id)?.experimentIds.includes(id))continue;
+        const alreadyLinked=analysisProgressStore.records.get(lead.id)?.properties
+          .some(p=>p.id===propertyId&&p.experimentIds.includes(id));
+        if(alreadyLinked)continue;
         if(!preexisting){
           stageLock.discover(id);
           stagedPlans.push({id,plan});
         }
         analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses,
           exp.path!==lead.path);
-        added++;repairAdded++;
+        added++;
+        if(!preexisting)repairAdded++;
         await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
           leadId:lead.id,experimentId:id,property:exp.securityProperty,
+          reused:!!preexisting,sourceSha256:lead.sourceSha256,
           witnesses:witnesses.length})+"\n");
       }
       analysisProgressStore.noteRepairAttempt(lead.id,strategy,
