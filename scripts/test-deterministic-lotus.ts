@@ -953,6 +953,11 @@ contract SiblingPool${n} {
       }
 
       const auditLog = await readFile(logPath, "utf8");
+      if(!/\[ANALYSIS_MODEL_EXPERIMENT_ADDED\][^\n]*BuggyAccountingVault\.(?:deposit|withdraw)/.test(auditLog)){
+        console.error("ADMISSION_DIAGNOSTIC",
+          auditLog.split("\n").filter(line=>/\[ANALYSIS_MODEL_|\[ANALYSIS_EXPERIMENT_|\[DETERMINISTIC_EXPERIMENT_UNRESOLVED\]|\[ANALYSIS_LEAD_/.test(line))
+            .filter(line=>/BuggyAccountingVault/.test(line)).slice(-28).join("\n").slice(0,12000));
+      }
       const graphBuilds = auditLog.match(/\[DETERMINISTIC_FACTS_GRAPH_BUILT\]/g) || [];
       assert.equal(graphBuilds.length, 1, "ProgramFactsGraph must be built ONCE per investigation and reused");
       assert.match(auditLog, /\[ANALYSIS_CANDIDATE_INVENTORY\]/, "Full candidate inventory telemetry must be logged");
