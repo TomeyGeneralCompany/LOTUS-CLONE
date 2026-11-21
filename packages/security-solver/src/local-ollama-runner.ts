@@ -457,7 +457,11 @@ export async function runLocalAudit(
           x.sourceSha256===record.sourceSha256))continue;
       const declarations=deterministicDeclarationsCache.get(lead.path)||[];
       if(!declarations.length){
-        analysisProgressStore.noteRepairAttempt(lead.id,strategy,"missing_source_declarations");
+        const reason="missing_source_declarations";
+        analysisProgressStore.noteRepairAttempt(lead.id,strategy,reason);
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
+          leadId:lead.id,path:lead.path,selector:lead.selector,reason,
+          sourceSha256:lead.sourceSha256})+"\n");
         repairBlocked++;
         continue;
       }
@@ -467,8 +471,11 @@ export async function runLocalAudit(
         declarations,staticLeads:limits.staticLeads||[],
       });
       if(!constructed.ok){
-        analysisProgressStore.noteRepairAttempt(lead.id,strategy,
-          constructed.code+":"+constructed.detail.slice(0,420));
+        const reason=constructed.code+":"+constructed.detail.slice(0,420);
+        analysisProgressStore.noteRepairAttempt(lead.id,strategy,reason);
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
+          leadId:lead.id,path:lead.path,selector:lead.selector,reason,
+          sourceSha256:lead.sourceSha256})+"\n");
         repairBlocked++;
         continue;
       }
@@ -494,7 +501,13 @@ export async function runLocalAudit(
       }
       analysisProgressStore.noteRepairAttempt(lead.id,strategy,
         added?("new_experiments:"+added):"no_distinct_sourced_experiment");
-      if(!added)repairBlocked++;
+      if(!added){
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
+          leadId:lead.id,path:lead.path,selector:lead.selector,
+          reason:"no_distinct_sourced_experiment",
+          sourceSha256:lead.sourceSha256})+"\n");
+        repairBlocked++;
+      }
     }
     await analysisProgressStore.save();
     await appendFile(logFile,"[EXPERIMENT_REPAIR_RECONCILIATION] "+JSON.stringify({
