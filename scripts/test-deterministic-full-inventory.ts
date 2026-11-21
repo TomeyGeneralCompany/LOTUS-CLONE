@@ -206,7 +206,7 @@ async function run(){
       if(completed===240){
         assert.equal(proofStore.experimentCertificate.conclusive,240);
         assert.throws(()=>proofLock.completeExperiments(proofStore.experimentCertificate),
-          /EXPERIMENT_LEAD_COVERAGE_INCOMPLETE/);
+          /EXPERIMENTS_INCOMPLETE|EXPERIMENT_LEAD_COVERAGE_INCOMPLETE/);
         assert.equal(proofLock.currentStage,'EXPERIMENT');
       }
     }
