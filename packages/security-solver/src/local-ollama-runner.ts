@@ -378,8 +378,11 @@ export async function runLocalAudit(
       analysisProgressStore.recordAssessment(
         lead.id,
         detail?.decision.matchedHypotheses.map(x=>x.id)||[],
-        [...(detail?.unresolvedReasons||[]),...missing.map(x=>
-          'constructed_but_not_scheduled:'+x.id)],
+        [...(detail?.unresolvedReasons||[]),
+          ...(!detail?['analysis_result_missing']:[]),
+          ...(detail?.constructionFeasibility.skippedReason==='missing_declarations'
+            ?['source_abi_declarations_missing']:[]),
+          ...missing.map(x=>'constructed_but_not_scheduled:'+x.id)],
         scheduled.map(x=>x.id),
       );
       analysisProgressStore.markTerminalAssessment(lead.id,
