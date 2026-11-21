@@ -126,7 +126,7 @@ async function run(){
       'A completed role test must not resolve an unrelated missing financial prerequisite');
     await pending.save();
     assert.equal(pending.counts.queued,1);
-    assert.equal(pending.counts.dependenciesPending,1);
+    assert.equal(pending.counts.dependenciesPending,2, 'Unexecutable properties are pending, not terminally exhausted');
     assert.equal(pending.counts.experimentsPending,1);
     assert.equal(pending.terminallyComplete,false);
     pending=await AnalysisProgressStore.open(pendingFile,pendingCandidates);
