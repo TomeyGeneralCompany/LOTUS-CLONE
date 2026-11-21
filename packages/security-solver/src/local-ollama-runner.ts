@@ -29,6 +29,7 @@ import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
+import {resolveAcquiredConcreteImplementations} from "./deterministic/fixture-dependency-planner";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
 async function recordToolActivity(logFile:string,event:Record<string,unknown>):Promise<void> {
@@ -470,8 +471,41 @@ export async function runLocalAudit(
         targetSelector:lead.selector,sources:deterministicSourceSnapshots,
         declarations,staticLeads:limits.staticLeads||[],
       });
-      if(!constructed.ok){
-        const reason=constructed.code+":"+constructed.detail.slice(0,420);
+      const successful=constructed.ok?[constructed]:[];
+      const altFailures:string[]=[];
+      if(!constructed.ok&&constructed.unresolvedCategory==="missing_fixture"&&
+        /abstract and cannot be instantiated/.test(constructed.detail)){
+        const rootSource=deterministicSourceSnapshots.find(source=>source.path===lead.path &&
+          source.sha256===lead.sourceSha256);
+        if(rootSource){
+          const method=lead.selector.split(".").pop()||"";
+          const abstractContract=lead.selector.slice(0,lead.selector.lastIndexOf("."));
+          const concrete=resolveAcquiredConcreteImplementations(rootSource,
+            abstractContract,method,deterministicSourceSnapshots);
+          for(const target of concrete.slice(0,8)){
+            const implMenu=deterministicDeclarationsCache.get(target.path)||[];
+            if(!implMenu.some(d=>d.selector===target.selector&&d.operation==="send")){
+              altFailures.push(target.selector+":concrete_send_declaration_missing");
+              continue;
+            }
+            const candidate=constructSolidityExperiments({
+              repositoryCommit:lead.sourceCommit,targetPath:target.path,
+              targetSelector:target.selector,sources:deterministicSourceSnapshots,
+              declarations:implMenu,staticLeads:limits.staticLeads||[],
+            });
+            if(candidate.ok)successful.push(candidate);
+            else altFailures.push(target.selector+":"+candidate.code+":"+candidate.detail.slice(0,180));
+          }
+          await appendFile(logFile,"[EXPERIMENT_CONCRETE_RESOLUTION] "+JSON.stringify({
+            leadId:lead.id,abstractSelector:lead.selector,
+            candidates:concrete.map(x=>({selector:x.selector,path:x.path,sourceSha256:x.sourceSha256})),
+            executable:successful.length,failures:altFailures})+"\n");
+        }
+      }
+      if(!successful.length){
+        const reason=constructed.ok?"no_constructed_experiment":
+          constructed.code+":"+constructed.detail.slice(0,420)+
+            (altFailures.length?"; concrete: "+altFailures.join("; ").slice(0,350):"");
         analysisProgressStore.noteRepairAttempt(lead.id,strategy,reason);
         await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
           leadId:lead.id,path:lead.path,selector:lead.selector,reason,
@@ -480,19 +514,22 @@ export async function runLocalAudit(
         continue;
       }
       let added=0;
-      for(const exp of constructed.experiments){
+      for(const built of successful)for(const exp of built.experiments){
         const plan={action:"plan_probe" as const,path:exp.path,query:exp.selector,
           answer:"solidity_sequence",hypothesis:exp.hypothesis,sequence:exp.sequence};
-        if(stagedPlans.some(x=>x.plan.path===plan.path &&
+        const preexisting=stagedPlans.find(x=>x.plan.path===plan.path &&
           x.plan.query===plan.query && x.plan.hypothesis===plan.hypothesis &&
-          JSON.stringify(x.plan.sequence)===JSON.stringify(plan.sequence)))continue;
+          JSON.stringify(x.plan.sequence)===JSON.stringify(plan.sequence));
         const witnesses=[lead.sourceEvidence,
           ...exp.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(":"))];
-        const id=JSON.stringify([exp.path,exp.selector,plan.answer,"repair",exp.id]);
+        const id=preexisting?.id||JSON.stringify([exp.path,exp.selector,plan.answer,"repair",exp.id]);
         const propertyId=createHash("sha256").update(JSON.stringify([
           lead.id,exp.securityProperty,witnesses])).digest("hex");
-        stageLock.discover(id);
-        stagedPlans.push({id,plan});
+        if(analysisProgressStore.records.get(lead.id)?.experimentIds.includes(id))continue;
+        if(!preexisting){
+          stageLock.discover(id);
+          stagedPlans.push({id,plan});
+        }
         analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses);
         added++;repairAdded++;
         await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
