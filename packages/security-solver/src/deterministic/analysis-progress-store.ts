@@ -42,7 +42,7 @@ export interface CandidateCoverage {
 }
 
 export interface AnalysisProgressSnapshot {
-  version:1|2|3; inventoryFingerprint:string;
+  version:1|2|3|4; inventoryFingerprint:string;
   candidateIds:string[]; records:CandidateProgress[];
   processedBatches:number; completedExperimentIds:string[];
 }
@@ -72,7 +72,7 @@ export class AnalysisProgressStore {
     const parsed=JSON.parse(raw) as AnalysisProgressSnapshot;
     // V1 snapshots contain valid source identities but lack the V2 terminality contract.
     // Preserve their candidate lifecycles and upgrade the schema on the next save.
-    if(![1,2,3].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
+    if(![1,2,3,4].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
        JSON.stringify([...parsed.candidateIds].sort())!==JSON.stringify([...store.records.keys()].sort()))
       throw new Error("ANALYSIS_CHECKPOINT_SOURCE_MISMATCH: source inventory or revision changed");
     if(!Array.isArray(parsed.records)||parsed.records.length!==candidates.length||
@@ -86,14 +86,33 @@ export class AnalysisProgressStore {
         throw new Error("ANALYSIS_CHECKPOINT_CORRUPT: "+r.id);
       // A process crash must never strand an admitted but unassessed candidate.
       if(r.lifecycle==="admitted"||r.lifecycle==="analyzing")r.lifecycle="queued";
-      // Older checkpoints contain completed IDs but no verifier evidence. Their
-      // records remain actionable until a source-identical replay is recorded.
-      if(r.lifecycle==="experiment_completed"&&!store.isConclusive(r))
+      // A legacy checkpoint may contain terminal dispositions and experiment IDs
+      // but no source-bound verifier evidence. Re-admit that candidate for
+      // deterministic source analysis instead of accepting its stale closure.
+      // Keep genuine source-bound evidence intact for reproducible continuation.
+      const legacyMissingEvidence=(r.experimentIds.length>0&&!r.experimentEvidence?.length)||
+        r.properties.some(p=>p.experimentIds.length>0&&!p.sourceWitnesses.length);
+      if((parsed.version<4 && legacyMissingEvidence) || (parsed.version<4 &&
+        !store.isConclusive(r) && ["dependencies_pending","analysis_exhausted","blocked"].includes(r.lifecycle))){
+        r.lifecycle="queued";
+        r.properties=[];
+        r.experimentIds=[];
+        r.repairAttempts=[];
+        r.inconclusiveAttempts=[];
+        r.lastError="checkpoint_requires_source_bound_replay";
+      } else if(!store.isConclusive(r)&&
+        ["experiment_completed","analysis_exhausted","blocked"].includes(r.lifecycle)){
         r.lifecycle="dependencies_pending";
+      }
       store.records.set(r.id,r);
     }
     store.processedBatches=parsed.processedBatches||0;
-    for(const id of parsed.completedExperimentIds||[])store.completedExperimentIds.add(id);
+    // Historical completion IDs remain audit history, not proof of a source-
+    // bound property; the certificate enforces the separate evidence contract.
+    for(const id of parsed.completedExperimentIds||[])
+      if(parsed.version>=4||[...store.records.values()].some(r=>
+        r.experimentIds.includes(id)&&r.experimentEvidence?.some(e=>e.experimentId===id)))
+        store.completedExperimentIds.add(id);
     return store;
   }
   get counts():CandidateCoverage {
@@ -246,10 +265,14 @@ export class AnalysisProgressStore {
       result:result.slice(0,500)});
     return true;
   }
-  addRepairExperiment(leadId:string,propertyId:string,experimentId:string,witnesses:string[]){
+  addRepairExperiment(leadId:string,propertyId:string,experimentId:string,witnesses:string[],resolvedAbstractFixture=false){
     const record=this.records.get(leadId);
+    // The lead's original source must be witnessed; the concrete imported
+    // implementation necessarily has a different SHA and must retain its
+    // own independent source-bound witness rather than inheriting the root hash.
     if(!record||!experimentId||!witnesses.length||
-      witnesses.some(x=>!x.includes(record.sourceSha256)))
+      !witnesses.some(x=>x.includes(record.sourceSha256))||
+      witnesses.some(x=>!/\b[a-f0-9]{64}\b/.test(x)))
       throw new Error("REPAIR_EXPERIMENT_SOURCE_WITNESS_REQUIRED: "+leadId);
     if(record.experimentIds.includes(experimentId))return;
     record.experimentIds.push(experimentId);
@@ -260,7 +283,9 @@ export class AnalysisProgressStore {
       p.unresolvedPrerequisites.length>0 &&
       p.unresolvedPrerequisites.every(reason=>
         /UNKNOWN_ASSERTION\((?:no_supported_property|missing_observable_state)\)/.test(reason)||
-        reason==="source_grounded_falsifier_missing"))
+        reason==="source_grounded_falsifier_missing"||
+        (resolvedAbstractFixture&&/UNKNOWN_ASSERTION\(missing_fixture\)/.test(reason)&&
+          /abstract and cannot be instantiated directly/.test(reason))))
       p.supersededBy=propertyId;
     record.properties=record.properties.filter(p=>!p.id.endsWith(":needs_property"));
     record.properties.push({id:propertyId,state:"test_constructed",
@@ -287,15 +312,19 @@ export class AnalysisProgressStore {
   // A blocked property remains durable and eligible for a genuinely different
   // source-backed experiment. Identical failed scripts cannot be counted twice.
   nextRepairBatch(max:number):AnalysisCandidate[]{
+    // Repair eligibility follows the actual evidence certificate, not a
+    // particular legacy lifecycle label. Both analysis_exhausted and
+    // experiment_pending can still have uncovered source-backed obligations.
     const eligible=this.candidates.filter(c=>{
       const record=this.records.get(c.id);
-      return record?.lifecycle==="dependencies_pending"&&
-        !record.properties.every(p=>p.state==="test_completed");
+      return !!record && record.lifecycle!=="queued" &&
+        record.lifecycle!=="admitted" && record.lifecycle!=="analyzing" &&
+        !this.isConclusive(record);
     });
     return eligible.slice(0,max);
   }
   async save():Promise<void>{
-    const state:AnalysisProgressSnapshot={version:3,inventoryFingerprint:this.inventoryFingerprint,
+    const state:AnalysisProgressSnapshot={version:4,inventoryFingerprint:this.inventoryFingerprint,
       candidateIds:[...this.records.keys()],records:[...this.records.values()],
       processedBatches:this.processedBatches,completedExperimentIds:[...this.completedExperimentIds]};
     await mkdir(dirname(this.path),{recursive:true});

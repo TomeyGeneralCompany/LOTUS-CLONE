@@ -5,12 +5,12 @@
  */
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {mkdtemp,rm} from 'node:fs/promises';
+import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
-import {resolveSourceFixtureDependencies} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -221,6 +221,78 @@ async function run(){
     proofLock.completeReviews();
     proofLock.completeReport(true);
     assert.equal(proofLock.currentStage,'COMPLETE');
+    // Regression for the real laptop: v3 persisted lead dispositions but no
+    // source-bound verifier evidence for the old 67 selected experiments.
+    // Migration must actually queue the leads for new source-grounded work,
+    // never silently certify them or strand them as already assessed.
+    const legacyFile=join(dir,'laptop-v3.json');
+    const legacyData=JSON.parse(await readFile(proofFile,'utf8')) as any;
+    legacyData.version=3;
+    const missing=legacyData.records[0];
+    missing.experimentEvidence=[];
+    missing.properties[0].sourceWitnesses=[];
+    missing.lifecycle='experiment_completed';
+    const deferred=legacyData.records[1];
+    deferred.experimentEvidence=[];
+    deferred.properties=[{id:'old-unresolved',state:'prerequisites_pending',
+      sourceWitnesses:[],unresolvedPrerequisites:['missing_fixture'],experimentIds:[]}];
+    deferred.experimentIds=[];
+    deferred.lifecycle='dependencies_pending';
+    await writeFile(legacyFile,JSON.stringify(legacyData));
+    const migrated=await AnalysisProgressStore.open(legacyFile,all241);
+    assert.equal(migrated.records.get(missing.id)?.lifecycle,'queued');
+    assert.equal(migrated.records.get(deferred.id)?.lifecycle,'queued');
+    assert.equal(migrated.remaining,2,'The two legacy unsupported states must be reanalyzed');
+    assert.equal(migrated.experimentCertificate.conclusive,239,
+      'Other 239 real source-evidence-backed cases must survive migration');
+    await migrated.save();
+    const stableMigration=await AnalysisProgressStore.open(legacyFile,all241);
+    assert.equal(stableMigration.remaining,2,'Version-four resume must not re-migrate');
+    assert.equal(stableMigration.experimentCertificate.conclusive,239);
+    // Repair selection follows evidence completeness, not legacy lifecycle.
+    // The old scheduler ignored analysis_exhausted, hiding 50 laptop leads.
+    const repairTypes=candidates.slice(0,4).map((c,i)=>({...c,id:hash('repair-state:'+i)}));
+    const repairStore=await AnalysisProgressStore.open(join(dir,'repair-selection.json'),repairTypes);
+    for(const lead of repairStore.nextBatch(4,4))
+      repairStore.recordAssessment(lead.id,[],[],[]);
+    repairStore.records.get(repairTypes[0].id)!.lifecycle="analysis_exhausted";
+    repairStore.records.get(repairTypes[1].id)!.lifecycle="dependencies_pending";
+    repairStore.records.get(repairTypes[2].id)!.lifecycle="experiment_pending";
+    repairStore.records.get(repairTypes[3].id)!.lifecycle="blocked";
+    assert.deepEqual(
+      new Set(repairStore.nextRepairBatch(4).map(x=>x.id)),
+      new Set(repairTypes.map(x=>x.id)),
+      'All four unresolved lifecycles need construction repair or explicit blockers');
+    const abstractLead=repairStore.records.get(repairTypes[0].id)!;
+    abstractLead.lifecycle="dependencies_pending";
+    abstractLead.properties=[{id:'abstract-deployment',state:'prerequisites_pending',
+      sourceWitnesses:[],experimentIds:[],
+      unresolvedPrerequisites:['UNKNOWN_ASSERTION(missing_fixture): Contract IWallet is abstract and cannot be instantiated directly']}];
+    const concreteEvidenceId=hash('concrete-implementation-run');
+    const concreteExperimentId=hash('concrete-wallet-experiment');
+    repairStore.addRepairExperiment(repairTypes[0].id,concreteEvidenceId,concreteExperimentId,
+      [path+':'+sourceSha, 'source-1/contracts/Wallet.sol:'+hash('actual wallet')],true);
+    repairStore.markExperimentCompleted(concreteExperimentId,{result:'not_observed',
+      evidenceId:hash('real-experiment-case'),verifierDigest:hash('real-verifier-output')});
+    assert.equal(repairStore.records.get(repairTypes[0].id)!.lifecycle,'experiment_completed');
+    assert.equal(repairStore.records.get(repairTypes[0].id)!.properties.length,1,
+      'A proven implementation may supersede only its abstract deployment blocker');
+    // Abstract interfaces must resolve only to acquired concrete implementations
+    // with an explicit import and direct inheritance of the target interface.
+    // Unrelated names and guessed network contracts cannot supply test evidence.
+    const abstractSource='pragma solidity ^0.8.0; interface IWallet { function withdraw(uint256 value) external; }';
+    const implSource='pragma solidity ^0.8.0; import "./IWallet.sol"; contract Wallet is IWallet { function withdraw(uint256 value) external override {} }';
+    const unrelatedSource='pragma solidity ^0.8.0; contract Other is IWallet { function withdraw(uint256 value) external {} }';
+    const targetInterface={path:'source-1/contracts/IWallet.sol',content:abstractSource,sha256:hash(abstractSource)};
+    const targetImpl={path:'source-1/contracts/Wallet.sol',content:implSource,sha256:hash(implSource)};
+    const unrelatedImpl={path:'source-1/contracts/Other.sol',content:unrelatedSource,sha256:hash(unrelatedSource)};
+    const available=resolveAcquiredConcreteImplementations(targetInterface,'IWallet','withdraw',
+      [targetInterface,targetImpl,unrelatedImpl]);
+    assert.equal(available.length,1,'An unrelated source with no verified import edge must not be substituted');
+    assert.equal(available[0].selector,'Wallet.withdraw');
+    assert.equal(available[0].sourceSha256,targetImpl.sha256);
+    assert.equal(resolveAcquiredConcreteImplementations(targetInterface,'IWallet','borrow',
+      [targetInterface,targetImpl]).length,0,'Do not invent an unimplemented method');
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);

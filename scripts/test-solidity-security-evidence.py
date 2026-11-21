@@ -30,6 +30,35 @@ CONTRACT_ADDR = "0x" + "44" * 20
 
 
 class SoliditySecurityEvidenceTests(unittest.TestCase):
+    def test_imported_inherited_method_requires_acquired_executable_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            src=root/"contracts"
+            src.mkdir()
+            abstract=src/"Rescuable.sol"
+            abstract.write_text(
+                "pragma solidity ^0.8.4; abstract contract Rescuable { "
+                "function rescue(uint256 amount) external virtual { require(amount>0); } }")
+            concrete=src/"Wallet.sol"
+            concrete.write_text(
+                'pragma solidity ^0.8.4; import "./Rescuable.sol"; '
+                'contract Wallet is Rescuable { }')
+            allowed,why=repro_mod.execution_capability(
+                root,"contracts/Wallet.sol","Wallet.rescue","solidity_sequence")
+            self.assertTrue(allowed,why)
+            interface=src/"IAccount.sol"
+            interface.write_text(
+                "pragma solidity ^0.8.4; interface IAccount { "
+                "function rescue(uint256 amount) external; }")
+            fake=src/"Fake.sol"
+            fake.write_text(
+                'pragma solidity ^0.8.4; import "./IAccount.sol"; '
+                'contract Fake is IAccount { }')
+            allowed,_=repro_mod.execution_capability(
+                root,"contracts/Fake.sol","Fake.rescue","solidity_sequence")
+            self.assertFalse(allowed,
+                "An imported ABI interface must not become an invented executable experiment")
+
     def test_reinit_takeover_positive_and_single_init_negative(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -316,6 +345,39 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                 {"sequence":{"steps":vestreq}})
             self.assertEqual(vestout[0],"behavior_not_observed")
             self.assertEqual(vestout[1],"vest_creation_negative")
+            # Exact laptop evidence: the verifier resolved $account2 into the
+            # third EVM signer. A placeholder is not a failed ownership assertion.
+            vest_with_setup=[
+                {"operation":"send","function":"initialize(address,string,string)",
+                 "sender":0,"reverted":False,"passed":True},
+                {"operation":"send","function":"setMPHMinter(address)",
+                 "sender":0,"reverted":False,"passed":True},
+                *veststeps,
+            ]
+            vest_source_requests=[
+                {"operation":"send","function":"initialize(address,string,string)",
+                 "sender":0},
+                {"operation":"send","function":"setMPHMinter(address)",
+                 "sender":0},
+                *vestreq,
+            ]
+            vest_source_requests[-1]["expect"]="$account2"
+            observed=security_experiment_disposition(root,vest,
+                "Vesting02.createVestForDeposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":vest_with_setup},
+                {"sequence":{"steps":vest_source_requests}})
+            self.assertEqual(observed[0],"behavior_not_observed",
+                "The exact 9-step laptop trace had all nine asserted steps pass")
+            self.assertEqual(observed[1],"vest_creation_negative")
+            wrong_owner=[dict(x) for x in vest_with_setup]
+            wrong_owner[-1]["actual"]=ACCOUNTS[1]
+            wrong_owner[-1]["passed"]=False
+            wrong=security_experiment_disposition(root,vest,
+                "Vesting02.createVestForDeposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":wrong_owner},
+                {"sequence":{"steps":vest_source_requests}})
+            self.assertEqual(wrong[0],"observation_only",
+                "An actual failed ownership assertion must not certify a negative")
             vestmissing=veststeps[:-1]
             self.assertEqual(security_experiment_disposition(root,vest,
                 "Vesting02.createVestForDeposit",

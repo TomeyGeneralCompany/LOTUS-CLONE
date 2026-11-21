@@ -171,7 +171,38 @@ def execution_capability(repository: Path, file: str, function: str, kind: str) 
             if not re.search(rf'\bcontract\s+{re.escape(contract_name)}\b', source):
                 return False, f'Solidity contract {contract_name} is not declared in {file}'
             if not re.search(rf'\bfunction\s+{re.escape(method_name)}\s*\(', source):
-                return False, f'Solidity function {method_name} is not declared in {file}'
+                # Directly inherited method execution is allowed only when an
+                # acquired, explicitly imported base contains the actual
+                # source-implemented function. An interface signature or
+                # arbitrary network/mocked implementation is insufficient.
+                inherited=False
+                for entry in re.finditer(r'\bimport\b[^;]{0,1000}["\']([^"\']+)["\']\s*;', source):
+                    imported_path=entry.group(1)
+                    if not imported_path.startswith('.'):
+                        continue
+                    try:
+                        parent=(target.parent/imported_path).resolve(strict=True)
+                        if not parent.is_relative_to(repository) or not parent.is_file():
+                            continue
+                        parent_source=parent.read_text(errors='replace')
+                    except OSError:
+                        continue
+                    for base in re.finditer(
+                        rf'\bcontract\s+{re.escape(contract_name)}\s+is\s+([^{{;]{{1,400}})\{{',
+                        source):
+                        for ancestor in re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', base.group(1)):
+                            if (re.search(r'\b(?:abstract\s+)?contract\s+'+re.escape(ancestor)+r'\b', parent_source)
+                                    and re.search(
+                                        rf'\bfunction\s+{re.escape(method_name)}\s*\([^;]{{0,500}}\)[^;]{{0,500}}\{{',
+                                        parent_source)):
+                                inherited=True
+                                break
+                        if inherited:
+                            break
+                    if inherited:
+                        break
+                if not inherited:
+                    return False, f'Solidity function {method_name} has no acquired executable body in {file}'
             return True, None
         return True, None
     return True, None
