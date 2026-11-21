@@ -86,6 +86,9 @@ export interface DeterministicAuditTurnInput {
   requestSchema?: Record<string, any>;
   initialSourcePaths?: readonly string[];
   readPaths?: readonly string[];
+  sourceIndexedCount?: number;
+  sourceReadCount?: number;
+  candidateCoverage?: import("./analysis-progress-store").CandidateCoverage;
   outcomes?: DeterministicOutcomeCounts;
   observedCases?: readonly DeterministicObservedCase[];
   recoveredFinalJson?: string | null;
@@ -173,15 +176,17 @@ function buildDeterministicNegativeFinal(input: DeterministicAuditTurnInput): Re
   };
   const totalSelected =
     o.observed + o.observation_only + o.not_observed + o.unsupported + o.incomplete + o.rejected + o.pending;
-  const readCount = input.readPaths?.length ?? input.sources.length;
-  const indexedCount = Math.max(readCount, input.initialSourcePaths?.length ?? input.sources.length);
-  const incompleteTotal = o.observation_only + o.incomplete + o.unsupported + o.pending;
+  const readCount = input.sourceReadCount ?? input.readPaths?.length ?? input.sources.length;
+  const indexedCount = input.sourceIndexedCount ?? Math.max(readCount, input.initialSourcePaths?.length ?? input.sources.length);
+  const unresolvedCandidates=input.candidateCoverage?.unresolvedIds.length ?? 0;
+  const incompleteTotal = o.observation_only + o.incomplete + o.unsupported + o.pending + unresolvedCandidates;
   const reason =
     `${readCount}/${indexedCount} source files inspected; ${totalSelected} experiments selected: ` +
     `${o.not_observed} source-supported negative experiments, ${o.observation_only} observation-only, ` +
-    `${o.incomplete} failed/incomplete fixtures, ${o.unsupported} unsupported, ${o.observed} observed behaviors. ` +
+    `${o.incomplete} failed/incomplete fixtures, ${o.unsupported} unsupported, ${o.observed} observed behaviors; ` +
+    `${unresolvedCandidates} candidate properties still unresolved. ` +
     (incompleteTotal > 0
-      ? `Deterministic analysis recorded no verified positive behavior; no vulnerability absence claim is made for ${incompleteTotal} incomplete, observation-only, or unsupported items.`
+      ? `Selected-experiment pass only; investigation partial. ${incompleteTotal} incomplete, observation-only, unsupported or pending items require resolution.`
       : `Deterministic analysis completed all ${totalSelected} selected experiments with zero observed security violations.`);
   return {
     findings: [],
