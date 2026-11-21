@@ -384,6 +384,8 @@ export async function runLocalAudit(
             ?['source_abi_declarations_missing']:[]),
           ...missing.map(x=>'constructed_but_not_scheduled:'+x.id)],
         scheduled.map(x=>x.id),
+        detail?.closedLoop.steps.map(step=>({adapter:step.adapter,status:step.status,
+          reason:step.reason,...(step.detail?{detail:step.detail}:{})}))||[],
       );
       analysisProgressStore.markTerminalAssessment(lead.id,
         lead.state.kind==="assessed" ? lead.state.reason : undefined);
