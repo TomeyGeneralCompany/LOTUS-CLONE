@@ -306,10 +306,14 @@ export class AnalysisProgressStore {
   // A blocked property remains durable and eligible for a genuinely different
   // source-backed experiment. Identical failed scripts cannot be counted twice.
   nextRepairBatch(max:number):AnalysisCandidate[]{
+    // Repair eligibility follows the actual evidence certificate, not a
+    // particular legacy lifecycle label. Both analysis_exhausted and
+    // experiment_pending can still have uncovered source-backed obligations.
     const eligible=this.candidates.filter(c=>{
       const record=this.records.get(c.id);
-      return record?.lifecycle==="dependencies_pending"&&
-        !record.properties.every(p=>p.state==="test_completed");
+      return !!record && record.lifecycle!=="queued" &&
+        record.lifecycle!=="admitted" && record.lifecycle!=="analyzing" &&
+        !this.isConclusive(record);
     });
     return eligible.slice(0,max);
   }
