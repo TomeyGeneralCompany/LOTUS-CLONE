@@ -14,7 +14,7 @@ export type PropertyResolution="unexamined"|"analyzing"|"prerequisites_pending"|
 
 export interface CandidatePropertyProgress {
   id:string; state:PropertyResolution; sourceWitnesses:string[];
-  unresolvedPrerequisites:string[]; experimentIds:string[];
+  unresolvedPrerequisites:string[]; experimentIds:string[]; supersededBy?:string;
 }
 export interface ExperimentEvidence {
   experimentId:string; leadId:string; sourceCommit:string; sourceSha256:string;
@@ -228,6 +228,9 @@ export class AnalysisProgressStore {
       for(const p of r.properties)if(p.experimentIds.includes(id)&&
         (r.experimentEvidence||[]).some(e=>e.experimentId===id))
         p.state="test_completed";
+      const successfulProperties=new Set(r.properties.filter(p=>p.state==="test_completed"&&
+        p.experimentIds.length>0).map(p=>p.id));
+      r.properties=r.properties.filter(p=>!(p.supersededBy&&successfulProperties.has(p.supersededBy)));
       if(r.experimentIds.every(x=>this.completedExperimentIds.has(x)) &&
         !r.properties.some(p=>p.state==="prerequisites_pending"))
         r.lifecycle="experiment_completed";
@@ -250,6 +253,15 @@ export class AnalysisProgressStore {
       throw new Error("REPAIR_EXPERIMENT_SOURCE_WITNESS_REQUIRED: "+leadId);
     if(record.experimentIds.includes(experimentId))return;
     record.experimentIds.push(experimentId);
+    // Only a missing-property/missing-observable refusal may be superseded
+    // by an executable property with verified source witnesses. External calls,
+    // ambiguous dependencies and unrelated prerequisites remain unresolved.
+    for(const p of record.properties)if(p.state==="prerequisites_pending" &&
+      p.unresolvedPrerequisites.length>0 &&
+      p.unresolvedPrerequisites.every(reason=>
+        /UNKNOWN_ASSERTION\((?:no_supported_property|missing_observable_state)\)/.test(reason)||
+        reason==="source_grounded_falsifier_missing"))
+      p.supersededBy=propertyId;
     record.properties=record.properties.filter(p=>!p.id.endsWith(":needs_property"));
     record.properties.push({id:propertyId,state:"test_constructed",
       sourceWitnesses:witnesses,unresolvedPrerequisites:[],experimentIds:[experimentId]});
