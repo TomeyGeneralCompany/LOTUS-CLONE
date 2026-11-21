@@ -74,7 +74,7 @@ function validateSequence(s) {
     if(typeof clone.deploymentId!=='string'||
        !(s.preparation?.deployments||[]).some(d=>d.id===clone.deploymentId)||
        typeof clone.function!=='string'||
-       !/^[A-Za-z_]\\w*\\([A-Za-z0-9_,()[\\]]*\\)$/.test(clone.function)||
+       !/^[A-Za-z_][A-Za-z0-9_]*\([A-Za-z0-9_,()[\]]*\)$/.test(clone.function)||
        !Number.isInteger(clone.sender)||clone.sender<0||clone.sender>2)
       throw new Error('Invalid source factory clone reference');
     args(clone.args);
