@@ -41,6 +41,8 @@ async function run(){
     let store=await AnalysisProgressStore.open(file,candidates);
     let lock=await stage();
     assert.throws(()=>lock.completeAnalysis(),/ANALYSIS_INVENTORY_INCOMPLETE/);
+    const experiments=Array.from({length:64},(_,i)=>hash('experiment:'+i));
+    const mapped=new Map(candidates.slice(0,64).map((c,i)=>[c.id,experiments[i]]));
     const seen=new Set<string>();
     let batches=0;
     while(store.remaining){
@@ -60,7 +62,7 @@ async function run(){
           disposition:'defer',
           reason:'Fixture establishes complete inventory accounting, not target exploitability',
         },'controller');
-        store.recordAssessment(item.id,[hash('property:'+item.id)],[],[]);
+        store.recordAssessment(item.id,[hash('property:'+item.id)],[],mapped.has(item.id)?[mapped.get(item.id)!]:[]);
       }
       lock.completeAnalysisBatch();
       store.processedBatches++;
@@ -84,7 +86,6 @@ async function run(){
     assert.equal(store.remaining,0);
     assert.equal(lock.analysisInventoryProgress.remaining,0);
     // The 64 distinct experiment identities are all retained; no tier-4 loss.
-    const experiments=Array.from({length:64},(_,i)=>hash('experiment:'+i));
     for(const id of experiments)lock.discover(id);
     lock.completeAnalysis();
     assert.equal(lock.currentStage,'EXPERIMENT');
@@ -95,6 +96,8 @@ async function run(){
     }
     await store.save();
     assert.equal(store.completedExperimentIds.size,64);
+    assert.equal(store.counts.experimentsCompleted,64);
+    assert.equal(store.counts.unresolvedIds.length,0);
     assert.equal(lock.completedCount,64);
     lock.completeExperiments();
     for(const id of experiments)lock.review(id);
@@ -104,6 +107,30 @@ async function run(){
     const resumed=await AnalysisProgressStore.open(file,candidates);
     assert.equal(resumed.completedExperimentIds.size,64);
     assert.equal(resumed.remaining,0);
+    // A second inventory must never turn unresolved dependencies, queued
+    // candidates or selected-but-unexecuted experiments into terminal claims.
+    const pendingCandidates=candidates.slice(0,6).map((c,i)=>({...c,id:hash('coverage-state:'+i)}));
+    const pendingFile=join(dir,'pending.json');
+    let pending=await AnalysisProgressStore.open(pendingFile,pendingCandidates);
+    const one=pending.nextBatch(5,5);
+    assert.equal(one.length,5);
+    pending.recordAssessment(one[0].id,['negative'],[],[hash('done-negative')]);
+    pending.recordAssessment(one[1].id,['positive'],[],[hash('done-positive')]);
+    pending.recordAssessment(one[2].id,['unsupported'],[],[]);
+    pending.recordAssessment(one[3].id,['money-market'],['unresolved_money_market'],[]);
+    pending.recordAssessment(one[4].id,['withdraw'],[],[hash('unexecuted')]);
+    pending.markExperimentCompleted(hash('done-negative'));
+    pending.markExperimentCompleted(hash('done-positive'));
+    await pending.save();
+    assert.equal(pending.counts.queued,1);
+    assert.equal(pending.counts.dependenciesPending,1);
+    assert.equal(pending.counts.experimentsPending,1);
+    assert.equal(pending.terminallyComplete,false);
+    pending=await AnalysisProgressStore.open(pendingFile,pendingCandidates);
+    assert.equal(pending.terminallyComplete,false,'checkpoint must preserve all three pending states');
+    assert.equal(pending.counts.unresolvedIds.length,3);
+    assert.throws(()=>pending.markExperimentCompleted(hash('unmatched')),
+      /ANALYSIS_EXPERIMENT_ID_UNMATCHED/);
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);
