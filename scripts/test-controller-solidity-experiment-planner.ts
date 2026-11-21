@@ -478,6 +478,59 @@ for (const [name, code] of [['BuggyAccountingVault', buggyVaultSrc], ['FixedAcco
   }
 }
 
+// Verified module operator rotation and bounded funding construction, source-only.
+{
+  const operatorSrc=`pragma solidity ^0.8.20;
+contract LedgerD007 {
+ address public administrator; address public operator;
+ constructor(){administrator=msg.sender;operator=msg.sender;}
+ function rotateOperator(address next) external {require(msg.sender==administrator,"admin only");operator=next;}
+ function settle(address recipient,uint256 amount) external view returns(uint256){require(msg.sender==operator);return amount;}
+}`;
+  const opPath="contracts/modules/LedgerD007.sol";
+  const op=constructSolidityExperiments({
+    repositoryCommit:"e".repeat(40),targetPath:opPath,
+    targetSelector:"LedgerD007.rotateOperator",
+    sources:[{path:opPath,content:operatorSrc,sha256:createHash("sha256").update(operatorSrc).digest("hex")}],
+    declarations:[{selector:"LedgerD007.rotateOperator",operation:"send",inputs:["address"]}],
+  });
+  assert.equal(op.ok,true,"Guarded operator rotation must admit an EVM experiment");
+  if(op.ok){
+    const test=op.experiments.find(x=>x.securityProperty==="source-proven operator rotation guard");
+    assert.ok(test);
+    assert.ok(test!.sequence.steps.some(step=>step.operation==="send"&&step.sender===1&&step.expectRevert===true));
+    assert.ok(test!.sequence.steps.some(step=>step.operation==="call"&&step.function==="operator()"&&step.expect==="$account2"));
+  }
+  const unguarded=operatorSrc.replace('require(msg.sender==administrator,"admin only");','');
+  const rejected=constructSolidityExperiments({
+    repositoryCommit:"e".repeat(40),targetPath:opPath,
+    targetSelector:"LedgerD007.rotateOperator",
+    sources:[{path:opPath,content:unguarded,sha256:createHash("sha256").update(unguarded).digest("hex")}],
+    declarations:[{selector:"LedgerD007.rotateOperator",operation:"send",inputs:["address"]}],
+    skipLegacy:true,
+  });
+  if(rejected.ok)assert.ok(rejected.experiments.every(x=>x.securityProperty!=="source-proven operator rotation guard"),
+    "Unguarded operator mutation must never receive guarded negative probe");
+  const fundSrc=`pragma solidity ^0.8.20;
+contract SettlementVault {
+ mapping(address=>uint256) public credit;
+ uint256 public totalCredit;
+ function fund(address recipient,uint256 amount) external {
+  uint256 v=amount.bounded(type(uint128).max);
+  credit[recipient]+=v;totalCredit+=v;
+ }
+}`;
+  const fundPath="contracts/settlement/SettlementVault.sol";
+  const fund=constructSolidityExperiments({
+    repositoryCommit:"e".repeat(40),targetPath:fundPath,
+    targetSelector:"SettlementVault.fund",
+    sources:[{path:fundPath,content:fundSrc,sha256:createHash("sha256").update(fundSrc).digest("hex")}],
+    declarations:[{selector:"SettlementVault.fund",operation:"send",inputs:["address","uint256"]}],
+  });
+  assert.equal(fund.ok,true,"Bounded credit mutation must produce an EVM assertion");
+  if(fund.ok)assert.ok(fund.experiments.some(x=>x.securityProperty==="source-proven bounded funding conservation"));
+}
+
 // 2. Internal ledger deposit(uint256) -> withdraw(uint256) conservation
 const internalLedgerSrc = `pragma solidity ^0.8.20;
 contract InternalLedgerVault {
