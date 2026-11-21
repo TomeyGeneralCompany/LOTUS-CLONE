@@ -21,7 +21,7 @@ import { SoliditySourceIndex } from "./solidity-source-index";
 import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequiredTail, auditCheckpoint, fitAuditToolOutput, latestAuditExchangeStart } from "./audit-context";
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
-import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
+import { buildAnalysisCandidateQueue, reconcileStagedLeadSelectors, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
@@ -1259,23 +1259,13 @@ export async function runLocalAudit(
             }
           }
         }
-        // A method must remain in the authoritative lead inventory even if
-        // the READ-stage controller already scheduled an executable test for it.
-        // Otherwise a newly constructible test silently deletes its original
-        // lead, as happened to BenqiERC20Market.claimRewards (241 -> 240).
-        for(const staged of stagedPlans){
-          const plan=staged.plan;
-          if(plan.answer!=="solidity_sequence"||
-            isTestOrMockContractPath(plan.path))continue;
-          const declaration=deterministicDeclarationsCache.get(plan.path)||[];
-          if(!declaration.some(d=>d.selector===plan.query&&d.operation==="send"))continue;
-          const set=selectorsByPath.get(plan.path)||new Set<string>();
-          set.add(plan.query);
-          selectorsByPath.set(plan.path,set);
-        }
+        // The original inventory is independent of whether a lead already
+        // has a staged executable test. Enrich rather than subtract from it.
+        const completeSelectorsByPath=reconcileStagedLeadSelectors(
+          selectorsByPath,stagedPlans,deterministicDeclarationsCache);
         const commitByDir=new Map<string,string>();
         const candidateSourceItems:Array<{path:string;sourceCommit:string;sourceContent:string;unqueuedSelectors:string[]}>=[];
-        for(const [itemPath,selSet] of selectorsByPath.entries()){
+        for(const [itemPath,selSet] of completeSelectorsByPath.entries()){
           const content=accessibleSoliditySources.get(itemPath);
           const unqueuedSelectors=[...selSet];
           if(!content||!unqueuedSelectors.length)continue;
