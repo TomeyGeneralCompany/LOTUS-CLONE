@@ -184,7 +184,10 @@ async function run(){
         proofLock.recordLeadAssessment(lead.id,{kind:'assessed',
           sourceEvidence:[lead.sourceEvidence],hypothesis:'Independent source-verified obligation',
           disposition:'test',reason:'Distinct lead must have an executable falsifier'},'controller');
-        proofStore.recordAssessment(lead.id,[hash('obligation-for-'+lead.id)],[],[exp]);
+        proofStore.recordAssessment(lead.id,[hash('obligation-for-'+lead.id)],[],[exp],[],[
+          {id:hash('obligation-for-'+lead.id),experimentIds:[exp],
+            sourceWitnesses:[lead.path+':'+lead.sourceSha256+':0:'+content.length]}
+        ]);
         proofLock.discover(exp);
         position++;
       }
