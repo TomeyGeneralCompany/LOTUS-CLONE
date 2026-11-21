@@ -2306,7 +2306,21 @@ export function extractSourceInvariantDescriptor(
     matchingBalance&&
     new RegExp("\\bvalue\\s*:\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
     !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
-  if(!directlyProven&&!coupledPayableConservation){
+  // ERC20 principal conservation remains falsifiable even if the aggregate
+  // ledger update is missing: a source-witnessed transfer and per-user
+  // liability decrement must be balanced by the aggregate total.
+  const matchedTokenPrincipal=totalReferenced&&balanceReferenced&&usesErc20Transfer&&
+    !!mockToken&&setup.usesToken&&
+    inflowFn.parameters.length===1&&outflowFn.parameters.length===1&&
+    /^uint/.test(String(inflowFn.parameters[0]?.typeName?.name||''))&&
+    /^uint/.test(String(outflowFn.parameters[0]?.typeName?.name||''))&&
+    new RegExp("\\b"+totalVarName+"\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
+    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
+    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*-=\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
+    /\.\s*(?:safeTransferFrom|transferFrom)\s*\(/.test(inflowEffects)&&
+    /\.\s*(?:safeTransfer|transfer)\s*\(/.test(outflowEffects)&&
+    !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
+  if(!directlyProven&&!coupledPayableConservation&&!matchedTokenPrincipal){
     return {ok:false,category:'no_supported_property',
       reason:'Fixed-value conservation was not source-proven for '+contract.name+'.'+
         inflowFn.name+'/'+outflowFn.name+'; requires a property-specific measured scenario.',
