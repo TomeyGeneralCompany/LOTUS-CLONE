@@ -10,7 +10,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
-import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -308,6 +308,38 @@ async function run(){
     assert.equal(available[0].sourceSha256,targetImpl.sha256);
     assert.equal(resolveAcquiredConcreteImplementations(targetInterface,'IWallet','borrow',
       [targetInterface,targetImpl]).length,0,'Do not invent an unimplemented method');
+    // Source-authenticated caller graph for interface-only leads: the caller
+    // directly imports this interface, holds a typed state binding and calls
+    // its method from an executable public operation. A mock without the import
+    // is not a production implementation.
+    const icTokenSource=`pragma solidity ^0.8.20;
+interface ICToken { function mint(uint256 amount) external returns(uint256); }`;
+    const realCallerSource=`pragma solidity ^0.8.20;
+import {ICToken} from "./ICToken.sol";
+contract Market {
+  ICToken public cToken;
+  constructor(address token) { cToken = ICToken(token); }
+  function deposit(uint256 amount) external { require(cToken.mint(amount)==0); }
+}`;
+    const fakeCallerSource=`pragma solidity ^0.8.20;
+contract UnlinkedMarket {
+  function deposit(uint256 amount) external { fake.mint(amount); }
+}`;
+    const icSnap={path:'source-1/contracts/ICToken.sol',content:icTokenSource,
+      sha256:hash(icTokenSource)};
+    const callerSnap={path:'source-1/contracts/Market.sol',content:realCallerSource,
+      sha256:hash(realCallerSource)};
+    const fakeSnap={path:'source-1/contracts/UnlinkedMarket.sol',content:fakeCallerSource,
+      sha256:hash(fakeCallerSource)};
+    const witnessedCallers=resolveAcquiredInterfaceCallers(icSnap,'ICToken','mint',
+      [icSnap,callerSnap,fakeSnap]);
+    assert.equal(witnessedCallers.length,1,
+      'Only acquired and verified imports may form an interface caller obligation');
+    assert.equal(witnessedCallers[0].selector,'Market.deposit');
+    assert.equal(witnessedCallers[0].receiver,'cToken');
+    assert.equal(witnessedCallers[0].sourceSha256,callerSnap.sha256);
+    assert.equal(resolveAcquiredInterfaceCallers(icSnap,'ICToken','burn',
+      [icSnap,callerSnap]).length,0,'No invented interface method');
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);
