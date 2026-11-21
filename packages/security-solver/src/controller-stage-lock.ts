@@ -210,7 +210,7 @@ export class ControllerStageLock {
      throw new Error('EXPERIMENTS_INCOMPLETE');
    // A selected queue is a subset of the immutable source inventory.
    // Reaching its end cannot discharge missing or inconclusive properties.
-   if(this.inventoryIds!==null){
+   if(this.inventoryIds!==null&&this.inventoryIds.size>0){
      const ids=[...this.inventoryIds].sort();
      const digest=createHash('sha256').update(JSON.stringify(ids)).digest('hex');
      if(!certificate||certificate.version!==1||certificate.manifestDigest!==digest||
