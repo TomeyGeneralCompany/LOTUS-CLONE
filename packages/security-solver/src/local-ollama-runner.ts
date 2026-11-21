@@ -3724,6 +3724,30 @@ export async function runLocalAudit(
               status.startsWith('unsupported')||status.startsWith('blocked')?'unsupported':
               status==='invalid_probe'?'rejected':'incomplete';
           }catch{}
+          // A verifier status cannot certify a security experiment from an
+          // unrecognized source revision. Match the executed Solidity file SHA
+          // to the exact acquired source snapshot BEFORE recording completion.
+          let sourceMismatch="";
+          const activeEntry=stagedPlans.find(item=>item.id===activeStageCandidate);
+          if((outcome==="observed"||outcome==="not_observed")&&
+            activeEntry?.plan.answer==="solidity_sequence"){
+            const expected=deterministicSourceSnapshots.find(src=>
+              src.path===activeEntry.plan.path);
+            let reported="";
+            try{
+              const value=JSON.parse(output) as {source_sha256?:unknown};
+              if(typeof value.source_sha256==="string")reported=value.source_sha256;
+            }catch{}
+            if(!expected||reported!==expected.sha256){
+              sourceMismatch="verifier_source_sha256_mismatch:"+
+                (expected?.sha256||"source_snapshot_missing")+":"+reported;
+              outcome="incomplete";
+              await appendFile(logFile,"[EXPERIMENT_SOURCE_IDENTITY_BLOCKED] "+
+                JSON.stringify({experimentId:activeStageCandidate,
+                  targetPath:activeEntry.plan.path,expectedSha:expected?.sha256,
+                  observedSha:reported})+"\n");
+            }
+          }
           stageLock.finishExperiment(activeStageCandidate,outcome);
           if(analysisProgressStore &&
             [...analysisProgressStore.records.values()].some(r=>r.experimentIds.includes(activeStageCandidate!))){
@@ -3742,7 +3766,7 @@ export async function runLocalAudit(
                 result:outcome,verifierDigest,evidenceId,
               });
             else analysisProgressStore.recordInconclusive(activeStageCandidate,
-              outcome,evidenceId,detail||'no_conclusive_falsifier');
+              outcome,evidenceId,sourceMismatch||detail||'no_conclusive_falsifier');
             await analysisProgressStore.save();
             limits.onCandidateCoverage?.(analysisProgressStore.counts);
           }
