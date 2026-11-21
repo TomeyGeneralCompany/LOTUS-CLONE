@@ -1921,8 +1921,11 @@ function reachableAccountingSource(snapshot:SourceSnapshot,contract:any,seed:any
 function accountingDirections(text:string,state:string):{increase:boolean;decrease:boolean}{
   // Solidity state-variable names are lexical identifiers, not arbitrary regex input.
   if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state))return {increase:false,decrease:false};
-  return {increase:new RegExp("\\b"+state+"\\s*\\+=").test(text),
-    decrease:new RegExp("\\b"+state+"\\s*-=").test(text)};
+  // Mapping-valued state updates use indexed lvalues; source-backed
+  // accounting pairing must recognize balances[msg.sender] +=/-= amount.
+  const lvalue="\\b"+state+"\\s*(?:\\[[^\\]\\n]{1,128}\\]\\s*){0,2}";
+  return {increase:new RegExp(lvalue+"\\+=").test(text),
+    decrease:new RegExp(lvalue+"-=").test(text)};
 }
 
 export function extractSourceInvariantDescriptor(
