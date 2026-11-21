@@ -263,6 +263,20 @@ async function run(){
       new Set(repairStore.nextRepairBatch(4).map(x=>x.id)),
       new Set(repairTypes.map(x=>x.id)),
       'All four unresolved lifecycles need construction repair or explicit blockers');
+    const abstractLead=repairStore.records.get(repairTypes[0].id)!;
+    abstractLead.lifecycle="dependencies_pending";
+    abstractLead.properties=[{id:'abstract-deployment',state:'prerequisites_pending',
+      sourceWitnesses:[],experimentIds:[],
+      unresolvedPrerequisites:['UNKNOWN_ASSERTION(missing_fixture): Contract IWallet is abstract and cannot be instantiated directly']}];
+    const concreteEvidenceId=hash('concrete-implementation-run');
+    const concreteExperimentId=hash('concrete-wallet-experiment');
+    repairStore.addRepairExperiment(repairTypes[0].id,concreteEvidenceId,concreteExperimentId,
+      [path+':'+sourceSha, 'source-1/contracts/Wallet.sol:'+hash('actual wallet')],true);
+    repairStore.markExperimentCompleted(concreteExperimentId,{result:'not_observed',
+      evidenceId:hash('real-experiment-case'),verifierDigest:hash('real-verifier-output')});
+    assert.equal(repairStore.records.get(repairTypes[0].id)!.lifecycle,'experiment_completed');
+    assert.equal(repairStore.records.get(repairTypes[0].id)!.properties.length,1,
+      'A proven implementation may supersede only its abstract deployment blocker');
     // Abstract interfaces must resolve only to acquired concrete implementations
     // with an explicit import and direct inheritance of the target interface.
     // Unrelated names and guessed network contracts cannot supply test evidence.
