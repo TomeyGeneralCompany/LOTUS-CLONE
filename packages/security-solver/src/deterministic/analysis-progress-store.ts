@@ -274,8 +274,16 @@ export class AnalysisProgressStore {
       !witnesses.some(x=>x.includes(record.sourceSha256))||
       witnesses.some(x=>!/\b[a-f0-9]{64}\b/.test(x)))
       throw new Error("REPAIR_EXPERIMENT_SOURCE_WITNESS_REQUIRED: "+leadId);
-    if(record.experimentIds.includes(experimentId))return;
-    record.experimentIds.push(experimentId);
+    // Re-link an already scheduled/executed experiment to a different proven
+    // property of the same lead. Queue deduplication is not property closure.
+    // One verifier transcript may discharge more than one lead/property only
+    // when the exact source-identified experiment and witnesses match.
+    const wasScheduled=record.experimentIds.includes(experimentId);
+    if(!wasScheduled)record.experimentIds.push(experimentId);
+    if(record.properties.some(p=>p.id===propertyId)){
+      if(record.properties.find(p=>p.id===propertyId)?.experimentIds.includes(experimentId))return;
+      throw new Error("REPAIR_PROPERTY_ID_CONFLICT: "+propertyId);
+    }
     // Only a missing-property/missing-observable refusal may be superseded
     // by an executable property with verified source witnesses. External calls,
     // ambiguous dependencies and unrelated prerequisites remain unresolved.
@@ -288,9 +296,17 @@ export class AnalysisProgressStore {
           /abstract and cannot be instantiated directly/.test(reason))))
       p.supersededBy=propertyId;
     record.properties=record.properties.filter(p=>!p.id.endsWith(":needs_property"));
-    record.properties.push({id:propertyId,state:"test_constructed",
+    const evidence=(record.experimentEvidence||[]).find(x=>x.experimentId===experimentId&&
+      x.leadId===record.id&&x.sourceCommit===record.sourceCommit&&
+      x.sourceSha256===record.sourceSha256&&
+      /^[a-f0-9]{64}$/.test(x.verifierDigest)&&
+      (x.result==="observed"||x.result==="not_observed"));
+    record.properties.push({id:propertyId,state:evidence?"test_completed":"test_constructed",
       sourceWitnesses:witnesses,unresolvedPrerequisites:[],experimentIds:[experimentId]});
-    record.lifecycle="experiment_pending";
+    const successful=new Set(record.properties.filter(p=>p.state==="test_completed").map(p=>p.id));
+    record.properties=record.properties.filter(p=>!(p.supersededBy&&successful.has(p.supersededBy)));
+    record.lifecycle=this.isConclusive(record)?"experiment_completed":
+      record.properties.some(p=>p.state==="prerequisites_pending")?"dependencies_pending":"experiment_pending";
   }
   recordInconclusive(id:string,status:string,evidenceId:string,reason:string){
     if(!this.records.size)throw new Error("EMPTY_ANALYSIS_INVENTORY");

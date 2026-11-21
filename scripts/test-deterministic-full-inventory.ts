@@ -10,7 +10,8 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
-import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
+import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -39,6 +40,27 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // Regression from the first PR-branch 88mph cloud trial. An ordinary
+    // staged source experiment must NEVER remove the originally queued
+    // BenqiERC20Market.claimRewards lead from the frozen source inventory.
+    const benqiPath='source-1/contracts/moneymarkets/benqi/BenqiERC20Market.sol';
+    const originalManifest=new Map<string,ReadonlySet<string>>([
+      [benqiPath,new Set(['BenqiERC20Market.deposit',
+        'BenqiERC20Market.claimRewards'])]]);
+    const scheduled=[{plan:{path:benqiPath,
+      query:'BenqiERC20Market.claimRewards',answer:'solidity_sequence'}}];
+    const menu=new Map([[benqiPath,[
+      {selector:'BenqiERC20Market.deposit',operation:'send'},
+      {selector:'BenqiERC20Market.claimRewards',operation:'send'}]]]);
+    const reconciled=reconcileStagedLeadSelectors(originalManifest,scheduled,menu);
+    assert.deepEqual([...reconciled.get(benqiPath)!].sort(),
+      ['BenqiERC20Market.claimRewards','BenqiERC20Market.deposit'].sort());
+    assert.equal(originalManifest.get(benqiPath)!.size,2,
+      'The original lead identity must never be mutated by experiment selection');
+    assert.deepEqual([...reconcileStagedLeadSelectors(new Map([[benqiPath,
+      new Set(['BenqiERC20Market.deposit'])]]),scheduled,menu).get(benqiPath)!].sort(),
+      ['BenqiERC20Market.deposit','BenqiERC20Market.claimRewards'].sort(),
+      'A staged selector must be ADDED when previously absent from analyzed inventory');
     let store=await AnalysisProgressStore.open(file,candidates);
     let lock=await stage();
     assert.throws(()=>lock.completeAnalysis(),/ANALYSIS_INVENTORY_INCOMPLETE/);
@@ -277,6 +299,21 @@ async function run(){
     assert.equal(repairStore.records.get(repairTypes[0].id)!.lifecycle,'experiment_completed');
     assert.equal(repairStore.records.get(repairTypes[0].id)!.properties.length,1,
       'A proven implementation may supersede only its abstract deployment blocker');
+    const anotherProperty=hash('independent-property-same-experiment');
+    // Same source-revision and same verifier trace may support another
+    // separately witnessed obligation; its property must not be orphaned by
+    // the experiment scheduler's ID deduplication.
+    repairStore.addRepairExperiment(repairTypes[0].id,anotherProperty,concreteExperimentId,
+      [path+':'+sourceSha, 'source-1/contracts/Wallet.sol:'+hash('actual wallet')],true);
+    assert.equal(repairStore.records.get(repairTypes[0].id)!.properties.length,2);
+    assert.equal(repairStore.records.get(repairTypes[0].id)!.properties[1].state,'test_completed');
+    assert.equal(repairStore.experimentCertificate.conclusive,1,
+      'Verifier-backed duplicate can satisfy two distinct source-witnessed properties');
+    const futureProperty=hash('new-property-pending-verifier');
+    repairStore.addRepairExperiment(repairTypes[0].id,futureProperty,hash('new-not-yet-run'),
+      [path+':'+sourceSha],false);
+    assert.equal(repairStore.experimentCertificate.conclusive,0,
+      'A linked second property without verifier transcript must reopen the lead');
     // Abstract interfaces must resolve only to acquired concrete implementations
     // with an explicit import and direct inheritance of the target interface.
     // Unrelated names and guessed network contracts cannot supply test evidence.
@@ -293,6 +330,38 @@ async function run(){
     assert.equal(available[0].sourceSha256,targetImpl.sha256);
     assert.equal(resolveAcquiredConcreteImplementations(targetInterface,'IWallet','borrow',
       [targetInterface,targetImpl]).length,0,'Do not invent an unimplemented method');
+    // Source-authenticated caller graph for interface-only leads: the caller
+    // directly imports this interface, holds a typed state binding and calls
+    // its method from an executable public operation. A mock without the import
+    // is not a production implementation.
+    const icTokenSource=`pragma solidity ^0.8.20;
+interface ICToken { function mint(uint256 amount) external returns(uint256); }`;
+    const realCallerSource=`pragma solidity ^0.8.20;
+import {ICToken} from "./ICToken.sol";
+contract Market {
+  ICToken public cToken;
+  constructor(address token) { cToken = ICToken(token); }
+  function deposit(uint256 amount) external { require(cToken.mint(amount)==0); }
+}`;
+    const fakeCallerSource=`pragma solidity ^0.8.20;
+contract UnlinkedMarket {
+  function deposit(uint256 amount) external { fake.mint(amount); }
+}`;
+    const icSnap={path:'source-1/contracts/ICToken.sol',content:icTokenSource,
+      sha256:hash(icTokenSource)};
+    const callerSnap={path:'source-1/contracts/Market.sol',content:realCallerSource,
+      sha256:hash(realCallerSource)};
+    const fakeSnap={path:'source-1/contracts/UnlinkedMarket.sol',content:fakeCallerSource,
+      sha256:hash(fakeCallerSource)};
+    const witnessedCallers=resolveAcquiredInterfaceCallers(icSnap,'ICToken','mint',
+      [icSnap,callerSnap,fakeSnap]);
+    assert.equal(witnessedCallers.length,1,
+      'Only acquired and verified imports may form an interface caller obligation');
+    assert.equal(witnessedCallers[0].selector,'Market.deposit');
+    assert.equal(witnessedCallers[0].receiver,'cToken');
+    assert.equal(witnessedCallers[0].sourceSha256,callerSnap.sha256);
+    assert.equal(resolveAcquiredInterfaceCallers(icSnap,'ICToken','burn',
+      [icSnap,callerSnap]).length,0,'No invented interface method');
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);

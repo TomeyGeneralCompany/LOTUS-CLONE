@@ -21,7 +21,7 @@ import { SoliditySourceIndex } from "./solidity-source-index";
 import { allocateAuditContext, compactAuditContext, compactAuditContextWithRequiredTail, auditCheckpoint, fitAuditToolOutput, latestAuditExchangeStart } from "./audit-context";
 import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequence } from "./solidity-sequence";
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
-import { buildAnalysisCandidateQueue, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
+import { buildAnalysisCandidateQueue, reconcileStagedLeadSelectors, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
 import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname } from "node:path";
@@ -29,7 +29,7 @@ import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
-import {resolveAcquiredConcreteImplementations} from "./deterministic/fixture-dependency-planner";
+import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers} from "./deterministic/fixture-dependency-planner";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
 async function recordToolActivity(logFile:string,event:Record<string,unknown>):Promise<void> {
@@ -450,9 +450,19 @@ export async function runLocalAudit(
     // exhausted. Give every pending property a source-only full-graph repair
     // attempt, without repeating an identical failed strategy across resumes.
     const sourceRepairBatch=analysisProgressStore.nextRepairBatch(analysisProgressStore.records.size);
+    // A completed repair attempt belongs to both the acquired source SHA and
+    // the controller implementation revision. After a code repair, the laptop
+    // must not skip 241 previously failed source-construction attempts merely
+    // because the old checkpoint recorded an identical source hash.
+    let implementationRevision=String(process.env.GITHUB_SHA||"").trim();
+    if(!/^[a-f0-9]{40}$/.test(implementationRevision)){
+      try{implementationRevision=execFileSync("git",["rev-parse","HEAD"],
+        {cwd:process.cwd(),encoding:"utf8",timeout:5000}).trim();}
+      catch{implementationRevision="unversioned";}
+    }
+    const strategy="source-fixture-property-engine-v2:"+implementationRevision;
     let repairAdded=0,repairBlocked=0;
     for(const lead of sourceRepairBatch){
-      const strategy="full-source-typed-property-v1";
       const record=analysisProgressStore.records.get(lead.id)!;
       if(record.repairAttempts?.some(x=>x.strategy===strategy&&
           x.sourceSha256===record.sourceSha256))continue;
@@ -472,6 +482,7 @@ export async function runLocalAudit(
         declarations,staticLeads:limits.staticLeads||[],
       });
       const successful=constructed.ok?[constructed]:[];
+      const callerOnly=new Set<string>();
       const altFailures:string[]=[];
       if(!constructed.ok&&constructed.unresolvedCategory==="missing_fixture"&&
         /abstract and cannot be instantiated/.test(constructed.detail)){
@@ -504,6 +515,45 @@ export async function runLocalAudit(
             executable:successful.length,failures:altFailures})+"\n");
         }
       }
+      // Interface declarations carry no executable body. Follow an exact
+      // acquired import and source callsite into a concrete consumer, then
+      // test the consumer's own source-derived obligation. This is caller-side
+      // evidence, not an assertion about an unavailable external protocol.
+      if(!constructed.ok&&constructed.unresolvedCategory==="missing_fixture"&&
+        /abstract and cannot be instantiated/.test(constructed.detail)){
+        const source=deterministicSourceSnapshots.find(x=>
+          x.path===lead.path&&x.sha256===lead.sourceSha256);
+        if(source){
+          const cut=lead.selector.lastIndexOf(".");
+          const contractName=lead.selector.slice(0,cut);
+          const method=lead.selector.slice(cut+1);
+          const callers=resolveAcquiredInterfaceCallers(source,
+            contractName,method,deterministicSourceSnapshots);
+          for(const caller of callers.slice(0,16)){
+            const menu=deterministicDeclarationsCache.get(caller.path)||[];
+            if(!menu.some(d=>d.selector===caller.selector&&d.operation==="send")){
+              altFailures.push(caller.selector+":caller_send_declaration_missing");
+              continue;
+            }
+            const candidate=constructSolidityExperiments({
+              repositoryCommit:lead.sourceCommit,targetPath:caller.path,
+              targetSelector:caller.selector,sources:deterministicSourceSnapshots,
+              declarations:menu,staticLeads:limits.staticLeads||[],
+            });
+            if(candidate.ok){
+              successful.push(candidate);
+              callerOnly.add(caller.path+":"+caller.selector);
+            }else altFailures.push(caller.selector+":"+candidate.code+":"+candidate.detail.slice(0,160));
+          }
+          if(callers.length)await appendFile(logFile,
+            "[EXPERIMENT_INTERFACE_CALLERS] "+JSON.stringify({
+              leadId:lead.id,interfaceSelector:lead.selector,
+              callers:callers.map(x=>({path:x.path,selector:x.selector,
+                receiver:x.receiver,sourceSha256:x.sourceSha256,
+                witness:x.witness})),
+              executable:successful.length})+"\n");
+        }
+      }
       if(!successful.length){
         const reason=constructed.ok?"no_constructed_experiment":
           constructed.code+":"+constructed.detail.slice(0,420)+
@@ -525,19 +575,27 @@ export async function runLocalAudit(
         const witnesses=[lead.sourceEvidence,
           ...exp.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(":"))];
         const id=preexisting?.id||JSON.stringify([exp.path,exp.selector,plan.answer,"repair",exp.id]);
+        const limitedToCaller=callerOnly.has(exp.path+":"+exp.selector);
         const propertyId=createHash("sha256").update(JSON.stringify([
-          lead.id,exp.securityProperty,witnesses])).digest("hex");
-        if(analysisProgressStore.records.get(lead.id)?.experimentIds.includes(id))continue;
+          lead.id,limitedToCaller?"caller_scope:"+exp.securityProperty:exp.securityProperty,witnesses])).digest("hex");
+        const alreadyLinked=analysisProgressStore.records.get(lead.id)?.properties
+          .some(p=>p.id===propertyId&&p.experimentIds.includes(id));
+        if(alreadyLinked)continue;
         if(!preexisting){
           stageLock.discover(id);
           stagedPlans.push({id,plan});
         }
+        // Caller integration does not discharge the interface's missing
+        // production implementation. Only source-proven concrete inheritance
+        // may replace that missing-fixture obligation.
         analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses,
-          exp.path!==lead.path);
-        added++;repairAdded++;
+          exp.path!==lead.path&&!limitedToCaller);
+        added++;
+        if(!preexisting)repairAdded++;
         await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
           leadId:lead.id,experimentId:id,property:exp.securityProperty,
-          witnesses:witnesses.length})+"\n");
+          reused:!!preexisting,scope:limitedToCaller?"caller_integration":"concrete_source",
+          sourceSha256:lead.sourceSha256,witnesses:witnesses.length})+"\n");
       }
       analysisProgressStore.noteRepairAttempt(lead.id,strategy,
         added?("new_experiments:"+added):"no_distinct_sourced_experiment");
@@ -551,7 +609,7 @@ export async function runLocalAudit(
     }
     await analysisProgressStore.save();
     await appendFile(logFile,"[EXPERIMENT_REPAIR_RECONCILIATION] "+JSON.stringify({
-      examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
+      strategy,examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
       unresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
     stageLock.assertAnalysisInventoryExhausted();
     limits.onCandidateCoverage?.(analysisProgressStore.counts);
@@ -1201,9 +1259,13 @@ export async function runLocalAudit(
             }
           }
         }
+        // The original inventory is independent of whether a lead already
+        // has a staged executable test. Enrich rather than subtract from it.
+        const completeSelectorsByPath=reconcileStagedLeadSelectors(
+          selectorsByPath,stagedPlans,deterministicDeclarationsCache);
         const commitByDir=new Map<string,string>();
         const candidateSourceItems:Array<{path:string;sourceCommit:string;sourceContent:string;unqueuedSelectors:string[]}>=[];
-        for(const [itemPath,selSet] of selectorsByPath.entries()){
+        for(const [itemPath,selSet] of completeSelectorsByPath.entries()){
           const content=accessibleSoliditySources.get(itemPath);
           const unqueuedSelectors=[...selSet];
           if(!content||!unqueuedSelectors.length)continue;
@@ -3652,6 +3714,30 @@ export async function runLocalAudit(
               status.startsWith('unsupported')||status.startsWith('blocked')?'unsupported':
               status==='invalid_probe'?'rejected':'incomplete';
           }catch{}
+          // A verifier status cannot certify a security experiment from an
+          // unrecognized source revision. Match the executed Solidity file SHA
+          // to the exact acquired source snapshot BEFORE recording completion.
+          let sourceMismatch="";
+          const activeEntry=stagedPlans.find(item=>item.id===activeStageCandidate);
+          if((outcome==="observed"||outcome==="not_observed")&&
+            activeEntry?.plan.answer==="solidity_sequence"){
+            const expected=deterministicSourceSnapshots.find(src=>
+              src.path===activeEntry.plan.path);
+            let reported="";
+            try{
+              const value=JSON.parse(output) as {source_sha256?:unknown};
+              if(typeof value.source_sha256==="string")reported=value.source_sha256;
+            }catch{}
+            if(!expected||reported!==expected.sha256){
+              sourceMismatch="verifier_source_sha256_mismatch:"+
+                (expected?.sha256||"source_snapshot_missing")+":"+reported;
+              outcome="incomplete";
+              await appendFile(logFile,"[EXPERIMENT_SOURCE_IDENTITY_BLOCKED] "+
+                JSON.stringify({experimentId:activeStageCandidate,
+                  targetPath:activeEntry.plan.path,expectedSha:expected?.sha256,
+                  observedSha:reported})+"\n");
+            }
+          }
           stageLock.finishExperiment(activeStageCandidate,outcome);
           if(analysisProgressStore &&
             [...analysisProgressStore.records.values()].some(r=>r.experimentIds.includes(activeStageCandidate!))){
@@ -3670,7 +3756,7 @@ export async function runLocalAudit(
                 result:outcome,verifierDigest,evidenceId,
               });
             else analysisProgressStore.recordInconclusive(activeStageCandidate,
-              outcome,evidenceId,detail||'no_conclusive_falsifier');
+              outcome,evidenceId,sourceMismatch||detail||'no_conclusive_falsifier');
             await analysisProgressStore.save();
             limits.onCandidateCoverage?.(analysisProgressStore.counts);
           }

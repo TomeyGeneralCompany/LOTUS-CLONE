@@ -12,7 +12,17 @@ function validateSequence(s) {
   };
   const args = a => {if(!Array.isArray(a)||a.length>32)throw new Error('Invalid ABI arguments');a.forEach(v=>value(v));};
   const wei = v => {if(v!==undefined && (typeof v!=='string'||!/^(0|[1-9][0-9]{0,29})$/.test(v)))throw new Error('Invalid wei amount');};
-  object(s,['constructorArgs','steps'],['constructorArgs','constructorValueWei','steps','deployment','preparation']);
+  object(s,['constructorArgs','steps'],['constructorArgs','constructorValueWei','steps','deployment','preparation','factoryClone','sourceProperty']);
+  if(s.sourceProperty!==undefined){
+    const p=s.sourceProperty;
+    object(p,['kind','state','method','parameter','amount','direction','sourceSha256']);
+    if(p.kind!=='scalar_delta'||p.direction!=='increase'||
+      !/^[A-Za-z_]\w*$/.test(p.state)||!/^[A-Za-z_]\w*$/.test(p.parameter)||
+      !/^[A-Za-z_]\w*\([A-Za-z0-9_,()[\]]*\)$/.test(p.method)||
+      !/^(0|[1-9][0-9]{0,29})$/.test(p.amount)||
+      !/^[a-f0-9]{64}$/.test(p.sourceSha256))
+      throw new Error('Invalid source-identified scalar obligation');
+  }
   if(s.deployment!==undefined) {
     object(s.deployment,['file','contract']);
     if(typeof s.deployment.file!=='string' || s.deployment.file.length>512 ||
@@ -58,6 +68,17 @@ function validateSequence(s) {
         throw new Error('Invalid preparation revert expectation');}
     }
   }
+  if(s.factoryClone!==undefined){
+    const clone=s.factoryClone;
+    object(clone,['deploymentId','function','args','sender']);
+    if(typeof clone.deploymentId!=='string'||
+       !(s.preparation?.deployments||[]).some(d=>d.id===clone.deploymentId)||
+       typeof clone.function!=='string'||
+       !/^[A-Za-z_][A-Za-z0-9_]*\([A-Za-z0-9_,()[\]]*\)$/.test(clone.function)||
+       !Number.isInteger(clone.sender)||clone.sender<0||clone.sender>2)
+      throw new Error('Invalid source factory clone reference');
+    args(clone.args);
+  }
   args(s.constructorArgs);wei(s.constructorValueWei);
   if(JSON.stringify(s).length>16000 || !Array.isArray(s.steps) || !s.steps.length || s.steps.length>16)throw new Error('Invalid sequence length');
   const prepDeployments=new Set((s.preparation?.deployments||[]).map(d=>d.id));
@@ -100,7 +121,8 @@ function normalize(v) {
 }
 async function runSequence(artifact, sequence, transport, preparationArtifacts={},metadata={}) {
   validateSequence(sequence);
-  const {BrowserProvider, ContractFactory}=require('ethers');
+  const {BrowserProvider, ContractFactory, Contract}=require('ethers');
+  const {createHash}=require('node:crypto');
   if(!artifact?.evm?.bytecode?.object || !/^[0-9a-fA-F]+$/.test(artifact.evm.bytecode.object))
     throw new Error('A deployable contract without unresolved library links is required');
   const provider=new BrowserProvider(transport,undefined,{cacheTimeout:-1,pollingInterval:10});
@@ -210,11 +232,44 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
     const deployGasLimit=latestBlock?.gasLimit && latestBlock.gasLimit > 12000000n
       ? (latestBlock.gasLimit * 9n) / 10n
       : 10000000n;
-    const contract=await new ContractFactory(artifact.abi,artifact.evm.bytecode.object,signers[0])
+    let contract=await new ContractFactory(artifact.abi,artifact.evm.bytecode.object,signers[0])
       .deploy(...sequence.constructorArgs.map(resolve),{value:sequence.constructorValueWei||'0',gasLimit:deployGasLimit});
     const deployment=await contract.deploymentTransaction().wait();
     if(!deployment || deployment.status!==1)throw new Error('Constructor deployment failed');
     address=await contract.getAddress();
+    // Source-defined 88mph Factory creates deterministic EIP-1167 clones of
+    // this deployed template. The actual factory implementation is compiled
+    // from acquired repository source, executed in this isolated local EVM.
+    // Never interpret the template constructor as initializing clone storage.
+    if(sequence.factoryClone){
+      runtimePhase='fixture_initialization';
+      const call=sequence.factoryClone;
+      const factory=deployed.get(call.deploymentId)?.contract;
+      if(!factory)throw new Error('Acquired source factory is not deployed');
+      const fn=factory.connect(signers[call.sender]).getFunction(call.function);
+      if(!['payable','nonpayable'].includes(fn.fragment.stateMutability))
+        throw new Error('Factory clone must be a source-declared transaction');
+      const values=call.args.map(resolve);
+      factory.interface.encodeFunctionData(fn.fragment,values);
+      const predicted=await fn.staticCall(...values,{gasLimit:deployGasLimit});
+      if(typeof predicted!=='string'||!/^0x[0-9a-fA-F]{40}$/.test(predicted)||
+        predicted.toLowerCase()===address.toLowerCase())
+        throw new Error('Factory returned no independently deployed clone address');
+      const tx=await fn.send(...values,{gasLimit:deployGasLimit});
+      const cloneReceipt=await tx.wait();
+      if(!cloneReceipt||cloneReceipt.status!==1)
+        throw new Error('Factory clone creation or initialization failed');
+      const code=await provider.getCode(predicted);
+      if(!/^0x[0-9a-fA-F]+$/.test(code)||code.length<=4)
+        throw new Error('Factory predicted clone has no executable EVM bytecode');
+      const cloneDigest=createHash('sha256').update(Buffer.from(code.slice(2),'hex')).digest('hex');
+      setupSteps.push({operation:'setup',function:'factoryClone:'+fn.fragment.format('sighash'),
+        sender:call.sender,gasUsed:cloneReceipt.gasUsed.toString(),passed:true,
+        purpose:'acquired factory '+call.deploymentId+' created clone '+predicted.toLowerCase()+
+          ' with runtime code sha256 '+cloneDigest});
+      address=predicted;
+      contract=new Contract(address,artifact.abi,signers[0]);
+    }
     runtimePhase='target_action';
     const steps=[...setupSteps];
     // Only the explicitly generated ERC1155 test harness gets automatic setup.

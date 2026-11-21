@@ -1,5 +1,6 @@
 export {
   buildAnalysisCandidateQueue,
+  reconcileStagedLeadSelectors,
   isTestOrMockContractPath,
   isExternalAdapterOrMarketPath,
   type AnalysisCandidate,

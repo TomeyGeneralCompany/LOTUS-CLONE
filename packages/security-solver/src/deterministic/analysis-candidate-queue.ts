@@ -174,6 +174,29 @@ function locateFunctionSpan(
  * Build the complete deterministic function-level candidate inventory and select
  * a bounded batch for admission without silently discarding overflow candidates.
  */
+/** Frozen lead admission must include source-grounded staged methods too.
+ * A method gaining an executable experiment must never disappear from the
+ * original source-property inventory (Benqi.claimRewards regression).
+ */
+export function reconcileStagedLeadSelectors(
+  initial:ReadonlyMap<string,ReadonlySet<string>>,
+  staged:readonly {plan:{path:string;query:string;answer:string}}[],
+  declarations:ReadonlyMap<string,readonly {selector:string;operation:string}[]>,
+):Map<string,Set<string>> {
+  const merged=new Map<string,Set<string>>(
+    [...initial].map(([path,selectors])=>[path,new Set(selectors)]));
+  for(const {plan} of staged){
+    if(plan.answer!=="solidity_sequence"||isTestOrMockContractPath(plan.path))
+      continue;
+    const menu=declarations.get(plan.path)||[];
+    if(!menu.some(d=>d.selector===plan.query&&d.operation==="send"))continue;
+    const selectors=merged.get(plan.path)||new Set<string>();
+    selectors.add(plan.query);
+    merged.set(plan.path,selectors);
+  }
+  return merged;
+}
+
 export function buildAnalysisCandidateQueue(
   options: AnalysisCandidateQueueOptions,
 ): AnalysisCandidateQueueResult {

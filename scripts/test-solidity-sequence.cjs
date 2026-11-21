@@ -189,6 +189,42 @@ async function execute(s) {
  assert.equal(exercisesSelected([{operation:'eth_balance',account:'$contract'}]),false);
  assert.equal(exercisesSelected([{operation:'eth_balance',account:'$contract'},
   {operation:'send',function:'deposit()',args:[]}]),false);
+ // Genuine source factory procedure: execute creation and initialization
+ // after a template deployment, then address the returned contract rather
+ // than incorrectly interacting with template storage.
+ const childSource='pragma solidity ^0.8.20; contract Child {'+
+   'uint256 public value; function initialize(uint256 n) external {'+
+   'require(value==0); value=n;} function set(uint256 n) external {value=n;} }';
+ const factorySource='pragma solidity ^0.8.20; import "./Child.sol"; '+
+   'contract Factory { function createChild(address template,uint256 n) external '+
+   'returns(Child){ require(template!=address(0)); Child result=new Child(); '+
+   'result.initialize(n); return result; } }';
+ const sourceCompiled=JSON.parse(solc.compile(JSON.stringify({language:'Solidity',
+   sources:{'Child.sol':{content:childSource},'Factory.sol':{content:factorySource}},
+   settings:{evmVersion:'shanghai',outputSelection:{'*':{'*':['abi','evm.bytecode.object']}}}})));
+ assert.deepEqual((sourceCompiled.errors||[]).filter(e=>e.severity==='error'),[]);
+ const childArtifact=sourceCompiled.contracts['Child.sol'].Child;
+ const factoryArtifact=sourceCompiled.contracts['Factory.sol'].Factory;
+ const clonedTransport=ganache.provider({logging:{quiet:true},
+   wallet:{deterministic:true,totalAccounts:3},chain:{hardfork:'shanghai'},
+   miner:{blockGasLimit:12000000}});
+ try{
+   const cloneSequence={constructorArgs:[],
+     preparation:{deployments:[{id:'factory',file:'Factory.sol',contract:'Factory',
+       constructorArgs:[]}],operations:[],checks:[]},
+     factoryClone:{deploymentId:'factory',function:'createChild(address,uint256)',
+       args:['$contract','7'],sender:0},
+     steps:[{operation:'call',function:'value()',args:[],expect:'7'},
+       {operation:'send',function:'set(uint256)',args:['9'],sender:0},
+       {operation:'call',function:'value()',args:[],expect:'9'}]};
+   validateSequence(cloneSequence);
+   const actual=await runSequence(childArtifact,cloneSequence,clonedTransport,
+     {'Factory.sol':{Factory:factoryArtifact}});
+   assert.equal(actual.steps[0].operation,'setup');
+   assert.match(actual.steps[1].purpose,/created clone.*runtime code sha256/);
+   assert.ok(actual.steps.every(x=>x.passed),JSON.stringify(actual));
+   assert.equal(actual.steps.at(-1).actual,'9');
+ }finally{await clonedTransport.disconnect();}
  const wrongArgs=structuredClone(sequence);wrongArgs.steps[2].args=['not an integer'];
  await assert.rejects(execute(wrongArgs),/invalid|argument/i,'Invalid ABI input cannot masquerade as an expected revert');
  const readAsSend={constructorArgs:['0','$account0'],steps:[{operation:'send',function:'value()',args:[]},sequence.steps[0]]};

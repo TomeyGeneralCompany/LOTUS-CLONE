@@ -384,6 +384,52 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                 {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":vestmissing},
                 {"sequence":{"steps":vestreq}})[0],"observation_only")
 
+    def test_general_source_scalar_conservation_is_independently_proven(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            source=root/"contracts"/"Ledger.sol"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "pragma solidity ^0.8.20; contract Ledger {\n"
+                "uint256 public reserve;\n"
+                "function accrue(uint256 amount) external { reserve += amount; }\n"
+                "}\n",encoding="utf8")
+            sha=hashlib.sha256(source.read_bytes()).hexdigest()
+            before={"operation":"call","function":"reserve()",
+                    "sender":0,"actual":"0","expected":"0","passed":True}
+            tx={"operation":"send","function":"accrue(uint256)",
+                "sender":0,"reverted":False,"passed":True}
+            after={"operation":"call","function":"reserve()",
+                   "sender":0,"actual":"1000","expected":"1000","passed":True}
+            requested=[
+                {"operation":"call","function":"reserve()","args":[],"expect":"0"},
+                {"operation":"send","function":"accrue(uint256)","args":["1000"],"sender":0},
+                {"operation":"call","function":"reserve()","args":[],"expect":"1000"},
+            ]
+            prop={"kind":"scalar_delta","state":"reserve","method":"accrue(uint256)",
+                  "parameter":"amount","amount":"1000","direction":"increase",
+                  "sourceSha256":sha}
+            spec={"sequence":{"constructorArgs":[],"steps":requested,"sourceProperty":prop}}
+            evidence={"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,
+                      "steps":[before,tx,after]}
+            certified=security_experiment_disposition(root,source,"Ledger.accrue",
+                evidence,spec)
+            self.assertEqual(certified[0],"behavior_not_observed")
+            self.assertEqual(certified[1],"source_scalar_delta_negative")
+            wrong_state=dict(after,actual="999",passed=False)
+            result=security_experiment_disposition(root,source,"Ledger.accrue",
+                {**evidence,"steps":[before,tx,wrong_state]},spec)
+            self.assertEqual(result[0],"observation_only")
+            stale_spec={"sequence":{**spec["sequence"],
+                "sourceProperty":{**prop,"sourceSha256":"0"*64}}}
+            self.assertEqual(security_experiment_disposition(
+                root,source,"Ledger.accrue",evidence,stale_spec)[0],"observation_only")
+            unrelated={"sequence":{**spec["sequence"],
+                "sourceProperty":{**prop,"method":"accrue(uint8)"}}}
+            self.assertEqual(security_experiment_disposition(
+                root,source,"Ledger.accrue",evidence,unrelated)[0],"observation_only")
+
     def test_bounded_funding_source_and_state_negative(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

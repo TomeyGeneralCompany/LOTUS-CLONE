@@ -10,6 +10,7 @@ as security proof. Every positive classification requires:
 from __future__ import annotations
 
 import re
+import hashlib
 from pathlib import Path
 from typing import Tuple
 
@@ -445,6 +446,91 @@ def _asserted_financial_or_vesting_negative(
     )
 
 
+def _asserted_source_scalar_delta(
+    file: Path, selector: str, requested_steps: list, actual_steps: list,
+    specification: dict | None,
+) -> tuple[str, str] | None:
+    """Independent source/replay proof of an exactly bounded scalar increment.
+
+    A passing arbitrary value check is never enough. Require an actual public
+    uint getter, matching full function signature, a literal source mutation,
+    a successful mined transaction, and both passing before/after reads.
+    """
+    seq=(specification or {}).get("sequence") or {}
+    property_spec=seq.get("sourceProperty")
+    if not isinstance(property_spec,dict) or property_spec.get("kind")!="scalar_delta":
+        return None
+    if property_spec.get("direction")!="increase":
+        return None
+    try:
+        text=file.read_text(encoding="utf8")
+        source_sha=hashlib.sha256(file.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    if property_spec.get("sourceSha256")!=source_sha:
+        return None
+    state=property_spec.get("state")
+    parameter=property_spec.get("parameter")
+    method=property_spec.get("method")
+    amount=property_spec.get("amount")
+    if not all(isinstance(v,str) and re.fullmatch(r"[A-Za-z_]\w*",v)
+               for v in (state,parameter)):
+        return None
+    if not isinstance(amount,str) or not re.fullmatch(r"(?:0|[1-9][0-9]{0,29})",amount) or int(amount)==0:
+        return None
+    if not isinstance(method,str) or not re.fullmatch(r"[A-Za-z_]\w*\(uint(?:[0-9]{1,3})?\)",method):
+        return None
+    if selector.rsplit(".",1)[-1]!=method.split("(",1)[0]:
+        return None
+    source=_strip_comments(text)
+    if not re.search(r"\buint(?:[0-9]{1,3})?\s+public\s+"+re.escape(state)+r"\s*;",source):
+        return None
+    name=method.split("(",1)[0]
+    header,fn_body=_extract_fn_body(source,name)
+    if not header or not fn_body:
+        return None
+    signature_match=re.search(r"\bfunction\s+"+re.escape(name)+r"\s*\(([^)]*)\)",header)
+    if not signature_match:
+        return None
+    declaration=signature_match.group(1).strip()
+    # Only exactly one declared scalar parameter; never select a different
+    # overload by name or infer an ABI from a guessed signature.
+    declared=re.fullmatch(r"(uint(?:[0-9]{1,3})?)\s+(?:(?:memory|calldata)\s+)?"+
+                          re.escape(parameter),declaration)
+    if not declared or method!=name+"("+declared.group(1)+")":
+        return None
+    if not re.search(r"\b"+re.escape(state)+r"\s*\+=\s*"+
+                     re.escape(parameter)+r"\s*;",fn_body):
+        return None
+    if len(actual_steps)!=len(requested_steps):
+        return None
+    getter=state+"()"
+    calls=[i for i,step in enumerate(requested_steps)
+           if step.get("operation")=="call" and step.get("function")==getter
+           and step.get("args")==[]]
+    sends=[i for i,step in enumerate(requested_steps)
+           if step.get("operation")=="send" and step.get("function")==method
+           and step.get("args")==[amount] and not step.get("deploymentId")]
+    if len(calls)!=2 or len(sends)!=1 or not(calls[0]<sends[0]<calls[1]):
+        return None
+    pre,transaction,post=(actual_steps[i] for i in (calls[0],sends[0],calls[1]))
+    if pre.get("passed") is not True or post.get("passed") is not True or \
+       transaction.get("passed") is not True or transaction.get("reverted") is not False:
+        return None
+    if pre.get("operation")!="call" or post.get("operation")!="call" or \
+       transaction.get("operation")!="send":
+        return None
+    if str(pre.get("actual"))!="0" or str(post.get("actual"))!=amount:
+        return None
+    if requested_steps[calls[0]].get("expect")!="0" or \
+       requested_steps[calls[1]].get("expect")!=amount:
+        return None
+    return ("source_scalar_delta_negative",
+            "Source-identified public scalar increment executed in the isolated EVM; "
+            "the prestate, successful transaction and poststate agree with the "
+            "source-derived bounded conservation equation. This proves only "
+            "the tested input and fixture state.")
+
 def security_experiment_disposition(
     repository: Path,
     file: Path,
@@ -473,6 +559,12 @@ def security_experiment_disposition(
     if any(step.get("passed") is not True for step in actual_steps
            if step.get("operation") not in ("observe",)):
         return "observation_only", None, explanation
+
+    scalar = _asserted_source_scalar_delta(
+        file, selector, requested_steps, actual_steps, specification
+    )
+    if scalar is not None:
+        return "behavior_not_observed", scalar[0], scalar[1]
 
     bounded = _asserted_financial_or_vesting_negative(
         file, selector, requested_steps, actual_steps,

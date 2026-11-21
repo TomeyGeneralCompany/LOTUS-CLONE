@@ -834,4 +834,142 @@ if (!abstractRes.ok) {
   assert.match(abstractRes.detail, /YVaultMarketV2/, 'Abstract contract refusal must report acquired concrete subclass');
 }
 
+// Dossier regression: a public variable generates a Solidity getter satisfying
+// an inherited abstract signature. This is a real concrete contract, not an
+// abstract deployment requiring a fabricated subclass.
+const generatedGetterSource=`pragma solidity ^0.8.20;
+abstract contract Base {
+  function stablecoin() external view virtual returns (address);
+}
+contract LiveMarket is Base {
+  address public override stablecoin;
+  uint256 public totalDeposits;
+  function deposit(uint256 amount) external { totalDeposits += amount; }
+  function withdraw(uint256 amount) external { totalDeposits -= amount; }
+}`;
+const generatedGetterSnap={path:'contracts/LiveMarket.sol',
+  sha256:createHash('sha256').update(generatedGetterSource).digest('hex'),
+  content:generatedGetterSource};
+const generatedGetterResult=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:generatedGetterSnap.path,
+  targetSelector:'LiveMarket.deposit',sources:[generatedGetterSnap],
+  declarations:[
+    {selector:'LiveMarket.deposit',operation:'send',inputs:['uint256']},
+    {selector:'LiveMarket.withdraw',operation:'send',inputs:['uint256']},
+    {selector:'LiveMarket.totalDeposits',operation:'call',inputs:[]},
+    {selector:'LiveMarket.stablecoin',operation:'call',inputs:[]},
+  ],
+});
+assert.equal(generatedGetterResult.ok,true,JSON.stringify(generatedGetterResult));
+if(generatedGetterResult.ok)
+  assert.ok(generatedGetterResult.experiments.some(x=>x.securityProperty.includes('financial')),
+    'Inherited generated public getter must not make concrete money market abstract');
+
+// An overload is distinguished by its ABI signature before finding compatible
+// accounting companions; two differently typed functions cannot be conflated.
+const overloadedAccounting=`pragma solidity ^0.8.20;
+contract Accumulator {
+  uint256 public totalDeposits;
+  function mint(uint256 amount) external { totalDeposits += amount; }
+  function mint(uint256 amount, bool enabled) external {
+    if (enabled) totalDeposits += amount;
+  }
+  function burn(uint256 amount) external { totalDeposits -= amount; }
+}`;
+const overloadedSnap={path:'contracts/Accumulator.sol',
+  sha256:createHash('sha256').update(overloadedAccounting).digest('hex'),
+  content:overloadedAccounting};
+const overloadResult=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:overloadedSnap.path,
+  targetSelector:'Accumulator.burn',sources:[overloadedSnap],
+  declarations:[
+    {selector:'Accumulator.mint',operation:'send',inputs:['uint256']},
+    {selector:'Accumulator.mint',operation:'send',inputs:['uint256','bool']},
+    {selector:'Accumulator.burn',operation:'send',inputs:['uint256']},
+    {selector:'Accumulator.totalDeposits',operation:'call',inputs:[]},
+  ],
+});
+assert.equal(overloadResult.ok,true,JSON.stringify(overloadResult));
+if(overloadResult.ok)
+  assert.ok(overloadResult.experiments.some(x=>x.sequence.steps.some(step=>
+    step.operation==='send'&&step.function==='mint(uint256)')),
+    'Use exact mint(uint256) overload for conservation, never mint(uint256,bool)');
+
+// Generic signed source-state delta: no special method naming templates.
+const ledgerSource=`pragma solidity ^0.8.20;
+contract Ledger {
+  uint256 public reserve;
+  function accrue(uint256 amount) external { reserve += amount; }
+}`;
+const ledgerSnapshot={path:'contracts/Ledger.sol',content:ledgerSource,
+  sha256:createHash('sha256').update(ledgerSource).digest('hex')};
+const ledgerProof=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:ledgerSnapshot.path,
+  targetSelector:'Ledger.accrue',sources:[ledgerSnapshot],
+  declarations:[{selector:'Ledger.accrue',operation:'send',inputs:['uint256']},
+    {selector:'Ledger.reserve',operation:'call',inputs:[]}],
+});
+assert.equal(ledgerProof.ok,true,JSON.stringify(ledgerProof));
+if(ledgerProof.ok){
+  const experiment=ledgerProof.experiments.find(x=>x.sequence.sourceProperty?.kind==='scalar_delta');
+  assert.ok(experiment,'A real public uint increment must be executable as a bounded conservation property');
+  assert.equal(experiment!.sequence.sourceProperty?.sourceSha256,ledgerSnapshot.sha256);
+  assert.deepEqual(experiment!.sequence.steps.map(x=>x.operation),['call','send','call']);
+  assert.equal(experiment!.sequence.steps[2].operation,'call');
+  if(experiment!.sequence.steps[2].operation==='call')
+    assert.equal(experiment!.sequence.steps[2].expect,'1000');
+}
+// An external dependency is not converted into a certified local scalar proof.
+const externalLedgerSource=ledgerSource.replace('reserve += amount;',
+  'IProtocol(protocol).deposit(amount); reserve += amount;');
+const externalLedgerSnap={...ledgerSnapshot,content:externalLedgerSource,
+  sha256:createHash('sha256').update(externalLedgerSource).digest('hex')};
+const externalLedger=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:externalLedgerSnap.path,
+  targetSelector:'Ledger.accrue',sources:[externalLedgerSnap],
+  declarations:[{selector:'Ledger.accrue',operation:'send',inputs:['uint256']},
+    {selector:'Ledger.reserve',operation:'call',inputs:[]}],
+});
+assert.equal(externalLedger.ok,false,
+  'An unknown external state transition cannot be treated as verified local conservation');
+
+// Factory clone must be sourced from the acquired factory itself, and an
+// initializer may be moved into that factory only when every ABI argument and
+// explicit source call matches the target implementation.
+const cloneTargetSource=`pragma solidity ^0.8.20;
+contract Market {
+  address public owner; uint256 public count;
+  function initialize(address firstOwner) external { owner=firstOwner; }
+  function accrue(uint256 amount) external { count += amount; }
+}`;
+const cloneFactorySource=`pragma solidity ^0.8.20;
+contract Factory {
+  function createMarket(address template, bytes32 salt, address firstOwner)
+    external returns(Market) {
+      Market clone = Market(template.cloneDeterministic(salt));
+      clone.initialize(firstOwner);
+      return clone;
+  }
+}`;
+const cloneTarget={path:'contracts/Market.sol',content:cloneTargetSource,
+  sha256:createHash('sha256').update(cloneTargetSource).digest('hex')};
+const cloneFactory={path:'contracts/Factory.sol',content:cloneFactorySource,
+  sha256:createHash('sha256').update(cloneFactorySource).digest('hex')};
+const clonedProperty=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:cloneTarget.path,
+  targetSelector:'Market.accrue',sources:[cloneTarget,cloneFactory],
+  declarations:[{selector:'Market.accrue',operation:'send',inputs:['uint256']},
+    {selector:'Market.count',operation:'call',inputs:[]}],
+});
+assert.equal(clonedProperty.ok,true,JSON.stringify(clonedProperty));
+if(clonedProperty.ok){
+  const plan=clonedProperty.experiments.find(e=>e.sequence.sourceProperty?.kind==='scalar_delta');
+  assert.ok(plan,'Source-defined increment property must survive factory construction');
+  assert.equal(plan!.sequence.factoryClone?.function,'createMarket(address,bytes32,address)');
+  assert.equal(plan!.sequence.preparation?.deployments.at(-1)?.file,cloneFactory.path);
+  assert.ok(plan!.witnesses.some(w=>w.path===cloneFactory.path));
+  assert.equal(plan!.sequence.steps.some(step=>step.operation==='send'&&
+    step.function==='initialize(address)'),false,'Factory already initialized the clone');
+}
+
 console.log('Standalone experiment construction passed');

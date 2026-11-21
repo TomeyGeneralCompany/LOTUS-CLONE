@@ -1387,22 +1387,59 @@ function isTestOrMockPath(path:string):boolean {
     /\.t\.sol$/i.test(norm);
 }
 
-function isAbstractContractNode(contract:any,chain:readonly ContractEntry[]=[]):boolean {
-  if(!contract||(contract.kind&&contract.kind!=='contract'))return true;
-  if((contract.subNodes||[]).some((n:any)=>n.type==='FunctionDefinition'&&!n.body))return true;
-  if(chain.length>1){
-    const implemented=new Set<string>();
-    for(const e of chain){
-      for(const n of e.contract.subNodes||[]){
-        if(n.type==='FunctionDefinition'&&n.body&&n.name)implemented.add(n.name);
-      }
-    }
-    for(const e of chain){
-      for(const n of e.contract.subNodes||[]){
-        if(n.type==='FunctionDefinition'&&!n.body&&n.name&&!implemented.has(n.name))return true;
-      }
+/** ABI argument identity is necessary for overload-safe abstract fulfillment.
+ * Public state variables generate Solidity getters even though there is no
+ * FunctionDefinition AST body for them.
+ */
+function canonicalShapeType(node:any):string {
+  if(!node)return '';
+  if(node.type==='ElementaryTypeName'){
+    const name=String(node.name||'');
+    return name==='uint'?'uint256':name==='int'?'int256':name==='address payable'?'address':name;
+  }
+  if(node.type==='UserDefinedTypeName')return 'address';
+  if(node.type==='ArrayTypeName'){
+    const base=canonicalShapeType(node.baseTypeName);
+    const literal=node.length?.number;
+    return base+'['+(literal===undefined?'':literal)+']';
+  }
+  if(node.type==='Mapping')return canonicalShapeType(node.valueType);
+  return '';
+}
+function canonicalFunctionIdentity(fn:any):string {
+  return String(fn.name||'')+'('+((fn.parameters||[]).map((p:any)=>
+    canonicalShapeType(p.typeName)).join(','))+')';
+}
+function publicGetterIdentities(variable:any):string[] {
+  if(variable.visibility!=='public'||!variable.name)return [];
+  const keys:string[]=[];
+  let type=variable.typeName;
+  while(type?.type==='Mapping'||type?.type==='ArrayTypeName'){
+    if(type.type==='Mapping'){
+      keys.push(canonicalShapeType(type.keyType));
+      type=type.valueType;
+    } else {
+      keys.push('uint256');type=type.baseTypeName;
     }
   }
+  return [variable.name+'('+keys.join(',')+')'];
+}
+function isAbstractContractNode(contract:any,chain:readonly ContractEntry[]=[]):boolean {
+  if(!contract||(contract.kind&&contract.kind!=='contract'))return true;
+  if(contract.abstract===true)return true;
+  const nodes=(chain.length?chain.map(e=>e.contract):[contract])
+    .flatMap((c:any)=>c.subNodes||[]);
+  const implemented=new Set<string>();
+  for(const n of nodes){
+    if(n.type==='FunctionDefinition'&&n.body&&n.name)
+      implemented.add(canonicalFunctionIdentity(n));
+    if(n.type==='StateVariableDeclaration')
+      for(const v of n.variables||[])
+        for(const id of publicGetterIdentities(v))implemented.add(id);
+  }
+  for(const n of nodes)
+    if(n.type==='FunctionDefinition'&&!n.body&&n.name&&
+      !implemented.has(canonicalFunctionIdentity(n)))return true;
   return false;
 }
 
@@ -1998,6 +2035,7 @@ export function extractSourceInvariantDescriptor(
   declarations: readonly SolidityProbeDeclaration[],
   sources: ReadonlyMap<string, SourceSnapshot>,
   selectedCompanion?:string,
+  selectedTargetSignature?:string,
 ): InvariantExtractionResult {
   if(isTestOrMockPath(snapshot.path))
     return {ok:false,category:'no_supported_property',
@@ -2040,7 +2078,8 @@ export function extractSourceInvariantDescriptor(
   const accountingStates=allNodes.filter((n:any)=>n.type==='StateVariableDeclaration')
     .flatMap((n:any)=>n.variables||[]).map((v:any)=>String(v.name||''))
     .filter(name=>/^(?:total|balance|deposit|share|reserve|principal|stake|asset|debt)/i.test(name));
-  const targetFn = fns.find((n: any) => n.name === method);
+  const targetFn = fns.find((n: any) => n.name === method &&
+    (!selectedTargetSignature || canonicalFunctionIdentity(n)===selectedTargetSignature));
   if (!targetFn) {
     return {
       ok: false,
@@ -2069,14 +2108,16 @@ export function extractSourceInvariantDescriptor(
     const reverse=targetEffect.minus.some(state=>effect.plus.includes(state));
     return forward!==reverse?[{fn,forward,reverse}]:[];
   });
-  const selected=selectedCompanion?counterparts.filter(x=>x.fn.name===selectedCompanion):counterparts;
+  const selected=selectedCompanion?counterparts.filter(x=>
+    canonicalFunctionIdentity(x.fn)===selectedCompanion):counterparts;
   if(selected.length!==1){
     return {ok:false,category:'no_supported_property',
       reason:'Source-backed accounting companion '+
         (counterparts.length?'ambiguous: ':'not established for ')+
-        contract.name+'.'+method+': '+counterparts.map(x=>x.fn.name).join(', '),
-      witnesses:[witness(snapshot,targetFn,contract.name+'.'+method)],
-      companionCandidates:[...new Set(counterparts.map(x=>x.fn.name))]};
+        contract.name+'.'+canonicalFunctionIdentity(targetFn)+': '+
+        counterparts.map(x=>canonicalFunctionIdentity(x.fn)).join(', '),
+      witnesses:[witness(snapshot,targetFn,contract.name+'.'+canonicalFunctionIdentity(targetFn))],
+      companionCandidates:[...new Set(counterparts.map(x=>canonicalFunctionIdentity(x.fn)))]};
   }
   const counterpart=selected[0];
   const inflowFn=counterpart.forward?targetFn:counterpart.fn;
@@ -2264,12 +2305,12 @@ export function extractSourceInvariantDescriptor(
     };
   }
 
-  const inflowDecl = declarations.find(
-    (d) => d.operation === 'send' && d.selector === `${contract.name}.${inflowFn.name}`,
-  );
-  const outflowDecl = declarations.find(
-    (d) => d.operation === 'send' && d.selector === `${contract.name}.${outflowFn.name}`,
-  );
+  const declarationFor=(fn:any)=>declarations.find(d=>d.operation==='send' &&
+    d.selector===contract.name+'.'+fn.name &&
+    JSON.stringify(d.inputs)===JSON.stringify((fn.parameters||[])
+      .map((p:any)=>canonicalAbiType(p.typeName))));
+  const inflowDecl = declarationFor(inflowFn);
+  const outflowDecl = declarationFor(outflowFn);
   if (!inflowDecl || !outflowDecl) {
     return {
       ok: false,
@@ -2639,6 +2680,160 @@ export function constructCoreInvariantExperiment(
   };
 }
 
+
+/** General source-defined public scalar increment, independent of function
+ * names. The isolated EVM will verify the actual prestate, transaction receipt
+ * and poststate, while the independent verifier checks the source predicate.
+ * Never infer security behavior from a mock or an external protocol call.
+ */
+function sourceScalarDeltaExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const publicCounters=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      v.visibility==='public'&&identifier.test(v.name||'')&&
+      v.typeName?.type==='ElementaryTypeName'&&
+      /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||'')&&!v.expression);
+  if(!publicCounters.length)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,
+    sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const constructor=nodes.find(n=>n.type==='FunctionDefinition'&&n.isConstructor);
+  const bodySource=snapshot.content;
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name===method&&
+    ['public','external'].includes(n.visibility))){
+    const inputs=(fn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
+    if(inputs.length!==1||!inputs[0]||!/^uint(?:[0-9]{1,3})?$/.test(inputs[0]))continue;
+    const param=fn.parameters[0];
+    if(!identifier.test(param.name||''))continue;
+    const signature=fn.name+'('+inputs[0]+')';
+    if(!declarations.some(d=>d.operation==='send'&&
+      d.selector===contract.name+'.'+method&&
+      JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
+    const modifiers=(fn.modifiers||[]).map((m:any)=>String(m.name||''));
+    if(modifiers.some((m:string)=>/(?:only|owner|admin|auth|role|minter|permission)/i.test(m)))continue;
+    const fnText=body(bodySource,fn)
+      .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
+    // Other contract calls create additional fixture prerequisites. Refuse until
+    // their actual implementations and preconditions have been connected.
+    if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText)||
+      /\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText))continue;
+    for(const state of publicCounters){
+      if(constructor&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,constructor)))continue;
+      if(setup.initSignature){
+        const init=nodes.find(n=>n.type==='FunctionDefinition'&&
+          (n.name==='initialize'||n.name==='init')&&n.body);
+        if(init&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,init)))continue;
+      }
+      const statement=new RegExp('\\b'+state.name+'\\s*\\+=\\s*'+param.name+'\\s*;');
+      if(!statement.test(fnText))continue;
+      const getter=state.name+'()';
+      const width=Number(inputs[0].replace(/\D/g,''))||256;
+      const amount=width<=8?'100':'1000';
+      const steps:SoliditySequence['steps']=[];
+      if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
+        args:setup.initArgs,sender:0,requiredSetup:true});
+      steps.push({operation:'call',function:getter,args:[],expect:'0'});
+      steps.push({operation:'send',function:signature,args:[amount],sender:0});
+      steps.push({operation:'call',function:getter,args:[],expect:amount});
+      out.push({
+        hypothesis:'Source-declared increment of '+state.name+' by '+param.name+
+          ' must produce '+amount+' from an initial zero state for '+contract.name+'.'+signature,
+        property:'source-defined bounded scalar conservation '+contract.name+'.'+signature+':'+state.name,
+        sequence:{constructorArgs:setup.constructorArgs,
+          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+          sourceProperty:{kind:'scalar_delta',state:state.name,method:signature,
+            parameter:param.name,amount,direction:'increase',sourceSha256:snapshot.sha256},
+          steps},
+        witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
+          witness(snapshot,state,contract.name+'.'+state.name)],
+      });
+    }
+  }
+  return out;
+}
+
+
+/** Convert a verified initializer setup into the actual source-declared
+ * factory clone pathway when the acquired Factory implementation provides one.
+ * No inferred clone behavior, guessed parameter order, arbitrary initializer,
+ * or deployment from outside the source manifest is admissible.
+ */
+function sourceFactoryCloneExperiment(
+  candidate:{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]},
+  target:SourceSnapshot,contract:any,sources:ReadonlyMap<string,SourceSnapshot>
+):typeof candidate {
+  const sequence=candidate.sequence;
+  if(sequence.factoryClone)return candidate;
+  const setupIndex=sequence.steps.findIndex(step=>
+    step.operation==='send'&&step.requiredSetup===true&&
+    /^initialize\(/.test(step.function)&&!step.deploymentId);
+  if(setupIndex<0)return candidate;
+  const initStep=sequence.steps[setupIndex];
+  if(initStep.operation!=='send')return candidate;
+  const init=(contract.subNodes||[]).find((n:any)=>
+    n.type==='FunctionDefinition'&&n.name==='initialize'&&n.body&&
+    canonicalFunctionIdentity(n)===initStep.function);
+  if(!init)return candidate;
+  for(const factorySource of sources.values()){
+    if(!/(?:^|\/)Factory\.sol$/.test(factorySource.path)||isTestOrMockPath(factorySource.path))
+      continue;
+    let parsed:any;try{parsed=parseAstCached(factorySource);}catch{continue;}
+    const factory=(parsed.children||[]).find((n:any)=>
+      n.type==='ContractDefinition'&&n.name==='Factory'&&
+      n.kind!=='interface'&&n.kind!=='library');
+    if(!factory)continue;
+    const create=(factory.subNodes||[]).find((n:any)=>n.type==='FunctionDefinition'&&
+      n.name==='create'+contract.name&&n.body&&
+      ['external','public'].includes(n.visibility));
+    if(!create)continue;
+    const params:any[]=create.parameters||[];
+    const initParams:any[]=init.parameters||[];
+    if(params.length!==initParams.length+2||
+      params[0]?.name!=='template'||params[1]?.name!=='salt'||
+      canonicalAbiType(params[0]?.typeName)!=='address'||
+      canonicalAbiType(params[1]?.typeName)!=='bytes32')continue;
+    const factoryTypes=params.map(p=>canonicalAbiType(p.typeName));
+    if(factoryTypes.some(t=>!t))continue;
+    if(!initParams.every((p,i)=>p.name&&p.name===params[i+2].name&&
+      canonicalAbiType(p.typeName)===factoryTypes[i+2]))continue;
+    const factoryBody=body(factorySource.content,create);
+    // Explicit template.cloneDeterministic(salt) and the exact initializer
+    // argument vector must occur in the acquired source.
+    if(!/\btemplate\s*\.\s*cloneDeterministic\s*\(\s*salt\s*\)/.test(factoryBody))
+      continue;
+    const initMatch=factoryBody.match(/\bclone\s*\.\s*initialize\s*\(([\s\S]*?)\)\s*;/);
+    if(!initMatch)continue;
+    const specifiedArgs=initMatch[1].split(',').map(x=>x.trim());
+    if(JSON.stringify(specifiedArgs)!==JSON.stringify(initParams.map(p=>p.name)))
+      continue;
+    const preparation=sequence.preparation||{deployments:[],operations:[],checks:[]};
+    if(preparation.deployments.length>=8)continue;
+    const id='sourceFactory';
+    if(preparation.deployments.some(d=>d.id===id))continue;
+    const cloneMethod=create.name+'('+factoryTypes.join(',')+')';
+    const updated:SoliditySequence={
+      ...sequence,
+      preparation:{deployments:[...preparation.deployments,
+        {id,file:factorySource.path,contract:factory.name,constructorArgs:[]}],
+        operations:[...preparation.operations],checks:[...preparation.checks]},
+      factoryClone:{deploymentId:id,function:cloneMethod,
+        args:['$contract',ZERO_BYTES32,...initStep.args],sender:0},
+      steps:sequence.steps.filter((_,i)=>i!==setupIndex),
+    };
+    return {...candidate,sequence:updated,witnesses:[
+      ...candidate.witnesses,witness(factorySource,create,'Factory.'+cloneMethod)]};
+  }
+  return candidate;
+}
+
 export function constructSolidityExperiments(input:ConstructionInput):ConstructionResult {
   if(!/^[a-f0-9]{40}$/.test(input.repositoryCommit))
     return {ok:false,code:'INVALID_COMMIT',detail:'Expected a source commit SHA'};
@@ -2703,6 +2898,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     const drainOrMintExp=unprotectedFundDrainOrMintExperiment(target,contract,method,indexed,input.declarations);
     if(drainOrMintExp)choices.push(drainOrMintExp);
   }
+  for(const scalar of sourceScalarDeltaExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(scalar);
   const vestingCreation=groundedVestingCreationExperiment(target,contract,method,input.declarations);
   if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
@@ -2727,36 +2924,44 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       };
     }
   } else {
-    const extracted = extractSourceInvariantDescriptor(target, contract, method, input.declarations, indexed);
-    if (extracted.ok) {
-      const built = constructCoreInvariantExperiment(extracted.invariant, target, contract, input.declarations, indexed);
-      if (built) {
-        choices.push(built);
-      } else {
-        invariantUnresolved = {
-          category: 'missing_fixture',
-          reason: `Extracted invariant for ${input.targetSelector} failed admission or fixture construction`,
-        };
+    // Every overload is an independent ABI entrypoint. Enumerate candidate
+    // companion signatures, then admit only pairs with an actual source and
+    // executable typed fixture. No name-only ambiguity or arbitrary first pick.
+    const targetVariants=(contract.subNodes||[])
+      .filter((fn:any)=>fn.type==='FunctionDefinition'&&fn.name===method&&
+        fn.body&&['public','external'].includes(fn.visibility))
+      .map(canonicalFunctionIdentity);
+    const signatures=targetVariants.length?targetVariants:[undefined];
+    const issues:string[]=[];
+    for(const targetSignature of signatures){
+      const extracted=extractSourceInvariantDescriptor(target,contract,method,
+        input.declarations,indexed,undefined,targetSignature);
+      const variants=extracted.ok?[extracted]:
+        extracted.companionCandidates?.length?
+          extracted.companionCandidates.map(companion=>
+            extractSourceInvariantDescriptor(target,contract,method,
+              input.declarations,indexed,companion,targetSignature)):[extracted];
+      for(const candidate of variants){
+        if(!candidate.ok){
+          issues.push((targetSignature||method)+':'+candidate.category+':'+candidate.reason);
+          if(!invariantUnresolved)invariantUnresolved={
+            category:candidate.category,reason:candidate.reason};
+          continue;
+        }
+        const built=constructCoreInvariantExperiment(candidate.invariant,target,
+          contract,input.declarations,indexed);
+        if(built)choices.push(built);
+        else{
+          const reason='Source-witnessed invariant failed typed fixture construction for '+
+            (targetSignature||method);
+          issues.push(reason);
+          if(!invariantUnresolved)invariantUnresolved={
+            category:'missing_fixture',reason};
+        }
       }
-    } else if(extracted.companionCandidates && extracted.companionCandidates.length>1){
-      // Ambiguous counterparts represent separate source-derived properties,
-      // not permission to discard the lead or select an arbitrary first match.
-      let constructed=0;
-      const issues:string[]=[];
-      for(const companion of extracted.companionCandidates){
-        const candidate=extractSourceInvariantDescriptor(target,contract,method,
-          input.declarations,indexed,companion);
-        if(!candidate.ok){issues.push(companion+':'+candidate.reason);continue;}
-        const built=constructCoreInvariantExperiment(candidate.invariant,target,contract,
-          input.declarations,indexed);
-        if(built){choices.push(built);constructed++;}
-        else issues.push(companion+':fixture_construction_failed');
-      }
-      if(!constructed)invariantUnresolved={category:extracted.category,
-        reason:issues.join('; ').slice(0,900)};
-    } else {
-      invariantUnresolved = { category: extracted.category, reason: extracted.reason };
     }
+    if(invariantUnresolved&&!choices.length)
+      invariantUnresolved.reason=issues.slice(0,18).join('; ').slice(0,1500);
   }
 
   if (!choices.length) {
@@ -2776,7 +2981,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     };
   }
   const seen=new Set<string>(),out:PreparedSecurityExperiment[]=[];
-  for(const c of choices) {
+  for(const original of choices) {
+    const c=sourceFactoryCloneExperiment(original,target,contract,indexed);
     const prereqs:PreparationPrerequisite[]=[];
     const graph=orderPreparation(prereqs);
     if(!graph.ok)return {ok:false,code:graph.code,detail:graph.detail};
