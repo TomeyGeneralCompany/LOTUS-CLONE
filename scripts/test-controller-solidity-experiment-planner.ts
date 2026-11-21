@@ -895,4 +895,42 @@ if(overloadResult.ok)
     step.operation==='send'&&step.function==='mint(uint256)')),
     'Use exact mint(uint256) overload for conservation, never mint(uint256,bool)');
 
+// Generic signed source-state delta: no special method naming templates.
+const ledgerSource=`pragma solidity ^0.8.20;
+contract Ledger {
+  uint256 public reserve;
+  function accrue(uint256 amount) external { reserve += amount; }
+}`;
+const ledgerSnapshot={path:'contracts/Ledger.sol',content:ledgerSource,
+  sha256:createHash('sha256').update(ledgerSource).digest('hex')};
+const ledgerProof=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:ledgerSnapshot.path,
+  targetSelector:'Ledger.accrue',sources:[ledgerSnapshot],
+  declarations:[{selector:'Ledger.accrue',operation:'send',inputs:['uint256']},
+    {selector:'Ledger.reserve',operation:'call',inputs:[]}],
+});
+assert.equal(ledgerProof.ok,true,JSON.stringify(ledgerProof));
+if(ledgerProof.ok){
+  const experiment=ledgerProof.experiments.find(x=>x.sequence.sourceProperty?.kind==='scalar_delta');
+  assert.ok(experiment,'A real public uint increment must be executable as a bounded conservation property');
+  assert.equal(experiment!.sequence.sourceProperty?.sourceSha256,ledgerSnapshot.sha256);
+  assert.deepEqual(experiment!.sequence.steps.map(x=>x.operation),['call','send','call']);
+  assert.equal(experiment!.sequence.steps[2].operation,'call');
+  if(experiment!.sequence.steps[2].operation==='call')
+    assert.equal(experiment!.sequence.steps[2].expect,'1000');
+}
+// An external dependency is not converted into a certified local scalar proof.
+const externalLedgerSource=ledgerSource.replace('reserve += amount;',
+  'IProtocol(protocol).deposit(amount); reserve += amount;');
+const externalLedgerSnap={...ledgerSnapshot,content:externalLedgerSource,
+  sha256:createHash('sha256').update(externalLedgerSource).digest('hex')};
+const externalLedger=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:externalLedgerSnap.path,
+  targetSelector:'Ledger.accrue',sources:[externalLedgerSnap],
+  declarations:[{selector:'Ledger.accrue',operation:'send',inputs:['uint256']},
+    {selector:'Ledger.reserve',operation:'call',inputs:[]}],
+});
+assert.equal(externalLedger.ok,false,
+  'An unknown external state transition cannot be treated as verified local conservation');
+
 console.log('Standalone experiment construction passed');
