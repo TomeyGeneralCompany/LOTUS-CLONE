@@ -402,7 +402,7 @@ export async function runLocalAudit(
             JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence));
           const witnesses=candidate
             ?candidate.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(':'))
-            :[lead.sourceEvidence];
+            :(inventoryEntry?[inventoryEntry.sourceEvidence]:[]);
           // Source evidence for this selector, not evidence for an unrelated
           // function, is required for pre-ANALYZE staged experiments.
           if(!witnesses.length||witnesses.some(x=>!x.includes(lead.sourceSha256)))return [];
