@@ -59,7 +59,7 @@ function initializerStateBindings(node:any):Array<{parameter:string;receiver:str
 }
 export interface AcquiredConcreteImplementation {
   path:string;contract:string;selector:string;sourceSha256:string;
-  witness:string;
+  inputs:string[];witness:string;
 }
 /** Map an abstract/interface function into actual acquired source, never
  * synthesize a behavior-bearing mock or assume an external dependency exists.
@@ -104,9 +104,23 @@ export function resolveAcquiredConcreteImplementations(
           x.name===method&&x.body&&["external","public"].includes(x.visibility));
       if(!fn&&!inherited)continue;
       const proof=fn||inherited;
+      const scalarAbi=(p:any):string|null=>{
+        const type=p?.typeName;
+        if(type?.type==="UserDefinedTypeName")return "address";
+        const kind=String(type?.name||"");
+        if(kind==="uint")return "uint256";
+        if(kind==="int")return "int256";
+        if(kind==="address"||kind==="bool"||kind==="string"||kind==="bytes"||
+          /^(?:u?int[0-9]{1,3}|bytes(?:[1-9]|[12][0-9]|3[012]))$/.test(kind))
+          return kind;
+        return null;
+      };
+      const declaredTypes=(proof.parameters||[]).map(scalarAbi);
+      if(declaredTypes.some((value:string|null)=>value===null))continue;
       const proofSource=fn?source:abstractSource;
       result.push({path:source.path,contract:node.name,
         selector:node.name+"."+method,sourceSha256:source.sha256,
+        inputs:declaredTypes as string[],
         witness:proofSource.path+":"+proofSource.sha256+":"+
           String(proof.loc?.start?.line||1)+":"+String(proof.loc?.end?.line||1)});
     }
