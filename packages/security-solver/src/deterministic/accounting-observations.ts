@@ -7,7 +7,8 @@ export type AccountingObservation =
   | {kind:"scalar";getter:string;sourceWitness:string;stateVariable:string}
   | {kind:"mapping";getter:string;keyType:string;stateVariable:string;sourceWitness:string}
   | {kind:"struct_field";getter:string;keyType:string;fieldName:string;fieldType:string;fieldIndex:number;stateVariable:string;sourceWitness:string}
-  | {kind:"collection_length";getter:string;stateVariable:string;sourceWitness:string};
+  | {kind:"collection_length";getter:string;stateVariable:string;sourceWitness:string}
+  | {kind:"external_balance";getter:string;keyType:"address";stateVariable:string;sourceWitness:string};
 
 const typeName=(node:any):string=>{
   if(!node)return "";
@@ -57,6 +58,18 @@ export function extractAccountingObservations(
       const stateType=state.typeName;
       if(new RegExp("\\b"+regexEscape(name)+"\\s*\\.\\s*length\\b").test(body)&&declaration.inputs.length===0&&simple(resultType)){
         add({kind:"collection_length",getter,stateVariable:name,sourceWitness:witness});
+      }
+      // Only an exact source-level return of token.balanceOf(caller) is an
+      // equivalent public readback. A fee, share-price or event-only wrapper
+      // cannot be interpreted as a token balance.
+      const tokenType=typeName(stateType);
+      const parameter=String(fn.parameters?.[0]?.name||"");
+      if(/^(?:I?ERC20|IERC20Upgradeable|ERC20Upgradeable|MockERC20|ERC20Mock)$/.test(tokenType)&&
+        declaration.inputs.length===1&&declaration.inputs[0]==="address"&&
+        /^[A-Za-z_][A-Za-z0-9_]*$/.test(parameter)&&
+        new RegExp("\\breturn\\s+"+regexEscape(name)+
+          "\\s*\\.\\s*balanceOf\\s*\\(\\s*"+parameter+"\\s*\\)\\s*;").test(body)){
+        add({kind:"external_balance",getter,keyType:"address",stateVariable:name,sourceWitness:witness});
       }
       if(stateType?.type==="Mapping"&&declaration.inputs.length===1){
         const keyType=typeName(stateType.keyType);

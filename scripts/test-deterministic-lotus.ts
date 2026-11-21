@@ -29,7 +29,8 @@ import {
   runClosedLoopLeadAnalysis,
   type DeterministicReviewEvidence,
 } from "../packages/security-solver/src/deterministic";
-import { constructSolidityExperiments } from "../packages/security-solver/src/controller-solidity-experiment-planner";
+import { constructSolidityExperiments, extractSourceInvariantDescriptor } from "../packages/security-solver/src/controller-solidity-experiment-planner";
+import { parse as parseSolidity } from "@solidity-parser/parser";
 import { controllerReviewGroundDefect } from "../packages/security-solver/src/controller-review-boundary";
 import { runLocalAudit } from "../packages/security-solver/src/local-ollama-runner";
 import { runEvidenceOnlyReview } from "../packages/security-solver/src/evidence-only-review";
@@ -831,6 +832,12 @@ contract PrivateVault {
     const conservationExp = preConstructed.ok
       ? preConstructed.experiments.find((e) => e.securityProperty.includes("conservation"))
       : null;
+    if(!conservationExp){
+      const parsed=parseSolidity(buggyAccountingVault,{loc:true,range:true}) as any;
+      const contract=parsed.children.find((n:any)=>n.type==='ContractDefinition'&&n.name==='BuggyAccountingVault');
+      const debug=extractSourceInvariantDescriptor(sources[0],contract,'withdraw',vaultDecls,new Map(sources.map(x=>[x.path,x])));
+      console.error("SOURCE_CONSERVATION_DIAGNOSTIC",JSON.stringify(debug));
+    }
     assert.ok(legacyExp && conservationExp, "withdraw must yield both legacy and conservation candidates");
 
     const existingIds = new Set<string>([legacyExp!.id]);
@@ -946,6 +953,11 @@ contract SiblingPool${n} {
       }
 
       const auditLog = await readFile(logPath, "utf8");
+      if(!/\[ANALYSIS_MODEL_EXPERIMENT_ADDED\][^\n]*BuggyAccountingVault\.(?:deposit|withdraw)/.test(auditLog)){
+        console.error("ADMISSION_DIAGNOSTIC",
+          auditLog.split("\n").filter(line=>/\[ANALYSIS_|\[DETERMINISTIC_DRIVER_ACTION\]|\[STAGE_UNLOCK\]/.test(line))
+            .slice(-120).join("\n").slice(-25000));
+      }
       const graphBuilds = auditLog.match(/\[DETERMINISTIC_FACTS_GRAPH_BUILT\]/g) || [];
       assert.equal(graphBuilds.length, 1, "ProgramFactsGraph must be built ONCE per investigation and reused");
       assert.match(auditLog, /\[ANALYSIS_CANDIDATE_INVENTORY\]/, "Full candidate inventory telemetry must be logged");

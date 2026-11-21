@@ -21,9 +21,16 @@ export interface CandidateProgress {
   lifecycle:CandidateLifecycle; attempts:number;
   properties:CandidatePropertyProgress[];
   experimentIds:string[]; lastError?:string;
+  specialistAttempts?:Array<{adapter:string;status:string;reason:string;detail?:string}>;
 }
+export interface CandidateCoverage {
+  total:number; queued:number; admitted:number; dependenciesPending:number;
+  experimentsPending:number; experimentsCompleted:number; terminalExhausted:number;
+  blocked:number; unresolvedIds:string[]; unresolvedPrerequisites:Record<string,string[]>;
+}
+
 export interface AnalysisProgressSnapshot {
-  version:1; inventoryFingerprint:string;
+  version:1|2; inventoryFingerprint:string;
   candidateIds:string[]; records:CandidateProgress[];
   processedBatches:number; completedExperimentIds:string[];
 }
@@ -51,7 +58,9 @@ export class AnalysisProgressStore {
     try{raw=await readFile(path,"utf8");}
     catch(e){if((e as NodeJS.ErrnoException).code==="ENOENT")return store;throw e;}
     const parsed=JSON.parse(raw) as AnalysisProgressSnapshot;
-    if(parsed.version!==1||parsed.inventoryFingerprint!==store.inventoryFingerprint||
+    // V1 snapshots contain valid source identities but lack the V2 terminality contract.
+    // Preserve their candidate lifecycles and upgrade the schema on the next save.
+    if(![1,2].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
        JSON.stringify([...parsed.candidateIds].sort())!==JSON.stringify([...store.records.keys()].sort()))
       throw new Error("ANALYSIS_CHECKPOINT_SOURCE_MISMATCH: source inventory or revision changed");
     if(!Array.isArray(parsed.records)||parsed.records.length!==candidates.length||
@@ -71,7 +80,25 @@ export class AnalysisProgressStore {
     for(const id of parsed.completedExperimentIds||[])store.completedExperimentIds.add(id);
     return store;
   }
-  get remaining(){return [...this.records.values()].filter(x=>x.lifecycle==="queued").length;}
+  get counts():CandidateCoverage {
+    const records=[...this.records.values()];
+    const count=(state:CandidateLifecycle)=>records.filter(r=>r.lifecycle===state).length;
+    const unresolved=records.filter(r=>["queued","admitted","analyzing","dependencies_pending","experiment_pending"].includes(r.lifecycle));
+    return {
+      total:records.length,queued:count("queued"),
+      admitted:count("admitted")+count("analyzing"),
+      dependenciesPending:count("dependencies_pending"),
+      experimentsPending:count("experiment_pending"),
+      experimentsCompleted:count("experiment_completed"),
+      terminalExhausted:count("analysis_exhausted"),blocked:count("blocked"),
+      unresolvedIds:unresolved.map(r=>r.id).sort(),
+      unresolvedPrerequisites:Object.fromEntries(unresolved
+        .filter(r=>r.properties.some(p=>p.unresolvedPrerequisites.length))
+        .map(r=>[r.id,[...new Set(r.properties.flatMap(p=>p.unresolvedPrerequisites))]])),
+    };
+  }
+  get terminallyComplete(){return this.counts.unresolvedIds.length===0;}
+  get remaining(){return this.counts.queued;}
   get assessed(){return this.records.size-this.remaining;}
   nextBatch(maxAdmitted:number,maxPerFile:number):AnalysisCandidate[]{
     const eligible=this.candidates.filter(c=>this.records.get(c.id)?.lifecycle==="queued");
@@ -93,16 +120,30 @@ export class AnalysisProgressStore {
     }
     return admitted;
   }
-  recordAssessment(id:string,propertyIds:readonly string[],unresolved:readonly string[],experimentIds:readonly string[]){
+  recordAssessment(id:string,propertyIds:readonly string[],unresolved:readonly string[],experimentIds:readonly string[],
+    specialistAttempts:ReadonlyArray<{adapter:string;status:string;reason:string;detail?:string}>=[]){
     const record=this.records.get(id);
     if(!record||!["admitted","analyzing","dependencies_pending"].includes(record.lifecycle))
       throw new Error("ANALYSIS_CANDIDATE_NOT_ACTIVE: "+id);
-    record.properties=[...new Set(propertyIds)].map(pid=>({
-      id:pid,state:experimentIds.length?"test_constructed":unresolved.length?"prerequisites_pending":"unsupported",
-      sourceWitnesses:[],unresolvedPrerequisites:[...unresolved],experimentIds:[...experimentIds],
-    }));
-    record.experimentIds=[...new Set([...record.experimentIds,...experimentIds])];
-    record.lifecycle=experimentIds.length?"experiment_pending":unresolved.length?"dependencies_pending":"analysis_exhausted";
+    // Multiple candidate properties must retain independent outcomes. A valid
+    // authorization experiment cannot discharge a separate unresolved
+    // accounting prerequisite for the same source function.
+    const properties:CandidatePropertyProgress[]=[];
+    const uniqueExperiments=[...new Set(experimentIds)];
+    for(const pid of [...new Set(propertyIds)]){
+      if(uniqueExperiments.length)properties.push({id:pid,state:"test_constructed",
+        sourceWitnesses:[],unresolvedPrerequisites:[],experimentIds:uniqueExperiments});
+    }
+    for(const [index,reason] of [...new Set(unresolved)].entries())
+      properties.push({id:id+":unresolved:"+index,state:"prerequisites_pending",
+        sourceWitnesses:[],unresolvedPrerequisites:[reason],experimentIds:[]});
+    if(!properties.length)properties.push({id:id+":unsupported",state:"unsupported",
+      sourceWitnesses:[],unresolvedPrerequisites:[],experimentIds:[]});
+    record.properties=properties;
+    record.experimentIds=[...new Set([...record.experimentIds,...uniqueExperiments])];
+    record.specialistAttempts=specialistAttempts.map(x=>({...x}));
+    record.lifecycle=unresolved.length?"dependencies_pending":
+      uniqueExperiments.length?"experiment_pending":"analysis_exhausted";
   }
   markTerminalAssessment(id:string,reason?:string){
     const record=this.records.get(id);
@@ -111,15 +152,21 @@ export class AnalysisProgressStore {
       record.lifecycle="analysis_exhausted";
     if(reason)record.lastError=reason;
   }
+  // A verifier completion is the only source of truth for experiment terminality.
+  // Rejected, incomplete and unsupported sequences remain unresolved.
   markExperimentCompleted(id:string){
+    if(![...this.records.values()].some(r=>r.experimentIds.includes(id)))
+      throw new Error("ANALYSIS_EXPERIMENT_ID_UNMATCHED: "+id);
     this.completedExperimentIds.add(id);
     for(const r of this.records.values())if(r.experimentIds.includes(id)){
       for(const p of r.properties)if(p.experimentIds.includes(id))p.state="test_completed";
-      if(r.experimentIds.every(x=>this.completedExperimentIds.has(x)))r.lifecycle="experiment_completed";
+      if(r.experimentIds.every(x=>this.completedExperimentIds.has(x)) &&
+        !r.properties.some(p=>p.state==="prerequisites_pending"))
+        r.lifecycle="experiment_completed";
     }
   }
   async save():Promise<void>{
-    const state:AnalysisProgressSnapshot={version:1,inventoryFingerprint:this.inventoryFingerprint,
+    const state:AnalysisProgressSnapshot={version:2,inventoryFingerprint:this.inventoryFingerprint,
       candidateIds:[...this.records.keys()],records:[...this.records.values()],
       processedBatches:this.processedBatches,completedExperimentIds:[...this.completedExperimentIds]};
     await mkdir(dirname(this.path),{recursive:true});

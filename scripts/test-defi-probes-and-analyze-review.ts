@@ -395,4 +395,120 @@ contract MarketWithContractGuards is OwnableUpgradeable {
   }
 }
 
+// Approved financial-property regression: the construction gate must build
+// source-grounded share and vesting tests without admitting guessed properties.
+{
+  const tokenSource='pragma solidity 0.8.4; contract ERC20Mock is ERC20 { function mint(address to,uint256 amount) public {_mint(to,amount);} }';
+  const tokenPath='source-1/contracts/mocks/ERC20Mock.sol';
+  const shareSource=`pragma solidity 0.8.4;
+contract xMPH is ERC20Upgradeable, AccessControlUpgradeable {
+ uint256 public constant MIN_AMOUNT=10**9;
+ function initialize(address _mph,uint256 rewardUnlockPeriod,address distributor) external {}
+ function getPricePerFullShare() public view returns(uint256) {
+   if (_lastRewardAmount == 0) {return mphBalance.div(totalShares);} return 0;
+ }
+ function deposit(uint256 _mphAmount) external returns(uint256 shareAmount) {
+   return _deposit(_mphAmount);
+ }
+ function _deposit(uint256 _mphAmount) internal returns(uint256 shareAmount) {
+   shareAmount = _mphAmount.div(getPricePerFullShare());
+   _mint(msg.sender, shareAmount);
+   mph.safeTransferFrom(msg.sender,address(this),_mphAmount);
+ }
+ function withdraw(uint256 _shareAmount) external returns(uint256 mphAmount) {
+   return _withdraw(_shareAmount);
+ }
+ function _withdraw(uint256 _shareAmount) internal returns(uint256 mphAmount) {
+   require(totalSupply() >= _shareAmount + MIN_AMOUNT);
+   mphAmount = _shareAmount.mul(getPricePerFullShare());
+   _burn(msg.sender,_shareAmount);
+   mph.safeTransfer(msg.sender,mphAmount);
+ }
+ function initSeed() internal { _deposit(MIN_AMOUNT); }
+}`;
+  const sharePath='source-1/contracts/rewards/xMPH.sol';
+  const sharePlan=constructSolidityExperiments({
+    repositoryCommit:'a'.repeat(40),targetPath:sharePath,targetSelector:'xMPH.withdraw',
+    sources:[{path:sharePath,content:shareSource,sha256:sha(shareSource)},
+      {path:tokenPath,content:tokenSource,sha256:sha(tokenSource)}],
+    declarations:[
+      {selector:'xMPH.initialize',operation:'send',inputs:['address','uint256','address']},
+      {selector:'xMPH.deposit',operation:'send',inputs:['uint256']},
+      {selector:'xMPH.withdraw',operation:'send',inputs:['uint256']},
+    ],
+  });
+  assert.equal(sharePlan.ok,true,'Source-backed zero-reward shares must yield an executable plan');
+  if(sharePlan.ok){
+    const plan=sharePlan.experiments.find(p=>p.securityProperty.includes('share conservation'));
+    assert.ok(plan,'Source-proven share test must survive normal planner admission');
+    assert.ok(plan.sequence.preparation?.operations.some(x=>x.id==='mintSeedAndDeposit'));
+    assert.ok(plan.sequence.steps.some(x=>x.operation==='call'&&x.function==='totalSupply()'));
+  }
+  const unprovedSource=shareSource.replace('_burn(msg.sender,_shareAmount);','');
+  const unproved=constructSolidityExperiments({
+    repositoryCommit:'a'.repeat(40),targetPath:sharePath,targetSelector:'xMPH.withdraw',
+    sources:[{path:sharePath,content:unprovedSource,sha256:sha(unprovedSource)},
+      {path:tokenPath,content:tokenSource,sha256:sha(tokenSource)}],
+    declarations:[{selector:'xMPH.withdraw',operation:'send',inputs:['uint256']},
+      {selector:'xMPH.deposit',operation:'send',inputs:['uint256']},
+      {selector:'xMPH.initialize',operation:'send',inputs:['address','uint256','address']}],
+  });
+  assert.equal(unproved.ok,false,'Do not guess share conservation after removing burn witness');
+  const vestSource=`pragma solidity 0.8.4;
+contract Vesting02 is ERC721URIStorageUpgradeable, BoringOwnable {
+ uint64[] public vestList;address public mphMinter;
+ mapping(address=>mapping(uint64=>uint64)) public depositIDToVestID;
+ function initialize(address _token,string calldata tokenName,string calldata tokenSymbol) external {}
+ function setMPHMinter(address value) external {mphMinter=value;}
+ function createVestForDeposit(address to,address pool,uint64 depositID,uint256 rate) external returns(uint64 vestID){
+   require(address(msg.sender) == address(mphMinter));
+   vestList.push(1);
+   vestID = uint64(vestList.length);
+   depositIDToVestID[pool][depositID] = vestID;
+   _safeMint(to, vestID);
+ }
+ function numVests() external view returns(uint256){return vestList.length;}
+}`;
+  const vestPath='source-1/contracts/rewards/Vesting02.sol';
+  const vest=constructSolidityExperiments({
+    repositoryCommit:'a'.repeat(40),targetPath:vestPath,targetSelector:'Vesting02.createVestForDeposit',
+    sources:[{path:vestPath,content:vestSource,sha256:sha(vestSource)}],
+    declarations:[
+      {selector:'Vesting02.initialize',operation:'send',inputs:['address','string','string']},
+      {selector:'Vesting02.setMPHMinter',operation:'send',inputs:['address']},
+      {selector:'Vesting02.createVestForDeposit',operation:'send',inputs:['address','address','uint64','uint256']},
+      {selector:'Vesting02.numVests',operation:'call',inputs:[]}],
+  });
+  assert.equal(vest.ok,true,'Vesting creation must be admitted by source effects, not name lists');
+  if(vest.ok)assert.ok(vest.experiments.some(p=>p.securityProperty.includes('vest creation')));
+}
+
+// A source with two valid outflows must produce two separate financial
+// properties rather than a guessed first companion or a discarded lead.
+{
+  const multiSource=`pragma solidity ^0.8.0;
+contract Finance {
+ uint256 public totalDeposits;
+ function deposit(uint256 amount) external {totalDeposits += amount;}
+ function withdraw(uint256 amount) external {totalDeposits -= amount;}
+ function redeem(uint256 amount) external {totalDeposits -= amount;}
+}`;
+  const path='source-1/contracts/Finance.sol';
+  const multi=constructSolidityExperiments({
+    repositoryCommit:'a'.repeat(40),targetPath:path,targetSelector:'Finance.deposit',
+    sources:[{path,content:multiSource,sha256:sha(multiSource)}],
+    declarations:[
+      {selector:'Finance.totalDeposits',operation:'call',inputs:[]},
+      {selector:'Finance.deposit',operation:'send',inputs:['uint256']},
+      {selector:'Finance.withdraw',operation:'send',inputs:['uint256']},
+      {selector:'Finance.redeem',operation:'send',inputs:['uint256']}],
+  });
+  assert.equal(multi.ok,true,'Ambiguous source-backed companion set must remain constructible');
+  if(multi.ok){
+    const pairs=multi.experiments.filter(x=>x.securityProperty.startsWith('financial '));
+    assert.equal(pairs.length,2);
+    assert.equal(new Set(pairs.map(x=>x.id)).size,2,'Each distinct proven counterpart requires its own experiment ID');
+  }
+}
+
 console.log("DeFi probes, security classification, ANALYZE window & REVIEW anti-bias tests PASSED");

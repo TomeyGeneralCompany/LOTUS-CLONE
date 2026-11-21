@@ -10,6 +10,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
+import {resolveSourceFixtureDependencies} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -41,6 +42,8 @@ async function run(){
     let store=await AnalysisProgressStore.open(file,candidates);
     let lock=await stage();
     assert.throws(()=>lock.completeAnalysis(),/ANALYSIS_INVENTORY_INCOMPLETE/);
+    const experiments=Array.from({length:64},(_,i)=>hash('experiment:'+i));
+    const mapped=new Map(candidates.slice(0,64).map((c,i)=>[c.id,experiments[i]]));
     const seen=new Set<string>();
     let batches=0;
     while(store.remaining){
@@ -60,7 +63,7 @@ async function run(){
           disposition:'defer',
           reason:'Fixture establishes complete inventory accounting, not target exploitability',
         },'controller');
-        store.recordAssessment(item.id,[hash('property:'+item.id)],[],[]);
+        store.recordAssessment(item.id,[hash('property:'+item.id)],[],mapped.has(item.id)?[mapped.get(item.id)!]:[]);
       }
       lock.completeAnalysisBatch();
       store.processedBatches++;
@@ -84,7 +87,6 @@ async function run(){
     assert.equal(store.remaining,0);
     assert.equal(lock.analysisInventoryProgress.remaining,0);
     // The 64 distinct experiment identities are all retained; no tier-4 loss.
-    const experiments=Array.from({length:64},(_,i)=>hash('experiment:'+i));
     for(const id of experiments)lock.discover(id);
     lock.completeAnalysis();
     assert.equal(lock.currentStage,'EXPERIMENT');
@@ -95,6 +97,8 @@ async function run(){
     }
     await store.save();
     assert.equal(store.completedExperimentIds.size,64);
+    assert.equal(store.counts.experimentsCompleted,64);
+    assert.equal(store.counts.unresolvedIds.length,0);
     assert.equal(lock.completedCount,64);
     lock.completeExperiments();
     for(const id of experiments)lock.review(id);
@@ -104,6 +108,66 @@ async function run(){
     const resumed=await AnalysisProgressStore.open(file,candidates);
     assert.equal(resumed.completedExperimentIds.size,64);
     assert.equal(resumed.remaining,0);
+    // A second inventory must never turn unresolved dependencies, queued
+    // candidates or selected-but-unexecuted experiments into terminal claims.
+    const pendingCandidates=candidates.slice(0,6).map((c,i)=>({...c,id:hash('coverage-state:'+i)}));
+    const pendingFile=join(dir,'pending.json');
+    let pending=await AnalysisProgressStore.open(pendingFile,pendingCandidates);
+    const one=pending.nextBatch(5,5);
+    assert.equal(one.length,5);
+    pending.recordAssessment(one[0].id,['negative'],[],[hash('done-negative')]);
+    pending.recordAssessment(one[1].id,['positive'],[],[hash('done-positive')]);
+    pending.recordAssessment(one[2].id,['unsupported'],[],[]);
+    pending.recordAssessment(one[3].id,['money-market'],['unresolved_money_market'],[hash('completed-other')]);
+    pending.recordAssessment(one[4].id,['withdraw'],[],[hash('unexecuted')]);
+    pending.markExperimentCompleted(hash('done-negative'));
+    pending.markExperimentCompleted(hash('done-positive'));
+    pending.markExperimentCompleted(hash('completed-other'));
+    assert.equal(pending.records.get(one[3].id)?.lifecycle,'dependencies_pending',
+      'A completed role test must not resolve an unrelated missing financial prerequisite');
+    await pending.save();
+    assert.equal(pending.counts.queued,1);
+    assert.equal(pending.counts.dependenciesPending,1);
+    assert.equal(pending.counts.experimentsPending,1);
+    assert.equal(pending.terminallyComplete,false);
+    pending=await AnalysisProgressStore.open(pendingFile,pendingCandidates);
+    assert.equal(pending.terminallyComplete,false,'checkpoint must preserve all three pending states');
+    assert.equal(pending.counts.unresolvedIds.length,3);
+    assert.throws(()=>pending.markExperimentCompleted(hash('unmatched')),
+      /ANALYSIS_EXPERIMENT_ID_UNMATCHED/);
+    // Source-typed, recursive fixture chain: Vault -> Adapter -> Token.
+    const vaultSource='pragma solidity ^0.8.0; contract Vault { IAdapter public adapter; function initialize(address _adapter) external { adapter = IAdapter(_adapter); } }';
+    const adapterSource='pragma solidity ^0.8.0; contract Adapter is IAdapter { constructor(Token token) {} }';
+    const tokenSource='pragma solidity ^0.8.0; contract Token { }';
+    const fixtureSources=[
+      {path:'source-1/contracts/Vault.sol',sha256:hash(vaultSource),content:vaultSource},
+      {path:'source-1/contracts/Adapter.sol',sha256:hash(adapterSource),content:adapterSource},
+      {path:'source-1/contracts/Token.sol',sha256:hash(tokenSource),content:tokenSource},
+    ];
+    const fixture=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',fixtureSources);
+    assert.equal(fixture.status,'resolved');
+    if(fixture.status==='resolved'){
+      assert.equal(fixture.deployments.length,2);
+      assert.deepEqual(fixture.deployments.map(x=>x.contract),['Token','Adapter']);
+      assert.equal(fixture.substitutions._adapter,'$deployment:dependency2');
+      assert.equal(fixture.bindings[0].receiver,'adapter');
+      assert.ok(fixture.witnesses.some(x=>x.sourceSha256===fixtureSources[0].sha256));
+    }
+    const ambiguousSource='pragma solidity ^0.8.0; contract AdapterTwo is IAdapter {}';
+    const ambiguous=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
+      ...fixtureSources,{path:'source-1/contracts/AdapterTwo.sol',content:ambiguousSource,sha256:hash(ambiguousSource)}]);
+    assert.equal(ambiguous.status,'unresolved');
+    if(ambiguous.status==='unresolved')
+      assert.ok(ambiguous.missingDependencies.some(x=>x.includes('ambiguous_implementation')));
+    const cycA='pragma solidity ^0.8.0; contract CycA { constructor(CycB dependency) {} }';
+    const cycB='pragma solidity ^0.8.0; contract CycB { constructor(CycA dependency) {} }';
+    const cycleSources=[
+      {path:'source-1/contracts/CycA.sol',content:cycA,sha256:hash(cycA)},
+      {path:'source-1/contracts/CycB.sol',content:cycB,sha256:hash(cycB)}];
+    const cycle=resolveSourceFixtureDependencies(cycleSources[0],'CycA',cycleSources);
+    assert.equal(cycle.status,'unresolved');
+    if(cycle.status==='unresolved')
+      assert.ok(cycle.missingDependencies.some(x=>x.includes('dependency_cycle')));
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);

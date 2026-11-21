@@ -28,7 +28,7 @@ import { resolve, relative, sep, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
-import {AnalysisProgressStore} from "./deterministic/analysis-progress-store";
+import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
 async function recordToolActivity(logFile:string,event:Record<string,unknown>):Promise<void> {
@@ -61,6 +61,7 @@ export interface LocalAuditLimits {
   prefetchReadOnly?: boolean;
   onAllowance?: (deadline:number) => Promise<void>;
   onAnalysisCertificate?: (certificate:AnalysisCertificate) => void;
+  onCandidateCoverage?: (coverage:CandidateCoverage) => void;
   onExperimentLedger?: (ledger:{selected:number;resolved:number;
     outcomes:{observed:number;observation_only:number;not_observed:number;unsupported:number;incomplete:number;rejected:number;pending:number}})=>void;
   checkpointPath?: string;
@@ -363,11 +364,35 @@ export async function runLocalAudit(
       if(!record||record.lifecycle==="queued")continue;
       if(["analysis_exhausted","dependencies_pending","experiment_pending","experiment_completed","blocked"].includes(record.lifecycle))continue;
       const detail=analysisResults.get(lead.id);
+      // Candidate experiment identity must match the actual stage-owned queue,
+      // not the offline planner's separate SHA identifier.
+      const constructed=detail?.experimentCandidates||[];
+      const scheduled=stagedPlans.filter(entry=>constructed.some(candidate=>
+        candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
+        candidate.hypothesis===entry.plan.hypothesis &&
+        JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence)));
+      const missing=constructed.filter(candidate=>!scheduled.some(entry=>
+        candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
+        candidate.hypothesis===entry.plan.hypothesis &&
+        JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence)));
+      const inventoryEntry=analysisProgressStore.candidates.find(x=>x.id===lead.id);
+      const highRiskPending=!!inventoryEntry?.selectionReasons.some(x=>
+        x.startsWith("financial_entrypoint")||x.startsWith("shared_state_coupling"));
+      // A proven unsupported nonfinancial function is terminal; a financial
+      // lead without a constructible invariant remains actionable and pending.
+      const unresolvedAssessment=(detail?.unresolvedReasons||[]).filter(reason=>
+        highRiskPending||!reason.startsWith("UNKNOWN_ASSERTION(no_supported_property)"));
       analysisProgressStore.recordAssessment(
         lead.id,
         detail?.decision.matchedHypotheses.map(x=>x.id)||[],
-        detail?.unresolvedReasons||[],
-        detail?.experimentCandidates.map(x=>x.id)||[],
+        [...unresolvedAssessment,
+          ...(!detail?['analysis_result_missing']:[]),
+          ...(detail?.constructionFeasibility.skippedReason==='missing_declarations'
+            ?['source_abi_declarations_missing']:[]),
+          ...missing.map(x=>'constructed_but_not_scheduled:'+x.id)],
+        scheduled.map(x=>x.id),
+        detail?.closedLoop.steps.map(step=>({adapter:step.adapter,status:step.status,
+          reason:step.reason,...(step.detail?{detail:step.detail}:{})}))||[],
       );
       analysisProgressStore.markTerminalAssessment(lead.id,
         lead.state.kind==="assessed" ? lead.state.reason : undefined);
@@ -403,6 +428,8 @@ export async function runLocalAudit(
       return;
     }
     stageLock.assertAnalysisInventoryExhausted();
+    limits.onCandidateCoverage?.(analysisProgressStore.counts);
+    await appendFile(logFile,"[ANALYSIS_PROPERTY_PENDING] "+JSON.stringify(analysisProgressStore.counts)+"\n");
     const cert=stageLock.analysisClosureCertificate(status,reason);
     stageLock.completeAnalysis(status,reason);
     limits.onAnalysisCertificate?.(cert);
@@ -2052,6 +2079,9 @@ export async function runLocalAudit(
             requestSchema,
             initialSourcePaths:limits.initialSourcePaths || [],
             readPaths:completedReadPaths,
+            sourceIndexedCount:stageLock?.coverage.count,
+            sourceReadCount:stageLock?.coverage.completedCount,
+            candidateCoverage:analysisProgressStore?.counts,
             outcomes:stageLock?.outcomeCounts,
             observedCases,
             recoveredFinalJson,
@@ -3477,6 +3507,12 @@ export async function runLocalAudit(
               status==='invalid_probe'?'rejected':'incomplete';
           }catch{}
           stageLock.finishExperiment(activeStageCandidate,outcome);
+          if(analysisProgressStore && (outcome==='observed'||outcome==='not_observed') &&
+            [...analysisProgressStore.records.values()].some(r=>r.experimentIds.includes(activeStageCandidate!))){
+            analysisProgressStore.markExperimentCompleted(activeStageCandidate);
+            await analysisProgressStore.save();
+            limits.onCandidateCoverage?.(analysisProgressStore.counts);
+          }
           await appendFile(logFile,'[STAGED_EXPERIMENT_RESULT] '+
             JSON.stringify({id:activeStageCandidate,outcome})+'\n');
           activeStageCandidate=null;
@@ -3671,6 +3707,10 @@ export async function runLocalAudit(
       throw new Error(`Ollama audit timed out after ${Math.round((allowance.deadline-auditStartedAt)/1000)} seconds; check model load/CPU contention and the turn timing log`);
     throw error;
   } finally {
+    if(analysisProgressStore){
+      limits.onCandidateCoverage?.(analysisProgressStore.counts);
+      await appendFile(logFile,"[FINAL_CANDIDATE_COVERAGE] "+JSON.stringify(analysisProgressStore.counts)+"\n").catch(()=>{});
+    }
     if(controller.signal.aborted)stoppingReason=controller.signal.reason === "operator_cancelled" ? "Cancelled by operator" : "Audit deadline reached";
     await writeFile(logFile+".summary.json",JSON.stringify({startedAt:new Date(auditStartedAt).toISOString(),
       endedAt:new Date().toISOString(),model,adapter,profile:modelProfile().name,workflow:workflow?.snapshot(),turns:usedTurns,successfulReads,stoppingReason,finalAnswer,hypotheses,
