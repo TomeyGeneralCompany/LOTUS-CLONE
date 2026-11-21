@@ -367,10 +367,12 @@ export async function runLocalAudit(
       // Candidate experiment identity must match the actual stage-owned queue,
       // not the offline planner's separate SHA identifier.
       const constructed=detail?.experimentCandidates||[];
-      const scheduled=stagedPlans.filter(entry=>constructed.some(candidate=>
-        candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
-        candidate.hypothesis===entry.plan.hypothesis &&
-        JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence)));
+      // Some source-grounded plans are admitted during READ before detailed
+      // ANALYZE property construction. They still belong to the exact immutable
+      // lead selector; never orphan successful EVM proof merely because the
+      // later planner assigned a different hash to the same source operation.
+      const scheduled=stagedPlans.filter(entry=>
+        entry.plan.path===lead.path && entry.plan.query===lead.selector);
       const missing=constructed.filter(candidate=>!scheduled.some(entry=>
         candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
         candidate.hypothesis===entry.plan.hypothesis &&
@@ -398,11 +400,15 @@ export async function runLocalAudit(
             candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
             candidate.hypothesis===entry.plan.hypothesis &&
             JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence));
-          if(!candidate)return [];
-          const witnesses=candidate.witnesses.map(w=>
-            [w.path,w.sourceSha256,w.start,w.end,w.symbol].join(':'));
+          const witnesses=candidate
+            ?candidate.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(':'))
+            :[lead.sourceEvidence];
+          // Source evidence for this selector, not evidence for an unrelated
+          // function, is required for pre-ANALYZE staged experiments.
+          if(!witnesses.length||witnesses.some(x=>!x.includes(lead.sourceSha256)))return [];
+          const property=candidate?.securityProperty||entry.plan.hypothesis;
           return [{id:createHash('sha256').update(JSON.stringify([
-              lead.id,candidate.securityProperty,witnesses])).digest('hex'),
+              lead.id,property,witnesses])).digest('hex'),
             experimentIds:[entry.id],sourceWitnesses:witnesses}];
         }),
       );
