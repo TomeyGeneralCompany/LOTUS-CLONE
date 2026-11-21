@@ -418,7 +418,7 @@ export function runPreparedFinancialFoundryProperty(
   });
   if(!experiment.securityProperty.startsWith("financial "))return unsupported("not_financial_property");
   if(experiment.path!==snapshot.path||
-    !experiment.witnesses.some(w=>w.file===snapshot.path&&w.sourceSha256===snapshot.sha256))
+    !experiment.witnesses.some(w=>w.path===snapshot.path&&w.sourceSha256===snapshot.sha256))
     return unsupported("source_identity_not_proven");
   const sequence=experiment.sequence;
   if(sequence.preparation||sequence.constructorArgs.length||sequence.constructorValueWei)
