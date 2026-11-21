@@ -307,7 +307,8 @@ def _unguarded_dangerous_primitive_observed(file: Path, selector: str, data: dic
 
 
 def _asserted_financial_or_vesting_negative(
-    file: Path, selector: str, requested_steps: list, actual_steps: list
+    file: Path, selector: str, requested_steps: list, actual_steps: list,
+    accounts: list | None = None, contract_address: str | None = None,
 ) -> tuple[str, str] | None:
     """A *bounded* falsifier that was actually executed with passing readbacks.
 
@@ -340,7 +341,15 @@ def _asserted_financial_or_vesting_negative(
             return None
         if observed.get("operation") == "call" and (
             "expect" not in expected or
-            str(expected["expect"]).lower() != str(observed.get("actual", "")).lower()
+            str(
+                (accounts[int(expected["expect"][8:])] 
+                 if isinstance(expected["expect"], str) and
+                    re.fullmatch(r"\\$account[0-2]", expected["expect"]) and
+                    isinstance(accounts, list) and len(accounts) == 3
+                 else contract_address
+                 if expected["expect"] == "$contract" and isinstance(contract_address, str)
+                 else expected["expect"])
+            ).lower() != str(observed.get("actual", "")).lower()
         ):
             return None
     targeted = [i for i, (req, got) in enumerate(zip(requested_steps, actual_steps))
@@ -466,7 +475,8 @@ def security_experiment_disposition(
         return "observation_only", None, explanation
 
     bounded = _asserted_financial_or_vesting_negative(
-        file, selector, requested_steps, actual_steps
+        file, selector, requested_steps, actual_steps,
+        data.get("accounts"), data.get("contract"),
     )
     if bounded is not None:
         return "behavior_not_observed", bounded[0], bounded[1]
