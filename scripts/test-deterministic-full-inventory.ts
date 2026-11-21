@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {mkdtemp,rm} from 'node:fs/promises';
+import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
@@ -221,6 +221,34 @@ async function run(){
     proofLock.completeReviews();
     proofLock.completeReport(true);
     assert.equal(proofLock.currentStage,'COMPLETE');
+    // Regression for the real laptop: v3 persisted lead dispositions but no
+    // source-bound verifier evidence for the old 67 selected experiments.
+    // Migration must actually queue the leads for new source-grounded work,
+    // never silently certify them or strand them as already assessed.
+    const legacyFile=join(dir,'laptop-v3.json');
+    const legacyData=JSON.parse(await readFile(proofFile,'utf8')) as any;
+    legacyData.version=3;
+    const missing=legacyData.records[0];
+    missing.experimentEvidence=[];
+    missing.properties[0].sourceWitnesses=[];
+    missing.lifecycle='experiment_completed';
+    const deferred=legacyData.records[1];
+    deferred.experimentEvidence=[];
+    deferred.properties=[{id:'old-unresolved',state:'prerequisites_pending',
+      sourceWitnesses:[],unresolvedPrerequisites:['missing_fixture'],experimentIds:[]}];
+    deferred.experimentIds=[];
+    deferred.lifecycle='dependencies_pending';
+    await writeFile(legacyFile,JSON.stringify(legacyData));
+    const migrated=await AnalysisProgressStore.open(legacyFile,all241);
+    assert.equal(migrated.records.get(missing.id)?.lifecycle,'queued');
+    assert.equal(migrated.records.get(deferred.id)?.lifecycle,'queued');
+    assert.equal(migrated.remaining,2,'The two legacy unsupported states must be reanalyzed');
+    assert.equal(migrated.experimentCertificate.conclusive,239,
+      'Other 239 real source-evidence-backed cases must survive migration');
+    await migrated.save();
+    const stableMigration=await AnalysisProgressStore.open(legacyFile,all241);
+    assert.equal(stableMigration.remaining,2,'Version-four resume must not re-migrate');
+    assert.equal(stableMigration.experimentCertificate.conclusive,239);
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);
