@@ -249,6 +249,20 @@ async function run(){
     const stableMigration=await AnalysisProgressStore.open(legacyFile,all241);
     assert.equal(stableMigration.remaining,2,'Version-four resume must not re-migrate');
     assert.equal(stableMigration.experimentCertificate.conclusive,239);
+    // Repair selection follows evidence completeness, not legacy lifecycle.
+    // The old scheduler ignored analysis_exhausted, hiding 50 laptop leads.
+    const repairTypes=candidates.slice(0,4).map((c,i)=>({...c,id:hash('repair-state:'+i)}));
+    const repairStore=await AnalysisProgressStore.open(join(dir,'repair-selection.json'),repairTypes);
+    for(const lead of repairStore.nextBatch(4,4))
+      repairStore.recordAssessment(lead.id,[],[],[]);
+    repairStore.records.get(repairTypes[0].id)!.lifecycle="analysis_exhausted";
+    repairStore.records.get(repairTypes[1].id)!.lifecycle="dependencies_pending";
+    repairStore.records.get(repairTypes[2].id)!.lifecycle="experiment_pending";
+    repairStore.records.get(repairTypes[3].id)!.lifecycle="blocked";
+    assert.deepEqual(
+      new Set(repairStore.nextRepairBatch(4).map(x=>x.id)),
+      new Set(repairTypes.map(x=>x.id)),
+      'All four unresolved lifecycles need construction repair or explicit blockers');
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);
