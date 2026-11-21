@@ -121,7 +121,8 @@ function normalize(v) {
 }
 async function runSequence(artifact, sequence, transport, preparationArtifacts={},metadata={}) {
   validateSequence(sequence);
-  const {BrowserProvider, ContractFactory}=require('ethers');
+  const {BrowserProvider, ContractFactory, Contract}=require('ethers');
+  const {createHash}=require('node:crypto');
   if(!artifact?.evm?.bytecode?.object || !/^[0-9a-fA-F]+$/.test(artifact.evm.bytecode.object))
     throw new Error('A deployable contract without unresolved library links is required');
   const provider=new BrowserProvider(transport,undefined,{cacheTimeout:-1,pollingInterval:10});
@@ -231,11 +232,44 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
     const deployGasLimit=latestBlock?.gasLimit && latestBlock.gasLimit > 12000000n
       ? (latestBlock.gasLimit * 9n) / 10n
       : 10000000n;
-    const contract=await new ContractFactory(artifact.abi,artifact.evm.bytecode.object,signers[0])
+    let contract=await new ContractFactory(artifact.abi,artifact.evm.bytecode.object,signers[0])
       .deploy(...sequence.constructorArgs.map(resolve),{value:sequence.constructorValueWei||'0',gasLimit:deployGasLimit});
     const deployment=await contract.deploymentTransaction().wait();
     if(!deployment || deployment.status!==1)throw new Error('Constructor deployment failed');
     address=await contract.getAddress();
+    // Source-defined 88mph Factory creates deterministic EIP-1167 clones of
+    // this deployed template. The actual factory implementation is compiled
+    // from acquired repository source, executed in this isolated local EVM.
+    // Never interpret the template constructor as initializing clone storage.
+    if(sequence.factoryClone){
+      runtimePhase='fixture_initialization';
+      const call=sequence.factoryClone;
+      const factory=deployed.get(call.deploymentId)?.contract;
+      if(!factory)throw new Error('Acquired source factory is not deployed');
+      const fn=factory.connect(signers[call.sender]).getFunction(call.function);
+      if(!['payable','nonpayable'].includes(fn.fragment.stateMutability))
+        throw new Error('Factory clone must be a source-declared transaction');
+      const values=call.args.map(resolve);
+      factory.interface.encodeFunctionData(fn.fragment,values);
+      const predicted=await fn.staticCall(...values,{gasLimit:deployGasLimit});
+      if(typeof predicted!=='string'||!/^0x[0-9a-fA-F]{40}$/.test(predicted)||
+        predicted.toLowerCase()===address.toLowerCase())
+        throw new Error('Factory returned no independently deployed clone address');
+      const tx=await fn.send(...values,{gasLimit:deployGasLimit});
+      const cloneReceipt=await tx.wait();
+      if(!cloneReceipt||cloneReceipt.status!==1)
+        throw new Error('Factory clone creation or initialization failed');
+      const code=await provider.getCode(predicted);
+      if(!/^0x[0-9a-fA-F]+$/.test(code)||code.length<=4)
+        throw new Error('Factory predicted clone has no executable EVM bytecode');
+      const cloneDigest=createHash('sha256').update(Buffer.from(code.slice(2),'hex')).digest('hex');
+      setupSteps.push({operation:'setup',function:'factoryClone:'+fn.fragment.format('sighash'),
+        sender:call.sender,gasUsed:cloneReceipt.gasUsed.toString(),passed:true,
+        purpose:'acquired factory '+call.deploymentId+' created clone '+predicted.toLowerCase()+
+          ' with runtime code sha256 '+cloneDigest});
+      address=predicted;
+      contract=new Contract(address,artifact.abi,signers[0]);
+    }
     runtimePhase='target_action';
     const steps=[...setupSteps];
     // Only the explicitly generated ERC1155 test harness gets automatic setup.
