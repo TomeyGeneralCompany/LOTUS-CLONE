@@ -13,6 +13,7 @@ import {AnalysisProgressStore} from '../packages/security-solver/src/determinist
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
+import {constructSolidityExperiments} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
 const path='source-1/contracts/Finance.sol';
@@ -449,6 +450,34 @@ contract UnlinkedMarket {
     assert.equal(witnessedCallers[0].sourceSha256,callerSnap.sha256);
     assert.equal(resolveAcquiredInterfaceCallers(icSnap,'ICToken','burn',
       [icSnap,callerSnap]).length,0,'No invented interface method');
+    // One target can have multiple independently source-proven opposing
+    // transitions. Neither the companion order nor names justify dropping one.
+    const ledgerText=`pragma solidity ^0.8.0;
+contract Ledger {
+  uint256 public total;
+  mapping(address => uint256) public balances;
+  function credit(uint256 amount) external { total += amount; balances[msg.sender] += amount; }
+  function reward(uint256 amount) external { total += amount; balances[msg.sender] += amount; }
+  function debit(uint256 amount) external { total -= amount; balances[msg.sender] -= amount; }
+}`;
+    const ledgerSource={path:'source-1/contracts/Ledger.sol',
+      content:ledgerText,sha256:hash(ledgerText)};
+    const ledgerDeclarations=['credit','reward','debit'].map(name=>({
+      selector:'Ledger.'+name,operation:'send' as const,inputs:['uint256'],
+      outputs:[],stateMutability:'nonpayable' as const}));
+    ledgerDeclarations.push({selector:'Ledger.total',operation:'call',
+      inputs:[],outputs:['uint256'],stateMutability:'view'} as any);
+    ledgerDeclarations.push({selector:'Ledger.balances',operation:'call',
+      inputs:['address'],outputs:['uint256'],stateMutability:'view'} as any);
+    const ledgerExperiment=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:ledgerSource.path,
+      targetSelector:'Ledger.debit',sources:[ledgerSource],
+      declarations:ledgerDeclarations as any,skipLegacy:true});
+    assert.equal(ledgerExperiment.ok,true,
+      'Distinct source-proven accounting companions must each be executable');
+    if(ledgerExperiment.ok)
+      assert.equal(ledgerExperiment.experiments.length,2,
+        'Credit and reward are independent opposing transitions for debit');
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);
