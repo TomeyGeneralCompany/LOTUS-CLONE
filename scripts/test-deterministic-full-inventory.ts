@@ -345,6 +345,17 @@ async function run(){
     assert.equal(deepImplementations[0].sourceSha256,leafSnap.sha256);
     assert.ok(deepImplementations[0].witness.startsWith(middleSnap.path+':'+middleSnap.sha256),
       'Inherited executable method must retain the implementing source witness');
+    // An acquired intermediate import may re-export the base type. Resolve
+    // that closure without admitting a disconnected same-name declaration.
+    const bridgeText='pragma solidity ^0.8.0; import "./WalletBase.sol";';
+    const bridgedLeafText='pragma solidity ^0.8.0; import "./Bridge.sol"; contract BridgedWallet is WalletBase {}';
+    const bridgeSnap={path:'source-1/contracts/Bridge.sol',content:bridgeText,sha256:hash(bridgeText)};
+    const bridgedSnap={path:'source-1/contracts/BridgedWallet.sol',content:bridgedLeafText,sha256:hash(bridgedLeafText)};
+    const bridged=resolveAcquiredConcreteImplementations(targetInterface,'IWallet','withdraw',
+      [targetInterface,middleSnap,bridgeSnap,bridgedSnap]);
+    assert.deepEqual(bridged.map(x=>x.selector),['BridgedWallet.withdraw'],
+      'Cycle-safe transitive import closure must preserve inherited method proof');
+    assert.ok(bridged[0].witness.startsWith(middleSnap.path+':'+middleSnap.sha256));
     // Source-authenticated caller graph for interface-only leads: the caller
     // directly imports this interface, holds a typed state binding and calls
     // its method from an executable public operation. A mock without the import
