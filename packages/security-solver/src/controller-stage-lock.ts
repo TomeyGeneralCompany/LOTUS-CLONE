@@ -117,6 +117,17 @@ export class ControllerStageLock {
    if(this.finalized||!id)throw new Error('DISCOVERY_CLOSED');
    if(!this.candidates.has(id))this.candidates.set(id,null);
  }
+ /** An EXPERIMENT-stage repair may only append a fresh source-witnessed
+  * candidate for a lead in the immutable, fully analyzed source inventory.
+  * Existing candidates, read coverage, and independent completion gates stay
+  * unchanged. No unverified outcome is recorded here. */
+ registerRepairedExperiment(id:string,leadId:string,sourceSha256:string,witnesses:readonly string[]){
+   if(this.stage!=='EXPERIMENT'||!this.inventoryIds?.has(leadId)||
+     !id||this.candidates.has(id)||!(/^[a-f0-9]{64}$/).test(sourceSha256)||
+     !witnesses.length||!witnesses.some(w=>w.includes(sourceSha256)))
+     throw new Error('EXPERIMENT_REPAIR_SOURCE_WITNESS_REQUIRED: '+leadId);
+   this.candidates.set(id,null);
+ }
  noteSourcePreclassified(path:string,status:'indexed-options-built'|'source-unavailable'){
     if(this.stage!=='ANALYZE'||!this.coverage.hasIndexed(path)||this.sourcePreclassified.has(path))
       throw new Error('INVALID_SOURCE_PRECLASSIFICATION');

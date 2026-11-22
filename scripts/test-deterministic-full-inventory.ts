@@ -113,6 +113,23 @@ async function run(){
     for(const id of experiments)lock.discover(id);
     lock.completeAnalysis();
     assert.equal(lock.currentStage,'EXPERIMENT');
+    const repairedId=hash('source-repair-experiment');
+    assert.throws(()=>lock.registerRepairedExperiment(repairedId,candidates[0].id,
+      sourceSha,[]),/EXPERIMENT_REPAIR_SOURCE_WITNESS_REQUIRED/,
+      'An unwitnessed runtime repair may not enter the experiment queue');
+    assert.throws(()=>lock.registerRepairedExperiment(repairedId,hash('unknown-lead'),
+      sourceSha,[candidates[0].sourceEvidence+':'+sourceSha]),
+      /EXPERIMENT_REPAIR_SOURCE_WITNESS_REQUIRED/,
+      'Repairs may not introduce a lead outside the immutable inventory');
+    lock.registerRepairedExperiment(repairedId,candidates[0].id,sourceSha,
+      [candidates[0].sourceEvidence+':'+sourceSha]);
+    assert.throws(()=>lock.registerRepairedExperiment(repairedId,candidates[0].id,
+      sourceSha,[candidates[0].sourceEvidence+':'+sourceSha]),
+      /EXPERIMENT_REPAIR_SOURCE_WITNESS_REQUIRED/,
+      'Identical repair experiments cannot be scheduled twice');
+    assert.equal(lock.candidateCount,65,'A valid repair is appended, not substituted');
+    lock.requireCandidate(repairedId);
+    lock.finishExperiment(repairedId,'incomplete');
     for(const id of experiments){
       lock.requireCandidate(id);
       lock.finishExperiment(id,'not_observed');
@@ -123,7 +140,7 @@ async function run(){
     assert.equal(store.counts.experimentsCompleted,64);
     assert.equal(store.counts.unresolvedIds.length,244,
       'The other 180 never-experimented leads and 64 unproven results remain unresolved');
-    assert.equal(lock.completedCount,64);
+    assert.equal(lock.completedCount,65);
     assert.throws(()=>lock.completeExperiments(store.experimentCertificate),
       /EXPERIMENT_LEAD_COVERAGE_INCOMPLETE/);
     assert.equal(lock.currentStage,'EXPERIMENT');

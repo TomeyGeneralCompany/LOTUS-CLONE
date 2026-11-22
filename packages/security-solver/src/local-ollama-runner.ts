@@ -346,109 +346,11 @@ export async function runLocalAudit(
     })+"\n");
     return batch.length;
   };
-  const closeAnalysis=async(status:'complete'|'partial',reason='')=>{
-    if(!stageLock||stageLock.currentStage!=='ANALYZE')return;
-    if(!analysisProgressStore)throw new Error("ANALYSIS_PROGRESS_STORE_MISSING");
-    // An exhausted turn budget or missing analytical evidence is a suspended
-    // investigation, never a successful REPORT with abandoned candidates.
-    if(status!=="complete"){
-      await analysisProgressStore.save();
-      await appendFile(logFile,"[ANALYSIS_SUSPENDED] "+JSON.stringify({
-        reason,pendingIds:stageLock.analysisProgress.pendingIds,
-        remainingInventory:analysisProgressStore.remaining,
-      })+"\n");
-      throw new Error("ANALYSIS_INCOMPLETE_SUSPENDED: "+reason);
-    }
-    stageLock.completeAnalysisBatch();
-    for(const lead of stageLock.analysisLeads){
-      const record=analysisProgressStore.records.get(lead.id);
-      if(!record||record.lifecycle==="queued")continue;
-      if(["analysis_exhausted","dependencies_pending","experiment_pending","experiment_completed","blocked"].includes(record.lifecycle))continue;
-      const detail=analysisResults.get(lead.id);
-      // Candidate experiment identity must match the actual stage-owned queue,
-      // not the offline planner's separate SHA identifier.
-      const constructed=detail?.experimentCandidates||[];
-      // Some source-grounded plans are admitted during READ before detailed
-      // ANALYZE property construction. They still belong to the exact immutable
-      // lead selector; never orphan successful EVM proof merely because the
-      // later planner assigned a different hash to the same source operation.
-      const scheduled=stagedPlans.filter(entry=>
-        entry.plan.path===lead.path && entry.plan.query===lead.selector);
-      const missing=constructed.filter(candidate=>!scheduled.some(entry=>
-        candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
-        candidate.hypothesis===entry.plan.hypothesis &&
-        JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence)));
-      const inventoryEntry=analysisProgressStore.candidates.find(x=>x.id===lead.id);
-      const highRiskPending=!!inventoryEntry?.selectionReasons.some(x=>
-        x.startsWith("financial_entrypoint")||x.startsWith("shared_state_coupling"));
-      // A proven unsupported nonfinancial function is terminal; a financial
-      // lead without a constructible invariant remains actionable and pending.
-      const unresolvedAssessment=(detail?.unresolvedReasons||[]).filter(reason=>
-        highRiskPending||!reason.startsWith("UNKNOWN_ASSERTION(no_supported_property)"));
-      analysisProgressStore.recordAssessment(
-        lead.id,
-        detail?.decision.matchedHypotheses.map(x=>x.id)||[],
-        [...unresolvedAssessment,
-          ...(!detail?['analysis_result_missing']:[]),
-          ...(detail?.constructionFeasibility.skippedReason==='missing_declarations'
-            ?['source_abi_declarations_missing']:[]),
-          ...missing.map(x=>'constructed_but_not_scheduled:'+x.id)],
-        scheduled.map(x=>x.id),
-        detail?.closedLoop.steps.map(step=>({adapter:step.adapter,status:step.status,
-          reason:step.reason,...(step.detail?{detail:step.detail}:{})}))||[],
-        scheduled.flatMap(entry=>{
-          const candidate=constructed.find(candidate=>
-            candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
-            candidate.hypothesis===entry.plan.hypothesis &&
-            JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence));
-          const witnesses=candidate
-            ?candidate.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(':'))
-            :(inventoryEntry?[inventoryEntry.sourceEvidence]:[]);
-          // Source evidence for this selector, not evidence for an unrelated
-          // function, is required for pre-ANALYZE staged experiments.
-          if(!witnesses.length||witnesses.some(x=>!x.includes(lead.sourceSha256)))return [];
-          const property=candidate?.securityProperty||entry.plan.hypothesis;
-          return [{id:createHash('sha256').update(JSON.stringify([
-              lead.id,property,witnesses])).digest('hex'),
-            experimentIds:[entry.id],sourceWitnesses:witnesses}];
-        }),
-      );
-      analysisProgressStore.markTerminalAssessment(lead.id,
-        lead.state.kind==="assessed" ? lead.state.reason : undefined);
-    }
-    analysisProgressStore.processedBatches++;
-    analysisInventoryMeta.queuedRemaining=analysisProgressStore.remaining;
-    await analysisProgressStore.save();
-    // Update the human-readable inventory artifact after every batch. The
-    // initial snapshot alone would misleadingly report zero processed forever.
-    const inventorySnapshot={
-      totalCandidates:analysisProgressStore.records.size,
-      admittedCount:analysisProgressStore.assessed,
-      queuedCount:analysisProgressStore.remaining,
-      blockedCount:analysisInventoryMeta.blockedCount,
-      processedBatches:analysisProgressStore.processedBatches,
-      candidates:analysisProgressStore.candidates.map(({sourceExcerpt:_excerpt,...candidate})=>({
-        ...candidate,lifecycle:analysisProgressStore!.records.get(candidate.id)?.lifecycle,
-      })),
-    };
-    const inventoryDestination=logFile+".analysis-candidates.json";
-    const inventoryTemporary=inventoryDestination+"."+process.pid+".tmp";
-    await writeFile(inventoryTemporary,JSON.stringify(inventorySnapshot,null,2),{mode:0o600});
-    await rename(inventoryTemporary,inventoryDestination);
-    await appendFile(logFile,"[ANALYSIS_BATCH_COMPLETE] "+JSON.stringify({
-      batch:analysisProgressStore.processedBatches,
-      resolved:analysisProgressStore.assessed,
-      inventoryTotal:analysisProgressStore.records.size,
-      queuedRemaining:analysisProgressStore.remaining,
-    })+"\n");
-    if(analysisProgressStore.remaining>0){
-      const admitted=await admitNextAnalysisBatch();
-      if(admitted===0)throw new Error("ANALYSIS_INVENTORY_STALLED: queued candidates could not be admitted");
-      return;
-    }
-    // A completed analytical inventory does not mean construction has been
-    // exhausted. Give every pending property a source-only full-graph repair
-    // attempt, without repeating an identical failed strategy across resumes.
+  // Reusable source-bound repair pass: never closes a lead without verifier evidence.
+  const repairOutstandingLeadExperiments=async(phase:"initial"|"post-experiment"):Promise<number>=>{
+    if(!analysisProgressStore||!stageLock||
+      (stageLock.currentStage!=="ANALYZE"&&stageLock.currentStage!=="EXPERIMENT"))
+      throw new Error("EXPERIMENT_REPAIR_STAGE_INVALID");
     const sourceRepairBatch=analysisProgressStore.nextRepairBatch(analysisProgressStore.records.size);
     // A completed repair attempt belongs to both the acquired source SHA and
     // the controller implementation revision. After a code repair, the laptop
@@ -460,7 +362,7 @@ export async function runLocalAudit(
         {cwd:process.cwd(),encoding:"utf8",timeout:5000}).trim();}
       catch{implementationRevision="unversioned";}
     }
-    const strategy="source-fixture-property-engine-v2:"+implementationRevision;
+    const strategy="source-fixture-property-engine-v2:"+implementationRevision+":"+phase;
     let repairAdded=0,repairBlocked=0;
     for(const lead of sourceRepairBatch){
       const record=analysisProgressStore.records.get(lead.id)!;
@@ -582,7 +484,8 @@ export async function runLocalAudit(
           .some(p=>p.id===propertyId&&p.experimentIds.includes(id));
         if(alreadyLinked)continue;
         if(!preexisting){
-          stageLock.discover(id);
+          if(phase==="post-experiment")stageLock.registerRepairedExperiment(id,lead.id,lead.sourceSha256,witnesses);
+          else stageLock.discover(id);
           stagedPlans.push({id,plan});
         }
         // Caller integration does not discharge the interface's missing
@@ -609,8 +512,114 @@ export async function runLocalAudit(
     }
     await analysisProgressStore.save();
     await appendFile(logFile,"[EXPERIMENT_REPAIR_RECONCILIATION] "+JSON.stringify({
-      strategy,examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
+      strategy,phase,examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
       unresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
+    return repairAdded;
+  };
+  const closeAnalysis=async(status:'complete'|'partial',reason='')=>{
+    if(!stageLock||stageLock.currentStage!=='ANALYZE')return;
+    if(!analysisProgressStore)throw new Error("ANALYSIS_PROGRESS_STORE_MISSING");
+    // An exhausted turn budget or missing analytical evidence is a suspended
+    // investigation, never a successful REPORT with abandoned candidates.
+    if(status!=="complete"){
+      await analysisProgressStore.save();
+      await appendFile(logFile,"[ANALYSIS_SUSPENDED] "+JSON.stringify({
+        reason,pendingIds:stageLock.analysisProgress.pendingIds,
+        remainingInventory:analysisProgressStore.remaining,
+      })+"\n");
+      throw new Error("ANALYSIS_INCOMPLETE_SUSPENDED: "+reason);
+    }
+    stageLock.completeAnalysisBatch();
+    for(const lead of stageLock.analysisLeads){
+      const record=analysisProgressStore.records.get(lead.id);
+      if(!record||record.lifecycle==="queued")continue;
+      if(["analysis_exhausted","dependencies_pending","experiment_pending","experiment_completed","blocked"].includes(record.lifecycle))continue;
+      const detail=analysisResults.get(lead.id);
+      // Candidate experiment identity must match the actual stage-owned queue,
+      // not the offline planner's separate SHA identifier.
+      const constructed=detail?.experimentCandidates||[];
+      // Some source-grounded plans are admitted during READ before detailed
+      // ANALYZE property construction. They still belong to the exact immutable
+      // lead selector; never orphan successful EVM proof merely because the
+      // later planner assigned a different hash to the same source operation.
+      const scheduled=stagedPlans.filter(entry=>
+        entry.plan.path===lead.path && entry.plan.query===lead.selector);
+      const missing=constructed.filter(candidate=>!scheduled.some(entry=>
+        candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
+        candidate.hypothesis===entry.plan.hypothesis &&
+        JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence)));
+      const inventoryEntry=analysisProgressStore.candidates.find(x=>x.id===lead.id);
+      const highRiskPending=!!inventoryEntry?.selectionReasons.some(x=>
+        x.startsWith("financial_entrypoint")||x.startsWith("shared_state_coupling"));
+      // A proven unsupported nonfinancial function is terminal; a financial
+      // lead without a constructible invariant remains actionable and pending.
+      const unresolvedAssessment=(detail?.unresolvedReasons||[]).filter(reason=>
+        highRiskPending||!reason.startsWith("UNKNOWN_ASSERTION(no_supported_property)"));
+      analysisProgressStore.recordAssessment(
+        lead.id,
+        detail?.decision.matchedHypotheses.map(x=>x.id)||[],
+        [...unresolvedAssessment,
+          ...(!detail?['analysis_result_missing']:[]),
+          ...(detail?.constructionFeasibility.skippedReason==='missing_declarations'
+            ?['source_abi_declarations_missing']:[]),
+          ...missing.map(x=>'constructed_but_not_scheduled:'+x.id)],
+        scheduled.map(x=>x.id),
+        detail?.closedLoop.steps.map(step=>({adapter:step.adapter,status:step.status,
+          reason:step.reason,...(step.detail?{detail:step.detail}:{})}))||[],
+        scheduled.flatMap(entry=>{
+          const candidate=constructed.find(candidate=>
+            candidate.path===entry.plan.path && candidate.selector===entry.plan.query &&
+            candidate.hypothesis===entry.plan.hypothesis &&
+            JSON.stringify(candidate.sequence)===JSON.stringify(entry.plan.sequence));
+          const witnesses=candidate
+            ?candidate.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(':'))
+            :(inventoryEntry?[inventoryEntry.sourceEvidence]:[]);
+          // Source evidence for this selector, not evidence for an unrelated
+          // function, is required for pre-ANALYZE staged experiments.
+          if(!witnesses.length||witnesses.some(x=>!x.includes(lead.sourceSha256)))return [];
+          const property=candidate?.securityProperty||entry.plan.hypothesis;
+          return [{id:createHash('sha256').update(JSON.stringify([
+              lead.id,property,witnesses])).digest('hex'),
+            experimentIds:[entry.id],sourceWitnesses:witnesses}];
+        }),
+      );
+      analysisProgressStore.markTerminalAssessment(lead.id,
+        lead.state.kind==="assessed" ? lead.state.reason : undefined);
+    }
+    analysisProgressStore.processedBatches++;
+    analysisInventoryMeta.queuedRemaining=analysisProgressStore.remaining;
+    await analysisProgressStore.save();
+    // Update the human-readable inventory artifact after every batch. The
+    // initial snapshot alone would misleadingly report zero processed forever.
+    const inventorySnapshot={
+      totalCandidates:analysisProgressStore.records.size,
+      admittedCount:analysisProgressStore.assessed,
+      queuedCount:analysisProgressStore.remaining,
+      blockedCount:analysisInventoryMeta.blockedCount,
+      processedBatches:analysisProgressStore.processedBatches,
+      candidates:analysisProgressStore.candidates.map(({sourceExcerpt:_excerpt,...candidate})=>({
+        ...candidate,lifecycle:analysisProgressStore!.records.get(candidate.id)?.lifecycle,
+      })),
+    };
+    const inventoryDestination=logFile+".analysis-candidates.json";
+    const inventoryTemporary=inventoryDestination+"."+process.pid+".tmp";
+    await writeFile(inventoryTemporary,JSON.stringify(inventorySnapshot,null,2),{mode:0o600});
+    await rename(inventoryTemporary,inventoryDestination);
+    await appendFile(logFile,"[ANALYSIS_BATCH_COMPLETE] "+JSON.stringify({
+      batch:analysisProgressStore.processedBatches,
+      resolved:analysisProgressStore.assessed,
+      inventoryTotal:analysisProgressStore.records.size,
+      queuedRemaining:analysisProgressStore.remaining,
+    })+"\n");
+    if(analysisProgressStore.remaining>0){
+      const admitted=await admitNextAnalysisBatch();
+      if(admitted===0)throw new Error("ANALYSIS_INVENTORY_STALLED: queued candidates could not be admitted");
+      return;
+    }
+    // A completed analytical inventory does not mean construction has been
+    // exhausted. Give every pending property a source-only full-graph repair
+    // attempt, without repeating an identical failed strategy across resumes.
+    await repairOutstandingLeadExperiments("initial");
     stageLock.assertAnalysisInventoryExhausted();
     limits.onCandidateCoverage?.(analysisProgressStore.counts);
     await appendFile(logFile,"[ANALYSIS_PROPERTY_PENDING] "+JSON.stringify(analysisProgressStore.counts)+"\n");
@@ -1373,6 +1382,18 @@ export async function runLocalAudit(
         const inconclusive=stageLock.outcomeCounts;
         if(certificate.unresolvedIds.length || inconclusive.observation_only ||
           inconclusive.incomplete || inconclusive.unsupported || inconclusive.rejected){
+          // A finished selected queue is not a completed investigation. Attempt
+          // a distinct source-grounded repair pass before suspending. A repair
+          // must introduce a genuinely new queued experiment; zero progress
+          // retains the same strict failure and checkpoint semantics.
+          if(certificate.unresolvedIds.length){
+            const added=await repairOutstandingLeadExperiments("post-experiment");
+            if(added>0){
+              await appendFile(logFile,'[EXPERIMENT_REPAIR_REQUEUED] '+
+                JSON.stringify({added,unresolved:certificate.unresolvedIds.length})+'\n');
+              continue;
+            }
+          }
           await analysisProgressStore.save();
           await appendFile(logFile,'[EXPERIMENT_GATE_BLOCKED] '+JSON.stringify({
             required:certificate.total,conclusive:certificate.conclusive,
