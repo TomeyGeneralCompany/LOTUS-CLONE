@@ -175,6 +175,21 @@ async function run(){
       assert.equal(fixture.bindings[0].receiver,'adapter');
       assert.ok(fixture.witnesses.some(x=>x.sourceSha256===fixtureSources[0].sha256));
     }
+    // Initializer-only dependencies can be discovered after the consumer was
+    // registered. Execution must deploy the producer before the consumer.
+    const initializedAdapter='pragma solidity ^0.8.0; contract Adapter is IAdapter { Token public token; function initialize(address _token) external { token = Token(_token); } }';
+    const initialized=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
+      fixtureSources[0],{...fixtureSources[1],content:initializedAdapter,
+        sha256:hash(initializedAdapter)},fixtureSources[2]]);
+    assert.equal(initialized.status,'resolved',
+      'A source-bound initializer dependency must produce a complete fixture');
+    if(initialized.status==='resolved'){
+      assert.deepEqual(initialized.deployments.map(x=>x.contract),['Token','Adapter'],
+        'Producer deployment must precede initializer consumer deployment');
+      assert.equal(initialized.initializerOperations.length,1);
+      assert.equal(initialized.initializerOperations[0].args[0],
+        '$deployment:'+initialized.deployments[0].id);
+    }
     // An acquired dependency whose initializer cannot be completely bound
     // must not be reported as an executable fixture.
     const unboundAdapter='pragma solidity ^0.8.0; contract Adapter is IAdapter { constructor(Token token) {} function initialize(string memory configuration) external {} }';
