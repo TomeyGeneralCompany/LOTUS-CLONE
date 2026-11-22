@@ -804,6 +804,77 @@ function checkRequireSafetyAndBounds(
   return {safe:true,contractParams};
 }
 
+
+/**
+ * An NFT burn needs a real pre-existing token. A single unauthorized burn
+ * transaction can revert for a missing token even when authorization is broken.
+ * Build the authorized mint prerequisite and compare independently against
+ * the same existing token, only when the acquired source proves both bodies
+ * and the inherited ownership/initializer fixture.
+ */
+function guardedErc721BurnExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  sources:ReadonlyMap<string,SourceSnapshot>,menu:readonly SolidityProbeDeclaration[]
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(method!=='burn'||contract.kind!=='contract')return null;
+  const {chain,oz,localOwnables}=resolveInheritance(snapshot,contract,sources);
+  if(isAbstractContractNode(contract,chain))return null;
+  const setup=resolveVerifiedSetup(snapshot,contract,chain,oz,localOwnables,menu);
+  if(!setup||setup.kind!=='owner')return null;
+  const functions=(contract.subNodes||[]).filter((fn:any)=>
+    fn.type==='FunctionDefinition'&&fn.body&&
+    ['public','external'].includes(fn.visibility));
+  const types=(fn:any)=>(fn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
+  const burn=functions.find((fn:any)=>fn.name==='burn'&&
+    JSON.stringify(types(fn))===JSON.stringify(['uint256'])&&
+    hasAuthorizationGuard(fn,'owner',chain));
+  const mint=functions.find((fn:any)=>fn.name==='mint'&&
+    JSON.stringify(types(fn))===JSON.stringify(['address','uint256'])&&
+    hasAuthorizationGuard(fn,'owner',chain));
+  if(!burn||!mint)return null;
+  const sourceCall=(fn:any,callee:string,names:string[]):boolean=>{
+    const stmts=fn.body?.statements||[];
+    if(stmts.length!==1||stmts[0].type!=='ExpressionStatement')return false;
+    const exp=stmts[0].expression;
+    if(exp?.type!=='FunctionCall'||exprIdentifier(exp.expression)!==callee||
+      (exp.arguments||[]).length!==names.length)return false;
+    return exp.arguments.every((arg:any,i:number)=>
+      arg.type==='Identifier'&&arg.name===names[i]);
+  };
+  const burnName=burn.parameters?.[0]?.name;
+  const mintNames=(mint.parameters||[]).map((p:any)=>p.name);
+  if(!identifier.test(burnName||'')||mintNames.length!==2||
+    mintNames.some((name:string)=>!identifier.test(name))||
+    !sourceCall(burn,'_burn',[burnName])||
+    !sourceCall(mint,'_safeMint',mintNames))return null;
+  const has=(selector:string,operation:'send'|'call',inputs:string[])=>
+    menu.some(item=>item.selector===contract.name+'.'+selector&&
+      item.operation===operation&&JSON.stringify(item.inputs)===JSON.stringify(inputs));
+  if(!has('burn','send',['uint256'])||!has('mint','send',['address','uint256'])||
+    !has('balanceOf','call',['address'])||!has('owner','call',[]))return null;
+  const steps:SoliditySequence['steps']=[];
+  if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
+    args:setup.initArgs,sender:0,requiredSetup:true});
+  steps.push(
+    {operation:'call',function:'owner()',args:[],expect:'$account0'},
+    {operation:'call',function:'balanceOf(address)',args:['$account2'],expect:'0'},
+    {operation:'send',function:'mint(address,uint256)',args:['$account2','1'],
+      sender:0,requiredSetup:true},
+    {operation:'call',function:'balanceOf(address)',args:['$account2'],expect:'1'},
+    {operation:'send',function:'burn(uint256)',args:['1'],sender:1,expectRevert:true},
+    {operation:'call',function:'balanceOf(address)',args:['$account2'],expect:'1'},
+    {operation:'send',function:'burn(uint256)',args:['1'],sender:0},
+    {operation:'call',function:'balanceOf(address)',args:['$account2'],expect:'0'},
+  );
+  return {hypothesis:'An unauthorized caller cannot burn an existing source-minted NFT; '+
+      'the initialized owner can burn that exact token.',
+    property:'source-proven ERC721 owner-gated burn and balance transition',
+    sequence:{constructorArgs:setup.constructorArgs,steps},
+    witnesses:[...setup.setupWitnesses,
+      witness(snapshot,mint,contract.name+'.mint(address,uint256)'),
+      witness(snapshot,burn,contract.name+'.burn(uint256)')]};
+}
+
 function broadenedAuthorizationExperiment(
   snapshot:SourceSnapshot,contract:any,method:string,
   sources:ReadonlyMap<string,SourceSnapshot>,menu:readonly SolidityProbeDeclaration[]
@@ -2874,6 +2945,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       property:'source-proven role mutation',sequence:item.probe.sequence,
       witnesses:[witness(target,contract,input.targetSelector)]});
   }
+  const erc721Burn=guardedErc721BurnExperiment(target,contract,method,indexed,input.declarations);
+  if(erc721Burn)choices.push(erc721Burn);
   const rotation=guardedOperatorRotationExperiment(target,contract,method,input.declarations);
   if(rotation)choices.push(rotation);
   const funding=sourceBoundedFundingExperiment(target,contract,method,input.declarations);

@@ -499,6 +499,47 @@ contract TransitiveMarket {
       [icSnap,callerSnap]).length,0,'No invented interface method');
     // One target can have multiple independently source-proven opposing
     // transitions. Neither the companion order nor names justify dropping one.
+    // A burn test without a valid minted token is a meaningless dual-revert.
+    // Source-proved mint/setup must be part of the same experiment.
+    const nftText=`pragma solidity ^0.8.4;
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {ERC721URIStorageUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721URIStorageUpgradeable.sol";
+contract GuardedNFT is ERC721URIStorageUpgradeable, OwnableUpgradeable {
+  function initialize(string calldata name, string calldata symbol) external initializer {
+    __Ownable_init(); __ERC721_init(name,symbol);
+  }
+  function mint(address recipient,uint256 tokenId) external onlyOwner {
+    _safeMint(recipient,tokenId);
+  }
+  function burn(uint256 tokenId) external onlyOwner { _burn(tokenId); }
+}`;
+    const nftSource={path:'source-1/contracts/GuardedNFT.sol',
+      content:nftText,sha256:hash(nftText)};
+    const nftDeclarations=[
+      {selector:'GuardedNFT.mint',operation:'send',inputs:['address','uint256']},
+      {selector:'GuardedNFT.burn',operation:'send',inputs:['uint256']},
+      {selector:'GuardedNFT.owner',operation:'call',inputs:[]},
+      {selector:'GuardedNFT.balanceOf',operation:'call',inputs:['address']},
+    ];
+    const nftBurn=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:nftSource.path,
+      targetSelector:'GuardedNFT.burn',sources:[nftSource],
+      declarations:nftDeclarations as any,skipLegacy:true
+    });
+    assert.equal(nftBurn.ok,true,
+      'Guarded ERC721 burn must include authorized mint prerequisites and witnessed ownership');
+    if(nftBurn.ok){
+      const candidate=nftBurn.experiments.find(x=>
+        x.securityProperty.includes('owner-gated burn'));
+      assert.ok(candidate,'NFT burn must not silently degrade into a generic test');
+      const operations=candidate.sequence.steps.filter(x=>x.operation==='send') as any[];
+      assert.deepEqual(operations.map(x=>x.function),[
+        'initialize(string,string)','mint(address,uint256)','burn(uint256)','burn(uint256)']);
+      assert.equal(operations[2].expectRevert,true,
+        'Unauthorized burn must be checked only after successful source-declared mint');
+      assert.notEqual(operations[3].expectRevert,true,
+        'Authorized comparison must succeed rather than accepting a dual revert');
+    }
     const ledgerText=`pragma solidity ^0.8.0;
 contract Ledger {
   uint256 public total;
