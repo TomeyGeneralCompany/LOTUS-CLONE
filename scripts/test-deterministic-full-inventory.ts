@@ -11,7 +11,7 @@ import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
-import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -211,6 +211,37 @@ async function run(){
     assert.equal(ambiguous.status,'unresolved');
     if(ambiguous.status==='unresolved')
       assert.ok(ambiguous.missingDependencies.some(x=>x.includes('ambiguous_implementation')));
+    // A source-declared interface method and an acquired concrete method ABI
+    // can disambiguate competing implementations without guessing by name.
+    const ifaceText='pragma solidity ^0.8.0; interface IAdapter { function quote(uint256 amount) external returns (uint256); }';
+    const consumerText='pragma solidity ^0.8.0; import "./IAdapter.sol"; contract Consumer { IAdapter public adapter; function initialize(address chosen) external { adapter = IAdapter(chosen); } function read(uint256 amount) external { adapter.quote(amount); } }';
+    const correctText='pragma solidity ^0.8.0; import "./IAdapter.sol"; contract CorrectAdapter is IAdapter { function quote(uint256 amount) external override returns (uint256) { return amount; } }';
+    const incompatibleText='pragma solidity ^0.8.0; import "./IAdapter.sol"; contract WrongAdapter is IAdapter { function quote(uint256 amount) external override returns (bool) { return true; } }';
+    const typedSources=[
+      {path:'source-1/contracts/IAdapter.sol',content:ifaceText,sha256:hash(ifaceText)},
+      {path:'source-1/contracts/Consumer.sol',content:consumerText,sha256:hash(consumerText)},
+      {path:'source-1/contracts/CorrectAdapter.sol',content:correctText,sha256:hash(correctText)},
+      {path:'source-1/contracts/WrongAdapter.sol',content:incompatibleText,sha256:hash(incompatibleText)}];
+    assert.deepEqual(verifyAcquiredReceiverMethods('IAdapter',['quote'],
+      typedSources[2].path,'CorrectAdapter',typedSources),{ok:true,missing:[]});
+    assert.equal(verifyAcquiredReceiverMethods('IAdapter',['quote'],
+      typedSources[3].path,'WrongAdapter',typedSources).ok,false,
+      'Matching method names cannot substitute for a matching return ABI');
+    const selectedFixture=resolveSourceFixtureDependencies(typedSources[1],'Consumer',typedSources);
+    assert.equal(selectedFixture.status,'resolved',
+      'An acquired caller ABI must uniquely select the compatible concrete implementation');
+    if(selectedFixture.status==='resolved'){
+      assert.deepEqual(selectedFixture.deployments.map(x=>x.contract),['CorrectAdapter']);
+      assert.equal(selectedFixture.bindings[0].receiver,'adapter');
+    }
+    const bothCompatible='pragma solidity ^0.8.0; import "./IAdapter.sol"; contract AlsoCorrect is IAdapter { function quote(uint256 amount) external override returns (uint256) { return amount; } }';
+    const unresolvedChoice=resolveSourceFixtureDependencies(typedSources[1],'Consumer',[
+      ...typedSources,{path:'source-1/contracts/AlsoCorrect.sol',
+        content:bothCompatible,sha256:hash(bothCompatible)}]);
+    assert.equal(unresolvedChoice.status,'unresolved',
+      'Two ABI-compatible implementations remain ambiguous without stronger binding evidence');
+    if(unresolvedChoice.status==='unresolved')
+      assert.ok(unresolvedChoice.missingDependencies.some(x=>x.includes('ambiguous_implementation')));
     const cycA='pragma solidity ^0.8.0; contract CycA { constructor(CycB dependency) {} }';
     const cycB='pragma solidity ^0.8.0; contract CycB { constructor(CycA dependency) {} }';
     const cycleSources=[
