@@ -175,6 +175,16 @@ async function run(){
       assert.equal(fixture.bindings[0].receiver,'adapter');
       assert.ok(fixture.witnesses.some(x=>x.sourceSha256===fixtureSources[0].sha256));
     }
+    // An acquired dependency whose initializer cannot be completely bound
+    // must not be reported as an executable fixture.
+    const unboundAdapter='pragma solidity ^0.8.0; contract Adapter is IAdapter { constructor(Token token) {} function initialize(string memory configuration) external {} }';
+    const unbound=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
+      fixtureSources[0],{...fixtureSources[1],content:unboundAdapter,sha256:hash(unboundAdapter)},fixtureSources[2]]);
+    assert.equal(unbound.status,'unresolved',
+      'Missing initializer arguments must invalidate the acquired deployment graph');
+    if(unbound.status==='unresolved')
+      assert.ok(unbound.missingDependencies.some(x=>x.includes('unsupported_initializer_parameter')||
+        x.includes('incomplete_initializer_arguments')));
     const ambiguousSource='pragma solidity ^0.8.0; contract AdapterTwo is IAdapter {}';
     const ambiguous=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
       ...fixtureSources,{path:'source-1/contracts/AdapterTwo.sol',content:ambiguousSource,sha256:hash(ambiguousSource)}]);
