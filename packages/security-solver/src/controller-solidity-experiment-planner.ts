@@ -2215,36 +2215,28 @@ export function extractSourceInvariantDescriptor(
     .filter((n: any) => n.type === 'StateVariableDeclaration')
     .flatMap((n: any) => n.variables || [])
     .filter((v: any) => v?.name);
-  const accountingStateVars = stateDecls.filter(
-    (v: any) => TOTAL_SCALAR_RE.test(v.name) || BALANCE_MAPPING_RE.test(v.name),
-  );
-
-  // Solidity generates ABI getters for public state variables. The function
-  // menu does not necessarily list them, but their visibility and ABI shape
-  // are proven by the acquired AST, so they are valid readback witnesses.
-  const publicTotal=stateDecls.find((v:any)=>v.visibility==="public"&&
-    TOTAL_SCALAR_RE.test(v.name)&&
+  // A readback is eligible only when the same acquired state is written in
+  // opposite directions by the selected source-witnessed transition pair.
+  // Public getter ABI is derived from the AST, never from an identifier prefix.
+  const pairedStates=new Set(accountingStates.filter(state=>
+    (targetEffect.plus.includes(state)&&effects.get(counterpart.fn)!.minus.includes(state))||
+    (targetEffect.minus.includes(state)&&effects.get(counterpart.fn)!.plus.includes(state))));
+  const accountingStateVars=stateDecls.filter((v:any)=>pairedStates.has(String(v.name)));
+  const publicTotal=accountingStateVars.find((v:any)=>v.visibility==="public"&&
     v.typeName?.type==="ElementaryTypeName"&&
     /^uint(?:[0-9]+)?$/.test(String(v.typeName.name||"")));
-  const publicBalance=stateDecls.find((v:any)=>v.visibility==="public"&&
-    BALANCE_MAPPING_RE.test(v.name)&&v.typeName?.type==="Mapping"&&
-    v.typeName.keyType?.name==="address"&&
+  const publicBalance=accountingStateVars.find((v:any)=>v.visibility==="public"&&
+    v.typeName?.type==="Mapping"&&v.typeName.keyType?.name==="address"&&
     /^uint(?:[0-9]+)?$/.test(String(v.typeName.valueType?.name||"")));
-  const totalGetterDecl = declarations.find(
-    (d) =>
-      d.operation === 'call' &&
-      d.inputs.length === 0 &&
-      d.selector.startsWith(contract.name+'.') &&
-      TOTAL_SCALAR_RE.test(d.selector.slice(contract.name.length + 1)),
-  ) || (publicTotal?{operation:'call' as const,selector:contract.name+'.'+publicTotal.name,inputs:[] as string[]}:undefined);
-  const balanceGetterDecl = declarations.find(
-    (d) =>
-      d.operation === 'call' &&
-      d.inputs.length === 1 &&
-      d.inputs[0] === 'address' &&
-      d.selector.startsWith(contract.name+'.') &&
-      BALANCE_MAPPING_RE.test(d.selector.slice(contract.name.length + 1)),
-  ) || (publicBalance?{operation:'call' as const,selector:contract.name+'.'+publicBalance.name,inputs:['address']}:undefined);
+  const getterDeclared=(name:string,inputs:string[])=>declarations.some(d=>
+    d.operation==="call"&&d.selector===contract.name+"."+name&&
+    JSON.stringify(d.inputs)===JSON.stringify(inputs));
+  const totalGetterDecl=publicTotal&&getterDeclared(publicTotal.name,[])?
+    {operation:"call" as const,selector:contract.name+"."+publicTotal.name,inputs:[] as string[]}:
+    publicTotal?{operation:"call" as const,selector:contract.name+"."+publicTotal.name,inputs:[] as string[]}:undefined;
+  const balanceGetterDecl=publicBalance&&getterDeclared(publicBalance.name,["address"])?
+    {operation:"call" as const,selector:contract.name+"."+publicBalance.name,inputs:["address"]}:
+    publicBalance?{operation:"call" as const,selector:contract.name+"."+publicBalance.name,inputs:["address"]}:undefined;
 
   // Source-backed collection and struct-return observations are distinct from
   // scalar balance getters. Admit only a directly witnessed transition.
