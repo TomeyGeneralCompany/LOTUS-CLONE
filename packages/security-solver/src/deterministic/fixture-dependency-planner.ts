@@ -35,9 +35,13 @@ const isDeclaredAbstract=(source:SourceSnapshot,node:any):boolean=>{
   const start=Array.isArray(node.range)?node.range[0]:undefined;
   if(Number.isInteger(start)){
     const header=source.content.slice(start,Math.min(source.content.length,start+180));
-    if(/^\\s*abstract\\s+contract\\s+/.test(header))return true;
+    if(/^\s*abstract\s+contract\s+/.test(header))return true;
   }
-  const escaped=String(node.name||"").replace(/[.*+?^${}()|[\\]\\]/g,"\\function descendants(node:any):any[]{");
+  const name=String(node.name||"");
+  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))return true;
+  return new RegExp("\\babstract\\s+contract\\s+"+name+"\\b").test(source.content);
+};
+function descendants(node:any):any[]{");
   return new RegExp("\\babstract\\s+contract\\s+"+escaped+"\\b").test(source.content);
 };
 function descendants(node:any):any[]{
