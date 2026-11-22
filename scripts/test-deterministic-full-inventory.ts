@@ -330,6 +330,21 @@ async function run(){
     assert.equal(available[0].sourceSha256,targetImpl.sha256);
     assert.equal(resolveAcquiredConcreteImplementations(targetInterface,'IWallet','borrow',
       [targetInterface,targetImpl]).length,0,'Do not invent an unimplemented method');
+    // Transitive A <- B <- C must resolve a real inherited implementation
+    // without admitting an unrelated same-named contract or an abstract leaf.
+    const middleText='pragma solidity ^0.8.0; import "./IWallet.sol"; abstract contract WalletBase is IWallet { function withdraw(uint256 value) external virtual override {} }';
+    const leafText='pragma solidity ^0.8.0; import "./WalletBase.sol"; contract FinalWallet is WalletBase {}';
+    const falseLeafText='pragma solidity ^0.8.0; contract UnlinkedWallet is WalletBase {}';
+    const middleSnap={path:'source-1/contracts/WalletBase.sol',content:middleText,sha256:hash(middleText)};
+    const leafSnap={path:'source-1/contracts/FinalWallet.sol',content:leafText,sha256:hash(leafText)};
+    const falseLeafSnap={path:'source-1/contracts/UnlinkedWallet.sol',content:falseLeafText,sha256:hash(falseLeafText)};
+    const deepImplementations=resolveAcquiredConcreteImplementations(
+      targetInterface,'IWallet','withdraw',[targetInterface,middleSnap,leafSnap,falseLeafSnap]);
+    assert.deepEqual(deepImplementations.map(x=>x.selector),['FinalWallet.withdraw'],
+      'Only a complete authenticated two-hop inheritance chain is executable');
+    assert.equal(deepImplementations[0].sourceSha256,leafSnap.sha256);
+    assert.ok(deepImplementations[0].witness.startsWith(middleSnap.path+':'+middleSnap.sha256),
+      'Inherited executable method must retain the implementing source witness');
     // Source-authenticated caller graph for interface-only leads: the caller
     // directly imports this interface, holds a typed state binding and calls
     // its method from an executable public operation. A mock without the import
