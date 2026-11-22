@@ -329,11 +329,13 @@ export function verifyAcquiredReceiverMethods(
   collect(concrete);
   if(ambiguousBase)return {ok:false,missing:["ambiguous_or_missing_inheritance"]};
   const implemented=new Map<string,{returns:string[]|null}>();
+  const inheritedDeclarations=new Set<string>();
   for(const entry of chain){
     for(const fn of (entry.node.subNodes||[]).filter((n:any)=>
       n.type==="FunctionDefinition"&&!n.isConstructor&&n.name)){
       const identity=callableIdentity(fn);
       if(!identity)continue;
+      if(["public","external"].includes(fn.visibility))inheritedDeclarations.add(identity);
       if(fn.body&&["public","external"].includes(fn.visibility))
         implemented.set(identity,{returns:callableReturns(fn)});
       else if(!fn.body)implemented.delete(identity);
@@ -345,6 +347,10 @@ export function verifyAcquiredReceiverMethods(
     }
   }
   const missing:string[]=[];
+  // An inherited abstract declaration without a surviving implementation
+  // prevents deployment even when the specifically requested method exists.
+  for(const identity of inheritedDeclarations)if(!implemented.has(identity))
+    missing.push(identity+":unimplemented_inherited_abstract");
   for(const method of new Set(methods)){
     const required=declared.flatMap(e=>(e.node.subNodes||[]).filter((fn:any)=>
       fn.type==="FunctionDefinition"&&fn.name===method));
