@@ -41,9 +41,6 @@ const isDeclaredAbstract=(source:SourceSnapshot,node:any):boolean=>{
   if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))return true;
   return new RegExp("\\babstract\\s+contract\\s+"+name+"\\b").test(source.content);
 };
-function descendants(node:any):any[]{");
-  return new RegExp("\\babstract\\s+contract\\s+"+escaped+"\\b").test(source.content);
-};
 function descendants(node:any):any[]{
   const out:any[]=[];const visited=new Set<any>();
   const walk=(v:any)=>{if(!v||typeof v!=="object"||visited.has(v))return;visited.add(v);
