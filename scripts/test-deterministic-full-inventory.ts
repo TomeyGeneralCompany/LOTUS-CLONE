@@ -516,6 +516,39 @@ contract Ledger {
       inputs:[],outputs:['uint256'],stateMutability:'view'} as any);
     ledgerDeclarations.push({selector:'Ledger.balances',operation:'call',
       inputs:['address'],outputs:['uint256'],stateMutability:'view'} as any);
+    // Regression: accounting writes in internal helpers must be observable
+    // through the same source-call closure used to detect the opposing pair.
+    // Previously the property extractor discovered the pair, then rejected
+    // the very same state getters because it searched only wrapper bodies.
+    const helperLedgerText=`pragma solidity ^0.8.0;
+contract HelperLedger {
+  uint256 public total;
+  mapping(address => uint256) public balances;
+  function credit(uint256 amount) external { _credit(amount); }
+  function debit(uint256 amount) external { _debit(amount); }
+  function _credit(uint256 amount) private {
+    total += amount; balances[msg.sender] += amount;
+  }
+  function _debit(uint256 amount) private {
+    total -= amount; balances[msg.sender] -= amount;
+  }
+}`;
+    const helperLedgerSource={path:'source-1/contracts/HelperLedger.sol',
+      content:helperLedgerText,sha256:hash(helperLedgerText)};
+    const helperLedgerDeclarations=['credit','debit'].map(name=>({
+      selector:'HelperLedger.'+name,operation:'send' as const,
+      inputs:['uint256'],outputs:[],stateMutability:'nonpayable' as const
+    }));
+    const helperExperiment=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:helperLedgerSource.path,
+      targetSelector:'HelperLedger.debit',sources:[helperLedgerSource],
+      declarations:helperLedgerDeclarations as any,skipLegacy:true
+    });
+    assert.equal(helperExperiment.ok,true,
+      'Source-reachable internal accounting helpers must retain their observable getter properties');
+    if(helperExperiment.ok)assert.ok(helperExperiment.experiments.some(x=>
+      x.securityProperty.startsWith('financial ')),
+      'The constructed property must be financial, not merely a generic call');
     const ledgerExperiment=constructSolidityExperiments({
       repositoryCommit:'b'.repeat(40),targetPath:ledgerSource.path,
       targetSelector:'Ledger.debit',sources:[ledgerSource],

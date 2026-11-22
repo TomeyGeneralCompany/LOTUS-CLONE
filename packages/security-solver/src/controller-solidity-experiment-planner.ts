@@ -2139,7 +2139,14 @@ export function extractSourceInvariantDescriptor(
 
   const inflowBody = body(snapshot.content, inflowFn);
   const outflowBody = body(snapshot.content, outflowFn);
-  const combinedBody = `${inflowBody}\n${outflowBody}`;
+  // Pair discovery already follows reachable local helper bodies. Observation
+  // and external-dependency validation must inspect that SAME witnessed call
+  // closure, otherwise source-visible accounting state written by a helper
+  // is incorrectly dismissed as an unobservable property.
+  const combinedBody = [
+    reachableAccountingSource(snapshot,contract,inflowFn),
+    reachableAccountingSource(snapshot,contract,outflowFn),
+  ].join("\n");
   const pairWitnesses: SourceWitness[] = [
     witness(snapshot, inflowFn, `${contract.name}.${inflowFn.name}`),
     witness(snapshot, outflowFn, `${contract.name}.${outflowFn.name}`),
