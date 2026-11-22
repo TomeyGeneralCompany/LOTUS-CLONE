@@ -136,7 +136,7 @@ export function resolveAcquiredConcreteImplementations(
   const targetFunctions=(root.subNodes||[]).filter((n:any)=>
     n.type==="FunctionDefinition"&&n.name===method);
   if(!targetFunctions.length)return [];
-  const targetIds=new Set(targetFunctions.map(identities).filter(Boolean));
+  const targetIds=new Set<string>(targetFunctions.map(identities).filter((id:string|null):id is string=>id!==null));
   const result:AcquiredConcreteImplementation[]=[];
   for(const candidate of entries){
     if(candidate.node.name===abstractContract&&candidate.source.path===abstractSource.path)continue;
