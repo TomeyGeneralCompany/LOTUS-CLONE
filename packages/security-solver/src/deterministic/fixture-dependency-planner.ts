@@ -272,6 +272,7 @@ export function resolveSourceFixtureDependencies(
   const deployments:PreparedDeployment[]=[],initializers:PreparedInitializerOperation[]=[];
   const substitutions:Record<string,string>={};
   const visited=new Map<string,string>(),stack=new Set<string>();
+  let nextDeploymentId=1;
   const MAX_DEPTH=6,MAX_NODES=8;
   const resolve=(typ:string,depth:number):string|null=>{
     attempts.push(typ);
@@ -295,7 +296,8 @@ export function resolveSourceFixtureDependencies(
       else {missing.push(key+":unsupported_constructor_type:"+argType);valid=false;break;}
     }
     if(!valid){stack.delete(key);return null;}
-    const id="dependency"+(deployments.length+1);
+    const id="dependency"+nextDeploymentId++;
+    // Reserve a stable ID before initializer recursion can add deployments.
     deployments.push({id,file:selected.source.path,contract:selected.node.name,constructorArgs:args});
     visited.set(key,id);stack.delete(key);
     witnesses.push({file:selected.source.path,line:selected.node.loc?.start?.line||1,
