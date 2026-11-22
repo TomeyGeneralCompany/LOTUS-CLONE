@@ -186,6 +186,11 @@ async function run(){
     if(initialized.status==='resolved'){
       assert.deepEqual(initialized.deployments.map(x=>x.contract),['Token','Adapter'],
         'Producer deployment must precede initializer consumer deployment');
+      assert.equal(new Set(initialized.deployments.map(x=>x.id)).size,
+        initialized.deployments.length,
+        'Initializer-recursive deployments must retain unique stable IDs');
+      assert.notEqual(initialized.deployments[0].id,initialized.deployments[1].id,
+        'Consumer and initializer-discovered producer cannot share a deployment ID');
       assert.equal(initialized.initializerOperations.length,1);
       assert.equal(initialized.initializerOperations[0].args[0],
         '$deployment:'+initialized.deployments[0].id);
