@@ -218,15 +218,30 @@ export function resolveAcquiredInterfaceCallers(
     if(source.path===interfaceSource.path||!source.path.endsWith('.sol')||
       source.path.split('/').some(part=>/^(?:mocks?|tests?|fixtures?|echidna)$/i.test(part)))continue;
     const ast=astOf(source);if(!ast)continue;
-    const importProof=(ast.children||[]).some((x:any)=>{
-      if(x.type!=='ImportDirective'||typeof x.path!=='string'||!x.path.startsWith('.'))
-        return false;
-      if(posix.normalize(posix.join(posix.dirname(source.path),x.path))!==interfaceSource.path)
-        return false;
-      return !Array.isArray(x.symbolAliases)||!x.symbolAliases.length||
-        x.symbolAliases.some(([original,alias]:[string,string|null])=>
-          original===interfaceName||(alias||original)===interfaceName);
-    });
+    // Follow only acquired import edges, including intermediate re-exports.
+    // An import cycle is harmless; a same-named unlinked type is not proof.
+    const reachable=new Set<string>(),pending=[source.path];
+    let importProof=false;
+    while(pending.length){
+      const current=pending.pop()!;
+      if(reachable.has(current))continue;
+      reachable.add(current);
+      const currentSource=sources.find(s=>s.path===current);
+      if(!currentSource)continue;
+      for(const imp of (astOf(currentSource)?.children||[]).filter((x:any)=>
+        x.type==='ImportDirective'&&typeof x.path==='string')){
+        const target=imp.path.startsWith('.')?
+          posix.normalize(posix.join(posix.dirname(current),imp.path)):imp.path;
+        if(target===interfaceSource.path){
+          const aliases=imp.symbolAliases;
+          if(!Array.isArray(aliases)||!aliases.length||
+            aliases.some(([original,alias]:[string,string|null])=>
+              original===interfaceName&&(alias===null||alias===interfaceName)))
+            importProof=true;
+        }
+        if(sources.some(s=>s.path===target)&&!reachable.has(target))pending.push(target);
+      }
+    }
     if(!importProof)continue;
     for(const contract of (ast.children||[]).filter((x:any)=>
       x.type==='ContractDefinition'&&x.kind!=='interface'&&x.kind!=='library')){
