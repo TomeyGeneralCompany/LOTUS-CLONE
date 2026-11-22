@@ -89,7 +89,6 @@ export function resolveAcquiredConcreteImplementations(
     }
     return paths;
   };
-  const entryByIdentity=new Map(entries.map(e=>[e.source.path+":"+e.node.name,e]));
   const basesOf=(entry:ContractEntry):ContractEntry[][]=>{
     const reachable=importedPaths(entry.source);
     return (entry.node.baseContracts||[]).map((b:any)=>{
