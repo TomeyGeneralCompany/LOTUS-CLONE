@@ -29,6 +29,17 @@ const initOf=(node:any)=>(node.subNodes||[]).find((x:any)=>x.type==="FunctionDef
 const isConcrete=(node:any)=>node?.type==="ContractDefinition"&&
   node.kind!=="interface"&&node.kind!=="library"&&!node.abstract&&!node.isAbstract&&
   !(node.subNodes||[]).some((x:any)=>x.type==="FunctionDefinition"&&!x.body);
+/** Some parser versions omit an abstract flag from ContractDefinition.
+ * Read the authenticated declaration header to reject abstract bytecode. */
+const isDeclaredAbstract=(source:SourceSnapshot,node:any):boolean=>{
+  const start=Array.isArray(node.range)?node.range[0]:undefined;
+  if(Number.isInteger(start)){
+    const header=source.content.slice(start,Math.min(source.content.length,start+180));
+    if(/^\\s*abstract\\s+contract\\s+/.test(header))return true;
+  }
+  const escaped=String(node.name||"").replace(/[.*+?^${}()|[\\]\\]/g,"\\function descendants(node:any):any[]{");
+  return new RegExp("\\babstract\\s+contract\\s+"+escaped+"\\b").test(source.content);
+};
 function descendants(node:any):any[]{
   const out:any[]=[];const visited=new Set<any>();
   const walk=(v:any)=>{if(!v||typeof v!=="object"||visited.has(v))return;visited.add(v);
@@ -128,7 +139,7 @@ export function resolveAcquiredConcreteImplementations(
   const result:AcquiredConcreteImplementation[]=[];
   for(const candidate of entries){
     if(candidate.node.name===abstractContract&&candidate.source.path===abstractSource.path)continue;
-    if(!isConcrete(candidate.node))continue;
+    if(!isConcrete(candidate.node)||isDeclaredAbstract(candidate.source,candidate.node))continue;
     const traversed=new Set<string>(),chain:ContractEntry[]=[];
     let invalid=false;
     const walk=(entry:ContractEntry):void=>{
@@ -390,7 +401,8 @@ export function resolveSourceFixtureDependencies(
   const resolve=(typ:string,depth:number):string|null=>{
     attempts.push(typ);
     if(depth>MAX_DEPTH){missing.push(typ+":max_dependency_depth");return null;}
-    const choices=scanned.filter(({node})=>isConcrete(node)&&extendsType(node,typ));
+    const choices=scanned.filter(({node,source})=>isConcrete(node)&&
+      !isDeclaredAbstract(source,node)&&extendsType(node,typ));
     // A source-proven ABI can distinguish concrete implementations. Without
     // proof, multiple candidates remain ambiguous rather than guessed.
     const receiverMethods=[...new Set(targetBindings.filter(b=>b.typeName===typ)
