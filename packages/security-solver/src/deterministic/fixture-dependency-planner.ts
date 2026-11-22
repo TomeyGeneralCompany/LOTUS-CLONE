@@ -246,6 +246,110 @@ export function resolveAcquiredInterfaceCallers(
   return callers.sort((a,b)=>a.path.localeCompare(b.path)||
     a.selector.localeCompare(b.selector)||a.receiver.localeCompare(b.receiver));
 }
+
+/** Canonical callable identity, derived from acquired Solidity declarations. */
+function callableTypes(parameters:readonly any[]):string[]|null {
+  const types:string[]=[];
+  for(const p of parameters){
+    const t=p.typeName;
+    if(t?.type==="UserDefinedTypeName"){types.push("address");continue;}
+    if(t?.type!=="ElementaryTypeName")return null;
+    const type=String(t.name||"");
+    const canonical=type==="uint"?"uint256":type==="int"?"int256":type==="address payable"?"address":type;
+    if(!/^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(canonical))return null;
+    types.push(canonical);
+  }
+  return types;
+}
+function callableIdentity(fn:any):string|null {
+  const types=callableTypes(fn.parameters||[]);
+  return types===null?null:String(fn.name||"")+"("+types.join(",")+")";
+}
+function callableReturns(fn:any):string[]|null {
+  return callableTypes(fn.returnParameters||[]);
+}
+/** A receiver can be substituted only if the actual deployed acquired contract
+ * supplies every source-declared interface call, including its return ABI.
+ * A declaration without a body is not executable; inherited bodies are eligible.
+ */
+export function verifyAcquiredReceiverMethods(
+  interfaceType:string,methods:readonly string[],implementationFile:string,
+  implementationContract:string,sources:readonly SourceSnapshot[],
+):{ok:boolean;missing:string[]} {
+  if(!methods.length)return {ok:true,missing:[]};
+  const entries=sources.flatMap(source=>(astOf(source)?.children||[])
+    .filter((node:any)=>node.type==="ContractDefinition")
+    .map((node:any)=>({source,node})));
+  const concrete=entries.find(e=>e.source.path===implementationFile&&
+    e.node.name===implementationContract);
+  if(!concrete||!isConcrete(concrete.node))return {ok:false,missing:["concrete_deployment_not_found"]};
+  const declared=entries.filter(e=>e.node.name===interfaceType);
+  const sourcePaths=new Map(sources.map(s=>[s.path,s]));
+  const reachable=new Set<string>(),pending=[implementationFile];
+  while(pending.length){
+    const path=pending.pop()!;
+    if(reachable.has(path))continue;
+    reachable.add(path);
+    const source=sourcePaths.get(path);
+    if(!source)continue;
+    for(const imp of (astOf(source)?.children||[]).filter((n:any)=>n.type==="ImportDirective")){
+      const impPath=String(imp.path||"");
+      if(!impPath)continue;
+      const normalized=impPath.startsWith(".")?
+        posix.normalize(posix.join(posix.dirname(path),impPath)):impPath;
+      if(sourcePaths.has(normalized))pending.push(normalized);
+    }
+  }
+  const chain:ContractEntry[]=[],visited=new Set<string>();
+  let ambiguousBase=false;
+  const collect=(entry:ContractEntry)=>{
+    const key=entry.source.path+":"+entry.node.name;
+    if(visited.has(key))return;
+    visited.add(key);
+    for(const base of entry.node.baseContracts||[]){
+      const name=String(base.baseName?.namePath||"").split(".").pop();
+      const choices=entries.filter(e=>e.node.name===name&&reachable.has(e.source.path));
+      if(choices.length!==1){ambiguousBase=true;continue;}
+      collect(choices[0]);
+    }
+    chain.push(entry);
+  };
+  collect(concrete);
+  if(ambiguousBase)return {ok:false,missing:["ambiguous_or_missing_inheritance"]};
+  const implemented=new Map<string,{returns:string[]|null}>();
+  for(const entry of chain){
+    for(const fn of (entry.node.subNodes||[]).filter((n:any)=>
+      n.type==="FunctionDefinition"&&!n.isConstructor&&n.name)){
+      const identity=callableIdentity(fn);
+      if(!identity)continue;
+      if(fn.body&&["public","external"].includes(fn.visibility))
+        implemented.set(identity,{returns:callableReturns(fn)});
+      else if(!fn.body)implemented.delete(identity);
+    }
+    for(const v of (entry.node.subNodes||[]).filter((n:any)=>
+      n.type==="StateVariableDeclaration").flatMap((n:any)=>n.variables||[])){
+      if(v.visibility==="public"&&v.name&&v.typeName?.type==="ElementaryTypeName")
+        implemented.set(v.name+"()",{returns:callableTypes([{typeName:v.typeName}])});
+    }
+  }
+  const missing:string[]=[];
+  for(const method of new Set(methods)){
+    const required=declared.flatMap(e=>(e.node.subNodes||[]).filter((fn:any)=>
+      fn.type==="FunctionDefinition"&&fn.name===method));
+    // If no interface ABI is acquired, the receiver cannot be authenticated.
+    if(!required.length){missing.push(method+":interface_abi_not_acquired");continue;}
+    for(const fn of required){
+      const identity=callableIdentity(fn);
+      const expected=callableReturns(fn);
+      const actual=identity?implemented.get(identity):undefined;
+      if(!identity||expected===null||!actual||actual.returns===null||
+        JSON.stringify(actual.returns)!==JSON.stringify(expected))
+        missing.push((identity||method)+":missing_or_incompatible_abi");
+    }
+  }
+  return {ok:missing.length===0,missing};
+}
+
 export function resolveSourceFixtureDependencies(
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
 ):FixtureResolution {
@@ -273,13 +377,29 @@ export function resolveSourceFixtureDependencies(
   const substitutions:Record<string,string>={};
   const visited=new Map<string,string>(),stack=new Set<string>();
   let nextDeploymentId=1;
+  // Prove caller demand from the acquired source, not from a guessed fixture.
+  const requiredReceiverMethods=new Map<string,string[]>();
+  for(const binding of initializerStateBindings(targetNode)){
+    const methods=[...target.content.matchAll(new RegExp(
+      "\\\\b"+binding.receiver+"\\\\s*\\\\.\\\\s*([A-Za-z_][A-Za-z0-9_]*)\\\\s*\\\\(","g"))]
+      .map(match=>match[1]);
+    requiredReceiverMethods.set(binding.receiver,[...new Set(methods)]);
+  }
   const MAX_DEPTH=6,MAX_NODES=8;
   const resolve=(typ:string,depth:number):string|null=>{
     attempts.push(typ);
     if(depth>MAX_DEPTH){missing.push(typ+":max_dependency_depth");return null;}
     const choices=scanned.filter(({node})=>isConcrete(node)&&extendsType(node,typ));
-    if(choices.length!==1){missing.push(typ+(choices.length===0?":no_acquired_concrete_implementation":":ambiguous_implementation"));return null;}
-    const selected=choices[0],key=selected.source.path+":"+selected.node.name;
+    // A source-proven ABI can distinguish concrete implementations. Without
+    // proof, multiple candidates remain ambiguous rather than guessed.
+    const receiverMethods=[...new Set(bindings.filter(b=>b.typeName===typ)
+      .flatMap(b=>requiredReceiverMethods.get(b.receiver)||[]))];
+    const qualified=choices.length>1&&receiverMethods.length?
+      choices.filter(choice=>verifyAcquiredReceiverMethods(typ,receiverMethods,
+        choice.source.path,choice.node.name,sources).ok):choices;
+    if(qualified.length!==1){missing.push(typ+(qualified.length===0?
+      ":no_acquired_abi_compatible_implementation":":ambiguous_implementation"));return null;}
+    const selected=qualified[0],key=selected.source.path+":"+selected.node.name;
     if(stack.has(key)){missing.push(typ+":dependency_cycle");return null;}
     if(visited.has(key))return visited.get(key)!;
     if(deployments.length>=MAX_NODES){missing.push(typ+":max_dependency_nodes");return null;}
