@@ -351,5 +351,33 @@ export function resolveSourceFixtureDependencies(
   // a synthesized protocol implementation.
   if(missing.length)return {status:"unresolved",missingDependencies:[...new Set(missing)],
     attemptedResolvers:[...new Set(attempts)],witnesses};
-  return {status:"resolved",deployments,substitutions,bindings,witnesses,initializerOperations:initializers};
+  // A consumer may acquire additional dependencies while resolving its initializer.
+  // Order the entire acquired deployment graph, not just constructor recursion.
+  // Keep stable deployment IDs so substitutions and proof bindings remain valid.
+  const byId=new Map(deployments.map(d=>[d.id,d]));
+  const dependencies=(id:string):string[]=>{
+    const deployment=byId.get(id);
+    const args=[...(deployment?.constructorArgs||[]),
+      ...initializers.filter(op=>op.deploymentId===id).flatMap(op=>op.args)];
+    return [...new Set(args.filter(arg=>arg.startsWith("$deployment:"))
+      .map(arg=>arg.slice("$deployment:".length)))];
+  };
+  const ordered:PreparedDeployment[]=[];
+  const permanent=new Set<string>(),active=new Set<string>();
+  const visit=(id:string):boolean=>{
+    if(permanent.has(id))return true;
+    if(active.has(id)||!byId.has(id))return false;
+    active.add(id);
+    for(const dep of dependencies(id))if(!visit(dep))return false;
+    active.delete(id);permanent.add(id);ordered.push(byId.get(id)!);
+    return true;
+  };
+  for(const deployment of deployments)if(!visit(deployment.id))
+    return {status:"unresolved",missingDependencies:["deployment_graph_cycle_or_missing_node"],
+      attemptedResolvers:[...new Set(attempts)],witnesses};
+  const rank=new Map(ordered.map((d,index)=>[d.id,index]));
+  const orderedInitializers=[...initializers].sort((a,b)=>
+    (rank.get(a.deploymentId)??Infinity)-(rank.get(b.deploymentId)??Infinity));
+  return {status:"resolved",deployments:ordered,substitutions,bindings,witnesses,
+    initializerOperations:orderedInitializers};
 }
