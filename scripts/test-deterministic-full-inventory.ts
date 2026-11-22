@@ -213,6 +213,20 @@ async function run(){
       assert.equal(initialized.initializerOperations[0].args[0],
         '$deployment:'+initialized.deployments[0].id);
     }
+    // Acquired initializer operation must invoke the actual declared ABI selector.
+    // Solidity contracts may expose init(...) rather than initialize(...).
+    const shortInitAdapter='pragma solidity ^0.8.0; contract Adapter is IAdapter { Token public token; function init(address _token) external { token = Token(_token); } }';
+    const shortInit=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
+      fixtureSources[0],{...fixtureSources[1],content:shortInitAdapter,sha256:hash(shortInitAdapter)},fixtureSources[2]]);
+    assert.equal(shortInit.status,'resolved',
+      'A source-declared init entrypoint with a fully bound dependency must be executable');
+    if(shortInit.status==='resolved'){
+      assert.equal(shortInit.initializerOperations.length,1);
+      assert.equal(shortInit.initializerOperations[0].function,'init(address)',
+        'Never fabricate initialize(address) when the acquired source declares init(address)');
+      assert.equal(shortInit.initializerOperations[0].args[0],
+        '$deployment:'+shortInit.deployments[0].id);
+    }
     // An acquired dependency whose initializer cannot be completely bound
     // must not be reported as an executable fixture.
     const unboundAdapter='pragma solidity ^0.8.0; contract Adapter is IAdapter { constructor(Token token) {} function initialize(string memory configuration) external {} }';
