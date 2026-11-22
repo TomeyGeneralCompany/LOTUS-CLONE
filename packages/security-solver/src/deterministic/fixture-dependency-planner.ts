@@ -316,7 +316,11 @@ export function resolveSourceFixtureDependencies(
         else if(argType==="bool")initArgs.push("false");
         else {missing.push(key+":unsupported_initializer_parameter:"+name);break;}
       }
-      if(initArgs.length===(initializer.parameters||[]).length){
+      if(initArgs.length!==(initializer.parameters||[]).length){
+        // A partially bound initializer is not an executable fixture. The
+        // dependency graph must fail closed instead of reporting resolution.
+        missing.push(key+":incomplete_initializer_arguments");
+      }else{
         const sigTypes=(initializer.parameters||[]).map((p:any)=>p.typeName?.type==="UserDefinedTypeName"?"address":typeOf(p.typeName));
         initializers.push({id:"setup"+(initializers.length+1),deploymentId:id,
           function:"initialize("+sigTypes.join(",")+")",args:initArgs,sender:0});
