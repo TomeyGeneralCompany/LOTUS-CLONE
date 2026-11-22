@@ -480,7 +480,7 @@ export function resolveSourceFixtureDependencies(
       }else{
         const sigTypes=(initializer.parameters||[]).map((p:any)=>p.typeName?.type==="UserDefinedTypeName"?"address":typeOf(p.typeName));
         initializers.push({id:"setup"+(initializers.length+1),deploymentId:id,
-          function:"initialize("+sigTypes.join(",")+")",args:initArgs,sender:0});
+          function:String(initializer.name)+"("+sigTypes.join(",")+")",args:initArgs,sender:0});
       }
     }
     return id;
