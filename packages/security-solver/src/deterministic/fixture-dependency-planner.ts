@@ -79,13 +79,21 @@ export function resolveAcquiredConcreteImplementations(
     .map((node:any)=>({source,node})));
   const sourceByPath=new Map(sources.map(s=>[s.path,s]));
   const importedPaths=(source:SourceSnapshot):Set<string>=>{
-    const paths=new Set<string>([source.path]);
-    for(const imp of (astOf(source)?.children||[]).filter((x:any)=>x.type==="ImportDirective")){
-      const ref=String(imp.path||"");
-      if(!ref)continue;
-      const path=ref.startsWith(".")?
-        posix.normalize(posix.join(posix.dirname(source.path),ref)):ref;
-      if(sourceByPath.has(path))paths.add(path);
+    const paths=new Set<string>();
+    const pending=[source.path];
+    while(pending.length){
+      const current=pending.pop()!;
+      if(paths.has(current))continue;
+      paths.add(current);
+      const acquired=sourceByPath.get(current);
+      if(!acquired)continue;
+      for(const imp of (astOf(acquired)?.children||[]).filter((x:any)=>x.type==="ImportDirective")){
+        const ref=String(imp.path||"");
+        if(!ref)continue;
+        const path=ref.startsWith(".")?
+          posix.normalize(posix.join(posix.dirname(current),ref)):ref;
+        if(sourceByPath.has(path)&&!paths.has(path))pending.push(path);
+      }
     }
     return paths;
   };
