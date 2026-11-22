@@ -2215,12 +2215,14 @@ export function extractSourceInvariantDescriptor(
     .filter((n: any) => n.type === 'StateVariableDeclaration')
     .flatMap((n: any) => n.variables || [])
     .filter((v: any) => v?.name);
-  // A readback is eligible only when the same acquired state is written in
-  // opposite directions by the selected source-witnessed transition pair.
-  // Public getter ABI is derived from the AST, never from an identifier prefix.
-  const pairedStates=new Set(accountingStates.filter(state=>
-    (targetEffect.plus.includes(state)&&effects.get(counterpart.fn)!.minus.includes(state))||
-    (targetEffect.minus.includes(state)&&effects.get(counterpart.fn)!.plus.includes(state))));
+  // The paired transition is established by opposite source-witnessed writes,
+  // but a second ledger may be updated on only one side: that missing write
+  // is precisely the falsifiable BuggyVault-style conservation violation.
+  // Retain every state written by either operation, with ABI shape from AST.
+  const pairedStates=new Set([
+    ...targetEffect.plus,...targetEffect.minus,
+    ...effects.get(counterpart.fn)!.plus,...effects.get(counterpart.fn)!.minus,
+  ]);
   const accountingStateVars=stateDecls.filter((v:any)=>pairedStates.has(String(v.name)));
   const publicTotal=accountingStateVars.find((v:any)=>v.visibility==="public"&&
     v.typeName?.type==="ElementaryTypeName"&&
@@ -2228,15 +2230,12 @@ export function extractSourceInvariantDescriptor(
   const publicBalance=accountingStateVars.find((v:any)=>v.visibility==="public"&&
     v.typeName?.type==="Mapping"&&v.typeName.keyType?.name==="address"&&
     /^uint(?:[0-9]+)?$/.test(String(v.typeName.valueType?.name||"")));
-  const getterDeclared=(name:string,inputs:string[])=>declarations.some(d=>
-    d.operation==="call"&&d.selector===contract.name+"."+name&&
-    JSON.stringify(d.inputs)===JSON.stringify(inputs));
-  const totalGetterDecl=publicTotal&&getterDeclared(publicTotal.name,[])?
-    {operation:"call" as const,selector:contract.name+"."+publicTotal.name,inputs:[] as string[]}:
-    publicTotal?{operation:"call" as const,selector:contract.name+"."+publicTotal.name,inputs:[] as string[]}:undefined;
-  const balanceGetterDecl=publicBalance&&getterDeclared(publicBalance.name,["address"])?
-    {operation:"call" as const,selector:contract.name+"."+publicBalance.name,inputs:["address"]}:
-    publicBalance?{operation:"call" as const,selector:contract.name+"."+publicBalance.name,inputs:["address"]}:undefined;
+  // Solidity generates a getter for a public state declaration even if the
+  // controller's function menu omitted the compiler-generated entry.
+  const totalGetterDecl=publicTotal?
+    {operation:"call" as const,selector:contract.name+"."+publicTotal.name,inputs:[] as string[]}:undefined;
+  const balanceGetterDecl=publicBalance?
+    {operation:"call" as const,selector:contract.name+"."+publicBalance.name,inputs:["address"]}:undefined;
 
   // Source-backed collection and struct-return observations are distinct from
   // scalar balance getters. Admit only a directly witnessed transition.
