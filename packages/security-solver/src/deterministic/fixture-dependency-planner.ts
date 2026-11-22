@@ -70,62 +70,110 @@ export function resolveAcquiredConcreteImplementations(
   abstractSource:SourceSnapshot,abstractContract:string,method:string,
   sources:readonly SourceSnapshot[],
 ):AcquiredConcreteImplementation[]{
-  const ast=astOf(abstractSource);
-  if(!(ast?.children||[]).some((x:any)=>x.type==="ContractDefinition"&&x.name===abstractContract))
-    return [];
-  const result:AcquiredConcreteImplementation[]=[];
-  for(const source of sources){
-    const parsed=astOf(source);if(!parsed)continue;
-    const sameFile=source.path===abstractSource.path;
-    const imports=(parsed.children||[]).filter((x:any)=>x.type==="ImportDirective"&&
-      typeof x.path==="string");
-    const imported=imports.some((x:any)=>{
-      const ref=String(x.path);
-      return ref.startsWith(".") &&
-        posix.normalize(posix.join(posix.dirname(source.path),ref))===abstractSource.path &&
-        (!Array.isArray(x.symbolAliases)||!x.symbolAliases.length||
-          x.symbolAliases.some(([name,alias]:[string,string|null])=>
-            name===abstractContract||(alias||name)===abstractContract));
+  const rootAst=astOf(abstractSource);
+  const root=(rootAst?.children||[]).find((x:any)=>
+    x.type==="ContractDefinition"&&x.name===abstractContract);
+  if(!root)return [];
+  const entries=sources.flatMap(source=>(astOf(source)?.children||[])
+    .filter((node:any)=>node.type==="ContractDefinition")
+    .map((node:any)=>({source,node})));
+  const sourceByPath=new Map(sources.map(s=>[s.path,s]));
+  const importedPaths=(source:SourceSnapshot):Set<string>=>{
+    const paths=new Set<string>([source.path]);
+    for(const imp of (astOf(source)?.children||[]).filter((x:any)=>x.type==="ImportDirective")){
+      const ref=String(imp.path||"");
+      if(!ref)continue;
+      const path=ref.startsWith(".")?
+        posix.normalize(posix.join(posix.dirname(source.path),ref)):ref;
+      if(sourceByPath.has(path))paths.add(path);
+    }
+    return paths;
+  };
+  const entryByIdentity=new Map(entries.map(e=>[e.source.path+":"+e.node.name,e]));
+  const basesOf=(entry:ContractEntry):ContractEntry[][]=>{
+    const reachable=importedPaths(entry.source);
+    return (entry.node.baseContracts||[]).map((b:any)=>{
+      const baseName=String(b.baseName?.namePath||"").split(".").pop();
+      return entries.filter(e=>e.node.name===baseName&&
+        reachable.has(e.source.path)&&e.node!==entry.node);
     });
-    if(!sameFile&&!imported)continue;
-    for(const node of (parsed.children||[]).filter((x:any)=>x.type==="ContractDefinition")){
-      if(!isConcrete(node)||node.name===abstractContract)continue;
-      const base=(node.baseContracts||[]).some((b:any)=>
-        b.baseName?.namePath===abstractContract);
-      if(!base)continue;
-      const fn=(node.subNodes||[]).find((x:any)=>x.type==="FunctionDefinition"&&
-        x.name===method&&x.body&&["external","public"].includes(x.visibility));
-      // A concrete deployed subclass also contains fully implemented methods
-      // inherited from an acquired abstract base. Test that actual inherited
-      // code, never an interface declaration or a synthetic stub.
-      const inherited=(ast?.children||[])
-        .find((x:any)=>x.type==="ContractDefinition"&&x.name===abstractContract)
-        ?.subNodes?.find((x:any)=>x.type==="FunctionDefinition"&&
-          x.name===method&&x.body&&["external","public"].includes(x.visibility));
-      if(!fn&&!inherited)continue;
-      const proof=fn||inherited;
-      const scalarAbi=(p:any):string|null=>{
-        const type=p?.typeName;
-        if(type?.type==="UserDefinedTypeName")return "address";
-        const kind=String(type?.name||"");
-        if(kind==="uint")return "uint256";
-        if(kind==="int")return "int256";
-        if(kind==="address"||kind==="bool"||kind==="string"||kind==="bytes"||
-          /^(?:u?int[0-9]{1,3}|bytes(?:[1-9]|[12][0-9]|3[012]))$/.test(kind))
-          return kind;
-        return null;
-      };
-      const declaredTypes=(proof.parameters||[]).map(scalarAbi);
-      if(declaredTypes.some((value:string|null)=>value===null))continue;
-      const proofSource=fn?source:abstractSource;
-      result.push({path:source.path,contract:node.name,
-        selector:node.name+"."+method,sourceSha256:source.sha256,
-        inputs:declaredTypes as string[],
-        witness:proofSource.path+":"+proofSource.sha256+":"+
-          String(proof.loc?.start?.line||1)+":"+String(proof.loc?.end?.line||1)});
+  };
+  const scalarAbi=(p:any):string|null=>{
+    const type=p?.typeName;
+    if(type?.type==="UserDefinedTypeName")return "address";
+    const kind=String(type?.name||"");
+    if(kind==="uint")return "uint256";
+    if(kind==="int")return "int256";
+    if(kind==="address"||kind==="bool"||kind==="string"||kind==="bytes"||
+      /^(?:u?int[0-9]{1,3}|bytes(?:[1-9]|[12][0-9]|3[012]))$/.test(kind))
+      return kind;
+    return null;
+  };
+  const identities=(fn:any):string|null=>{
+    const types=(fn.parameters||[]).map(scalarAbi);
+    return types.some((type:string|null)=>type===null)?null:
+      String(fn.name)+"("+types.join(",")+")";
+  };
+  const targetFunctions=(root.subNodes||[]).filter((n:any)=>
+    n.type==="FunctionDefinition"&&n.name===method);
+  if(!targetFunctions.length)return [];
+  const targetIds=new Set(targetFunctions.map(identities).filter(Boolean));
+  const result:AcquiredConcreteImplementation[]=[];
+  for(const candidate of entries){
+    if(candidate.node.name===abstractContract&&candidate.source.path===abstractSource.path)continue;
+    if(candidate.node.kind==="interface"||candidate.node.kind==="library"||candidate.node.abstract)continue;
+    const traversed=new Set<string>(),chain:ContractEntry[]=[];
+    let invalid=false;
+    const walk=(entry:ContractEntry):void=>{
+      const key=entry.source.path+":"+entry.node.name;
+      if(traversed.has(key))return;
+      traversed.add(key);chain.push(entry);
+      for(const choices of basesOf(entry)){
+        // Ambiguous names cannot prove an inheritance edge.
+        if(choices.length!==1){invalid=true;continue;}
+        walk(choices[0]);
+      }
+    };
+    walk(candidate);
+    if(invalid||!chain.some(e=>e.source.path===abstractSource.path&&
+      e.node.name===abstractContract))continue;
+    const implemented=new Map<string,{entry:ContractEntry;fn:any}>();
+    const declarations=new Set<string>();
+    for(const entry of [...chain].reverse()){
+      for(const fn of (entry.node.subNodes||[]).filter((n:any)=>
+        n.type==="FunctionDefinition"&&!n.isConstructor&&n.name)){
+        const id=identities(fn);
+        if(!id){invalid=true;continue;}
+        declarations.add(id);
+        if(fn.body)implemented.set(id,{entry,fn});
+        else implemented.delete(id);
+      }
+      for(const variable of (entry.node.subNodes||[])
+        .filter((n:any)=>n.type==="StateVariableDeclaration")
+        .flatMap((n:any)=>n.variables||[])){
+        if(variable.visibility==="public"&&variable.name){
+          // A public scalar generates a getter satisfying a base declaration.
+          const typ=variable.typeName;
+          if(typ?.type==="ElementaryTypeName")implemented.set(
+            variable.name+"()",{entry,fn:variable});
+        }
+      }
+    }
+    if(invalid||[...declarations].some(id=>!implemented.has(id)))continue;
+    for(const id of targetIds){
+      const proof=implemented.get(id);
+      if(!proof||proof.fn.type!=="FunctionDefinition"||!proof.fn.body)continue;
+      const types=(proof.fn.parameters||[]).map(scalarAbi);
+      if(types.some((type:string|null)=>type===null))continue;
+      result.push({path:candidate.source.path,contract:candidate.node.name,
+        selector:candidate.node.name+"."+method,sourceSha256:candidate.source.sha256,
+        inputs:types as string[],
+        witness:proof.entry.source.path+":"+proof.entry.source.sha256+":"+
+          String(proof.fn.loc?.start?.line||1)+":"+String(proof.fn.loc?.end?.line||1)});
     }
   }
-  return result.sort((a,b)=>a.path.localeCompare(b.path)||a.contract.localeCompare(b.contract));
+  return result.sort((a,b)=>a.path.localeCompare(b.path)||
+    a.contract.localeCompare(b.contract)||a.inputs.join(",").localeCompare(b.inputs.join(",")));
 }
 export interface AcquiredInterfaceCaller {
   path:string;selector:string;sourceSha256:string;interfaceName:string;
