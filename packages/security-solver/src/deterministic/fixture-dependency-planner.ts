@@ -27,7 +27,7 @@ const ctorOf=(node:any)=>(node.subNodes||[]).find((x:any)=>x.type==="FunctionDef
 const initOf=(node:any)=>(node.subNodes||[]).find((x:any)=>x.type==="FunctionDefinition"&&
   /^(?:initialize|init)$/i.test(x.name||"")&&x.body&&["public","external"].includes(x.visibility));
 const isConcrete=(node:any)=>node?.type==="ContractDefinition"&&
-  node.kind!=="interface"&&node.kind!=="library"&&!node.abstract&&
+  node.kind!=="interface"&&node.kind!=="library"&&!node.abstract&&!node.isAbstract&&
   !(node.subNodes||[]).some((x:any)=>x.type==="FunctionDefinition"&&!x.body);
 function descendants(node:any):any[]{
   const out:any[]=[];const visited=new Set<any>();
@@ -128,7 +128,7 @@ export function resolveAcquiredConcreteImplementations(
   const result:AcquiredConcreteImplementation[]=[];
   for(const candidate of entries){
     if(candidate.node.name===abstractContract&&candidate.source.path===abstractSource.path)continue;
-    if(candidate.node.kind==="interface"||candidate.node.kind==="library"||candidate.node.abstract)continue;
+    if(!isConcrete(candidate.node))continue;
     const traversed=new Set<string>(),chain:ContractEntry[]=[];
     let invalid=false;
     const walk=(entry:ContractEntry):void=>{
