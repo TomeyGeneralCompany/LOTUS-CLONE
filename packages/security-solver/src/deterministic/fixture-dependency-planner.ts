@@ -379,9 +379,10 @@ export function resolveSourceFixtureDependencies(
   let nextDeploymentId=1;
   // Prove caller demand from the acquired source, not from a guessed fixture.
   const requiredReceiverMethods=new Map<string,string[]>();
-  for(const binding of initializerStateBindings(targetNode)){
+  const targetBindings=initializerStateBindings(targetNode);
+  for(const binding of targetBindings){
     const methods=[...target.content.matchAll(new RegExp(
-      "\\\\b"+binding.receiver+"\\\\s*\\\\.\\\\s*([A-Za-z_][A-Za-z0-9_]*)\\\\s*\\\\(","g"))]
+      "\\b"+binding.receiver+"\\s*\\.\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(","g"))]
       .map(match=>match[1]);
     requiredReceiverMethods.set(binding.receiver,[...new Set(methods)]);
   }
@@ -392,7 +393,7 @@ export function resolveSourceFixtureDependencies(
     const choices=scanned.filter(({node})=>isConcrete(node)&&extendsType(node,typ));
     // A source-proven ABI can distinguish concrete implementations. Without
     // proof, multiple candidates remain ambiguous rather than guessed.
-    const receiverMethods=[...new Set(bindings.filter(b=>b.typeName===typ)
+    const receiverMethods=[...new Set(targetBindings.filter(b=>b.typeName===typ)
       .flatMap(b=>requiredReceiverMethods.get(b.receiver)||[]))];
     const qualified=choices.length>1&&receiverMethods.length?
       choices.filter(choice=>verifyAcquiredReceiverMethods(typ,receiverMethods,
@@ -452,7 +453,6 @@ export function resolveSourceFixtureDependencies(
   };
   // Constructor and initializer parameter-to-state assignments establish a
   // binding edge. Arbitrary address arguments are never treated as dependencies.
-  const targetBindings=initializerStateBindings(targetNode);
   const params=[...(ctorOf(targetNode)?.parameters||[])];
   for(const p of params)if(p.typeName?.type==="UserDefinedTypeName"){
     const name=String(p.name||""),typ=typeOf(p.typeName),dep=resolve(typ,0);
