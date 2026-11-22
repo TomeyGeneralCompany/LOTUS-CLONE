@@ -465,6 +465,22 @@ contract UnlinkedMarket {
     assert.equal(witnessedCallers[0].selector,'Market.deposit');
     assert.equal(witnessedCallers[0].receiver,'cToken');
     assert.equal(witnessedCallers[0].sourceSha256,callerSnap.sha256);
+    const intermediateText='pragma solidity ^0.8.20; import "./ICToken.sol";';
+    const transitiveText=`pragma solidity ^0.8.20;
+import "./Intermediate.sol";
+contract TransitiveMarket {
+  ICToken public cToken;
+  function deposit(uint256 amount) external { require(cToken.mint(amount)==0); }
+}`;
+    const intermediateSnap={path:'source-1/contracts/Intermediate.sol',
+      content:intermediateText,sha256:hash(intermediateText)};
+    const transitiveSnap={path:'source-1/contracts/TransitiveMarket.sol',
+      content:transitiveText,sha256:hash(transitiveText)};
+    const transitiveCallers=resolveAcquiredInterfaceCallers(icSnap,'ICToken','mint',
+      [icSnap,intermediateSnap,transitiveSnap,fakeSnap]);
+    assert.deepEqual(transitiveCallers.map(x=>x.selector),['TransitiveMarket.deposit'],
+      'An acquired transitive import must preserve a real interface call witness');
+    assert.equal(transitiveCallers[0].sourceSha256,transitiveSnap.sha256);
     assert.equal(resolveAcquiredInterfaceCallers(icSnap,'ICToken','burn',
       [icSnap,callerSnap]).length,0,'No invented interface method');
     // One target can have multiple independently source-proven opposing
