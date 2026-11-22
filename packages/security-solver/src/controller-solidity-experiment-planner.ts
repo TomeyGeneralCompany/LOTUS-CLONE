@@ -11,7 +11,7 @@ import type {SoliditySequence} from './solidity-sequence';
 import {sourceGroundedSolidityProbes} from './controller-solidity-security-probes';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
 import {extractAccountingObservations} from './deterministic/accounting-observations';
-import {resolveSourceFixtureDependencies, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies, verifyAcquiredReceiverMethods, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
 
 export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
@@ -2198,8 +2198,13 @@ export function extractSourceInvariantDescriptor(
   const dependencyPlan=resolveSourceFixtureDependencies(snapshot,contract.name,[...sources.values()]);
   const unresolvedRemaining=unresolvedExt.filter(call=>{
     if(dependencyPlan.status!=="resolved")return true;
-    const recv=call.split('.')[0];
-    return !Object.prototype.hasOwnProperty.call(dependencyPlan.substitutions,recv);
+    const [recv,methodCalled]=call.split('.');
+    const binding=dependencyPlan.bindings.find(b=>b.receiver===recv);
+    if(!binding||dependencyPlan.substitutions[recv]!=='$deployment:'+binding.deploymentId)return true;
+    const deployment=dependencyPlan.deployments.find(d=>d.id===binding.deploymentId);
+    if(!deployment)return true;
+    return !verifyAcquiredReceiverMethods(binding.typeName,[methodCalled],
+      deployment.file,deployment.contract,[...sources.values()]).ok;
   });
   if (unresolvedRemaining.length > 0) {
     return {
