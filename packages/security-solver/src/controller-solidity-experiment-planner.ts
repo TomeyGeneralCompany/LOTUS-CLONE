@@ -2075,9 +2075,14 @@ export function extractSourceInvariantDescriptor(
       !['view', 'pure'].includes(n.stateMutability || '') &&
       n.body,
   );
-  const accountingStates=allNodes.filter((n:any)=>n.type==='StateVariableDeclaration')
-    .flatMap((n:any)=>n.variables||[]).map((v:any)=>String(v.name||''))
-    .filter(name=>/^(?:total|balance|deposit|share|reserve|principal|stake|asset|debt)/i.test(name));
+  // State names do not establish accounting semantics. Discover every declared
+  // state lvalue and let witnessed opposite writes determine candidates; a
+  // lexical prefix filter silently discards real acquired ledgers.
+  const accountingStates=[...new Set(allNodes
+    .filter((n:any)=>n.type==='StateVariableDeclaration')
+    .flatMap((n:any)=>n.variables||[])
+    .map((v:any)=>String(v.name||''))
+    .filter(name=>/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)))];
   const targetFn = fns.find((n: any) => n.name === method &&
     (!selectedTargetSignature || canonicalFunctionIdentity(n)===selectedTargetSignature));
   if (!targetFn) {
