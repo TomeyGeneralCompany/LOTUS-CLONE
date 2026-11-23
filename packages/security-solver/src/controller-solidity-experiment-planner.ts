@@ -3969,6 +3969,14 @@ export function sourcePreparationGraph(
   for(const ref of sequence.constructorArgs.flatMap(dependencies))
     if(!availableIds.has(ref))
       return reject('Target constructor references unacquired deployment: '+ref);
+  if(sequence.factoryClone)
+    for(const ref of sequence.factoryClone.args.flatMap(dependencies))
+      if(!availableIds.has(ref))
+        return reject('Source factory arguments reference unacquired deployment: '+ref);
+  for(const check of preparation?.checks||[])
+    for(const ref of dependencies(check.expect))
+      if(!availableIds.has(ref))
+        return reject('Preparation readback expects an unacquired deployment: '+ref);
   const appendTarget=():void=>{
     if(!target||!contract)return;
     // The target cannot exist before every declared prerequisite deployment,
