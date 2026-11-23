@@ -29,7 +29,7 @@ import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
-import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers} from "./deterministic/fixture-dependency-planner";
+import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,enumerateAcquiredInheritedAbi} from "./deterministic/fixture-dependency-planner";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
 async function recordToolActivity(logFile:string,event:Record<string,unknown>):Promise<void> {
@@ -435,11 +435,25 @@ export async function runLocalAudit(
             // they aren't declared in the subclass file. The verified base's
             // AST signature is still in the compiled subclass ABI.
             const discovered=deterministicDeclarationsCache.get(target.path)||[];
-            const implMenu=discovered.some(d=>
-              d.selector===target.selector&&d.operation===target.operation&&
-              JSON.stringify(d.inputs)===JSON.stringify(target.inputs))
-              ?discovered:[...discovered,{selector:target.selector,
-                operation:target.operation,inputs:target.inputs}];
+            // Every inherited method supplied to the subclass menu comes
+            // from an authenticated actual acquired base declaration. This
+            // includes source-proven ownership getters and prerequisite
+            // transfer methods, not only the single abstract target method.
+            const acquiredBaseAbi=enumerateAcquiredInheritedAbi(rootSource,
+              abstractContract,target.contract,deterministicSourceSnapshots);
+            const implMenu=[...discovered];
+            for(const method of acquiredBaseAbi){
+              if(!implMenu.some(d=>d.selector===method.selector&&
+                d.operation===method.operation&&
+                JSON.stringify(d.inputs)===JSON.stringify(method.inputs)))
+                implMenu.push({selector:method.selector,
+                  operation:method.operation,inputs:method.inputs});
+            }
+            if(!implMenu.some(d=>d.selector===target.selector&&
+              d.operation===target.operation&&
+              JSON.stringify(d.inputs)===JSON.stringify(target.inputs)))
+              implMenu.push({selector:target.selector,operation:target.operation,
+                inputs:target.inputs});
             const candidate=constructSolidityExperiments({
               repositoryCommit:lead.sourceCommit,targetPath:target.path,
               targetSelector:target.selector,sources:deterministicSourceSnapshots,
