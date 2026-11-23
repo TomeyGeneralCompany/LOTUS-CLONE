@@ -441,6 +441,37 @@ contract ConstantBoundedCaller {
       assert.deepEqual(sourceConstrained.deployments.find(x=>x.contract==='ConstantBounded')?.constructorArgs,
         ['1000000001'],'10**9 constant precondition must be evaluated precisely');
     }
+    // Imported namespaced structs and enums have UDT AST nodes but are
+    // compiler ABI VALUES, never concrete receiver deployments.
+    const importedTypesSource=`pragma solidity ^0.8.0;
+library SharedTypes {
+  struct Choice { uint256 value; bool active; }
+  enum Status { Pending, Active }
+}`;
+    const importedValueConsumer=`pragma solidity ^0.8.0;
+import "./SharedTypes.sol";
+contract ImportedValues {
+  SharedTypes.Choice public choice;
+  SharedTypes.Status public status;
+  function initialize(SharedTypes.Choice memory selected,SharedTypes.Status mode) external {
+    choice = selected;
+    status = mode;
+  }
+}`;
+    const importedValueSources=[
+      {path:'source-1/contracts/SharedTypes.sol',
+        content:importedTypesSource,sha256:hash(importedTypesSource)},
+      {path:'source-1/contracts/ImportedValues.sol',
+        content:importedValueConsumer,sha256:hash(importedValueConsumer)}
+    ];
+    const importedValues=resolveSourceFixtureDependencies(importedValueSources[1],
+      'ImportedValues',importedValueSources);
+    assert.equal(importedValues.status,'resolved',
+      'Acquired imported struct/enum variables must not generate contract fixture requirements');
+    if(importedValues.status==='resolved'){
+      assert.deepEqual(importedValues.deployments,[]);
+      assert.deepEqual(importedValues.bindings,[]);
+    }
     // A Solidity user-defined type may be a struct or enum, not an address.
     // Exact imported ABI identities are required for concrete receivers.
     const shapeTypes=`pragma solidity ^0.8.0;
