@@ -2197,11 +2197,13 @@ function accountingDirections(text:string,state:string):{increase:boolean;decrea
  * A shared symbol or a different mapping index is never enough for admission. */
 function sourceExactAccountingDelta(
   text:string,state:string,amount:string,direction:"increase"|"decrease",
-  accountKey:""|"msg.sender"=""
+  accountKey:string=""
 ):boolean {
   if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state)||
     !/^(?:[A-Za-z_][A-Za-z0-9_]*|msg\.value)$/.test(amount))return false;
-  const key=accountKey==="msg.sender"?"\\s*\\[\\s*msg\\.sender\\s*\\]":"";
+  if(accountKey&&accountKey!=="msg.sender"&&!identifier.test(accountKey))return false;
+  const key=accountKey==="msg.sender"?String.raw`\\s*\\[\\s*msg\\.sender\\s*\\]`:
+    accountKey?String.raw`\\s*\\[\\s*`+accountKey+String.raw`\\s*\\]`:"";
   const ref="\\b"+state+key;
   const value=amount==="msg.value"?"msg\\.value":amount;
   const op=direction==="increase"?"\\+":"-";
