@@ -1223,6 +1223,44 @@ contract GuardedNFT is ERC721URIStorageUpgradeable, OwnableUpgradeable {
     // than +=. That is still a falsifiable getter-backed property.
     // A private accounting scalar may still have a strictly equivalent,
     // source-declared view readback. Getter identity must be exact.
+    const privatePairSource=`pragma solidity ^0.8.0;
+contract PrivatePair {
+  uint256 private stored;
+  function remaining() external view returns(uint256) { return stored; }
+  function increase(uint256 amount) external { stored += amount; }
+  function decrease(uint256 amount) external { stored -= amount; }
+  function decreaseUnrelated(uint256 amount) external { other -= amount; }
+  uint256 private other;
+}`;
+    const privatePairSnap={path:'source-1/contracts/PrivatePair.sol',
+      content:privatePairSource,sha256:hash(privatePairSource)};
+    const pairMenu=[
+      {selector:'PrivatePair.remaining',operation:'call',inputs:[]},
+      {selector:'PrivatePair.increase',operation:'send',inputs:['uint256']},
+      {selector:'PrivatePair.decrease',operation:'send',inputs:['uint256']},
+      {selector:'PrivatePair.decreaseUnrelated',operation:'send',inputs:['uint256']}
+    ];
+    for(const method of ['increase','decrease']){
+      const pair=constructSolidityExperiments({
+        repositoryCommit:'b'.repeat(40),targetPath:privatePairSnap.path,
+        targetSelector:'PrivatePair.'+method,sources:[privatePairSnap],
+        declarations:pairMenu as any,skipLegacy:true});
+      assert.equal(pair.ok,true,'Paired scalar transition source must be executable: '+method);
+      if(pair.ok)assert.ok(pair.experiments.some(e=>
+        e.securityProperty.startsWith('source-paired scalar conservation')&&
+        e.sequence.steps.some(step=>step.operation==='call'&&
+          step.function==='remaining()'&&step.expect==='0')&&
+        e.sequence.steps.filter(step=>step.operation==='send').length===2),
+        'Opposite writes to a single private state must produce source-proven paired evidence');
+    }
+    const mismatchedPair=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:privatePairSnap.path,
+      targetSelector:'PrivatePair.decreaseUnrelated',sources:[privatePairSnap],
+      declarations:pairMenu as any,skipLegacy:true});
+    assert.ok(!mismatchedPair.ok||!mismatchedPair.experiments.some(e=>
+      e.securityProperty.startsWith('source-paired scalar conservation')&&
+      e.securityProperty.endsWith(':stored')),
+      'Two different storage variables cannot be conflated into conservation');
     const privateScalarText=`pragma solidity ^0.8.0;
 contract PrivateScalar {
   uint256 private accumulated;
