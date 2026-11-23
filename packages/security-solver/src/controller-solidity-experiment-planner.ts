@@ -3211,10 +3211,12 @@ function sourceInternalMappingSetterExperiments(
   const indexPath=(n:any):{name:string;keys:string[]}|null=>{
     if(n?.type==='Identifier'&&identifier.test(n.name||''))
       return {name:n.name,keys:[]};
-    if(n?.type!=='IndexAccess'||n.index?.type!=='Identifier')return null;
+    if(n?.type!=='IndexAccess')return null;
+    const name=n.index?.type==='Identifier'?String(n.index.name||''):
+      isMsgSender(n.index)?'msg.sender':'';
     const parent=indexPath(n.base);
-    return parent&&identifier.test(n.index.name||'')?
-      {name:parent.name,keys:[...parent.keys,n.index.name]}:null;
+    return parent&&(identifier.test(name)||name==='msg.sender')?
+      {name:parent.name,keys:[...parent.keys,name]}:null;
   };
   const functions=nodes.filter(n=>n.type==='FunctionDefinition'&&n.name&&n.body);
   const getterCandidates=functions.filter(fn=>
@@ -3259,6 +3261,7 @@ function sourceInternalMappingSetterExperiments(
     const helperParams:any[]=helper.parameters||[];
     const bindings=new Map<string,string>();
     let valid=true;
+    let incrementalRead:{name:string;keys:string[]}|null=null;
     for(let i=0;i<helperParams.length;i++){
       const argument=call.arguments[i];
       let sourceValue:string|null=null;
@@ -3266,9 +3269,16 @@ function sourceInternalMappingSetterExperiments(
         sourceValue='$account2';
       else if(argument.type==='Identifier'&&argument.name===params[1].name)
         sourceValue='7';
-      else if(argument.type==='MemberAccess'&&argument.memberName==='sender'&&
-        argument.expression?.type==='Identifier'&&argument.expression.name==='msg')
+      else if(isMsgSender(argument))
         sourceValue='$account0';
+      else if(argument.type==='BinaryOperation'&&argument.operator==='+'&&
+        argument.right?.type==='Identifier'&&
+        argument.right.name===params[1].name){
+        // Exact existing mapping read plus the supplied source amount.
+        // The EVM pre-readback must prove the zero baseline before the send.
+        incrementalRead=indexPath(argument.left);
+        if(incrementalRead)sourceValue='7';
+      }
       if(!sourceValue||!identifier.test(helperParams[i].name||'')){
         valid=false;break;
       }
@@ -3289,6 +3299,11 @@ function sourceInternalMappingSetterExperiments(
     const resolvedKeys=left.keys.map(name=>bindings.get(name));
     if(resolvedKeys.some(value=>value!=='$account0'&&value!=='$account2')||
       new Set(resolvedKeys).size!==2)continue;
+    if(incrementalRead&&(
+      incrementalRead.name!==left.name||
+      incrementalRead.keys.length!==2||
+      incrementalRead.keys[0]!=='msg.sender'||
+      incrementalRead.keys[1]!==params[0].name))continue;
     for(const getter of getterCandidates){
       const ret=indexPath(getter.body.statements[0].expression);
       const readerParams:any[]=getter.parameters||[];
