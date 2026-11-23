@@ -695,7 +695,17 @@ function publicGetter(variable:any,owner:ContractEntry,
     }
   }
   const output=callableType(type,owner,entries);
-  return output?{identity:variable.name+"("+inputs.join(",")+")",returns:[output]}:null;
+  if(!output)return null;
+  // Solidity public STRUCT getters return an ABI list of elementary fields,
+  // not a single tuple output. Flatten only the known all-scalar shape;
+  // nested mappings/tuples remain unresolved pending compiler ABI evidence.
+  if(type?.type==="UserDefinedTypeName"&&
+    output.startsWith("(")&&output.endsWith(")")){
+    const fields=output.slice(1,-1).split(",");
+    if(!fields.length||fields.some(t=>!t||/[()[\]]/.test(t)))return null;
+    return {identity:variable.name+"("+inputs.join(",")+")",returns:fields};
+  }
+  return {identity:variable.name+"("+inputs.join(",")+")",returns:[output]};
 }
 function callableIdentity(fn:any,owner:ContractEntry,entries:readonly ContractEntry[]):string|null {
   const types=callableTypes(fn.parameters||[],owner,entries);
