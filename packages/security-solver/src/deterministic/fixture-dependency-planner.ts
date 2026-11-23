@@ -589,10 +589,36 @@ export function resolveAcquiredInterfaceCallers(
     if(!importProof)continue;
     for(const contract of (ast.children||[]).filter((x:any)=>
       x.type==='ContractDefinition'&&x.kind!=='interface'&&x.kind!=='library')){
-      const receivers=(contract.subNodes||[]).filter((x:any)=>
-        x.type==='StateVariableDeclaration').flatMap((x:any)=>x.variables||[])
-        .filter((v:any)=>v.typeName?.type==='UserDefinedTypeName'&&
-          v.typeName.namePath===interfaceName).map((v:any)=>String(v.name));
+      // The caller can reference a receiver declared in an acquired base
+      // contract. Resolve each inherited source edge through the same
+      // authenticated import closure; never borrow a same-named foreign base.
+      const getReceivers=(node:any,ownerPath:string,
+        seen=new Set<string>(),depth=0):string[]=>{
+        const key=ownerPath+':'+String(node.name||'');
+        if(seen.has(key)||depth>12)return [];
+        seen.add(key);
+        const own=(node.subNodes||[])
+          .filter((x:any)=>x.type==='StateVariableDeclaration')
+          .flatMap((x:any)=>x.variables||[])
+          .filter((v:any)=>v.typeName?.type==='UserDefinedTypeName'&&
+            v.typeName.namePath===interfaceName)
+          .map((v:any)=>String(v.name));
+        for(const base of node.baseContracts||[]){
+          const baseName=String(base.baseName?.namePath||'').split('.').pop();
+          if(!baseName)continue;
+          const possible=sources.flatMap(candidate=>
+            (astOf(candidate)?.children||[])
+              .filter((item:any)=>item.type==='ContractDefinition'&&item.name===baseName)
+              .map((item:any)=>({source:candidate,node:item})))
+            .filter(candidate=>reachable.has(candidate.source.path));
+          const local=possible.filter(candidate=>candidate.source.path===ownerPath);
+          const eligible=local.length?local:possible;
+          if(eligible.length!==1)continue;
+          own.push(...getReceivers(eligible[0].node,eligible[0].source.path,seen,depth+1));
+        }
+        return own;
+      };
+      const receivers=[...new Set(getReceivers(contract,source.path))];
       if(!receivers.length)continue;
       for(const fn of (contract.subNodes||[]).filter((x:any)=>
         x.type==='FunctionDefinition'&&x.body&&x.name&&
