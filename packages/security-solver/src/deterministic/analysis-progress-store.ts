@@ -54,7 +54,9 @@ export interface CandidateCoverage {
 }
 
 export interface AnalysisProgressSnapshot {
-  version:1|2|3|4; inventoryFingerprint:string;
+  version:1|2|3|4|5; inventoryFingerprint:string;
+  /** Explicitly version the source-property interpreter, independently of the acquired program SHA. */
+  analysisEngineRevision?:string;
   candidateIds:string[]; records:CandidateProgress[];
   processedBatches:number; completedExperimentIds:string[];
 }
@@ -68,7 +70,8 @@ export class AnalysisProgressStore {
   readonly inventoryFingerprint:string;
   processedBatches=0;
   readonly completedExperimentIds=new Set<string>();
-  private constructor(readonly path:string,candidates:readonly AnalysisCandidate[]) {
+  private constructor(readonly path:string,candidates:readonly AnalysisCandidate[],
+    readonly analysisEngineRevision:string) {
     this.candidates=[...candidates];
     this.inventoryFingerprint=fingerprint(candidates);
     for(const c of candidates)this.records.set(c.id,{
@@ -76,20 +79,24 @@ export class AnalysisProgressStore {
       lifecycle:"queued",attempts:0,properties:[],experimentIds:[],
     });
   }
-  static async open(path:string,candidates:readonly AnalysisCandidate[]):Promise<AnalysisProgressStore>{
-    const store=new AnalysisProgressStore(path,candidates);
+  static async open(path:string,candidates:readonly AnalysisCandidate[],
+    analysisEngineRevision="source-property-engine-v5"):Promise<AnalysisProgressStore>{
+    if(!analysisEngineRevision.trim())
+      throw new Error("ANALYSIS_ENGINE_REVISION_REQUIRED");
+    const store=new AnalysisProgressStore(path,candidates,analysisEngineRevision);
     let raw:string;
     try{raw=await readFile(path,"utf8");}
     catch(e){if((e as NodeJS.ErrnoException).code==="ENOENT")return store;throw e;}
     const parsed=JSON.parse(raw) as AnalysisProgressSnapshot;
     // V1 snapshots contain valid source identities but lack the V2 terminality contract.
     // Preserve their candidate lifecycles and upgrade the schema on the next save.
-    if(![1,2,3,4].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
+    if(![1,2,3,4,5].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
        JSON.stringify([...parsed.candidateIds].sort())!==JSON.stringify([...store.records.keys()].sort()))
       throw new Error("ANALYSIS_CHECKPOINT_SOURCE_MISMATCH: source inventory or revision changed");
     if(!Array.isArray(parsed.records)||parsed.records.length!==candidates.length||
        new Set(parsed.records.map(x=>x.id)).size!==candidates.length)
       throw new Error("ANALYSIS_CHECKPOINT_CORRUPT: candidate set");
+    const engineChanged=parsed.analysisEngineRevision!==analysisEngineRevision;
     for(const r of parsed.records){
       const orig=store.records.get(r.id);
       if(!orig||orig.sourceCommit!==r.sourceCommit||orig.sourceSha256!==r.sourceSha256)
@@ -116,6 +123,16 @@ export class AnalysisProgressStore {
         store.pruneSubsumedWitnesslessProperties(r);
         if(store.isConclusive(r)){
           r.lifecycle="experiment_completed";
+        } else if(store.hasSourceUnavailableEvidence(r)){
+          r.lifecycle="source_unavailable";
+        } else if(engineChanged){
+          // A new source-property interpreter must reassess every unresolved
+          // immutable lead; a resumed cached assessment is not a new analysis.
+          // Keep EVM transcripts, inconclusive attempts, source witnesses and
+          // unresolved obligations as durable audit history until independently
+          // verified source evidence supersedes them.
+          r.lifecycle="queued";
+          r.lastError="reassessment_required_for_engine_revision:"+analysisEngineRevision;
         } else if(["experiment_completed","analysis_exhausted","blocked"].includes(r.lifecycle)){
           r.lifecycle="dependencies_pending";
         }
@@ -543,7 +560,8 @@ export class AnalysisProgressStore {
     return eligible.slice(0,max);
   }
   async save():Promise<void>{
-    const state:AnalysisProgressSnapshot={version:4,inventoryFingerprint:this.inventoryFingerprint,
+    const state:AnalysisProgressSnapshot={version:5,analysisEngineRevision:this.analysisEngineRevision,
+      inventoryFingerprint:this.inventoryFingerprint,
       candidateIds:[...this.records.keys()],records:[...this.records.values()],
       processedBatches:this.processedBatches,completedExperimentIds:[...this.completedExperimentIds]};
     await mkdir(dirname(this.path),{recursive:true});
