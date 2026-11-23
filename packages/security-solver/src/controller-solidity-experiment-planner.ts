@@ -854,7 +854,7 @@ function guardedErc721BurnExperiment(
   // the acquired NFT source declares only its own functions. Admit the known
   // inherited getters solely when BOTH the canonical OpenZeppelin import and
   // corresponding explicit Solidity base contract are source-proven.
-  const inheritedNames=new Set((contract.baseContracts||[])
+  const inheritedNames=new Set<string>((contract.baseContracts||[])
     .map((base:any)=>String(base.baseName?.namePath||'')));
   const inheritedOwnerGetter=oz.has('ownable_upgradeable')&&
     inheritedNames.has('OwnableUpgradeable');
