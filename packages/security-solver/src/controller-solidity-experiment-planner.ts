@@ -3037,6 +3037,86 @@ function sourceMappingDeltaExperiments(
         if(!supported)continue;
         const targetKey=key==='msg.sender'?'$account0':'$account2';
         const signature=canonicalFunctionIdentity(fn);
+        // A checked increase with an acquired supply precondition must be
+        // funded before testing. Executing it against zero supply yields a
+        // revert observation, not an experiment on its source-defined branch.
+        // Admit a funding pathway only when both independent storage writes
+        // and the guard are visible in the same acquired contract.
+        const totals=nodes.filter(n=>n.type==='StateVariableDeclaration')
+          .flatMap(n=>n.variables||[]).filter((v:any)=>
+            v.visibility==='public'&&identifier.test(v.name||'')&&
+            v.typeName?.type==='ElementaryTypeName'&&
+            /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||''));
+        const constrained=totals.find(total=>{
+          const amount=amountParam.name.replace(/[.*+?^{}$()|[\]\\]/g,'\\        const steps:SoliditySequence['steps']=[];');
+          const state=total.name.replace(/[.*+?^{}$()|[\]\\]/g,'\\        const steps:SoliditySequence['steps']=[];');
+          return new RegExp(String.raw`\b`+amount+
+            String.raw`\s*>\s*0\s*&&\s*`+amount+
+            String.raw`\s*<=\s*`+state).test(methodSource)&&
+            sourceExactAccountingDelta(methodSource,total.name,amountParam.name,'decrease');
+        });
+        if(constrained){
+          const candidate=nodes.filter(n=>n.type==='FunctionDefinition'&&
+            n.name!==method&&n.body&&['external','public'].includes(n.visibility)&&
+            !(n.modifiers||[]).length&&(n.parameters||[]).length===2);
+          const acquiredFunding=candidate.flatMap((fund:any)=>{
+            const p:any[]=fund.parameters||[];
+            if(canonicalAbiType(p[0].typeName)!=='address'||
+              !/^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p[1].typeName)||'')||
+              !identifier.test(p[0].name||'')||!identifier.test(p[1].name||''))
+              return [];
+            const sig=canonicalFunctionIdentity(fund);
+            if(!declarations.some(d=>d.selector===contract.name+'.'+fund.name&&
+              d.operation==='send'&&JSON.stringify(d.inputs)===
+                JSON.stringify([canonicalAbiType(p[0].typeName),canonicalAbiType(p[1].typeName)])))
+              return [];
+            const text=body(snapshot.content,fund);
+            const bound=text.match(new RegExp(
+              String.raw`\buint(?:256)?\s+([A-Za-z_]\w*)\s*=\s*`+
+              p[1].name+String.raw`\s*\.\s*bounded\s*\(`));
+            const amountValue=bound?.[1]||p[1].name;
+            if(!sourceExactAccountingDelta(text,variable.name,amountValue,'increase',p[0].name)||
+              !sourceExactAccountingDelta(text,constrained.name,amountValue,'increase'))
+              return [];
+            return [{fund,signature:sig}];
+          });
+          if(acquiredFunding.length!==1)continue;
+          if(key==='msg.sender')continue;
+          const evidence=acquiredFunding[0];
+          const prepared:SoliditySequence['steps']=[];
+          if(setup.initSignature)prepared.push({
+            operation:'send',function:setup.initSignature,args:setup.initArgs,
+            sender:0,requiredSetup:true});
+          // The EVM itself establishes role eligibility: no guessed
+          // administrator identity substitutes for the actual operator getter.
+          if(/require\s*\(\s*msg\s*\.\s*sender\s*==\s*operator\b/.test(methodSource)&&
+            declarations.some(d=>d.selector===contract.name+'.operator'&&d.operation==='call'))
+            prepared.push({operation:'call',function:'operator()',args:[],expect:'$account0'});
+          prepared.push({operation:'call',function:constrained.name+'()',args:[],expect:'0'});
+          prepared.push({operation:'call',function:variable.name+'(address)',
+            args:[targetKey],expect:'0'});
+          prepared.push({operation:'send',function:evidence.signature,
+            args:[targetKey,'5'],sender:0,requiredSetup:true});
+          prepared.push({operation:'call',function:variable.name+'(address)',
+            args:[targetKey],expect:'5'});
+          prepared.push({operation:'call',function:constrained.name+'()',args:[],expect:'5'});
+          prepared.push({operation:'send',function:signature,args,sender:0});
+          prepared.push({operation:'call',function:variable.name+'(address)',
+            args:[targetKey],expect:'6'});
+          prepared.push({operation:'call',function:constrained.name+'()',args:[],expect:'4'});
+          out.push({
+            hypothesis:'Acquired funding satisfies source total precondition; the selected bounded settlement changes the exact mapping by +1 and total by -1',
+            property:'source-funded mapping balance '+contract.name+'.'+signature+':'+variable.name,
+            sequence:{constructorArgs:setup.constructorArgs,
+              ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+              steps:prepared},
+            witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
+              witness(snapshot,variable,contract.name+'.'+variable.name),
+              witness(snapshot,constrained,contract.name+'.'+constrained.name),
+              witness(snapshot,evidence.fund,contract.name+'.'+evidence.signature)],
+          });
+          continue;
+        }
         const steps:SoliditySequence['steps']=[];
         if(setup.initSignature)steps.push({
           operation:'send',function:setup.initSignature,args:setup.initArgs,
