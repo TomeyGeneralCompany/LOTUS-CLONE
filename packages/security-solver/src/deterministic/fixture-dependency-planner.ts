@@ -695,7 +695,7 @@ export function resolveAcquiredInterfaceCallers(
     for(const base of node.baseContracts||[]){
       const name=String(base.baseName?.namePath||'').split('.').pop();
       if(!name)return false;
-      const declarations=(path:string,symbol:string)=>
+      const declarations=(path:string,symbol:string):Array<{path:string;node:any}>=>
         (astOf(byPath.get(path)!)?.children||[])
           .filter((n:any)=>n.type==='ContractDefinition'&&n.name===symbol)
           .map((n:any)=>({path,node:n}));
