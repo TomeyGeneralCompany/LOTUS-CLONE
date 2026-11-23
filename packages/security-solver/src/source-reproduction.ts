@@ -46,6 +46,11 @@ const fixtureDiagnosticsSchema=z.object({
   selectedFile:z.string().max(4096).nullish(),contractName:z.string().max(128).nullish(),
   compilerVersion:z.string().max(128).nullish(),evmVersion:z.string().max(64).nullish(),
   cacheHit:z.boolean().nullish(),bytecodeSha256:digest.nullish(),
+  // The isolated Solidity compiler emits these source-bound certificates
+  // for the selected contract and every acquired preparation deployment.
+  // Reject malformed or invented digests; do not silently strip the proof.
+  abiSha256:digest.nullish(),
+  preparationAbiSha256:z.record(z.string().min(1).max(128),digest).optional(),
   constructorTypes:z.array(z.string().max(128)).max(16).optional(),
   stepIndex:z.number().int().min(0).max(64).nullish(),
   receiptStatus:z.number().int().min(0).max(1).nullish(),
