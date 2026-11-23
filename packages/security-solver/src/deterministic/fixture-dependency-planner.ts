@@ -2,13 +2,14 @@
 import {parse} from "@solidity-parser/parser";
 import {posix} from "node:path";
 import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
-export interface PreparedDeployment {id:string;file:string;contract:string;constructorArgs:string[];}
+type PreparedArg=string|string[];
+export interface PreparedDeployment {id:string;file:string;contract:string;constructorArgs:PreparedArg[];}
 export interface FixtureSourceWitness {file:string;line:number;contract:string;sourceSha256?:string;parameter?:string;stateVariable?:string;}
 export interface VerifiedDependencyBinding {parameter:string;receiver:string;typeName:string;deploymentId:string;file:string;sourceSha256:string;}
 export type FixtureResolution=
   | {status:"resolved";deployments:PreparedDeployment[];substitutions:Record<string,string>;bindings:VerifiedDependencyBinding[];witnesses:FixtureSourceWitness[];initializerOperations:PreparedInitializerOperation[];}
   | {status:"unresolved";missingDependencies:string[];attemptedResolvers:string[];witnesses:FixtureSourceWitness[];};
-export interface PreparedInitializerOperation {id:string;deploymentId:string;function:string;args:string[];sender:0;}
+export interface PreparedInitializerOperation {id:string;deploymentId:string;function:string;args:PreparedArg[];sender:0;}
 type ContractEntry={source:SourceSnapshot;node:any};
 // Source-revision cache avoids reparsing the complete 88mph inventory for
 // each assessed candidate. Immutable source hashes prevent stale reuse.
@@ -48,6 +49,29 @@ function descendants(node:any):any[]{
     out.push(v);for(const [k,value] of Object.entries(v))if(k!=="loc"&&k!=="range")walk(value);};
   walk(node);return out;
 }
+/** Construct ABI-typed zero/one fixture values only for known elementary
+ * and bounded one-dimensional array types. Solidity constructor/initializer
+ * reverts remain real executor failures, never presumed successes. */
+function primitiveFixtureArg(type:any,nonzero=false):PreparedArg|null {
+  if(type?.type==="ArrayTypeName"){
+    const base=primitiveFixtureArg(type.baseTypeName,nonzero);
+    if(typeof base!=="string")return null;
+    if(!type.length)return [];
+    const len=type.length?.type==="NumberLiteral"?Number(type.length.number):NaN;
+    if(!Number.isSafeInteger(len)||len<0||len>32)return null;
+    return Array(len).fill(base);
+  }
+  if(type?.type!=="ElementaryTypeName")return null;
+  const k=String(type.name||"");
+  if(k==="address"||k==="address payable")return "$account0";
+  if(k==="bool")return "false";
+  if(k==="string")return "";
+  if(k==="bytes")return "0x";
+  const bytes=k.match(/^bytes([1-9]|[12][0-9]|3[012])$/);
+  if(bytes)return "0x"+"00".repeat(Number(bytes[1]));
+  if(/^(?:u?int)(?:[0-9]{1,3})?$/.test(k))return nonzero?"1":"0";
+  return null;
+}
 function initializerStateBindings(node:any):Array<{parameter:string;receiver:string;typeName:string;line:number}>{
   const vars=new Map<string,string>();
   for(const item of node.subNodes||[])if(item.type==="StateVariableDeclaration")
@@ -60,10 +84,18 @@ function initializerStateBindings(node:any):Array<{parameter:string;receiver:str
       const receiver=String(n.left?.name||"");
       const declared=vars.get(receiver);
       const cast=n.right;
-      if(!declared||cast?.type!=="FunctionCall"||cast.expression?.type!=="Identifier"||
-        String(cast.expression.name)!==declared||!Array.isArray(cast.arguments)||cast.arguments.length!==1)continue;
-      const parameter=String(cast.arguments[0]?.name||"");
-      if(!parameter)continue;
+      const params=new Map((fn.parameters||[]).map((p:any)=>[
+        String(p.name||""),typeOf(p.typeName)]));
+      // Both "receiver = Interface(paramAddress)" and the directly typed
+      // "receiver = interfaceParameter" are compiler-valid binding edges.
+      let parameter="";
+      if(cast?.type==="FunctionCall"&&cast.expression?.type==="Identifier"&&
+        String(cast.expression.name)===declared&&
+        Array.isArray(cast.arguments)&&cast.arguments.length===1)
+        parameter=String(cast.arguments[0]?.name||"");
+      else if(cast?.type==="Identifier"&&params.get(String(cast.name||""))===declared)
+        parameter=String(cast.name);
+      if(!declared||!parameter)continue;
       out.push({parameter,receiver,typeName:declared,line:n.loc?.start?.line||fn.loc?.start?.line||1});
     }
   }
@@ -539,6 +571,17 @@ export function resolveSourceFixtureDependencies(
   // Prove caller demand from the acquired source, not from a guessed fixture.
   const requiredReceiverMethods=new Map<string,string[]>();
   const targetBindings=initializerStateBindings(targetNode);
+  // Source-referenced constructor-injected dependencies must also contribute
+  // receiver ABI requirements to implementation disambiguation.
+  const constructorDemands=new Map<string,string[]>();
+  for(const p of ctorOf(targetNode)?.parameters||[]){
+    if(p.typeName?.type!=="UserDefinedTypeName"||!p.name)continue;
+    const name=String(p.name);
+    if(!/^[A-Za-z_]\w*$/.test(name))continue;
+    constructorDemands.set(typeOf(p.typeName),[...new Set([...target.content.matchAll(
+      new RegExp("\\b"+name+"\\s*\\.\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(","g")
+    )].map(m=>m[1]))]);
+  }
   for(const binding of targetBindings){
     const methods=[...target.content.matchAll(new RegExp(
       "\\b"+binding.receiver+"\\s*\\.\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(","g"))]
@@ -553,8 +596,11 @@ export function resolveSourceFixtureDependencies(
       !isDeclaredAbstract(source,node)&&extendsType(node,typ));
     // A source-proven ABI can distinguish concrete implementations. Without
     // proof, multiple candidates remain ambiguous rather than guessed.
-    const receiverMethods=[...new Set(targetBindings.filter(b=>b.typeName===typ)
-      .flatMap(b=>requiredReceiverMethods.get(b.receiver)||[]))];
+    const receiverMethods=[...new Set([
+      ...targetBindings.filter(b=>b.typeName===typ)
+        .flatMap(b=>requiredReceiverMethods.get(b.receiver)||[]),
+      ...(constructorDemands.get(typ)||[])
+    ])];
     const qualified=choices.length>1&&receiverMethods.length?
       choices.filter(choice=>verifyAcquiredReceiverMethods(typ,receiverMethods,
         choice.source.path,choice.node.name,sources).ok):choices;
@@ -565,16 +611,20 @@ export function resolveSourceFixtureDependencies(
     if(visited.has(key))return visited.get(key)!;
     if(deployments.length>=MAX_NODES){missing.push(typ+":max_dependency_nodes");return null;}
     stack.add(key);
-    const args:string[]=[];let valid=true;
+    const args:PreparedArg[]=[];let valid=true;
     for(const p of ctorOf(selected.node)?.parameters||[]){
       const argType=typeOf(p.typeName);
-      if(!argType){missing.push(key+":unknown_constructor_type");valid=false;break;}
-      if(p.typeName?.type==="UserDefinedTypeName"){const dep=resolve(argType,depth+1);
-        if(!dep){valid=false;break;}args.push("$deployment:"+dep);}
-      else if(argType==="address")args.push("$account0");
-      else if(/^(?:u?int(?:[0-9]+)?|bytes[0-9]+)$/.test(argType))args.push("0");
-      else if(argType==="bool")args.push("false");
-      else {missing.push(key+":unsupported_constructor_type:"+argType);valid=false;break;}
+      if(p.typeName?.type==="UserDefinedTypeName"){
+        const dep=resolve(argType,depth+1);
+        if(!dep){valid=false;break;}args.push("$deployment:"+dep);
+      }else{
+        const literal=primitiveFixtureArg(p.typeName);
+        if(literal===null){
+          missing.push(key+":unsupported_constructor_type:"+(argType||p.typeName?.type||"unknown"));
+          valid=false;break;
+        }
+        args.push(literal);
+      }
     }
     if(!valid){stack.delete(key);return null;}
     const id="dependency"+nextDeploymentId++;
@@ -587,24 +637,31 @@ export function resolveSourceFixtureDependencies(
     // bindings or are ordinary role/scalar values; anything else remains unresolved.
     const initializer=initOf(selected.node);
     if(initializer){
-      const initArgs:string[]=[];
+      const initArgs:PreparedArg[]=[];
       const initBindings=initializerStateBindings(selected.node);
       for(const p of initializer.parameters||[]){
         const name=String(p.name||""),argType=typeOf(p.typeName);
         const matching=initBindings.find(x=>x.parameter===name);
-        if(matching){const dep=resolve(matching.typeName,depth+1);
-          if(!dep){missing.push(key+":initializer_dependency:"+name);break;}initArgs.push("$deployment:"+dep);}
-        else if(argType==="address")initArgs.push("$account0");
-        else if(/^(?:u?int(?:[0-9]+)?)$/.test(argType))initArgs.push("1");
-        else if(argType==="bool")initArgs.push("false");
-        else {missing.push(key+":unsupported_initializer_parameter:"+name);break;}
+        if(matching){
+          const dep=resolve(matching.typeName,depth+1);
+          if(!dep){missing.push(key+":initializer_dependency:"+name);break;}
+          initArgs.push("$deployment:"+dep);
+        }else{
+          const literal=primitiveFixtureArg(p.typeName,true);
+          if(literal===null){
+            missing.push(key+":unsupported_initializer_parameter:"+name+":"+
+              (argType||p.typeName?.type||"unknown"));break;
+          }
+          initArgs.push(literal);
+        }
       }
       if(initArgs.length!==(initializer.parameters||[]).length){
         // A partially bound initializer is not an executable fixture. The
         // dependency graph must fail closed instead of reporting resolution.
         missing.push(key+":incomplete_initializer_arguments");
       }else{
-        const sigTypes=(initializer.parameters||[]).map((p:any)=>p.typeName?.type==="UserDefinedTypeName"?"address":typeOf(p.typeName));
+        const sigTypes=(initializer.parameters||[]).map((p:any)=>
+          p.typeName?.type==="UserDefinedTypeName"?"address":callableType(p.typeName));
         initializers.push({id:"setup"+(initializers.length+1),deploymentId:id,
           function:String(initializer.name)+"("+sigTypes.join(",")+")",args:initArgs,sender:0});
       }
@@ -642,7 +699,8 @@ export function resolveSourceFixtureDependencies(
     // The isolated executor deploys the entire graph before sending ANY
     // initializer; cross-referencing initializer parameters are legal.
     const args=byId.get(id)?.constructorArgs||[];
-    return [...new Set(args.filter(arg=>arg.startsWith("$deployment:"))
+    return [...new Set(args.filter((arg):arg is string=>
+      typeof arg==="string"&&arg.startsWith("$deployment:"))
       .map(arg=>arg.slice("$deployment:".length)))];
   };
   const ordered:PreparedDeployment[]=[];
