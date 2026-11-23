@@ -2202,8 +2202,8 @@ function sourceExactAccountingDelta(
   if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state)||
     !/^(?:[A-Za-z_][A-Za-z0-9_]*|msg\.value)$/.test(amount))return false;
   if(accountKey&&accountKey!=="msg.sender"&&!identifier.test(accountKey))return false;
-  const key=accountKey==="msg.sender"?String.raw`\\s*\\[\\s*msg\\.sender\\s*\\]`:
-    accountKey?String.raw`\\s*\\[\\s*`+accountKey+String.raw`\\s*\\]`:"";
+  const key=accountKey==="msg.sender"?String.raw`\s*\[\s*msg\.sender\s*\]`:
+    accountKey?String.raw`\s*\[\s*`+accountKey+String.raw`\s*\]`:"";
   const ref="\\b"+state+key;
   const value=amount==="msg.value"?"msg\\.value":amount;
   const op=direction==="increase"?"\\+":"-";
