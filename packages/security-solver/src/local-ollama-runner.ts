@@ -415,13 +415,13 @@ export async function runLocalAudit(
         p.state==="prerequisites_pending"||p.unresolvedPrerequisites.length>0)
         .flatMap(p=>p.unresolvedPrerequisites);
       for(const reason of persisted){
-        if(/(?:^|\\W)no_supported_property(?:\\W|$)|source_grounded_falsifier_missing/.test(reason))
+        if(/(?:^|\W)no_supported_property(?:\W|$)|source_grounded_falsifier_missing/.test(reason))
           categories.add("no_supported_property");
-        if(/(?:^|\\W)missing_fixture(?:\\W|$)|(?:^|\\W)initializer_dependency(?:\\W|$)/.test(reason))
+        if(/(?:^|\W)missing_fixture(?:\W|$)|(?:^|\W)initializer_dependency(?:\W|$)/.test(reason))
           categories.add("missing_fixture");
-        if(/(?:^|\\W)unresolved_dependency(?:\\W|$)|^(?:unresolved_external_call|unresolved_call|ambiguous_call):/.test(reason))
+        if(/(?:^|\W)unresolved_dependency(?:\W|$)|^(?:unresolved_external_call|unresolved_call|ambiguous_call):/.test(reason))
           categories.add("unresolved_dependency");
-        if(/(?:^|\\W)missing_observable_state(?:\\W|$)|^missing_public_getter:/.test(reason))
+        if(/(?:^|\W)missing_observable_state(?:\W|$)|^missing_public_getter:/.test(reason))
           categories.add("missing_observable_state");
       }
       const rootSource=deterministicSourceSnapshots.find(source=>
