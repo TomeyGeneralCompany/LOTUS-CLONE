@@ -278,7 +278,19 @@ contract TomeyERC1155ProbeHarness is ERC1155Upgradeable {
         file:spec.file,selector:spec.function,sourceSha256,selectedFile,contractName,
         compilerVersion:solc.version(),cacheHit,evmVersion,
         constructorTypes:artifact.abi.find(x=>x.type==='constructor')?.inputs?.map(x=>x.type)||[],
-        bytecodeSha256:createHash('sha256').update(artifact.evm.bytecode.object).digest('hex')};
+        bytecodeSha256:createHash('sha256').update(artifact.evm.bytecode.object).digest('hex'),
+        // A compiler-authoritative ABI certificate for the exact selected
+        // contract and each acquired preparation deployment. Source AST-only
+        // guesses never substitute for the isolated compiler's real artifact.
+        abiSha256:fingerprint(artifact.abi),
+        preparationAbiSha256:Object.fromEntries(
+          (spec.sequence.preparation?.deployments||[]).map(item=>{
+            const acquired=compiled.contracts?.[item.file]?.[item.contract];
+            if(!Array.isArray(acquired?.abi))throw new Error(
+              'Compiler ABI missing for acquired dependency '+item.file+':'+item.contract);
+            return [item.id,fingerprint(acquired.abi)];
+          })
+        )};
       return await require('./solidity-sequence.cjs').runSequence(
         artifact,spec.sequence,transport,compiled.contracts||{},meta);
     }
