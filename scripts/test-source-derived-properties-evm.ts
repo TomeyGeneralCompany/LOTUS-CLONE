@@ -172,4 +172,40 @@ assert.ok(delegatedEvm.steps.every((step:any)=>step.passed!==false),
   'Acquired interprocedural source witness failed in actual EVM: '+JSON.stringify(delegatedEvm));
 assert.ok(delegatedEvm.steps.some((step:any)=>step.operation==='call'&&
   step.function==='amount()'&&step.actual==='7'));
+const guardedSource=[
+  'pragma solidity ^0.8.20;',
+  'contract GuardedState {',
+  ' address public trusted;',
+  ' uint256 public stored;',
+  ' constructor(){trusted=msg.sender;}',
+  ' function update(uint256 next) external {',
+  '   require(msg.sender==trusted,"owner");',
+  '   stored=next;',
+  ' }',
+  '}',
+].join('\n');
+const guardedFile='source-1/contracts/GuardedState.sol';
+const guardedMenu=[{selector:'GuardedState.update',operation:'send' as const,inputs:['uint256']}];
+const guardedBuilt=constructSolidityExperiments({
+  repositoryCommit:'d'.repeat(40),targetPath:guardedFile,
+  targetSelector:'GuardedState.update',
+  sources:[{path:guardedFile,content:guardedSource,sha256:sha(guardedSource)}],
+  declarations:guardedMenu,skipLegacy:true});
+assert.equal(guardedBuilt.ok,true,JSON.stringify(guardedBuilt));
+if(!guardedBuilt.ok)throw new Error('Guarded source property missing');
+const guardedProperty=guardedBuilt.experiments.find(e=>
+  e.securityProperty.startsWith('source-proof generic owner guard'));
+assert.ok(guardedProperty,'Generic authenticated storage property missing');
+const guardedObserved=await execute(
+  compile(guardedFile,guardedSource,'GuardedState'),guardedProperty.sequence);
+assert.ok(guardedObserved.steps.every((step:any)=>step.passed!==false),
+  'Source guardian proof failed actual EVM replay: '+JSON.stringify(guardedObserved));
+assert.equal(guardedObserved.steps.find((step:any)=>step.operation==='send')?.reverted,true);
+const invertedGuard=guardedSource.replace(
+  'msg.sender==trusted','msg.sender!=trusted');
+const nonownerAllowed=await execute(
+  compile(guardedFile,invertedGuard,'GuardedState'),guardedProperty.sequence);
+assert.ok(nonownerAllowed.steps.some((step:any)=>
+  step.operation==='send'&&step.sender===1&&step.passed===false),
+  'Reversing the real owner condition must produce an independently observed counterexample');
 console.log('SOURCE_DERIVED_FINANCIAL_EVM_ORACLES_PASSED');
