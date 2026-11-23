@@ -730,19 +730,25 @@ export function resolveAcquiredInterfaceCallers(
       for(const fn of (contract.subNodes||[]).filter((x:any)=>
         x.type==='FunctionDefinition'&&x.body&&x.name&&
         ['external','public'].includes(x.visibility))){
-        const bodyStart=fn.body?.range?.[0]??fn.range?.[0];
-        const bodyEnd=fn.body?.range?.[1]??fn.range?.[1];
-        if(!Number.isInteger(bodyStart)||!Number.isInteger(bodyEnd))continue;
-        const sourceBody=source.content.slice(bodyStart,bodyEnd+1);
+        // A real caller edge is a compiler-parsed method invocation, not a
+        // substring in a comment, quoted string or unrelated expression.
+        const astNodes=descendants(fn.body);
         for(const receiver of receivers){
           if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(receiver))continue;
           if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(method))continue;
-          const expression=new RegExp('\\b'+receiver+'\\s*\\.\\s*'+method+'\\s*\\(');
-          if(!expression.test(sourceBody))continue;
+          if((fn.parameters||[]).some((p:any)=>p.name===receiver)||
+            astNodes.some((n:any)=>n.type==="VariableDeclaration"&&n.name===receiver))continue;
+          const actualCall=astNodes.find((n:any)=>
+            n.type==="FunctionCall"&&n.expression?.type==="MemberAccess"&&
+            n.expression.memberName===method&&
+            n.expression.expression?.type==="Identifier"&&
+            n.expression.expression.name===receiver);
+          if(!actualCall)continue;
           callers.push({path:source.path,selector:contract.name+'.'+fn.name,
             sourceSha256:source.sha256,interfaceName,method,receiver,
             witness:source.path+':'+source.sha256+':'+
-              String(fn.loc?.start?.line||1)+':'+String(fn.loc?.end?.line||1)});
+              String(actualCall.loc?.start?.line||fn.loc?.start?.line||1)+':'+
+              String(actualCall.loc?.end?.line||fn.loc?.end?.line||1)});
         }
       }
     }
