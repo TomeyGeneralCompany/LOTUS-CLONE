@@ -1403,6 +1403,12 @@ contract PureArithmetic {
       declarations:pureMenu as any,skipLegacy:true});
     const pureSuccess=pureConstruct('calc');
     assert.equal(pureSuccess.ok,true,'Exact pure expression must construct an executable oracle');
+    if(pureSuccess.ok){
+      assert.ok(pureSuccess.experiments.every(exp=>
+        exp.prerequisites.some(p=>p.id==='target:deploy'&&p.kind==='deploy'&&
+          p.sourceEvidence.some(w=>w.sourceSha256===pureSnapshot.sha256))),
+        'Every experiment must attest its actual source-identified target deployment');
+    }
     if(pureSuccess.ok)assert.ok(pureSuccess.experiments.some(exp=>
       exp.securityProperty.startsWith('source-exact pure return')&&
       exp.sequence.steps.some(step=>step.operation==='call'&&step.expect==='23')));
