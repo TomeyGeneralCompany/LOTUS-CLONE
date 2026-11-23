@@ -29,6 +29,7 @@ import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
+import {sourceRepairRoutes} from "./deterministic/typed-repair-routes";
 import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,enumerateAcquiredInheritedAbi} from "./deterministic/fixture-dependency-planner";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
@@ -408,33 +409,22 @@ export async function runLocalAudit(
       // or caller implementations merely because one constructor succeeded.
       // Exactly typed outstanding prerequisites, not model text or a generic
       // name heuristic, determine the remaining deterministic repair routes.
-      const categories=new Set<string>();
-      if(!constructed.ok&&constructed.unresolvedCategory)
-        categories.add(constructed.unresolvedCategory);
       const persisted=record.properties.filter(p=>
         p.state==="prerequisites_pending"||p.unresolvedPrerequisites.length>0)
         .flatMap(p=>p.unresolvedPrerequisites);
-      for(const reason of persisted){
-        if(/(?:^|\W)no_supported_property(?:\W|$)|source_grounded_falsifier_missing/.test(reason))
-          categories.add("no_supported_property");
-        if(/(?:^|\W)missing_fixture(?:\W|$)|(?:^|\W)initializer_dependency(?:\W|$)/.test(reason))
-          categories.add("missing_fixture");
-        if(/(?:^|\W)unresolved_dependency(?:\W|$)|^(?:unresolved_external_call|unresolved_call|ambiguous_call):/.test(reason))
-          categories.add("unresolved_dependency");
-        if(/(?:^|\W)missing_observable_state(?:\W|$)|^missing_public_getter:/.test(reason))
-          categories.add("missing_observable_state");
-      }
+      const initialCategory=!constructed.ok&&
+        constructed.unresolvedCategory!=="unavailable_replay_capability"?
+        constructed.unresolvedCategory:null;
+      const routes=sourceRepairRoutes(initialCategory,persisted,constructed.ok);
+      const categories=routes.categories;
+      const needsAdditionalResolution=routes.hasUnresolved;
+      const recoverConcrete=routes.concrete;
+      const recoverCaller=routes.callers;
       const rootSource=deterministicSourceSnapshots.find(source=>
         source.path===lead.path&&source.sha256===lead.sourceSha256);
-      const needsAdditionalResolution=!constructed.ok||persisted.length>0;
-      const recoverConcrete=needsAdditionalResolution&&[
-        "missing_fixture","unresolved_dependency",
-        "no_supported_property","missing_observable_state"
-      ].some(category=>categories.has(category));
-      const recoverCaller=recoverConcrete;
       if(needsAdditionalResolution&&rootSource){
         await appendFile(logFile,"[EXPERIMENT_REPAIR_ROUTES] "+JSON.stringify({
-          leadId:lead.id,categories:[...categories].sort(),
+          leadId:lead.id,categories,
           previouslyVerifiedProperties:record.properties.filter(p=>p.state==="test_completed").length,
           routes:[...(recoverConcrete?["concrete_source"]:[]),
             ...(recoverCaller?["acquired_interface_callers"]:[])],
