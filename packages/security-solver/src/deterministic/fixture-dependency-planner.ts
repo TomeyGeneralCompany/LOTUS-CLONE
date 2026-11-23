@@ -516,7 +516,22 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
     if(!/^[A-Za-z_]\w*$/.test(name))return null;
     const local=(owner.node.subNodes||[]).filter((n:any)=>n.name===name&&
       ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type));
-    const nested=entries.filter(e=>e.source.path===owner.source.path&&
+    const sourceByPath=new Map(entries.map(e=>[e.source.path,e.source]));
+    const reachable=new Set<string>(),queue=[owner.source.path];
+    while(queue.length&&reachable.size<=256){
+      const path=queue.shift()!;
+      if(reachable.has(path))continue;
+      reachable.add(path);
+      const source=sourceByPath.get(path);
+      if(!source)continue;
+      for(const imp of (astOf(source)?.children||[]).filter((n:any)=>
+        n.type==="ImportDirective"&&typeof n.path==="string")){
+        const normalized=imp.path.startsWith(".")?
+          posix.normalize(posix.join(posix.dirname(path),imp.path)):imp.path;
+        if(sourceByPath.has(normalized)&&!reachable.has(normalized))queue.push(normalized);
+      }
+    }
+    const nested=entries.filter(e=>reachable.has(e.source.path)&&
       (parts.length===0||parts.join(".")===e.node.name))
       .flatMap(e=>(e.node.subNodes||[]).filter((n:any)=>n.name===name&&
         ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type)));
@@ -534,9 +549,8 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
       return callableType(def.underlyingType||def.typeName,owner,entries,depth+1);
     }
     const contractDefs=entries.filter(e=>e.node.name===name&&
-      (e.source.path===owner.source.path||
-       (owner.node.baseContracts||[]).some((base:any)=>
-         String(base.baseName?.namePath||"").split(".").pop()===name)));
+      reachable.has(e.source.path)&&
+      (parts.length===0||parts.join(".")===e.node.name));
     return contractDefs.length===1?"address":null;
   }
   if(type?.type!=="ElementaryTypeName")return null;
