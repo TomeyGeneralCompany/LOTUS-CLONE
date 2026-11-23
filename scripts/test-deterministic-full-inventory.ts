@@ -604,6 +604,35 @@ contract PlugConsumer {
       assert.deepEqual(extended.initializerOperations[0].args,['','0x',[]]);
       assert.equal(extended.bindings[0].receiver,'plug');
     }
+    // Verified deep transitive constructor chains are no longer discarded at
+    // the historical eight-contract ceiling; bounds remain configurable and
+    // must fail closed before EVM execution when explicitly exceeded.
+    const deepChainText='pragma solidity ^0.8.0; contract Leaf {} '+
+      Array.from({length:10},(_,i)=>'contract Node'+(i+1)+
+        ' { constructor('+(i===0?'Leaf':'Node'+i)+' dependency) {} }').join(' ')+
+      ' contract DeepConsumer { Node10 public node; '+
+      'function initialize(address chosen) external { node = Node10(chosen); } }';
+    const deepChainSource={path:'source-1/contracts/DeepConsumer.sol',
+      content:deepChainText,sha256:hash(deepChainText)};
+    const deepGraph=resolveSourceFixtureDependencies(deepChainSource,
+      'DeepConsumer',[deepChainSource]);
+    assert.equal(deepGraph.status,'resolved',
+      'Eleven acquired transitive contracts must fit within the bounded graph');
+    if(deepGraph.status==='resolved'){
+      assert.equal(deepGraph.deployments.length,11);
+      assert.deepEqual(deepGraph.deployments.map(x=>x.contract),
+        ['Leaf',...Array.from({length:10},(_,i)=>'Node'+(i+1))]);
+    }
+    const artificiallySmall=resolveSourceFixtureDependencies(deepChainSource,
+      'DeepConsumer',[deepChainSource],{maxDepth:10,maxNodes:8});
+    assert.equal(artificiallySmall.status,'unresolved');
+    if(artificiallySmall.status==='unresolved')assert.ok(
+      artificiallySmall.missingDependencies.some(x=>x.includes('max_dependency_nodes')));
+    const invalidBudget=resolveSourceFixtureDependencies(deepChainSource,
+      'DeepConsumer',[deepChainSource],{maxNodes:100});
+    assert.equal(invalidBudget.status,'unresolved');
+    if(invalidBudget.status==='unresolved')assert.ok(
+      invalidBudget.missingDependencies.includes('invalid_fixture_resource_budget'));
     const cycA='pragma solidity ^0.8.0; contract CycA { constructor(CycB dependency) {} }';
     const cycB='pragma solidity ^0.8.0; contract CycB { constructor(CycA dependency) {} }';
     const cycleSources=[
