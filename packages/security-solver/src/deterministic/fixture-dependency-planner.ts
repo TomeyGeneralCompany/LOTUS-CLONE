@@ -11,6 +11,24 @@ export type FixtureResolution=
   | {status:"unresolved";missingDependencies:string[];attemptedResolvers:string[];witnesses:FixtureSourceWitness[];};
 export interface PreparedInitializerOperation {id:string;deploymentId:string;function:string;args:PreparedArg[];sender:0;}
 type ContractEntry={source:SourceSnapshot;node:any};
+/** Source-global struct, enum and value-type declarations must participate in
+ * ABI resolution even when their acquired file declares no contract at all.
+ * The synthetic namespace below is NOT a deployable contract, fixture, mock,
+ * or compiler substitute; it only carries actual parsed source declarations.
+ */
+function acquiredTypeEntries(sources:readonly SourceSnapshot[]):ContractEntry[]{
+  return sources.flatMap(source=>{
+    const children:any[]=astOf(source)?.children||[];
+    const contracts=children.filter(node=>node.type==="ContractDefinition")
+      .map(node=>({source,node}));
+    const globals=children.filter(node=>
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(node.type));
+    return globals.length?
+      [...contracts,{source,node:{type:"ContractDefinition",kind:"library",
+        name:"__acquired_global_types_"+source.sha256.slice(0,16),
+        subNodes:globals,baseContracts:[]}}]:contracts;
+  });
+}
 // Source-revision cache avoids reparsing the complete 88mph inventory for
 // each assessed candidate. Immutable source hashes prevent stale reuse.
 const parsedCache=new Map<string,any|null>();
@@ -437,9 +455,7 @@ export function resolveAcquiredConcreteImplementations(
   const root=(rootAst?.children||[]).find((x:any)=>
     x.type==="ContractDefinition"&&x.name===abstractContract);
   if(!root)return [];
-  const entries=sources.flatMap(source=>(astOf(source)?.children||[])
-    .filter((node:any)=>node.type==="ContractDefinition")
-    .map((node:any)=>({source,node})));
+  const entries=acquiredTypeEntries(sources);
   const sourceByPath=new Map(sources.map(s=>[s.path,s]));
   const importedPaths=(source:SourceSnapshot):Set<string>=>{
     const paths=new Set<string>();
@@ -817,9 +833,7 @@ export function verifyAcquiredReceiverMethods(
   implementationContract:string,sources:readonly SourceSnapshot[],
 ):{ok:boolean;missing:string[]} {
   if(!methods.length)return {ok:true,missing:[]};
-  const entries=sources.flatMap(source=>(astOf(source)?.children||[])
-    .filter((node:any)=>node.type==="ContractDefinition")
-    .map((node:any)=>({source,node})));
+  const entries=acquiredTypeEntries(sources);
   const concrete=entries.find(e=>e.source.path===implementationFile&&
     e.node.name===implementationContract);
   if(!concrete||!isConcrete(concrete.node))return {ok:false,missing:["concrete_deployment_not_found"]};
