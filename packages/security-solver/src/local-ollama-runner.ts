@@ -414,9 +414,10 @@ export async function runLocalAudit(
         failureCategory==="unresolved_dependency"||
         failureCategory==="no_supported_property"||
         failureCategory==="missing_observable_state";
-      const recoverCaller=recoverConcrete||
-        failureCategory==="no_supported_property"||
-        failureCategory==="missing_observable_state";
+      // All four typed blockers are eligible for both recovered paths.
+      // The same boolean prevents narrowing the remaining failure union
+      // to an impossible comparison under strict TypeScript.
+      const recoverCaller=recoverConcrete;
       if(!constructed.ok&&rootSource){
         await appendFile(logFile,"[EXPERIMENT_REPAIR_ROUTES] "+JSON.stringify({
           leadId:lead.id,category:failureCategory||"unknown",
