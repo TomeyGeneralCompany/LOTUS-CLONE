@@ -284,7 +284,7 @@ function fixtureAbiType(type:any,contract:any,depth=0,source?:SourceSnapshot,
     if(values.length===0)return "address";
     const definition=values[0];
     if(definition.type==="EnumDefinition")return (definition.members||[]).length<=256?"uint8":null;
-    if(definition.type==="UserDefinedValueTypeDefinition")
+    if(["UserDefinedValueTypeDefinition","TypeDefinition"].includes(definition.type))
       return fixtureAbiType(definition.underlyingType||definition.typeName,contract,depth+1);
     const fields=(definition.members||[]).map((field:any)=>
       fixtureAbiType(field.typeName,contract,depth+1));
@@ -993,7 +993,7 @@ export function resolveSourceFixtureDependencies(
           if(segments.length&&segments.join(".")===declaration.name)
             for(const sub of declaration.subNodes||[])
               if(sub.name===name&&["StructDefinition","EnumDefinition",
-                "UserDefinedValueTypeDefinition"].includes(sub.type))
+                "UserDefinedValueTypeDefinition","TypeDefinition"].includes(sub.type))
                 declarations.push("value");
         }else if(!segments.length&&declaration.name===name&&
           ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(declaration.type))
@@ -1009,7 +1009,7 @@ export function resolveSourceFixtureDependencies(
       const compatible=scanned.filter(e=>e.node.name===name);
       const conflicting=sources.some(src=>(astOf(src)?.children||[]).some((d:any)=>
         d.name===name&&["StructDefinition","EnumDefinition",
-          "UserDefinedValueTypeDefinition"].includes(d.type)));
+          "UserDefinedValueTypeDefinition","TypeDefinition"].includes(d.type)));
       if(compatible.length===1&&!conflicting)return "contract";
     }
     return "unknown";
