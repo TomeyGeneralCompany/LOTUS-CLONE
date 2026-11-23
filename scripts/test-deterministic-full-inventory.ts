@@ -500,6 +500,38 @@ contract SourceStructGetter {
     assert.equal(verifyAcquiredReceiverMethods('IStructGetter',['read'],
       wrongOrderSources[1].path,'SourceStructGetter',wrongOrderSources).ok,false,
       'Field order and ABI return types must be authenticated, not name-matched');
+    // A transitive constructor imports an enum from an acquired library.
+    // Its ABI value must be uint8 zero, never a synthetic contract reference.
+    const importedEnumTypes='pragma solidity ^0.8.0; library ChoiceTypes { enum Tier { Basic, Premium } }';
+    const importedEnumImpl=`pragma solidity ^0.8.0;
+import "./ChoiceTypes.sol";
+import "./IEnumService.sol";
+contract ImportedEnumService is IEnumService {
+  ChoiceTypes.Tier public tier;
+  constructor(ChoiceTypes.Tier selected) { tier = selected; }
+  function ping() external override {}
+}`;
+    const importedEnumIface='pragma solidity ^0.8.0; interface IEnumService { function ping() external; }';
+    const importedEnumCaller=`pragma solidity ^0.8.0;
+import "./IEnumService.sol";
+contract ImportedEnumConsumer {
+  IEnumService public service;
+  function initialize(address chosen) external { service = IEnumService(chosen); }
+  function run() external { service.ping(); }
+}`;
+    const enumImportSources=[
+      {path:'source-1/contracts/ChoiceTypes.sol',content:importedEnumTypes,sha256:hash(importedEnumTypes)},
+      {path:'source-1/contracts/IEnumService.sol',content:importedEnumIface,sha256:hash(importedEnumIface)},
+      {path:'source-1/contracts/ImportedEnumService.sol',content:importedEnumImpl,sha256:hash(importedEnumImpl)},
+      {path:'source-1/contracts/ImportedEnumConsumer.sol',content:importedEnumCaller,sha256:hash(importedEnumCaller)}
+    ];
+    const importedEnumFixture=resolveSourceFixtureDependencies(enumImportSources[3],
+      'ImportedEnumConsumer',enumImportSources);
+    assert.equal(importedEnumFixture.status,'resolved',JSON.stringify(importedEnumFixture));
+    if(importedEnumFixture.status==='resolved'){
+      assert.deepEqual(importedEnumFixture.deployments.map(x=>x.contract),['ImportedEnumService']);
+      assert.deepEqual(importedEnumFixture.deployments[0].constructorArgs,['0']);
+    }
     // A Solidity user-defined type may be a struct or enum, not an address.
     // Exact imported ABI identities are required for concrete receivers.
     const shapeTypes=`pragma solidity ^0.8.0;
