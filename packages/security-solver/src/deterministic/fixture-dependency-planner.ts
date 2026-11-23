@@ -241,7 +241,7 @@ const standardInheritedAbi:Readonly<Record<string,Readonly<Record<string,readonl
 };
 export interface AcquiredConcreteImplementation {
   path:string;contract:string;selector:string;sourceSha256:string;
-  inputs:string[];witness:string;
+  inputs:string[];operation:"call"|"send";witness:string;
 }
 /** Map an abstract/interface function into actual acquired source, never
  * synthesize a behavior-bearing mock or assume an external dependency exists.
@@ -319,33 +319,23 @@ export function resolveAcquiredConcreteImplementations(
         reachable.has(e.source.path)&&e.node!==entry.node);
     });
   };
-  const typeAbi=(type:any):string|null=>{
-    if(!type)return null;
-    if(type.type==="ArrayTypeName"){
-      const base=typeAbi(type.baseTypeName);
-      if(!base)return null;
-      const len=type.length?.type==="NumberLiteral"?String(type.length.number):"";
-      return base+"["+len+"]";
-    }
-    if(type.type==="UserDefinedTypeName")return "address";
-    const kind=String(type.name||"");
-    if(kind==="uint")return "uint256";
-    if(kind==="int")return "int256";
-    if(kind==="address"||kind==="bool"||kind==="string"||kind==="bytes"||
-      /^(?:u?int[0-9]{1,3}|bytes(?:[1-9]|[12][0-9]|3[012]))$/.test(kind))
-      return kind;
-    return null;
-  };
-  const scalarAbi=(p:any):string|null=>typeAbi(p?.typeName);
-  const identities=(fn:any):string|null=>{
-    const types=(fn.parameters||[]).map(scalarAbi);
+  const typeAbi=(type:any,entry:ContractEntry):string|null=>
+    callableType(type,entry,entries);
+  const scalarAbi=(p:any,entry:ContractEntry):string|null=>
+    typeAbi(p?.typeName,entry);
+  const identities=(fn:any,entry:ContractEntry):string|null=>{
+    const types=(fn.parameters||[]).map((p:any)=>scalarAbi(p,entry));
     return types.some((type:string|null)=>type===null)?null:
       String(fn.name)+"("+types.join(",")+")";
   };
   const targetFunctions=(root.subNodes||[]).filter((n:any)=>
     n.type==="FunctionDefinition"&&n.name===method);
   if(!targetFunctions.length)return [];
-  const targetIds=new Set<string>(targetFunctions.map(identities).filter((id:string|null):id is string=>id!==null));
+  const rootEntry={source:abstractSource,node:root};
+  const targetIds=new Set<string>(targetFunctions.map((fn:any)=>
+    identities(fn,rootEntry)).filter((id:string|null):id is string=>id!==null));
+  const targetReturns=new Map(targetFunctions.map((fn:any)=>[
+    identities(fn,rootEntry),callableReturns(fn,rootEntry,entries)]));
   const result:AcquiredConcreteImplementation[]=[];
   for(const candidate of entries){
     if(candidate.node.name===abstractContract&&candidate.source.path===abstractSource.path)continue;
@@ -376,7 +366,7 @@ export function resolveAcquiredConcreteImplementations(
     for(const entry of [...chain].reverse()){
       for(const fn of (entry.node.subNodes||[]).filter((n:any)=>
         n.type==="FunctionDefinition"&&!n.isConstructor&&n.name)){
-        const id=identities(fn);
+        const id=identities(fn,entry);
         if(!id){if(!fn.body)invalid=true;continue;}
         declarations.add(id);
         if(fn.body)implemented.set(id,{entry,fn});
@@ -395,7 +385,7 @@ export function resolveAcquiredConcreteImplementations(
             const keyTypes:string[]=[];
             let cur:any=typ,ok=true;
             while(cur?.type==="Mapping"){
-              const kt=typeAbi(cur.keyType);
+              const kt=typeAbi(cur.keyType,entry);
               if(!kt){ok=false;break;}
               keyTypes.push(kt);
               cur=cur.valueType;
@@ -410,11 +400,16 @@ export function resolveAcquiredConcreteImplementations(
     for(const id of targetIds){
       const proof=implemented.get(id);
       if(!proof||proof.fn.type!=="FunctionDefinition"||!proof.fn.body)continue;
-      const types=(proof.fn.parameters||[]).map(scalarAbi);
+      const types=(proof.fn.parameters||[]).map((p:any)=>scalarAbi(p,proof.entry));
       if(types.some((type:string|null)=>type===null))continue;
+      const actualReturns=callableReturns(proof.fn,proof.entry,entries);
+      const expectedReturns=targetReturns.get(id);
+      if(!actualReturns||!expectedReturns||
+        JSON.stringify(actualReturns)!==JSON.stringify(expectedReturns))continue;
       result.push({path:candidate.source.path,contract:candidate.node.name,
         selector:candidate.node.name+"."+method,sourceSha256:candidate.source.sha256,
         inputs:types as string[],
+        operation:['pure','view'].includes(proof.fn.stateMutability)?'call':'send',
         witness:proof.entry.source.path+":"+proof.entry.source.sha256+":"+
           String(proof.fn.loc?.start?.line||1)+":"+String(proof.fn.loc?.end?.line||1)});
     }
