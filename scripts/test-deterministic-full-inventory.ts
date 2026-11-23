@@ -1332,6 +1332,20 @@ contract ChildTokenConsumer {
     assert.deepEqual(resolveAcquiredInterfaceCallers(inheritedTokenSnapshots[1],
       'IChildToken','mint',inheritedTokenSnapshots.slice(1)),[],
       'An unacquired parent cannot invent an inherited ABI method');
+    const aliasedTokenChild='pragma solidity ^0.8.20; import {IBaseToken as TokenBase} from "./IBaseToken.sol"; interface IChildToken is TokenBase {}';
+    const aliasedChild={...inheritedTokenSnapshots[1],
+      content:aliasedTokenChild,sha256:hash(aliasedTokenChild)};
+    const aliasedRoutes=resolveAcquiredInterfaceCallers(aliasedChild,'IChildToken','mint',
+      [inheritedTokenSnapshots[0],aliasedChild,inheritedTokenSnapshots[2]]);
+    assert.deepEqual(aliasedRoutes.map(x=>x.selector),['ChildTokenConsumer.use'],
+      'Actual acquired Solidity import aliases must resolve inherited interface methods');
+    const unboundSecondParent='pragma solidity ^0.8.20; import "./IBaseToken.sol"; interface IChildToken is IBaseToken, IMissingBase {}';
+    const missingSecond={...inheritedTokenSnapshots[1],
+      content:unboundSecondParent,sha256:hash(unboundSecondParent)};
+    assert.deepEqual(resolveAcquiredInterfaceCallers(missingSecond,'IChildToken','mint',
+      [inheritedTokenSnapshots[0],missingSecond,inheritedTokenSnapshots[2]]),[],
+      'One valid inherited method must not conceal another unresolved base');
+
     assert.equal(resolveAcquiredInterfaceCallers(icSnap,'ICToken','burn',
       [icSnap,callerSnap]).length,0,'No invented interface method');
     // A source-acquired concrete child must remain discoverable even when
