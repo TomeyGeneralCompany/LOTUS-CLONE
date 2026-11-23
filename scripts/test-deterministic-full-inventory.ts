@@ -279,11 +279,11 @@ async function run(){
     }
     // An acquired dependency whose initializer cannot be completely bound
     // must not be reported as an executable fixture.
-    const unboundAdapter='pragma solidity ^0.8.0; contract Adapter is IAdapter { constructor(Token token) {} function initialize(string memory configuration) external {} }';
+    const unboundAdapter='pragma solidity ^0.8.0; contract Adapter is IAdapter { constructor(Token token) {} function initialize(uint256[33] memory configuration) external {} }';
     const unbound=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
       fixtureSources[0],{...fixtureSources[1],content:unboundAdapter,sha256:hash(unboundAdapter)},fixtureSources[2]]);
     assert.equal(unbound.status,'unresolved',
-      'Missing initializer arguments must invalidate the acquired deployment graph');
+      'An oversized initializer array must invalidate the bounded fixture graph');
     if(unbound.status==='unresolved')
       assert.ok(unbound.missingDependencies.some(x=>x.includes('unsupported_initializer_parameter')||
         x.includes('incomplete_initializer_arguments')));
