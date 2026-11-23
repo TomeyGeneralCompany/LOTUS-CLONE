@@ -1454,9 +1454,11 @@ contract PrivateAllowance {
       exp.sequence.steps.some(step=>step.operation==='call'&&
         step.function==='allowance(address,address)'&&step.expect==='7')),
       'Private mapping mutation must be falsified by an actual getter result');
+    // A getter whose parameter positions do not match the storage key
+    // order cannot justify the assumed owner/spender mapping identity.
     const wrongAllowance=nestedAllowance.replace(
-      '_allowances[owner][spender] = amount;',
-      '_allowances[spender][owner] = amount;');
+      'return _allowances[owner][spender];',
+      'return _allowances[spender][owner];');
     const wrongAllowanceSnap={...nestedAllowanceSnap,content:wrongAllowance,
       sha256:hash(wrongAllowance)};
     const wrongAllowancePlan=constructSolidityExperiments({
