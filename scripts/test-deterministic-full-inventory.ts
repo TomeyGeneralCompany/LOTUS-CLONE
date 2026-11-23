@@ -1004,6 +1004,44 @@ contract DirectMap {
       e.securityProperty.endsWith(':recipient')),
       'Crediting msg.sender must not prove a credit to recipient');
 
+    const directStateText=`pragma solidity ^0.8.0;
+contract DirectState {
+  uint256 public amount;
+  bool public enabled;
+  address public recipient;
+  function change(uint256 next) external { amount = next; }
+  function enable(bool value) external { enabled = value; }
+  function choose(address chosen) external { recipient = chosen; }
+  function conditional(uint256 next) external { if (next > 3) amount = next; }
+}`;
+    const directStateSnap={path:'source-1/contracts/DirectState.sol',
+      content:directStateText,sha256:hash(directStateText)};
+    const directStateMenu=[
+      {selector:'DirectState.change',operation:'send',inputs:['uint256']},
+      {selector:'DirectState.enable',operation:'send',inputs:['bool']},
+      {selector:'DirectState.choose',operation:'send',inputs:['address']},
+      {selector:'DirectState.conditional',operation:'send',inputs:['uint256']}
+    ];
+    for(const [name,getter,expected] of [
+      ['change','amount()','7'],
+      ['enable','enabled()',true],
+      ['choose','recipient()','$account2']
+    ] as const){
+      const built=constructSolidityExperiments({repositoryCommit:'b'.repeat(40),
+        targetPath:directStateSnap.path,targetSelector:'DirectState.'+name,
+        sources:[directStateSnap],declarations:directStateMenu as any,skipLegacy:true});
+      assert.equal(built.ok,true,'Direct state assignment must be source-testable: '+name);
+      if(built.ok)assert.ok(built.experiments.some(exp=>
+        exp.securityProperty.startsWith('source-defined direct state assignment')&&
+        exp.sequence.steps.some(step=>step.operation==='call'&&
+          step.function===getter&&step.expect===expected)));
+    }
+    const branchState=constructSolidityExperiments({repositoryCommit:'b'.repeat(40),
+      targetPath:directStateSnap.path,targetSelector:'DirectState.conditional',
+      sources:[directStateSnap],declarations:directStateMenu as any,skipLegacy:true});
+    assert.ok(!branchState.ok||!branchState.experiments.some(exp=>
+      exp.securityProperty.startsWith('source-defined direct state assignment')),
+      'Conditional writes must not be mistaken for unconditional source assignments');
     const sourcePureText=`pragma solidity ^0.8.0;
 contract PureArithmetic {
   function calc(uint256 value) external pure returns(uint256) { return (value * 3) + 2; }
