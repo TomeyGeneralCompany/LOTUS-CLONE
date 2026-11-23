@@ -28,6 +28,7 @@ import { resolve, relative, sep, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
+import {fileURLToPath} from "node:url";
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
 import {sourceRepairRoutes} from "./deterministic/typed-repair-routes";
 import {repairAttemptIdentity} from "./deterministic/repair-attempt-identity";
@@ -1514,9 +1515,14 @@ export async function runLocalAudit(
           "scripts/solidity_security_evidence.py",
           "scripts/reproduction-runtime/solidity-sequence.cjs",
         ];
+        // 'root' is the audited SOURCE workspace, which in tests and
+        // production acquisitions may be a temporary directory containing
+        // only target code. Resolve engine inputs relative to this module,
+        // never against the audited target's cwd.
+        const engineRoot=resolve(dirname(fileURLToPath(import.meta.url)),"../../..");
         const engineDigest=createHash("sha256");
         for(const enginePath of enginePaths){
-          const content=await readFile(join(root,enginePath));
+          const content=await readFile(join(engineRoot,enginePath));
           engineDigest.update(enginePath).update("\u0000").update(content).update("\u0000");
         }
         const analysisEngineRevision=engineDigest.digest("hex");
