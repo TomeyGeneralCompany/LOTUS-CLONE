@@ -40,7 +40,7 @@ export const sourceProbeSpecSchema = z.object({file:z.string().min(1).max(4096),
   });
 // ERC1155 reproduction may insert mined mint/approval prerequisite transactions
 // before a requested send. They are recorded as setup, never as vulnerability evidence.
-const fixtureDiagnosticsSchema=z.object({
+export const fixtureDiagnosticsSchema=z.object({
   experimentId:digest.nullish(),fixtureId:digest.nullish(),sourceSha256:digest.nullish(),
   file:z.string().max(4096).nullish(),selector:z.string().max(160).nullish(),
   selectedFile:z.string().max(4096).nullish(),contractName:z.string().max(128).nullish(),
