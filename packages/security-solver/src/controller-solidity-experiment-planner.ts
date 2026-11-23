@@ -3100,6 +3100,10 @@ function sourcePureExpressionExperiment(
         try{return BigInt(raw);}catch{return null;}
       }
       if(n.type==='BooleanLiteral')return n.value===true;
+      // Solidity parser represents redundant arithmetic parentheses as
+      // one-element TupleExpression nodes. They do not change evaluation.
+      if(n.type==='TupleExpression'&&n.components?.length===1)
+        return evaluate(n.components[0],depth+1);
       if(n.type==='Identifier')return params.get(String(n.name||''))??null;
       if(n.type==='UnaryOperation'){
         const operand=evaluate(n.subExpression,depth+1);
