@@ -3099,6 +3099,8 @@ function sourceDirectAssignmentExperiments(
     }
     if(!valid||!declarations.some(d=>d.selector===contract.name+'.'+method&&
       d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
+    const fnText=body(snapshot.content,fn);
+    if(hasAnySourceAuthGuard(fn,fnText))continue;
     const statements:any[]=fn.body.statements||[];
     // Only a top-level direct assignment is considered unconditional. A
     // branch-sensitive store or helper call requires deeper symbolic analysis.
