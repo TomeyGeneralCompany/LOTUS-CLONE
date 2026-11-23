@@ -1323,6 +1323,45 @@ contract GuardedNFT is ERC721URIStorageUpgradeable, OwnableUpgradeable {
     // than +=. That is still a falsifiable getter-backed property.
     // A private accounting scalar may still have a strictly equivalent,
     // source-declared view readback. Getter identity must be exact.
+    // The source argument is passed to a uniquely identified private
+    // helper, which performs an unconditional exact state assignment. This
+    // is testable even if the state getter bears a different name.
+    const internalScalarText=`pragma solidity ^0.8.0;
+contract InternalScalar {
+  uint256 private held;
+  function amount() external view returns(uint256) { return held; }
+  function update(uint256 value) external { _set(value); }
+  function _set(uint256 next) internal { held = next; }
+  function updateUnrelated(uint256 value) external { _other(value); }
+  function _other(uint256 next) internal { elsewhere = next; }
+  uint256 private elsewhere;
+}`;
+    const internalScalarSnap={path:'source-1/contracts/InternalScalar.sol',
+      content:internalScalarText,sha256:hash(internalScalarText)};
+    const internalScalarMenu=[
+      {selector:'InternalScalar.amount',operation:'call',inputs:[]},
+      {selector:'InternalScalar.update',operation:'send',inputs:['uint256']},
+      {selector:'InternalScalar.updateUnrelated',operation:'send',inputs:['uint256']}
+    ];
+    const internalScalarPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:internalScalarSnap.path,
+      targetSelector:'InternalScalar.update',sources:[internalScalarSnap],
+      declarations:internalScalarMenu as any,skipLegacy:true});
+    assert.equal(internalScalarPlan.ok,true,
+      'Source-exact helper delegation must construct a state obligation');
+    if(internalScalarPlan.ok)assert.ok(internalScalarPlan.experiments.some(e=>
+      e.securityProperty.startsWith('source internal state assignment')&&
+      e.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='amount()'&&step.expect==='7')&&
+      e.witnesses.some(w=>w.symbol.includes('_set'))));
+    const unrelatedScalar=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:internalScalarSnap.path,
+      targetSelector:'InternalScalar.updateUnrelated',sources:[internalScalarSnap],
+      declarations:internalScalarMenu as any,skipLegacy:true});
+    assert.ok(!unrelatedScalar.ok||!unrelatedScalar.experiments.some(e=>
+      e.securityProperty.startsWith('source internal state assignment')&&
+      e.securityProperty.endsWith(':held')),
+      'Internal helper mutating unrelated storage cannot prove held state');
     const privatePairSource=`pragma solidity ^0.8.0;
 contract PrivatePair {
   uint256 private stored;
