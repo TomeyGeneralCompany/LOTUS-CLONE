@@ -741,6 +741,7 @@ export function verifyAcquiredReceiverMethods(
 
 export function resolveSourceFixtureDependencies(
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
+  limits:Readonly<{maxDepth?:number;maxNodes?:number}>={},
 ):FixtureResolution {
   const ast=astOf(target);
   const targetNode=(ast?.children||[]).find((n:any)=>n.type==="ContractDefinition"&&n.name===contractName);
@@ -786,7 +787,15 @@ export function resolveSourceFixtureDependencies(
       .map(match=>match[1]);
     requiredReceiverMethods.set(binding.receiver,[...new Set(methods)]);
   }
-  const MAX_DEPTH=6,MAX_NODES=8;
+  // Planner resource limits are independently bounded by the execution schema
+  // and local gas/sequence limits. A deep acquired dependency chain is not a
+  // missing implementation simply because a historical fixture budget was 8.
+  const MAX_DEPTH=limits.maxDepth===undefined?10:limits.maxDepth;
+  const MAX_NODES=limits.maxNodes===undefined?16:limits.maxNodes;
+  if(!Number.isSafeInteger(MAX_DEPTH)||MAX_DEPTH<1||MAX_DEPTH>12||
+     !Number.isSafeInteger(MAX_NODES)||MAX_NODES<1||MAX_NODES>16)
+    return {status:"unresolved",missingDependencies:["invalid_fixture_resource_budget"],
+      attemptedResolvers:[],witnesses:[]};
   const resolve=(typ:string,depth:number):string|null=>{
     attempts.push(typ);
     if(depth>MAX_DEPTH){missing.push(typ+":max_dependency_depth");return null;}
