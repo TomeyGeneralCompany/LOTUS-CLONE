@@ -243,9 +243,16 @@ export class AnalysisProgressStore {
       if(uniqueExperiments.length)properties.push({id:pid,state:"test_constructed",
         sourceWitnesses:[],unresolvedPrerequisites:[],experimentIds:uniqueExperiments});
     }
-    for(const [index,reason] of [...new Set(unresolved)].entries())
-      properties.push({id:id+":unresolved:"+index,state:"prerequisites_pending",
+    // The unmet-prerequisite identity belongs to the exact source-backed
+    // blocker, not its incidental array position. Regenerating analysis in
+    // another order must not silently assign the old property ID to a new
+    // unrelated prerequisite or permit an incorrect supersession.
+    for(const reason of [...new Set(unresolved)].sort()){
+      const blockerId=createHash("sha256").update(JSON.stringify([
+        record.sourceCommit,record.sourceSha256,reason])).digest("hex");
+      properties.push({id:id+":unresolved:"+blockerId,state:"prerequisites_pending",
         sourceWitnesses:[],unresolvedPrerequisites:[reason],experimentIds:[]});
+    }
     if(!properties.length)properties.push({id:id+":needs_property",state:"prerequisites_pending",
       sourceWitnesses:[],unresolvedPrerequisites:["source_grounded_falsifier_missing"],experimentIds:[]});
     record.properties=properties;
