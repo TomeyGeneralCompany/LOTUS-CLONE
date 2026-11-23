@@ -333,6 +333,14 @@ contract TupleConsumer {
     assert.equal(verifyAcquiredReceiverMethods('IAdapter',['quote'],
       typedSources[3].path,'WrongAdapter',typedSources).ok,false,
       'Matching method names cannot substitute for a matching return ABI');
+    const soleIncompatible=resolveSourceFixtureDependencies(
+      typedSources[1],'Consumer',[typedSources[0],typedSources[1],typedSources[3]]);
+    assert.equal(soleIncompatible.status,'unresolved',
+      'A single ABI-incompatible implementation must not be accepted by default');
+    if(soleIncompatible.status==='unresolved')
+      assert.ok(soleIncompatible.missingDependencies.some(x=>
+        x.includes('no_acquired_abi_compatible_implementation')),
+        'Reject the incompatible receiver by ABI rather than declaring fixture success');
     const selectedFixture=resolveSourceFixtureDependencies(typedSources[1],'Consumer',typedSources);
     assert.equal(selectedFixture.status,'resolved',
       'An acquired caller ABI must uniquely select the compatible concrete implementation');
