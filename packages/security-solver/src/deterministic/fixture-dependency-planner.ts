@@ -234,8 +234,18 @@ function constrainedFixtureArg(type:any,parameter:string,fn:any,nonzero:boolean,
 }
 /** The compiler ABI represents a struct as a tuple of its acquired fields.
  * This does not infer any business-level property or nondefault configuration. */
-function fixtureAbiType(type:any,contract:any,depth=0):string|null {
+function fixtureAbiType(type:any,contract:any,depth=0,source?:SourceSnapshot,
+  acquired:readonly SourceSnapshot[]=[]):string|null {
   if(depth>5)return null;
+  if(source){
+    const entries:ContractEntry[]=acquired.flatMap(s=>
+      (astOf(s)?.children||[]).filter((n:any)=>n.type==="ContractDefinition")
+        .map((n:any)=>({source:s,node:n})));
+    const actual=callableType(type,{source,node:contract},entries);
+    if(actual!==null)return actual;
+    // A failed acquired UDT ABI identity is not automatically an address.
+    if(type?.type==="UserDefinedTypeName")return null;
+  }
   if(type?.type==="ArrayTypeName"){
     const base=fixtureAbiType(type.baseTypeName,contract,depth+1);
     if(!base)return null;
@@ -1094,7 +1104,7 @@ export function resolveSourceFixtureDependencies(
         missing.push(key+":incomplete_initializer_arguments");
       }else{
         const sigTypes=(initializer.parameters||[]).map((p:any)=>
-          fixtureAbiType(p.typeName,selected.node));
+          fixtureAbiType(p.typeName,selected.node,0,selected.source,sources));
         if(sigTypes.some((value:any)=>value===null))
           missing.push(key+":unsupported_initializer_abi");
         else initializers.push({id:"setup"+(initializers.length+1),deploymentId:id,
