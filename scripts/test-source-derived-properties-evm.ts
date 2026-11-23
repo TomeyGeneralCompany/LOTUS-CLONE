@@ -104,4 +104,40 @@ const mappingObserved=await execute(
 assert.ok(mappingObserved.steps.every((step:any)=>step.passed!==false));
 assert.ok(mappingObserved.steps.some((step:any)=>
   step.operation==='call'&&step.function==='credit(address)'&&step.actual==='1'));
+const internalSource=[
+  'pragma solidity ^0.8.20;',
+  'contract InternalAllowance {',
+  ' mapping(address=>mapping(address=>uint256)) private _allowances;',
+  ' function allowance(address owner,address spender) external view returns(uint256) {',
+  '   return _allowances[owner][spender];',
+  ' }',
+  ' function increaseAllowance(address spender,uint256 amount) external returns(bool) {',
+  '   _approve(msg.sender,spender,_allowances[msg.sender][spender]+amount);',
+  '   return true;',
+  ' }',
+  ' function _approve(address owner,address spender,uint256 amount) internal {',
+  '   _allowances[owner][spender] = amount;',
+  ' }',
+  '}',
+].join('\n');
+const internalFile='source-1/contracts/InternalAllowance.sol';
+const internalPlan=constructSolidityExperiments({
+  repositoryCommit:'d'.repeat(40),targetPath:internalFile,
+  targetSelector:'InternalAllowance.increaseAllowance',
+  sources:[{path:internalFile,content:internalSource,sha256:sha(internalSource)}],
+  declarations:[
+    {selector:'InternalAllowance.increaseAllowance',operation:'send',inputs:['address','uint256']},
+    {selector:'InternalAllowance.allowance',operation:'call',inputs:['address','address']}
+  ],skipLegacy:true});
+assert.equal(internalPlan.ok,true,JSON.stringify(internalPlan));
+if(!internalPlan.ok)throw new Error('Source helper property missing');
+const internalProperty=internalPlan.experiments.find(e=>
+  e.securityProperty.startsWith('source-backed internal setter'));
+assert.ok(internalProperty,'Exact helper state writes must yield source property');
+const internalActual=await execute(
+  compile(internalFile,internalSource,'InternalAllowance'),internalProperty.sequence);
+assert.ok(internalActual.steps.every((step:any)=>step.passed!==false),
+  'Actual private nested-mapping helper readback failed: '+JSON.stringify(internalActual));
+assert.ok(internalActual.steps.some((step:any)=>step.operation==='call'&&
+  step.function==='allowance(address,address)'&&step.actual==='7'));
 console.log('SOURCE_DERIVED_FINANCIAL_EVM_ORACLES_PASSED');
