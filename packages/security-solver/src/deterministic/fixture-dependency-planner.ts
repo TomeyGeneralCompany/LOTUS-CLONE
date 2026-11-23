@@ -530,14 +530,33 @@ export function resolveAcquiredConcreteImplementations(
     return types.some((type:string|null)=>type===null)?null:
       String(fn.name)+"("+types.join(",")+")";
   };
-  const targetFunctions=(root.subNodes||[]).filter((n:any)=>
-    n.type==="FunctionDefinition"&&n.name===method);
-  if(!targetFunctions.length)return [];
-  const rootEntry={source:abstractSource,node:root};
-  const targetIds=new Set<string>(targetFunctions.map((fn:any)=>
-    identities(fn,rootEntry)).filter((id:string|null):id is string=>id!==null));
-  const targetReturns=new Map(targetFunctions.map((fn:any)=>[
-    identities(fn,rootEntry),callableReturns(fn,rootEntry,entries)]));
+  // Abstract interfaces can inherit the requested entrypoint from another
+  // acquired interface. Resolve its true declaration/ABI through imported
+  // parent edges, not through the selected interface's empty local body.
+  const rootEntry:ContractEntry={source:abstractSource,node:root};
+  const targetDeclarations:Array<{entry:ContractEntry;fn:any}>=[];
+  let targetInvalid=false;
+  const visitTarget=(entry:ContractEntry,visited=new Set<string>(),depth=0):void=>{
+    const identity=entry.source.path+":"+entry.node.name;
+    if(visited.has(identity)||depth>12){targetInvalid=true;return;}
+    visited.add(identity);
+    for(const fn of entry.node.subNodes||[])
+      if(fn.type==="FunctionDefinition"&&fn.name===method&&!fn.isConstructor)
+        targetDeclarations.push({entry,fn});
+    const inherited=entry.node.baseContracts||[],parents=basesOf(entry);
+    for(let i=0;i<inherited.length;i++){
+      const possibilities=parents[i]||[];
+      if(possibilities.length!==1){targetInvalid=true;continue;}
+      visitTarget(possibilities[0],visited,depth+1);
+    }
+  };
+  visitTarget(rootEntry);
+  if(targetInvalid||!targetDeclarations.length)return [];
+  const targetIds=new Set<string>(targetDeclarations.map(({fn,entry})=>
+    identities(fn,entry)).filter((id:string|null):id is string=>id!==null));
+  if(targetIds.size!==targetDeclarations.length)return [];
+  const targetReturns=new Map(targetDeclarations.map(({fn,entry})=>[
+    identities(fn,entry),callableReturns(fn,entry,entries)]));
   const result:AcquiredConcreteImplementation[]=[];
   for(const candidate of entries){
     if(candidate.node.name===abstractContract&&candidate.source.path===abstractSource.path)continue;
