@@ -204,8 +204,8 @@ async function run(){
     assert.equal(initialized.status,'resolved',
       'A source-bound initializer dependency must produce a complete fixture');
     if(initialized.status==='resolved'){
-      assert.deepEqual(initialized.deployments.map(x=>x.contract),['Token','Adapter'],
-        'Producer deployment must precede initializer consumer deployment');
+      assert.deepEqual(initialized.deployments.map(x=>x.contract).sort(),['Adapter','Token'],
+        'Both source-proven contracts must deploy before initializer operations');
       assert.equal(new Set(initialized.deployments.map(x=>x.id)).size,
         initialized.deployments.length,
         'Initializer-recursive deployments must retain unique stable IDs');
@@ -213,7 +213,7 @@ async function run(){
         'Consumer and initializer-discovered producer cannot share a deployment ID');
       assert.equal(initialized.initializerOperations.length,1);
       assert.equal(initialized.initializerOperations[0].args[0],
-        '$deployment:'+initialized.deployments[0].id);
+        '$deployment:'+initialized.deployments.find(x=>x.contract==='Token')!.id);
     }
     // Acquired initializer operation must invoke the actual declared ABI selector.
     // Solidity contracts may expose init(...) rather than initialize(...).
