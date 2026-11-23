@@ -206,7 +206,6 @@ async function run(){
     assert.equal(history.inconclusiveAttempts?.length,1,'Failed receipt must persist');
 
     const replacementLock=await stage([replacementLead]);
-    replacementLock.registerAnalysisInventory([replacementLead.id]);
     replacementLock.registerAnalysisLead({id:replacementLead.id,
       path:replacementLead.path,selector:replacementLead.selector,
       sourceCommit:replacementLead.sourceCommit,sourceSha256:replacementLead.sourceSha256});
