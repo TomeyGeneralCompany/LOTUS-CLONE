@@ -153,15 +153,29 @@ function fixtureAbiType(type:any,contract:any,depth=0):string|null {
   }
   return callableType(type);
 }
-function initializerStateBindings(node:any):Array<{parameter:string;receiver:string;typeName:string;line:number}>{
-  // Only a compiler AST user-defined contract/interface reference can create a
-  // deployment edge. Elementary types (including uint256 casts), arrays,
-  // mappings and value types belong to ordinary initializer argument binding.
-  // The downstream resolver will still prove the acquired implementation.
+function initializerStateBindings(node:any,source:SourceSnapshot):Array<{parameter:string;receiver:string;typeName:string;line:number}>{
+  // UserDefinedTypeName also denotes struct, enum and user-defined value types.
+  // Check declarations BEFORE making a deployment edge; those types are values,
+  // not contracts. Qualified names retain their actual declaration namespace.
+  const nonDeployable=new Set<string>();
+  const collectValueTypes=(owner:any,prefix="")=>{
+    for(const declaration of owner.subNodes||[]){
+      if(!["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(declaration.type)||
+        !declaration.name)continue;
+      nonDeployable.add(prefix+String(declaration.name));
+    }
+  };
+  collectValueTypes(node);
+  const parsed=astOf(source);
+  for(const declaration of parsed?.children||[]){
+    if(declaration.type==="ContractDefinition")collectValueTypes(declaration,declaration.name+".");
+    else if(["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(declaration.type)&&
+      declaration.name)nonDeployable.add(String(declaration.name));
+  }
   const vars=new Map<string,string>();
   for(const item of node.subNodes||[])if(item.type==="StateVariableDeclaration")
     for(const v of item.variables||[])if(v.name&&v.typeName?.type==="UserDefinedTypeName"&&
-      typeOf(v.typeName))vars.set(v.name,typeOf(v.typeName));
+      typeOf(v.typeName)&&!nonDeployable.has(typeOf(v.typeName)))vars.set(v.name,typeOf(v.typeName));
   const out:Array<{parameter:string;receiver:string;typeName:string;line:number}>=[];
   for(const fn of (node.subNodes||[]).filter((x:any)=>x.type==="FunctionDefinition"&&x.body&&
     /^(?:initialize|init|__.*init.*)$/i.test(x.name||""))){
@@ -656,7 +670,7 @@ export function resolveSourceFixtureDependencies(
   let nextDeploymentId=1;
   // Prove caller demand from the acquired source, not from a guessed fixture.
   const requiredReceiverMethods=new Map<string,string[]>();
-  const targetBindings=initializerStateBindings(targetNode);
+  const targetBindings=initializerStateBindings(targetNode,target);
   // Source-referenced constructor-injected dependencies must also contribute
   // receiver ABI requirements to implementation disambiguation.
   const constructorDemands=new Map<string,string[]>();
@@ -727,7 +741,7 @@ export function resolveSourceFixtureDependencies(
     const initializer=initOf(selected.node);
     if(initializer){
       const initArgs:PreparedArg[]=[];
-      const initBindings=initializerStateBindings(selected.node);
+      const initBindings=initializerStateBindings(selected.node,selected.source);
       for(const p of initializer.parameters||[]){
         const name=String(p.name||""),argType=typeOf(p.typeName);
         const matching=initBindings.find(x=>x.parameter===name);
