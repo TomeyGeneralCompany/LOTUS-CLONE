@@ -771,6 +771,27 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
       if(def.type==="EnumDefinition")return (def.members||[]).length<=256?"uint8":null;
       return callableType(def.underlyingType||def.typeName,owner,entries,depth+1);
     }
+    // solidity-parser releases used by the offline index can omit the
+    // Solidity 0.8.8+ top-level "type X is T" AST. Preserve the *exact
+    // acquired source text* declaration as the type witness; never infer an
+    // ABI from the name alone. The actual compiler must still approve it.
+    const matchingValueTypes:Array<{underlying:string;path:string}>=[];
+    if(parts.length===0){
+      const escapedName=name.replace(/[.*+?^$()|[\]{}\\]/g,"\\    const contractDefs=entries.filter(e=>e.node.name===name&&");
+      const typePattern=new RegExp("(?:^|\\n)\\s*type\\s+"+escapedName+
+        "\\s+is\\s+(u?int(?:[0-9]{1,3})?|address|bool|bytes(?:[0-9]{1,2})?)\\s*;","g");
+      for(const path of reachable){
+        const text=sourceByPath.get(path)?.content||"";
+        for(const match of text.matchAll(typePattern))
+          matchingValueTypes.push({underlying:match[1],path});
+      }
+    }
+    if(matchingValueTypes.length>1)return null;
+    if(matchingValueTypes.length===1){
+      const underlying=matchingValueTypes[0].underlying;
+      return callableType({type:"ElementaryTypeName",name:underlying},
+        owner,entries,depth+1);
+    }
     const contractDefs=entries.filter(e=>e.node.name===name&&
       reachable.has(e.source.path)&&
       (parts.length===0||parts.join(".")===e.node.name));
