@@ -207,29 +207,54 @@ function fixtureAbiType(type:any,contract:any,depth=0):string|null {
   return /^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(standard)?
     standard:null;
 }
-function initializerStateBindings(node:any,source:SourceSnapshot):Array<{parameter:string;receiver:string;typeName:string;line:number}>{
-  // UserDefinedTypeName also denotes struct, enum and user-defined value types.
-  // Check declarations BEFORE making a deployment edge; those types are values,
-  // not contracts. Qualified names retain their actual declaration namespace.
+function initializerStateBindings(
+  node:any,source:SourceSnapshot,sources:readonly SourceSnapshot[]
+):Array<{parameter:string;receiver:string;typeName:string;line:number}>{
+  // Solidity user-defined names also denote structs, enums and value types,
+  // including qualified declarations imported from other acquired files.
+  // Verify the actual acyclic import namespace before constructing ANY
+  // deployment edge; a struct parameter cannot be a concrete contract.
+  const byPath=new Map(sources.map(s=>[s.path,s]));
+  byPath.set(source.path,source);
   const nonDeployable=new Set<string>();
-  const collectValueTypes=(owner:any,prefix="")=>{
-    for(const declaration of owner.subNodes||[]){
-      if(!["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(declaration.type)||
-        !declaration.name)continue;
-      nonDeployable.add(prefix+String(declaration.name));
+  const visited=new Set<string>(),pending=[source.path];
+  while(pending.length&&visited.size<512){
+    const path=pending.shift()!;
+    if(visited.has(path))continue;
+    visited.add(path);
+    const snapshot=byPath.get(path);
+    if(!snapshot)continue;
+    const ast=astOf(snapshot);
+    for(const declaration of ast?.children||[]){
+      if(declaration.type==="ContractDefinition"){
+        for(const nested of declaration.subNodes||[]){
+          if(!["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"]
+            .includes(nested.type)||!nested.name)continue;
+          nonDeployable.add(String(nested.name));
+          nonDeployable.add(String(declaration.name)+"."+nested.name);
+        }
+      }else if(["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"]
+        .includes(declaration.type)&&declaration.name)
+        nonDeployable.add(String(declaration.name));
     }
-  };
-  collectValueTypes(node);
-  const parsed=astOf(source);
-  for(const declaration of parsed?.children||[]){
-    if(declaration.type==="ContractDefinition")collectValueTypes(declaration,declaration.name+".");
-    else if(["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(declaration.type)&&
-      declaration.name)nonDeployable.add(String(declaration.name));
+    for(const imp of (ast?.children||[]).filter((i:any)=>
+      i.type==="ImportDirective"&&typeof i.path==="string")){
+      const imported=imp.path.startsWith(".")?
+        posix.normalize(posix.join(posix.dirname(path),imp.path)):imp.path;
+      if(byPath.has(imported)&&!visited.has(imported))pending.push(imported);
+    }
   }
+  // Explicitly local contract/interface declarations take precedence over
+  // homonymous imported types. The compiler will still reject invalid
+  // cross-file symbols during the real isolated EVM compilation.
+  const localContracts=new Set((astOf(source)?.children||[]).filter((d:any)=>
+    d.type==="ContractDefinition").map((d:any)=>String(d.name||"")));
   const vars=new Map<string,string>();
   for(const item of node.subNodes||[])if(item.type==="StateVariableDeclaration")
     for(const v of item.variables||[])if(v.name&&v.typeName?.type==="UserDefinedTypeName"&&
-      typeOf(v.typeName)&&!nonDeployable.has(typeOf(v.typeName)))vars.set(v.name,typeOf(v.typeName));
+      typeOf(v.typeName)&&(!localContracts.has(typeOf(v.typeName))?
+        !nonDeployable.has(typeOf(v.typeName)):true))
+      vars.set(v.name,typeOf(v.typeName));
   const out:Array<{parameter:string;receiver:string;typeName:string;line:number}>=[];
   for(const fn of (node.subNodes||[]).filter((x:any)=>x.type==="FunctionDefinition"&&x.body&&
     /^(?:initialize|init|__.*init.*)$/i.test(x.name||""))){
@@ -808,7 +833,7 @@ export function resolveSourceFixtureDependencies(
   let nextDeploymentId=1;
   // Prove caller demand from the acquired source, not from a guessed fixture.
   const requiredReceiverMethods=new Map<string,string[]>();
-  const targetBindings=initializerStateBindings(targetNode,target);
+  const targetBindings=initializerStateBindings(targetNode,target,sources);
   // Source-referenced constructor-injected dependencies must also contribute
   // receiver ABI requirements to implementation disambiguation.
   const constructorDemands=new Map<string,string[]>();
@@ -892,7 +917,7 @@ export function resolveSourceFixtureDependencies(
     const initializer=initOf(selected.node);
     if(initializer){
       const initArgs:PreparedArg[]=[];
-      const initBindings=initializerStateBindings(selected.node,selected.source);
+      const initBindings=initializerStateBindings(selected.node,selected.source,sources);
       for(const p of initializer.parameters||[]){
         const name=String(p.name||""),argType=typeOf(p.typeName);
         const matching=initBindings.find(x=>x.parameter===name);
