@@ -403,29 +403,44 @@ export async function runLocalAudit(
       const successful=constructed.ok?[constructed]:[];
       const callerOnly=new Set<string>();
       const altFailures:string[]=[];
-      const failureCategory=!constructed.ok?constructed.unresolvedCategory:null;
-      const rootSource=!constructed.ok?deterministicSourceSnapshots.find(source=>
-        source.path===lead.path&&source.sha256===lead.sourceSha256):undefined;
-      // Inherited concrete targets may provide the initializer and executable
-      // property that a standalone abstract OR uninitialized base lacks.
-      // Every such candidate still requires a complete acquired inheritance
-      // witness, successful construction and independent local EVM evidence.
-      const recoverConcrete=failureCategory==="missing_fixture"||
-        failureCategory==="unresolved_dependency"||
-        failureCategory==="no_supported_property"||
-        failureCategory==="missing_observable_state";
-      // All four typed blockers are eligible for both recovered paths.
-      // The same boolean prevents narrowing the remaining failure union
-      // to an impossible comparison under strict TypeScript.
+      // A lead may have one completed source-grounded property while another
+      // independent property remains blocked. Do not stop exploring inherited
+      // or caller implementations merely because one constructor succeeded.
+      // Exactly typed outstanding prerequisites, not model text or a generic
+      // name heuristic, determine the remaining deterministic repair routes.
+      const categories=new Set<string>();
+      if(!constructed.ok&&constructed.unresolvedCategory)
+        categories.add(constructed.unresolvedCategory);
+      const persisted=record.properties.filter(p=>
+        p.state==="prerequisites_pending"||p.unresolvedPrerequisites.length>0)
+        .flatMap(p=>p.unresolvedPrerequisites);
+      for(const reason of persisted){
+        if(/(?:^|\\W)no_supported_property(?:\\W|$)|source_grounded_falsifier_missing/.test(reason))
+          categories.add("no_supported_property");
+        if(/(?:^|\\W)missing_fixture(?:\\W|$)|(?:^|\\W)initializer_dependency(?:\\W|$)/.test(reason))
+          categories.add("missing_fixture");
+        if(/(?:^|\\W)unresolved_dependency(?:\\W|$)|^(?:unresolved_external_call|unresolved_call|ambiguous_call):/.test(reason))
+          categories.add("unresolved_dependency");
+        if(/(?:^|\\W)missing_observable_state(?:\\W|$)|^missing_public_getter:/.test(reason))
+          categories.add("missing_observable_state");
+      }
+      const rootSource=deterministicSourceSnapshots.find(source=>
+        source.path===lead.path&&source.sha256===lead.sourceSha256);
+      const needsAdditionalResolution=!constructed.ok||persisted.length>0;
+      const recoverConcrete=needsAdditionalResolution&&[
+        "missing_fixture","unresolved_dependency",
+        "no_supported_property","missing_observable_state"
+      ].some(category=>categories.has(category));
       const recoverCaller=recoverConcrete;
-      if(!constructed.ok&&rootSource){
+      if(needsAdditionalResolution&&rootSource){
         await appendFile(logFile,"[EXPERIMENT_REPAIR_ROUTES] "+JSON.stringify({
-          leadId:lead.id,category:failureCategory||"unknown",
+          leadId:lead.id,categories:[...categories].sort(),
+          previouslyVerifiedProperties:record.properties.filter(p=>p.state==="test_completed").length,
           routes:[...(recoverConcrete?["concrete_source"]:[]),
             ...(recoverCaller?["acquired_interface_callers"]:[])],
           sourceSha256:lead.sourceSha256})+"\n");
       }
-      if(!constructed.ok&&rootSource&&recoverConcrete){
+      if(rootSource&&recoverConcrete){
         if(rootSource){
           const method=lead.selector.split(".").pop()||"";
           const abstractContract=lead.selector.slice(0,lead.selector.lastIndexOf("."));
@@ -473,7 +488,7 @@ export async function runLocalAudit(
       // acquired import and source callsite into a concrete consumer, then
       // test the consumer's own source-derived obligation. This is caller-side
       // evidence, not an assertion about an unavailable external protocol.
-      if(!constructed.ok&&rootSource&&recoverCaller){
+      if(rootSource&&recoverCaller){
         const source=rootSource;
         if(source){
           const cut=lead.selector.lastIndexOf(".");
