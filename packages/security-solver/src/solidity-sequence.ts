@@ -25,7 +25,7 @@ const prepSend=z.object({id:prepId,deploymentId:prepId,function:signature,args,
 const prepCheck=z.object({id:prepId,deploymentId:prepId,function:signature,args,
   sender,expect:abiValue}).strict();
 export const solidityPreparationSchema=z.object({
-  deployments:z.array(prepDeployment).max(8),
+  deployments:z.array(prepDeployment).max(16),
   operations:z.array(prepSend).max(24),
   checks:z.array(prepCheck).max(16)
 }).strict().superRefine((plan,ctx)=>{
