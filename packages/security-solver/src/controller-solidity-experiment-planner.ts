@@ -3187,7 +3187,145 @@ function sourceStructOverrideExperiments(
   const mappings=nodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>
       v.visibility==='public'&&v.typeName?.type==='Mapping'&&identifier.test(v.name||''));
-  const escaped=(v:string)=>v.replace(/[.*+?^{}$()|[\]\\]/g,'\\/** Deterministic source-expression oracle for directly executable pure entrypoints.');
+  const escaped=(v:string)=>v.replace(/[.*+?^{}$()|[\]\\]/g,'\\/** Prove a cross-function mapping write from an acquired exact internal helper
+ * and its independently declared public getter. This is a small source-level
+ * def/use proof, NOT a heuristic inference from function or variable names.
+ * Reads and write keys must be the same mapping lvalue under proven parameter
+ * substitution; EVM executes the actual helper bytecode and return assertions. */
+function sourceInternalMappingSetterExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const mappingNodes=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      identifier.test(v.name||'')&&v.typeName?.type==='Mapping'&&
+      v.typeName?.keyType?.name==='address'&&
+      v.typeName?.valueType?.type==='Mapping'&&
+      v.typeName?.valueType?.keyType?.name==='address'&&
+      /^uint(?:[0-9]{1,3})?$/.test(String(v.typeName?.valueType?.valueType?.name||'')));
+  if(!mappingNodes.length)return [];
+  const indexPath=(n:any):{name:string;keys:string[]}|null=>{
+    if(n?.type==='Identifier'&&identifier.test(n.name||''))
+      return {name:n.name,keys:[]};
+    if(n?.type!=='IndexAccess'||n.index?.type!=='Identifier')return null;
+    const parent=indexPath(n.base);
+    return parent&&identifier.test(n.index.name||'')?
+      {name:parent.name,keys:[...parent.keys,n.index.name]}:null;
+  };
+  const functions=nodes.filter(n=>n.type==='FunctionDefinition'&&n.name&&n.body);
+  const getterCandidates=functions.filter(fn=>
+    ['public','external'].includes(fn.visibility)&&
+    fn.stateMutability==='view'&&(fn.parameters||[]).length===2&&
+    (fn.returnParameters||[]).length===1&&
+    (fn.body?.statements||[]).length===1&&
+    fn.body.statements[0].type==='ReturnStatement');
+
+  const owner=resolveInheritance(snapshot,contract,sources);
+  const setup=resolveFlexibleSetup(snapshot,contract,owner.chain,
+    sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+  const targets=functions.filter(fn=>fn.name===method&&
+    ['public','external'].includes(fn.visibility)&&
+    !['pure','view'].includes(fn.stateMutability||''));
+  for(const fn of targets){
+    if((fn.modifiers||[]).length)continue;
+    const params:any[]=fn.parameters||[];
+    const inputs=params.map(p=>canonicalAbiType(p.typeName));
+    if(inputs.length!==2||inputs[0]!=='address'||
+      !/^uint(?:[0-9]{1,3})?$/.test(inputs[1]||'')||
+      !declarations.some(d=>d.selector===contract.name+'.'+method&&
+        d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
+    if(!params.every((p:any)=>identifier.test(p.name||'')))continue;
+    const statements:any[]=fn.body.statements||[];
+    if(statements.length!==2||
+      statements[0]?.type!=='ExpressionStatement'||
+      statements[0].expression?.type!=='FunctionCall'||
+      statements[0].expression.expression?.type!=='Identifier'||
+      statements[1]?.type!=='ReturnStatement'||
+      statements[1]?.expression?.type!=='BooleanLiteral'||
+      statements[1].expression.value!==true)continue;
+    const call=statements[0].expression;
+    const helperName=String(call.expression.name||'');
+    const helperCandidates=functions.filter(h=>h.name===helperName&&
+      ['internal','private'].includes(h.visibility)&&
+      (h.parameters||[]).length===(call.arguments||[]).length);
+    if(helperCandidates.length!==1)continue;
+    const helper=helperCandidates[0];
+    const helperParams:any[]=helper.parameters||[];
+    const bindings=new Map<string,string>();
+    let valid=true;
+    for(let i=0;i<helperParams.length;i++){
+      const argument=call.arguments[i];
+      let sourceValue:string|null=null;
+      if(argument.type==='Identifier'&&argument.name===params[0].name)
+        sourceValue='$account2';
+      else if(argument.type==='Identifier'&&argument.name===params[1].name)
+        sourceValue='7';
+      else if(argument.type==='MemberAccess'&&argument.memberName==='sender'&&
+        argument.expression?.type==='Identifier'&&argument.expression.name==='msg')
+        sourceValue='$account0';
+      if(!sourceValue||!identifier.test(helperParams[i].name||'')){
+        valid=false;break;
+      }
+      bindings.set(helperParams[i].name,sourceValue);
+    }
+    if(!valid)continue;
+    const helperStatements:any[]=helper.body.statements||[];
+    const assignment=helperStatements.find((n:any)=>n.type==='ExpressionStatement'&&
+      n.expression?.type==='BinaryOperation'&&n.expression.operator==='=');
+    if(!assignment||helperStatements.some((n:any)=>n!==assignment&&
+      n.type!=='EmitStatement'&&!(n.type==='ExpressionStatement'&&
+        n.expression?.type==='FunctionCall'&&n.expression.expression?.name==='require')))continue;
+    const left=indexPath(assignment.expression.left);
+    const rhs=assignment.expression.right;
+    if(!left||left.keys.length!==2||rhs?.type!=='Identifier'||
+      !mappingNodes.some(m=>m.name===left.name)||
+      !bindings.has(rhs.name)||bindings.get(rhs.name)!=='7')continue;
+    const resolvedKeys=left.keys.map(name=>bindings.get(name));
+    if(resolvedKeys.some(value=>value!=='$account0'&&value!=='$account2')||
+      new Set(resolvedKeys).size!==2)continue;
+    for(const getter of getterCandidates){
+      const ret=indexPath(getter.body.statements[0].expression);
+      const readerParams:any[]=getter.parameters||[];
+      if(!ret||ret.name!==left.name||ret.keys.length!==2||
+        ret.keys[0]!==readerParams[0]?.name||
+        ret.keys[1]!==readerParams[1]?.name||
+        !readerParams.every(p=>canonicalAbiType(p.typeName)==='address')||
+        canonicalAbiType(getter.returnParameters[0].typeName)!=='uint256')continue;
+      const sig=canonicalFunctionIdentity(fn);
+      const getterSig=canonicalFunctionIdentity(getter);
+      const stepArgs:SolidityArgValue[]=['$account2','7'];
+      const steps:SoliditySequence['steps']=[];
+      if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
+        args:setup.initArgs,sender:0,requiredSetup:true});
+      steps.push({operation:'call',function:getterSig,
+        args:resolvedKeys as string[],expect:'0'});
+      steps.push({operation:'send',function:sig,args:stepArgs,sender:0});
+      steps.push({operation:'call',function:getterSig,
+        args:resolvedKeys as string[],expect:'7'});
+      out.push({
+        hypothesis:'Source-internal helper writes 7 to the exact private mapping keys and the independent public getter must expose that value',
+        property:'source-backed internal setter and public mapping getter '+contract.name+'.'+sig,
+        sequence:{constructorArgs:setup.constructorArgs,
+          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+          steps},
+        witnesses:[witness(snapshot,fn,contract.name+'.'+sig),
+          witness(snapshot,helper,contract.name+'.'+helperName),
+          witness(snapshot,getter,contract.name+'.'+getterSig),
+          witness(snapshot,mappingNodes.find(m=>m.name===left.name),
+            contract.name+'.'+left.name)],
+      });
+    }
+  }
+  return out;
+}
+
+/** Deterministic source-expression oracle for directly executable pure entrypoints.');
   const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
 
   for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
@@ -3632,6 +3770,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     input.declarations,indexed))choices.push(mapping);
   for(const scalarPure of sourcePureExpressionExperiment(target,contract,method,
     input.declarations,indexed))choices.push(scalarPure);
+  for(const internalMapping of sourceInternalMappingSetterExperiments(
+    target,contract,method,input.declarations,indexed))choices.push(internalMapping);
   for(const assignment of sourceDirectAssignmentExperiments(target,contract,method,
     input.declarations,indexed))choices.push(assignment);
   for(const struct of sourceStructOverrideExperiments(target,contract,method,
