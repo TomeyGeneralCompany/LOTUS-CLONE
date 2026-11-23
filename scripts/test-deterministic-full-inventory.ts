@@ -547,6 +547,31 @@ contract ImportedEnumConsumer {
       assert.deepEqual(importedEnumFixture.deployments.map(x=>x.contract),['ImportedEnumService']);
       assert.deepEqual(importedEnumFixture.deployments[0].constructorArgs,['0']);
     }
+    // An imported enum initializer must use the compiler ABI uint8 and a
+    // typed zero value, not a fictitious initialize(address) call.
+    const enumInitContract=`pragma solidity ^0.8.0;
+import "./ChoiceTypes.sol";
+import "./IEnumService.sol";
+contract ImportedEnumInitializable is IEnumService {
+ ChoiceTypes.Tier public tier;
+ function initialize(ChoiceTypes.Tier selected) external {tier=selected;}
+ function ping() external override {}
+}`;
+    const importedEnumInitSources=[
+      enumImportSources[0],enumImportSources[1],
+      {path:'source-1/contracts/ImportedEnumInitializable.sol',
+       content:enumInitContract,sha256:hash(enumInitContract)},
+      enumImportSources[3]];
+    const enumInitializerPlan=resolveSourceFixtureDependencies(
+      importedEnumInitSources[3],'ImportedEnumConsumer',importedEnumInitSources);
+    assert.equal(enumInitializerPlan.status,'resolved',JSON.stringify(enumInitializerPlan));
+    if(enumInitializerPlan.status==='resolved'){
+      assert.deepEqual(enumInitializerPlan.deployments.map(x=>x.contract),['ImportedEnumInitializable']);
+      assert.equal(enumInitializerPlan.initializerOperations.length,1);
+      assert.equal(enumInitializerPlan.initializerOperations[0].function,
+        'initialize(uint8)');
+      assert.deepEqual(enumInitializerPlan.initializerOperations[0].args,['0']);
+    }
     // A Solidity user-defined type may be a struct or enum, not an address.
     // Exact imported ABI identities are required for concrete receivers.
     const shapeTypes=`pragma solidity ^0.8.0;
