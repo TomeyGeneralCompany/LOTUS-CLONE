@@ -11,6 +11,7 @@ import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
 import {sourceRepairRoutes} from '../packages/security-solver/src/deterministic/typed-repair-routes';
+import {repairAttemptIdentity} from '../packages/security-solver/src/deterministic/repair-attempt-identity';
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
@@ -44,6 +45,35 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // Repair attempts have a real fixed-point identity. An audit history
+    // append alone cannot trigger another identical retry, whereas a genuine
+    // independently failed EVM execution must open a new recovery generation.
+    const retrySource=[candidates[3]];
+    const retryStore=await AnalysisProgressStore.open(
+      join(dir,'repair-fingerprint.json'),retrySource);
+    retryStore.nextBatch(1,1);
+    const retryId=hash('source-recovery-attempt');
+    retryStore.recordAssessment(retrySource[0].id,['property:stored'],
+      [],[retryId],[],[{
+        id:'property:stored',experimentIds:[retryId],
+        sourceWitnesses:[retrySource[0].path+':'+retrySource[0].sourceSha256]
+      }]);
+    const retryProgress=retryStore.records.get(retrySource[0].id)!;
+    const firstRetryKey=repairAttemptIdentity(retryProgress);
+    retryStore.noteRepairAttempt(retrySource[0].id,
+      'source-property-controller:'+firstRetryKey,'no_new_experiment');
+    assert.equal(repairAttemptIdentity(retryProgress),firstRetryKey,
+      'A no-op attempt must not rearm an identical deterministic repair');
+    retryStore.recordInconclusive(retryId,'incomplete',
+      hash('actual-incomplete-receipt'),'source-observed contract revert');
+    const secondRetryKey=repairAttemptIdentity(retryProgress);
+    assert.notEqual(secondRetryKey,firstRetryKey,
+      'Independent runtime failure must unlock a different sourced retry generation');
+    await retryStore.save();
+    const reopenedRetry=await AnalysisProgressStore.open(
+      join(dir,'repair-fingerprint.json'),retrySource);
+    assert.equal(repairAttemptIdentity(reopenedRetry.records.get(retrySource[0].id)!),
+      secondRetryKey,'Checkpoint recovery must preserve repair generation identity');
     // A valid completed property does not close a different unmet obligation.
     // The dispatcher must choose authenticated alternative routes even when
     // direct construction succeeded for a different security property.
