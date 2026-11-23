@@ -33,6 +33,8 @@ jobs:
           npm install --prefix scripts/reproduction-runtime --ignore-scripts --no-audit --no-fund
       - name: Install application dependencies for workflow integration
         run: npm ci
+      - name: Regress strict Solidity verifier ABI evidence transport
+        run: node --import tsx scripts/test-source-reproduction-abi-diagnostics.ts
       - name: Verify actual stateful session execution and independent replay
         run: node --import tsx scripts/test-source-probe-session.ts --isolated
       - name: Test controller cold-memory archive integrity
