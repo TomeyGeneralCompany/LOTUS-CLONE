@@ -26,7 +26,7 @@ function acquiredTypeEntries(sources:readonly SourceSnapshot[]):ContractEntry[]{
     // The installed parser may reject the 0.8.8+ global UDVT syntax
     // altogether. Keep that exact source in the acquired namespace so the
     // validated lexical declaration can resolve through real import edges.
-    const lexicalGlobalValue=/(?:^|\\n)\\s*type\\s+[A-Za-z_]\\w*\\s+is\\s+(?:u?int(?:[0-9]{1,3})?|address|bool|bytes(?:[0-9]{1,2})?)\\s*;/m
+    const lexicalGlobalValue=/(?:^|\n)\s*type\s+[A-Za-z_]\w*\s+is\s+(?:u?int(?:[0-9]{1,3})?|address|bool|bytes(?:[0-9]{1,2})?)\s*;/m
       .test(source.content);
     return globals.length||lexicalGlobalValue?
       [...contracts,{source,node:{type:"ContractDefinition",kind:"library",
