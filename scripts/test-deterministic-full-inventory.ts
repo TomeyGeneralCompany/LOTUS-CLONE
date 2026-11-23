@@ -311,6 +311,27 @@ contract TupleConsumer {
     if(tupleResolved.status==='resolved')
       assert.deepEqual(tupleResolved.deployments[0].constructorArgs,[['0',false]],
         'Struct ABI must encode bool as false, not as truthy string');
+    // Primitive casts are initializer values, never deployable contract edges.
+    // Regression: the controller previously requested a uint256 implementation.
+    const primitiveInitSource=`pragma solidity ^0.8.0;
+contract PrimitiveInit {
+  uint256 public accrued;
+  function initialize(uint256 amount) external {
+    accrued = uint256(amount);
+  }
+}`;
+    const primitiveInitSnapshot={path:'source-1/contracts/PrimitiveInit.sol',
+      content:primitiveInitSource,sha256:hash(primitiveInitSource)};
+    const primitiveInitResolved=resolveSourceFixtureDependencies(
+      primitiveInitSnapshot,'PrimitiveInit',[primitiveInitSnapshot]);
+    assert.equal(primitiveInitResolved.status,'resolved',
+      'A uint256 initializer cast must be treated as a value, not a contract dependency');
+    if(primitiveInitResolved.status==='resolved'){
+      assert.deepEqual(primitiveInitResolved.deployments,[],
+        'Primitive state bindings must never create deployment nodes');
+      assert.deepEqual(primitiveInitResolved.bindings,[],
+        'Primitive state bindings must never create contract bindings');
+    }
     const ambiguousSource='pragma solidity ^0.8.0; contract AdapterTwo is IAdapter {}';
     const ambiguous=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
       ...fixtureSources,{path:'source-1/contracts/AdapterTwo.sol',content:ambiguousSource,sha256:hash(ambiguousSource)}]);
