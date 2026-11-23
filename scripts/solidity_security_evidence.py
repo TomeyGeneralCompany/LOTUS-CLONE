@@ -619,6 +619,133 @@ def _source_witnessed_direct_assignment_negative(
     )
 
 
+def _source_witnessed_funded_mapping_negative(
+    file: Path, selector: str, requested_steps: list,
+    actual_steps: list,
+) -> tuple[str, str] | None:
+    """A tested cross-function source relation, not inferred security absence.
+
+    Both the funding and settlement lvalue arithmetic must be present in the
+    acquired file, and the isolated EVM must confirm each actual transaction
+    plus independent before/after readbacks for BOTH storage values.
+    """
+    if not isinstance(requested_steps, list) or not requested_steps or \
+       len(requested_steps) != len(actual_steps):
+        return None
+    try:
+        source = _strip_comments(file.read_text(encoding="utf8"))
+    except OSError:
+        return None
+    method = selector.rsplit(".", 1)[-1]
+    header, body = _extract_fn_body(source, method)
+    if not header or not body:
+        return None
+    signature = re.search(
+        r"\bfunction\s+" + re.escape(method) +
+        r"\s*\(\s*address\s+([A-Za-z_]\w*)\s*,\s*uint(?:256)?\s+([A-Za-z_]\w*)\s*\)",
+        header,
+    )
+    if not signature:
+        return None
+    account_key, amount_key = signature.groups()
+    mapping = re.search(
+        r"\bmapping\s*\(\s*address\s*=>\s*uint(?:256)?\s*\)\s*public\s+([A-Za-z_]\w*)\s*;",
+        source,
+    )
+    total = re.search(r"\buint(?:256)?\s+public\s+([A-Za-z_]\w*)\s*;", source)
+    if not mapping or not total:
+        return None
+    account, scalar = mapping.group(1), total.group(1)
+    if not re.search(r"\b" + re.escape(account) +
+                     r"\s*\[\s*" + re.escape(account_key) +
+                     r"\s*\]\s*\+=\s*" + re.escape(amount_key) + r"\s*;", body):
+        return None
+    if not re.search(r"\b" + re.escape(scalar) +
+                     r"\s*-=\s*" + re.escape(amount_key) + r"\s*;", body):
+        return None
+    if not re.search(re.escape(amount_key) +
+                     r"\s*>\s*0\s*&&\s*" + re.escape(amount_key) +
+                     r"\s*<=\s*" + re.escape(scalar), body):
+        return None
+    # Independently witness that another acquired entrypoint is a matching
+    # source-backed inflow, not an invented initial balance.
+    funding = re.search(
+        r"\bfunction\s+([A-Za-z_]\w*)\s*\(\s*address\s+([A-Za-z_]\w*)"
+        r"\s*,\s*uint(?:256)?\s+([A-Za-z_]\w*)\s*\)\s*external\b[^{]*\{"
+        r"([\s\S]*?)\}", source
+    )
+    if not funding:
+        return None
+    fund_name, fund_account, fund_amount, fund_body = funding.groups()
+    if fund_name == method:
+        return None
+    local = re.search(
+        r"\buint(?:256)?\s+([A-Za-z_]\w*)\s*=\s*" +
+        re.escape(fund_amount) + r"\s*\.\s*bounded\s*\(", fund_body,
+    )
+    inflow_var = local.group(1) if local else fund_amount
+    if not re.search(r"\b" + re.escape(account) +
+                     r"\s*\[\s*" + re.escape(fund_account) +
+                     r"\s*\]\s*\+=\s*" + re.escape(inflow_var) + r"\s*;", fund_body) or \
+       not re.search(r"\b" + re.escape(scalar) +
+                     r"\s*\+=\s*" + re.escape(inflow_var) + r"\s*;", fund_body):
+        return None
+
+    def actual_call(name: str, before: bool, at: int, args: list | None = None):
+        region = range(at) if before else range(at+1, len(actual_steps))
+        for i in (reversed(tuple(region)) if before else region):
+            requested, observed = requested_steps[i], actual_steps[i]
+            if requested.get("operation") != "call" or \
+               requested.get("function") != name or observed.get("passed") is not True:
+                continue
+            if args is not None and requested.get("args") != args:
+                continue
+            raw = str(observed.get("actual", ""))
+            if re.fullmatch(r"\d+", raw):
+                return int(raw)
+        return None
+
+    for index, (requested, observed) in enumerate(zip(requested_steps,actual_steps)):
+        if requested.get("operation") != "send" or \
+           requested.get("function", "").split("(", 1)[0] != method or \
+           requested.get("sender") != 0 or \
+           observed.get("passed") is not True or observed.get("reverted") is not False:
+            continue
+        args = requested.get("args") or []
+        if len(args) != 2 or not re.fullmatch(r"[1-9]\d*", str(args[1])):
+            continue
+        amount = int(args[1])
+        funded = any(
+            i < index and req.get("operation") == "send" and
+            req.get("function", "").split("(", 1)[0] == fund_name and
+            req.get("args", [None])[0] == args[0] and
+            got.get("passed") is True and got.get("reverted") is False
+            for i,(req,got) in enumerate(zip(requested_steps,actual_steps))
+        )
+        if not funded:
+            continue
+        mapping_getter=account+"(address)"
+        total_getter=scalar+"()"
+        args_key=[args[0]]
+        account_before=actual_call(mapping_getter,True,index,args_key)
+        account_after=actual_call(mapping_getter,False,index,args_key)
+        total_before=actual_call(total_getter,True,index,[])
+        total_after=actual_call(total_getter,False,index,[])
+        if None in (account_before,account_after,total_before,total_after):
+            continue
+        if total_before>=amount and \
+           account_after-account_before==amount and \
+           total_before-total_after==amount:
+            return (
+                "source_funded_mapping_negative",
+                "The exact acquired source provided a concrete funding precondition "
+                "and two independent EVM storage readbacks. The selected operation "
+                "increased the specified mapping entry and decreased the bounded "
+                "total by the measured input; only this local property was tested."
+            )
+    return None
+
+
 def security_experiment_disposition(
     repository: Path,
     file: Path,
@@ -647,6 +774,12 @@ def security_experiment_disposition(
     if any(step.get("passed") is not True for step in actual_steps
            if step.get("operation") not in ("observe",)):
         return "observation_only", None, explanation
+
+    funded = _source_witnessed_funded_mapping_negative(
+        file, selector, requested_steps, actual_steps
+    )
+    if funded is not None:
+        return "behavior_not_observed", funded[0], funded[1]
 
     direct = _source_witnessed_direct_assignment_negative(
         file, selector, requested_steps, actual_steps, data.get("accounts")
