@@ -3152,6 +3152,105 @@ function sourceDirectAssignmentExperiments(
   return out;
 }
 
+/** Source-proven onlyOwner direct public mapping-of-struct override.
+ * Both ABI return fields, the owner guard and the mined revert are verified. */
+function sourceStructOverrideExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  menu:readonly SolidityProbeDeclaration[],sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const ast=parseAstCached(snapshot);
+  const owns=(contract.baseContracts||[]).some((b:any)=>b.baseName?.namePath==='Ownable')&&
+    (ast.children||[]).some((i:any)=>i.type==='ImportDirective'&&
+      i.path==='@openzeppelin/contracts/access/Ownable.sol');
+  if(!owns)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,sources,menu,null);
+  if(!setup||setup.usesToken)return [];
+  const defs=new Map<string,any>();
+  for(const n of nodes)if(n.type==='StructDefinition'&&n.name)defs.set(n.name,n);
+  const mappings=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      v.visibility==='public'&&v.typeName?.type==='Mapping'&&identifier.test(v.name||''));
+  const escaped=(v:string)=>v.replace(/[.*+?^{}$()|[\]\\]/g,'\\/** Deterministic source-expression oracle for directly executable pure entrypoints.');
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+    ['public','external'].includes(n.visibility)&&
+    (n.modifiers||[]).some((m:any)=>m.name==='onlyOwner'))){
+    const params:any[]=fn.parameters||[];
+    const types:string[]=params.map((p:any)=>canonicalAbiType(p.typeName)||'');
+    if(types.some(t=>!t)||!menu.some(d=>d.operation==='send'&&
+      d.selector===contract.name+'.'+method&&
+      JSON.stringify(d.inputs)===JSON.stringify(types)))continue;
+    const sourceBody=body(snapshot.content,fn);
+    for(const variable of mappings){
+      let inner:any=variable.typeName;
+      const keys:string[]=[],names:string[]=[];
+      while(inner?.type==='Mapping'&&keys.length<3){
+        const type=canonicalAbiType(inner.keyType);
+        if(!type||!['address','uint64','uint256','uint8'].includes(type))break;
+        keys.push(type);inner=inner.valueType;
+      }
+      const name=String(inner?.namePath||'').split('.').pop()||'';
+      const struct=defs.get(name),members:any[]=struct?.members||[];
+      if(!keys.length||members.length!==2||members[0].typeName?.name!=='bool'||
+        !/^uint(?:[0-9]{1,3})?$/.test(String(members[1].typeName?.name||'')))continue;
+      let valid=true;
+      for(const type of keys){
+        const param=params.find((p:any)=>canonicalAbiType(p.typeName)===type&&
+          !names.includes(p.name));
+        if(!param||!identifier.test(param.name||'')){valid=false;break;}
+        names.push(param.name);
+      }
+      if(!valid)continue;
+      const amount=params.find((p:any)=>identifier.test(p.name||'')&&
+        /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p.typeName)||'')&&
+        !names.includes(p.name));
+      if(!amount)continue;
+      const lhs=escaped(variable.name)+names.map(n=>
+        '\\s*\\[\\s*'+escaped(n)+'\\s*\\]').join('');
+      const rhs=escaped(name)+'\\s*\\(\\s*\\{\\s*'+escaped(members[0].name)+
+        '\\s*:\\s*true\\s*,\\s*'+escaped(members[1].name)+
+        '\\s*:\\s*'+escaped(amount.name)+'\\s*\\}\\s*\\)';
+      if(!new RegExp('\\b'+lhs+'\\s*=\\s*'+rhs).test(sourceBody))continue;
+      const keyValues=keys.map(type=>type==='address'?'$account2':'1');
+      const args:SolidityArgValue[]=[];
+      for(let i=0;i<params.length;i++){
+        const keyIndex=names.indexOf(params[i].name);
+        const v:SolidityArgValue|null=keyIndex>=0?keyValues[keyIndex]:
+          params[i].name===amount.name?'7':
+          pickFlexibleArg(types[i],params[i].name||'',{ownerAccount:'$account0'});
+        if(v===null){valid=false;break;}args.push(v);
+      }
+      if(!valid)continue;
+      const signature=canonicalFunctionIdentity(fn);
+      const getter=variable.name+'('+keys.join(',')+')';
+      const steps:SoliditySequence['steps']=[];
+      if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
+        args:setup.initArgs,sender:0,requiredSetup:true});
+      steps.push({operation:'call',function:'owner()',args:[],expect:'$account0'});
+      steps.push({operation:'call',function:getter,args:keyValues,expect:[false,'0']});
+      steps.push({operation:'send',function:signature,args,sender:1,expectRevert:true});
+      steps.push({operation:'call',function:getter,args:keyValues,expect:[false,'0']});
+      steps.push({operation:'send',function:signature,args,sender:0});
+      steps.push({operation:'call',function:getter,args:keyValues,expect:[true,'7']});
+      out.push({
+        hypothesis:'Direct source-owned struct override rejects an unauthorized caller and writes both public struct fields only for the owner',
+        property:'owner-gated source struct override '+contract.name+'.'+signature+':'+variable.name,
+        sequence:{constructorArgs:setup.constructorArgs,
+          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),steps},
+        witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
+          witness(snapshot,variable,contract.name+'.'+variable.name),
+          witness(snapshot,struct,contract.name+'.'+name)],
+      });
+    }
+  }
+  return out;
+}
+
 /** Deterministic source-expression oracle for directly executable pure entrypoints.
  * The output is derived only from an acquired expression AST and concrete ABI
  * arguments; arbitrary helper calls, external dependencies, unknown symbols
@@ -3509,6 +3608,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     input.declarations,indexed))choices.push(scalarPure);
   for(const assignment of sourceDirectAssignmentExperiments(target,contract,method,
     input.declarations,indexed))choices.push(assignment);
+  for(const struct of sourceStructOverrideExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(struct);
   const vestingCreation=groundedVestingCreationExperiment(target,contract,method,input.declarations);
   if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
