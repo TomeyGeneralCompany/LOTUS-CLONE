@@ -472,6 +472,34 @@ contract ImportedValues {
       assert.deepEqual(importedValues.deployments,[]);
       assert.deepEqual(importedValues.bindings,[]);
     }
+    // Solidity's public mapping-of-struct getter returns elementary ABI
+    // fields separately; source-verified interface compatibility must not
+    // confuse (bool,uint256) tuple input with two getter outputs.
+    const structGetterInterface=`pragma solidity ^0.8.0;
+interface IStructGetter {
+ function read(address account) external view returns(bool,uint256);
+}`;
+    const structGetterImpl=`pragma solidity ^0.8.0;
+contract SourceStructGetter {
+ struct Data {bool ready;uint256 amount;}
+ mapping(address=>Data) public read;
+}`;
+    const structGetterSources=[
+      {path:'source-1/contracts/IStructGetter.sol',content:structGetterInterface,
+        sha256:hash(structGetterInterface)},
+      {path:'source-1/contracts/SourceStructGetter.sol',content:structGetterImpl,
+        sha256:hash(structGetterImpl)}
+    ];
+    assert.deepEqual(verifyAcquiredReceiverMethods('IStructGetter',['read'],
+      structGetterSources[1].path,'SourceStructGetter',structGetterSources),
+      {ok:true,missing:[]},
+      'Compiler-generated public struct mapping getter must expose two typed ABI returns');
+    const wrongOrder=structGetterInterface.replace('returns(bool,uint256)','returns(uint256,bool)');
+    const wrongOrderSources=[{...structGetterSources[0],content:wrongOrder,
+      sha256:hash(wrongOrder)},structGetterSources[1]];
+    assert.equal(verifyAcquiredReceiverMethods('IStructGetter',['read'],
+      wrongOrderSources[1].path,'SourceStructGetter',wrongOrderSources).ok,false,
+      'Field order and ABI return types must be authenticated, not name-matched');
     // A Solidity user-defined type may be a struct or enum, not an address.
     // Exact imported ABI identities are required for concrete receivers.
     const shapeTypes=`pragma solidity ^0.8.0;
