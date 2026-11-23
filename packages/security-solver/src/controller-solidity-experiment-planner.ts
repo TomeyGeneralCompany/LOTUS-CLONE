@@ -2933,8 +2933,9 @@ function sourceScalarDeltaExperiments(
           (n.name==='initialize'||n.name==='init')&&n.body);
         if(init&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,init)))continue;
       }
-      const statement=new RegExp('\\b'+state.name+'\\s*\\+=\\s*'+param.name+'\\s*;');
-      if(!statement.test(fnText))continue;
+      // Reuse exact-lvalue source accounting proof for assignment and SafeMath
+      // forms. Never equate a different storage key or symbol with this state.
+      if(!sourceExactAccountingDelta(fnText,state.name,param.name,'increase'))continue;
       const getter=state.name+'()';
       const width=Number(inputs[0].replace(/\D/g,''))||256;
       const amount=width<=8?'100':'1000';
