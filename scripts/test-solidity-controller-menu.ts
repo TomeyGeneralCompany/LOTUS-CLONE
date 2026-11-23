@@ -32,7 +32,12 @@ try {
  const getterPath=join(root,'GetterCoverage.sol');
  await writeFile(getterPath,getterSource);
  const acquiredGetterMenu=await index.probeMenu(getterPath,24);
- assert.deepEqual(acquiredGetterMenu.filter(x=>x.operation==='call')
+ // The source unit also declares IUnit.read, a real interface ABI entry.
+ // Filter only this concrete contract's public getters for this assertion.
+ assert.ok(acquiredGetterMenu.some(x=>x.selector==='IUnit.read'&&
+   x.operation==='call'),'Do not suppress acquired interface declarations');
+ assert.deepEqual(acquiredGetterMenu.filter(x=>x.operation==='call'&&
+   x.selector.startsWith('GetterCoverage.'))
    .map(x=>({selector:x.selector,inputs:x.inputs})),[
      {selector:'GetterCoverage.rates',inputs:['address','uint64']},
      {selector:'GetterCoverage.series',inputs:['uint256']},
