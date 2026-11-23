@@ -2101,13 +2101,25 @@ function reachableAccountingSource(snapshot:SourceSnapshot,contract:any,seed:any
   return parts.join("\n");
 }
 function accountingDirections(text:string,state:string):{increase:boolean;decrease:boolean}{
-  // Solidity state-variable names are lexical identifiers, not arbitrary regex input.
-  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state))return {increase:false,decrease:false};
-  // Mapping-valued state updates use indexed lvalues; source-backed
-  // accounting pairing must recognize balances[msg.sender] +=/-= amount.
-  const lvalue="\\b"+state+"\\s*(?:\\[[^\\]\\n]{1,128}\\]\\s*){0,2}";
-  return {increase:new RegExp(lvalue+"\\+=").test(text),
-    decrease:new RegExp(lvalue+"-=").test(text)};
+  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state))
+    return {increase:false,decrease:false};
+  // A source lvalue is the declared state symbol plus at most two identical
+  // mapping indices. The RHS must refer to that SAME source lvalue; unrelated
+  // names or different account keys never establish an accounting transition.
+  const indexed="(?:\\s*\\[[^\\]\\n]{1,128}\\]){0,2}";
+  const lvalue="\\b"+state+"("+indexed+")\\s*";
+  const simple="\\b"+state+"\\s*"+indexed+"\\s*";
+  const assigned=(operation:"add"|"sub")=>{
+    const arithmetic=operation==="add"?"\\+":"-";
+    return new RegExp(lvalue+"=\\s*"+state+"\\1\\s*(?:"+arithmetic+
+      "|\\.\\s*"+operation+"\\s*\\()");
+  };
+  return {
+    increase:new RegExp(simple+"\\+=").test(text)||
+      assigned("add").test(text),
+    decrease:new RegExp(simple+"-=").test(text)||
+      assigned("sub").test(text),
+  };
 }
 
 export function extractSourceInvariantDescriptor(

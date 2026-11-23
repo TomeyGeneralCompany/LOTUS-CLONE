@@ -605,6 +605,55 @@ contract HelperLedger {
     if(helperExperiment.ok)assert.ok(helperExperiment.experiments.some(x=>
       x.securityProperty.startsWith('financial ')),
       'The constructed property must be financial, not merely a generic call');
+    // A source-backed pair may use explicit assignments or SafeMath.add/sub
+    // instead of Solidity +=/-=. Unrelated RHS balances may not qualify.
+    const mathLedgerText=`pragma solidity ^0.8.0;
+library ProvenMath {
+  function add(uint256 a,uint256 b) internal pure returns(uint256) { return a+b; }
+  function sub(uint256 a,uint256 b) internal pure returns(uint256) { return a-b; }
+}
+contract MathLedger {
+  using ProvenMath for uint256;
+  uint256 public total;
+  mapping(address=>uint256) public balances;
+  function credit(uint256 amount) external {
+    total = total.add(amount);
+    balances[msg.sender] = balances[msg.sender].add(amount);
+  }
+  function debit(uint256 amount) external {
+    total = total.sub(amount);
+    balances[msg.sender] = balances[msg.sender].sub(amount);
+  }
+}`;
+    const mathLedgerSource={path:'source-1/contracts/MathLedger.sol',
+      content:mathLedgerText,sha256:hash(mathLedgerText)};
+    const mathLedgerDecls=['credit','debit'].map(name=>({
+      selector:'MathLedger.'+name,operation:'send' as const,
+      inputs:['uint256'],outputs:[],stateMutability:'nonpayable' as const
+    }));
+    const mathBuilt=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:mathLedgerSource.path,
+      targetSelector:'MathLedger.debit',sources:[mathLedgerSource],
+      declarations:mathLedgerDecls as any,skipLegacy:true
+    });
+    assert.equal(mathBuilt.ok,true,
+      'Acquired Same-lvalue SafeMath.add/sub accounting pairs must be constructible');
+    if(mathBuilt.ok)assert.ok(mathBuilt.experiments.some(e=>
+      e.securityProperty.startsWith('financial ')),
+      'Must construct an actual financial conservation experiment');
+    const falsePairText=mathLedgerText.replace(
+      'total = total.sub(amount);','total = balances[msg.sender].sub(amount);');
+    const falsePairSource={...mathLedgerSource,content:falsePairText,
+      sha256:hash(falsePairText)};
+    const falseBuilt=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:falsePairSource.path,
+      targetSelector:'MathLedger.debit',sources:[falsePairSource],
+      declarations:mathLedgerDecls as any,skipLegacy:true
+    });
+    if(falseBuilt.ok)assert.ok(falseBuilt.experiments.every(e=>
+      !e.securityProperty.startsWith('financial ')||
+      !e.hypothesis.includes('total')),
+      'An unrelated right-hand ledger must not establish a total-balance decrement');
     const ledgerExperiment=constructSolidityExperiments({
       repositoryCommit:'b'.repeat(40),targetPath:ledgerSource.path,
       targetSelector:'Ledger.debit',sources:[ledgerSource],
