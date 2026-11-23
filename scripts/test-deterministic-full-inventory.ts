@@ -46,6 +46,42 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // A changed property engine must reopen unresolved checkpoints, never
+    // reuse the old blocked assessment as proof that it was reevaluated.
+    // Preserve the old source-bound property and attempt history for audit.
+    const revisionFile=join(dir,'engine-revision-reassessment.json');
+    const revisionCandidate=candidates[0];
+    const priorEngine=await AnalysisProgressStore.open(revisionFile,
+      [revisionCandidate],'property-engine-old');
+    priorEngine.nextBatch(1,1);
+    priorEngine.recordAssessment(revisionCandidate.id,[],
+      ['source_grounded_falsifier_missing'],[]);
+    await priorEngine.save();
+    const rescanned=await AnalysisProgressStore.open(revisionFile,
+      [revisionCandidate],'property-engine-current');
+    assert.equal(rescanned.remaining,1,
+      'Engine revision must requeue the actual unresolved source lead');
+    assert.equal(rescanned.records.get(revisionCandidate.id)?.properties[0]
+      ?.unresolvedPrerequisites[0],'source_grounded_falsifier_missing',
+      'Reassessment must preserve the prior unmet prerequisite as evidence history');
+    await rescanned.save();
+    const sameEngine=await AnalysisProgressStore.open(revisionFile,
+      [revisionCandidate],'property-engine-current');
+    assert.equal(sameEngine.remaining,1,
+      'Restarting the same revision cannot discard unfinished analysis');
+    sameEngine.nextBatch(1,1);
+    sameEngine.recordAssessment(revisionCandidate.id,[],
+      ['source_grounded_falsifier_missing'],[]);
+    await sameEngine.save();
+    const completedAssessment=await AnalysisProgressStore.open(revisionFile,
+      [revisionCandidate],'property-engine-current');
+    assert.equal(completedAssessment.remaining,0,
+      'An unchanged engine must resume an already analyzed source lead');
+    const nextEngine=await AnalysisProgressStore.open(revisionFile,
+      [revisionCandidate],'property-engine-next');
+    assert.equal(nextEngine.remaining,1,
+      'A later engine revision must reassess unresolved leads again');
+
     // A nondeployable interface is NOT automatically source-unavailable.
     // The entire acquired inventory must prove the absence of any executable
     // implementer and any typed callsite, with a second independent check.
