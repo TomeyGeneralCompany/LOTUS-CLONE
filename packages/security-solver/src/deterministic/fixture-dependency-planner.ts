@@ -82,6 +82,53 @@ function primitiveFixtureArg(type:any,nonzero=false,contract?:any):PreparedArg|n
   if(/^(?:u?int)(?:[0-9]{1,3})?$/.test(k))return nonzero?"1":"0";
   return null;
 }
+/** Derive a scalar fixture value from literal require() bounds in the exact
+ * acquired constructor/initializer AST. Unknown or relational conditions are
+ * still checked by the executor; this never certifies a deployment receipt. */
+function constrainedFixtureArg(type:any,parameter:string,fn:any,nonzero:boolean,contract:any):PreparedArg|null {
+  const fallback=primitiveFixtureArg(type,nonzero,contract);
+  if(type?.type!=="ElementaryTypeName"||!parameter||!fn?.body)return fallback;
+  const match=String(type.name||"").match(/^(u?int)([0-9]{0,3})$/);
+  if(!match)return fallback;
+  const bits=match[2]?Number(match[2]):256;
+  if(bits<8||bits>256||bits%8!==0)return fallback;
+  const signed=match[1]==="int";
+  let lower=signed?-(1n<<BigInt(bits-1)):0n;
+  let upper=signed?(1n<<BigInt(bits-1))-1n:(1n<<BigInt(bits))-1n;
+  const excluded=new Set<string>();
+  const reverse:Record<string,string>={">":"<","<":">",">=":"<=","<=":">=","==":"==","!=":"!="};
+  const apply=(expr:any):void=>{
+    if(expr?.type!=="BinaryOperation")return;
+    if(expr.operator==="&&"){apply(expr.left);apply(expr.right);return;}
+    let op=String(expr.operator||"");
+    let literal=expr.right;
+    if(expr.left?.type==="NumberLiteral"&&expr.right?.type==="Identifier"&&
+      expr.right.name===parameter){op=reverse[op]||"";literal=expr.left;}
+    else if(expr.left?.type!=="Identifier"||expr.left.name!==parameter)return;
+    if(literal?.type!=="NumberLiteral"||!reverse[op])return;
+    const representation=String(literal.number||"").replace(/_/g,"");
+    if(!/^(?:0|[1-9][0-9]*)$/.test(representation))return;
+    const value=BigInt(representation);
+    switch(op){
+      case ">": if(value+1n>lower)lower=value+1n;break;
+      case ">=": if(value>lower)lower=value;break;
+      case "<": if(value-1n<upper)upper=value-1n;break;
+      case "<=": if(value<upper)upper=value;break;
+      case "==": lower=lower>value?lower:value;upper=upper<value?upper:value;break;
+      case "!=": excluded.add(value.toString());break;
+    }
+  };
+  for(const call of descendants(fn.body))if(call.type==="FunctionCall"&&
+    call.expression?.type==="Identifier"&&call.expression.name==="require"&&
+    Array.isArray(call.arguments)&&call.arguments.length>0)apply(call.arguments[0]);
+  if(lower>upper)return null;
+  let candidate=typeof fallback==="string"&&/^-?[0-9]+$/.test(fallback)?BigInt(fallback):lower;
+  if(candidate<lower)candidate=lower;
+  if(candidate>upper)candidate=upper;
+  while(excluded.has(candidate.toString())&&candidate<upper)candidate++;
+  if(excluded.has(candidate.toString()))return null;
+  return candidate.toString();
+}
 /** The compiler ABI represents a struct as a tuple of its acquired fields.
  * This does not infer any business-level property or nondefault configuration. */
 function fixtureAbiType(type:any,contract:any,depth=0):string|null {
@@ -660,7 +707,7 @@ export function resolveSourceFixtureDependencies(
         const dep=resolve(argType,depth+1);
         if(!dep){valid=false;break;}args.push("$deployment:"+dep);
       }else{
-        const literal=primitiveFixtureArg(p.typeName,false,selected.node);
+        const literal=constrainedFixtureArg(p.typeName,String(p.name||""),ctorOf(selected.node),false,selected.node);
         if(literal===null){
           missing.push(key+":unsupported_constructor_type:"+(argType||p.typeName?.type||"unknown"));
           valid=false;break;
@@ -689,7 +736,7 @@ export function resolveSourceFixtureDependencies(
           if(!dep){missing.push(key+":initializer_dependency:"+name);break;}
           initArgs.push("$deployment:"+dep);
         }else{
-          const literal=primitiveFixtureArg(p.typeName,true,selected.node);
+          const literal=constrainedFixtureArg(p.typeName,name,initializer,true,selected.node);
           if(literal===null){
             missing.push(key+":unsupported_initializer_parameter:"+name+":"+
               (argType||p.typeName?.type||"unknown"));break;
