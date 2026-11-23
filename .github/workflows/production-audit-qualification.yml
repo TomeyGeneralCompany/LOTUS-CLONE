@@ -38,6 +38,8 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+      - name: Regress strict Solidity verifier ABI evidence transport
+        run: node --import tsx scripts/test-source-reproduction-abi-diagnostics.ts
       - run: npm ci
       - name: Validate source acquisition
         run: |
