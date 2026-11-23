@@ -120,11 +120,45 @@ export class SoliditySourceIndex {
         if(member.type==='StateVariableDeclaration'){
           for(const variable of (member as any).variables||[]) {
             if(variable?.visibility!=='public' || typeof variable.name!=='string')continue;
-            let declaredType='';
-            try {declaredType=unit.text.slice(...bounds(variable.typeName)).trim();}catch{}
-            if(!/^(?:address(?: payable)?|bool|string|u?int(?:\d{0,3})?|bytes(?:[1-9]|[12]\d|3[012])?)$/.test(declaredType))continue;
-            entries.push({selector:node.name+'.'+variable.name,signature:variable.name+'()',operation:'call',
-              visibility:'public',inputs:[]});
+            // Getters for public mapping, nested mapping, arrays, typed
+            // contract references and structs are actual compiler ABI entrypoints.
+            // Earlier scalar-only indexing hid independent readback witnesses
+            // from the controller even when the deployed contract exposed them.
+            const canonical=(t:any):string|null=>{
+              if(t?.type!=='ElementaryTypeName')return null;
+              const name=String(t.name||'');
+              const abi=name==='uint'?'uint256':name==='int'?'int256':
+                name==='address payable'?'address':name;
+              return /^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(abi)?abi:null;
+            };
+            const keyTypes:string[]=[];
+            let valueType:any=variable.typeName;
+            while(keyTypes.length<8&&
+              (valueType?.type==='Mapping'||valueType?.type==='ArrayTypeName')){
+              if(valueType.type==='ArrayTypeName'){
+                keyTypes.push('uint256');valueType=valueType.baseTypeName;
+              }else{
+                const key=canonical(valueType.keyType);
+                if(!key){keyTypes.length=0;valueType=null;break;}
+                keyTypes.push(key);valueType=valueType.valueType;
+              }
+            }
+            if(!valueType||valueType.type==='Mapping'||valueType.type==='ArrayTypeName')continue;
+            // Built-in ABI outputs, address-valued contract refs, and local
+            // scalar structs all create real source-declared public getters.
+            let available=!!canonical(valueType);
+            if(valueType.type==='UserDefinedTypeName'){
+              const name=String(valueType.namePath||'').split('.').pop();
+              const knownStruct=(node.subNodes||[]).find((d:any)=>
+                d.type==='StructDefinition'&&d.name===name);
+              if(knownStruct){
+                available=(knownStruct.members||[]).some((m:any)=>!!canonical(m.typeName));
+              }else available=true; // compiler confirms the acquired contract/type
+            }
+            if(!available)continue;
+            entries.push({selector:node.name+'.'+variable.name,
+              signature:variable.name+'('+keyTypes.join(',')+')',operation:'call',
+              visibility:'public',inputs:keyTypes});
             if(entries.length>=limit)return entries;
           }
           continue;
