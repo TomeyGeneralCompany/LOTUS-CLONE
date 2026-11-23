@@ -403,16 +403,28 @@ export async function runLocalAudit(
       const successful=constructed.ok?[constructed]:[];
       const callerOnly=new Set<string>();
       const altFailures:string[]=[];
-      if(!constructed.ok&&constructed.unresolvedCategory==="missing_fixture"&&
-        /abstract and cannot be instantiated/.test(constructed.detail)){
-        const rootSource=deterministicSourceSnapshots.find(source=>source.path===lead.path &&
-          source.sha256===lead.sourceSha256);
+      const failureCategory=!constructed.ok?constructed.unresolvedCategory:null;
+      const rootSource=!constructed.ok?deterministicSourceSnapshots.find(source=>
+        source.path===lead.path&&source.sha256===lead.sourceSha256):undefined;
+      const recoverConcrete=failureCategory==="missing_fixture"||
+        failureCategory==="unresolved_dependency";
+      const recoverCaller=recoverConcrete||
+        failureCategory==="no_supported_property"||
+        failureCategory==="missing_observable_state";
+      if(!constructed.ok&&rootSource){
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_ROUTES] "+JSON.stringify({
+          leadId:lead.id,category:failureCategory||"unknown",
+          routes:[...(recoverConcrete?["concrete_source"]:[]),
+            ...(recoverCaller?["acquired_interface_callers"]:[])],
+          sourceSha256:lead.sourceSha256})+"\n");
+      }
+      if(!constructed.ok&&rootSource&&recoverConcrete){
         if(rootSource){
           const method=lead.selector.split(".").pop()||"";
           const abstractContract=lead.selector.slice(0,lead.selector.lastIndexOf("."));
           const concrete=resolveAcquiredConcreteImplementations(rootSource,
             abstractContract,method,deterministicSourceSnapshots);
-          for(const target of concrete.slice(0,8)){
+          for(const target of concrete.slice(0,32)){
             // SoliditySourceIndex may omit inherited public methods because
             // they aren't declared in the subclass file. The verified base's
             // AST signature is still in the compiled subclass ABI.
@@ -438,17 +450,15 @@ export async function runLocalAudit(
       // acquired import and source callsite into a concrete consumer, then
       // test the consumer's own source-derived obligation. This is caller-side
       // evidence, not an assertion about an unavailable external protocol.
-      if(!constructed.ok&&constructed.unresolvedCategory==="missing_fixture"&&
-        /abstract and cannot be instantiated/.test(constructed.detail)){
-        const source=deterministicSourceSnapshots.find(x=>
-          x.path===lead.path&&x.sha256===lead.sourceSha256);
+      if(!constructed.ok&&rootSource&&recoverCaller){
+        const source=rootSource;
         if(source){
           const cut=lead.selector.lastIndexOf(".");
           const contractName=lead.selector.slice(0,cut);
           const method=lead.selector.slice(cut+1);
           const callers=resolveAcquiredInterfaceCallers(source,
             contractName,method,deterministicSourceSnapshots);
-          for(const caller of callers.slice(0,16)){
+          for(const caller of callers.slice(0,32)){
             const menu=deterministicDeclarationsCache.get(caller.path)||[];
             if(!menu.some(d=>d.selector===caller.selector&&d.operation==="send")){
               altFailures.push(caller.selector+":caller_send_declaration_missing");
