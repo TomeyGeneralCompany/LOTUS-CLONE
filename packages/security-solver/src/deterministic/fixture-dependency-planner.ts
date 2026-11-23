@@ -662,8 +662,47 @@ export function resolveAcquiredInterfaceCallers(
   const iface=(original?.children||[]).find((x:any)=>
     x.type==='ContractDefinition'&&x.name===interfaceName&&
     (x.kind==='interface'||x.kind==='contract'));
-  if(!iface||!(iface.subNodes||[]).some((x:any)=>
-    x.type==='FunctionDefinition'&&x.name===method))return [];
+  if(!iface)return [];
+  // Interfaces can inherit the original callable ABI without redeclaring
+  // the function. Follow acquired imports and only uniquely bound ancestors;
+  // a name match in an unrelated source is not a source-grounded callsite.
+  const byPath=new Map(sources.map(source=>[source.path,source]));
+  const methodDeclared=(node:any,sourcePath:string,
+    ancestors=new Set<string>(),depth=0):boolean=>{
+    if(depth>12)return false;
+    const id=sourcePath+':'+String(node.name||'');
+    if(ancestors.has(id))return false;
+    if((node.subNodes||[]).some((fn:any)=>
+      fn.type==='FunctionDefinition'&&fn.name===method))return true;
+    const source=byPath.get(sourcePath);
+    if(!source)return false;
+    const visited=new Set(ancestors);visited.add(id);
+    const reachable=new Set<string>(),pending=[sourcePath];
+    while(pending.length&&reachable.size<=256){
+      const path=pending.shift()!;
+      if(reachable.has(path))continue;
+      reachable.add(path);
+      const item=byPath.get(path);
+      if(!item)continue;
+      for(const imp of (astOf(item)?.children||[]).filter((v:any)=>
+        v.type==='ImportDirective'&&typeof v.path==='string')){
+        const resolved=imp.path.startsWith('.')?
+          posix.normalize(posix.join(posix.dirname(path),imp.path)):imp.path;
+        if(byPath.has(resolved)&&!reachable.has(resolved))pending.push(resolved);
+      }
+    }
+    for(const base of node.baseContracts||[]){
+      const name=String(base.baseName?.namePath||'').split('.').pop();
+      const parents=[...reachable].flatMap(path=>
+        (astOf(byPath.get(path)!)?.children||[])
+          .filter((n:any)=>n.type==='ContractDefinition'&&n.name===name)
+          .map((n:any)=>({path,node:n})));
+      if(parents.length!==1)return false;
+      if(methodDeclared(parents[0].node,parents[0].path,visited,depth+1))return true;
+    }
+    return false;
+  };
+  if(!methodDeclared(iface,interfaceSource.path))return [];
   const callers:AcquiredInterfaceCaller[]=[];
   for(const source of sources){
     if(source.path===interfaceSource.path||!source.path.endsWith('.sol')||
