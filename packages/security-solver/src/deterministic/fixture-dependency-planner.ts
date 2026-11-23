@@ -691,16 +691,42 @@ export function resolveAcquiredInterfaceCallers(
         if(byPath.has(resolved)&&!reachable.has(resolved))pending.push(resolved);
       }
     }
+    let foundMethod=false;
     for(const base of node.baseContracts||[]){
       const name=String(base.baseName?.namePath||'').split('.').pop();
-      const parents=[...reachable].flatMap(path=>
+      if(!name)return false;
+      const declarations=(path:string,symbol:string)=>
         (astOf(byPath.get(path)!)?.children||[])
-          .filter((n:any)=>n.type==='ContractDefinition'&&n.name===name)
-          .map((n:any)=>({path,node:n})));
-      if(parents.length!==1)return false;
-      if(methodDeclared(parents[0].node,parents[0].path,visited,depth+1))return true;
+          .filter((n:any)=>n.type==='ContractDefinition'&&n.name===symbol)
+          .map((n:any)=>({path,node:n}));
+      // Resolve lexical local declarations before acquired imports.
+      const local=declarations(sourcePath,name);
+      let parents=local;
+      if(parents.length===0){
+        for(const imp of (astOf(source)?.children||[]).filter((n:any)=>
+          n.type==='ImportDirective'&&typeof n.path==='string')){
+          const importPath=imp.path.startsWith('.')?
+            posix.normalize(posix.join(posix.dirname(sourcePath),imp.path)):imp.path;
+          if(!byPath.has(importPath)||!reachable.has(importPath))continue;
+          const aliases=imp.symbolAliases;
+          if(Array.isArray(aliases)&&aliases.length){
+            for(const [original,alias] of aliases as [string,string|null][])
+              if((alias||original)===name)
+                parents.push(...declarations(importPath,original));
+          }else parents.push(...declarations(importPath,name));
+        }
+      }
+      if(parents.length===0)
+        parents=[...reachable].flatMap(path=>declarations(path,name));
+      // A missing or ambiguous inherited declaration invalidates the whole
+      // interface proof even when some other branch supplies this method.
+      const unique=[...new Map(parents.map(entry=>[
+        entry.path+':'+entry.node.name,entry])).values()];
+      if(unique.length!==1)return false;
+      if(methodDeclared(unique[0].node,unique[0].path,visited,depth+1))
+        foundMethod=true;
     }
-    return false;
+    return foundMethod;
   };
   if(!methodDeclared(iface,interfaceSource.path))return [];
   const callers:AcquiredInterfaceCaller[]=[];
