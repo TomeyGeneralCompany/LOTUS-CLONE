@@ -74,4 +74,58 @@ contract Authority {
     assert _source_witnessed_direct_assignment_negative(
         path,"Authority.rotateOperator",requested,actual,accounts) is None
 
+with tempfile.TemporaryDirectory() as td:
+    path=Path(td)/"MeasuredLedger.sol"
+    path.write_text("""pragma solidity ^0.8.20;
+contract MeasuredLedger {
+ mapping(address=>uint256) public credit;
+ uint256 public totalCredit;
+ function fund(address recipient,uint256 amount) external {
+   credit[recipient]+=amount;totalCredit+=amount;
+ }
+ function settle(address recipient,uint256 amount) external {
+   require(amount>0&&amount<=totalCredit,"bad amount");
+   credit[recipient]+=amount;totalCredit-=amount;
+ }
+}""")
+    from solidity_security_evidence import _source_witnessed_funded_mapping_negative
+    req=[
+      {"operation":"call","function":"totalCredit()","args":[],"expect":"0"},
+      {"operation":"call","function":"credit(address)","args":["$account2"],"expect":"0"},
+      {"operation":"send","function":"fund(address,uint256)",
+       "args":["$account2","5"],"sender":0},
+      {"operation":"call","function":"credit(address)","args":["$account2"],"expect":"5"},
+      {"operation":"call","function":"totalCredit()","args":[],"expect":"5"},
+      {"operation":"send","function":"settle(address,uint256)",
+       "args":["$account2","1"],"sender":0},
+      {"operation":"call","function":"credit(address)","args":["$account2"],"expect":"6"},
+      {"operation":"call","function":"totalCredit()","args":[],"expect":"4"},
+    ]
+    got=[
+      {"operation":"call","actual":"0","passed":True},
+      {"operation":"call","actual":"0","passed":True},
+      {"operation":"send","passed":True,"reverted":False},
+      {"operation":"call","actual":"5","passed":True},
+      {"operation":"call","actual":"5","passed":True},
+      {"operation":"send","passed":True,"reverted":False},
+      {"operation":"call","actual":"6","passed":True},
+      {"operation":"call","actual":"4","passed":True},
+    ]
+    observed=_source_witnessed_funded_mapping_negative(
+        path,"MeasuredLedger.settle",req,got)
+    assert observed and observed[0]=="source_funded_mapping_negative",observed
+    assert _source_witnessed_funded_mapping_negative(
+        path,"MeasuredLedger.settle",req,[*got[:7],{**got[7],"actual":"5"}]) is None
+    assert _source_witnessed_funded_mapping_negative(
+        path,"MeasuredLedger.settle",req,
+        [*got[:5],{**got[5],"passed":False,"reverted":True},*got[6:]]) is None
+    assert _source_witnessed_funded_mapping_negative(
+        path,"MeasuredLedger.settle",req[3:],got[3:]) is None, \
+        "Without actual funding the nonzero required balance is not established"
+    path.write_text(path.read_text().replace(
+        "totalCredit-=amount;","totalCredit+=amount;"))
+    assert _source_witnessed_funded_mapping_negative(
+        path,"MeasuredLedger.settle",req,got) is None, \
+        "A source revision that changes accounting cannot inherit past evidence"
+
 print('Solidity non-deployer state-transition classifier PASSED')
