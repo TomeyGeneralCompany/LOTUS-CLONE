@@ -3165,29 +3165,7 @@ function sourceDirectAssignmentExperiments(
   return out;
 }
 
-/** Source-proven onlyOwner direct public mapping-of-struct override.
- * Both ABI return fields, the owner guard and the mined revert are verified. */
-function sourceStructOverrideExperiments(
-  snapshot:SourceSnapshot,contract:any,method:string,
-  menu:readonly SolidityProbeDeclaration[],sources:ReadonlyMap<string,SourceSnapshot>
-):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
-  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
-    resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
-  const ast=parseAstCached(snapshot);
-  const owns=(contract.baseContracts||[]).some((b:any)=>b.baseName?.namePath==='Ownable')&&
-    (ast.children||[]).some((i:any)=>i.type==='ImportDirective'&&
-      i.path==='@openzeppelin/contracts/access/Ownable.sol');
-  if(!owns)return [];
-  const setup=resolveFlexibleSetup(snapshot,contract,
-    resolveInheritance(snapshot,contract,sources).chain,sources,menu,null);
-  if(!setup||setup.usesToken)return [];
-  const defs=new Map<string,any>();
-  for(const n of nodes)if(n.type==='StructDefinition'&&n.name)defs.set(n.name,n);
-  const mappings=nodes.filter(n=>n.type==='StateVariableDeclaration')
-    .flatMap(n=>n.variables||[]).filter((v:any)=>
-      v.visibility==='public'&&v.typeName?.type==='Mapping'&&identifier.test(v.name||''));
-  const escaped=(v:string)=>v.replace(/[.*+?^{}$()|[\]\\]/g,'\\/** Prove a cross-function mapping write from an acquired exact internal helper
+/** Prove a cross-function mapping write from an acquired exact internal helper
  * and its independently declared public getter. This is a small source-level
  * def/use proof, NOT a heuristic inference from function or variable names.
  * Reads and write keys must be the same mapping lvalue under proven parameter
@@ -3340,7 +3318,29 @@ function sourceInternalMappingSetterExperiments(
   return out;
 }
 
-/** Deterministic source-expression oracle for directly executable pure entrypoints.');
+/** Source-proven onlyOwner direct public mapping-of-struct override.
+ * Both ABI return fields, the owner guard and the mined revert are verified. */
+function sourceStructOverrideExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  menu:readonly SolidityProbeDeclaration[],sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const ast=parseAstCached(snapshot);
+  const owns=(contract.baseContracts||[]).some((b:any)=>b.baseName?.namePath==='Ownable')&&
+    (ast.children||[]).some((i:any)=>i.type==='ImportDirective'&&
+      i.path==='@openzeppelin/contracts/access/Ownable.sol');
+  if(!owns)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,sources,menu,null);
+  if(!setup||setup.usesToken)return [];
+  const defs=new Map<string,any>();
+  for(const n of nodes)if(n.type==='StructDefinition'&&n.name)defs.set(n.name,n);
+  const mappings=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      v.visibility==='public'&&v.typeName?.type==='Mapping'&&identifier.test(v.name||''));
+  const escaped=(v:string)=>v.replace(/[.*+?^{}$()|[\]\\]/g,'\\$&');
   const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
 
   for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
