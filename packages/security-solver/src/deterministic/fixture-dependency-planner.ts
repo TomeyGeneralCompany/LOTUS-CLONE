@@ -856,7 +856,19 @@ export function resolveSourceFixtureDependencies(
           declarations.push("value");
       }
     }
-    return declarations.length===1?declarations[0]:"unknown";
+    if(declarations.length===1)return declarations[0];
+    if(declarations.length>1)return "unknown";
+    // Source bundles can carry a separately acquired, uniquely declared
+    // contract/interface without reproducing the original import directive.
+    // Preserve its declaration kind, but never guess between multiple names.
+    if(!segments.length){
+      const compatible=scanned.filter(e=>e.node.name===name);
+      const conflicting=sources.some(src=>(astOf(src)?.children||[]).some((d:any)=>
+        d.name===name&&["StructDefinition","EnumDefinition",
+          "UserDefinedValueTypeDefinition"].includes(d.type)));
+      if(compatible.length===1&&!conflicting)return "contract";
+    }
+    return "unknown";
   };
   const entryByName=new Map<string,ContractEntry[]>();
   for(const entry of scanned){const group=entryByName.get(entry.node.name)||[];group.push(entry);entryByName.set(entry.node.name,group);}
