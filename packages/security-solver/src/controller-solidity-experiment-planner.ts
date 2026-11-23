@@ -3074,7 +3074,7 @@ function sourcePureExpressionExperiment(
     if(statements.length!==1||statements[0].type!=='ReturnStatement')continue;
     const inputs=(fn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
     const outputs=(fn.returnParameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
-    if(inputs.some(t=>!t)||outputs.length!==1||!outputs[0]||
+    if(inputs.some((t:string|null)=>!t)||outputs.length!==1||!outputs[0]||
       !/^(?:u?int(?:[0-9]{1,3})?|bool)$/.test(outputs[0]))continue;
     if(!declarations.some(d=>d.selector===contract.name+'.'+method&&
       d.operation==='call'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
