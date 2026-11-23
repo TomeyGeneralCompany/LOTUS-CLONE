@@ -69,6 +69,39 @@ function initializerStateBindings(node:any):Array<{parameter:string;receiver:str
   }
   return out;
 }
+/** A canonical OpenZeppelin import proves a standard package edge exists,
+ * not that an unavailable source has been independently analyzed. */
+function hasCanonicalPackageBase(entry:ContractEntry,name:string):boolean {
+  return (astOf(entry.source)?.children||[]).some((imp:any)=>{
+    if(imp.type!=="ImportDirective"||typeof imp.path!=="string"||
+      !/^@openzeppelin\/contracts(?:-upgradeable)?\/.+\.sol$/.test(imp.path))return false;
+    const declared=posix.basename(imp.path,".sol");
+    if(Array.isArray(imp.symbolAliases)&&imp.symbolAliases.length)
+      return imp.symbolAliases.some(([original,alias]:[string,string|null])=>
+        original===declared&&(alias||original)===name);
+    return declared===name;
+  });
+}
+
+/** The ABI of canonical inherited OpenZeppelin entrypoints. Only credit an
+ * exact directly imported standard base; actual deployments still require
+ * compilation and execution of its installed implementation. */
+const standardInheritedAbi:Readonly<Record<string,Readonly<Record<string,readonly string[]>>>>={
+  Ownable:{'owner()':['address'],'transferOwnership(address)':[],'renounceOwnership()':[]},
+  OwnableUpgradeable:{'owner()':['address'],'transferOwnership(address)':[],'renounceOwnership()':[]},
+  ERC20:{'balanceOf(address)':['uint256'],'totalSupply()':['uint256'],
+    'allowance(address,address)':['uint256'],'transfer(address,uint256)':['bool'],
+    'approve(address,uint256)':['bool'],'transferFrom(address,address,uint256)':['bool']},
+  ERC20Upgradeable:{'balanceOf(address)':['uint256'],'totalSupply()':['uint256'],
+    'allowance(address,address)':['uint256'],'transfer(address,uint256)':['bool'],
+    'approve(address,uint256)':['bool'],'transferFrom(address,address,uint256)':['bool']},
+  ERC721:{'balanceOf(address)':['uint256'],'ownerOf(uint256)':['address'],
+    'getApproved(uint256)':['address'],'isApprovedForAll(address,address)':['bool'],
+    'transferFrom(address,address,uint256)':[]},
+  ERC721Upgradeable:{'balanceOf(address)':['uint256'],'ownerOf(uint256)':['address'],
+    'getApproved(uint256)':['address'],'isApprovedForAll(address,address)':['bool'],
+    'transferFrom(address,address,uint256)':[]},
+};
 export interface AcquiredConcreteImplementation {
   path:string;contract:string;selector:string;sourceSha256:string;
   inputs:string[];witness:string;
@@ -109,20 +142,6 @@ export function resolveAcquiredConcreteImplementations(
     }
     return paths;
   };
-  // Standard package inheritance may be compiled from the installed lockfile
-  // even when the third-party source is not part of the audited 91-file source
-  // inventory. Such an edge is eligible for CONCRETE CANDIDATE DISCOVERY only:
-  // it never supplies a behavioral witness or bypasses EVM compilation.
-  const hasCanonicalPackageBase=(entry:ContractEntry,name:string):boolean=>
-    (astOf(entry.source)?.children||[]).some((imp:any)=>{
-      if(imp.type!=="ImportDirective"||typeof imp.path!=="string"||
-        !/^@openzeppelin\/contracts(?:-upgradeable)?\/.+\.sol$/.test(imp.path))return false;
-      const declared=posix.basename(imp.path,".sol");
-      if(Array.isArray(imp.symbolAliases)&&imp.symbolAliases.length)
-        return imp.symbolAliases.some(([original,alias]:[string,string|null])=>
-          original===declared&&(alias||original)===name);
-      return declared===name;
-    });
   const basesOf=(entry:ContractEntry):ContractEntry[][]=>{
     const reachable=importedPaths(entry.source);
     const imports=(astOf(entry.source)?.children||[]).filter((n:any)=>
@@ -347,18 +366,44 @@ export function resolveAcquiredInterfaceCallers(
 }
 
 /** Canonical callable identity, derived from acquired Solidity declarations. */
-function callableTypes(parameters:readonly any[]):string[]|null {
-  const types:string[]=[];
-  for(const p of parameters){
-    const t=p.typeName;
-    if(t?.type==="UserDefinedTypeName"){types.push("address");continue;}
-    if(t?.type!=="ElementaryTypeName")return null;
-    const type=String(t.name||"");
-    const canonical=type==="uint"?"uint256":type==="int"?"int256":type==="address payable"?"address":type;
-    if(!/^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(canonical))return null;
-    types.push(canonical);
+function callableType(type:any):string|null {
+  if(type?.type==="ArrayTypeName"){
+    const item=callableType(type.baseTypeName);
+    if(!item)return null;
+    if(type.length && (type.length.type!=="NumberLiteral"||
+      !/^(?:0|[1-9][0-9]*)$/.test(String(type.length.number))))return null;
+    return item+"["+(type.length?type.length.number:"")+"]";
   }
-  return types;
+  if(type?.type==="UserDefinedTypeName")return "address";
+  if(type?.type!=="ElementaryTypeName")return null;
+  const t=String(type.name||"");
+  const canonical=t==="uint"?"uint256":t==="int"?"int256":t==="address payable"?"address":t;
+  return /^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(canonical)?
+    canonical:null;
+}
+function callableTypes(parameters:readonly any[]):string[]|null {
+  const types=parameters.map(p=>callableType(p.typeName));
+  return types.some(x=>x===null)?null:types as string[];
+}
+/** Compiler-generated public getter signature for scalar, mapping and array
+ * state. The source type, not a symbol-name guess, determines its ABI. */
+function publicGetter(variable:any):{identity:string;returns:string[]}|null {
+  if(variable.visibility!=="public"||!variable.name)return null;
+  let type=variable.typeName;
+  const inputs:string[]=[];
+  while(type?.type==="Mapping"||type?.type==="ArrayTypeName"){
+    if(type.type==="Mapping"){
+      const key=callableType(type.keyType);
+      if(!key)return null;
+      inputs.push(key);
+      type=type.valueType;
+    }else{
+      inputs.push("uint256");
+      type=type.baseTypeName;
+    }
+  }
+  const output=callableType(type);
+  return output?{identity:variable.name+"("+inputs.join(",")+")",returns:[output]}:null;
 }
 function callableIdentity(fn:any):string|null {
   const types=callableTypes(fn.parameters||[]);
@@ -400,6 +445,7 @@ export function verifyAcquiredReceiverMethods(
     }
   }
   const chain:ContractEntry[]=[],visited=new Set<string>();
+  const packageMethods=new Map<string,{returns:string[]}>();
   let ambiguousBase=false;
   const collect=(entry:ContractEntry)=>{
     const key=entry.source.path+":"+entry.node.name;
@@ -407,7 +453,15 @@ export function verifyAcquiredReceiverMethods(
     visited.add(key);
     for(const base of entry.node.baseContracts||[]){
       const name=String(base.baseName?.namePath||"").split(".").pop();
-      const choices=entries.filter(e=>e.node.name===name&&reachable.has(e.source.path));
+      const local=entries.filter(e=>e.node.name===name&&
+        e.source.path===entry.source.path&&e.node!==entry.node);
+      const choices=local.length?local:entries.filter(e=>e.node.name===name&&reachable.has(e.source.path));
+      if(choices.length===0&&name&&hasCanonicalPackageBase(entry,name)){
+        const signatures=standardInheritedAbi[name];
+        if(signatures)for(const [signature,returns] of Object.entries(signatures))
+          packageMethods.set(signature,{returns:[...returns]});
+        continue;
+      }
       if(choices.length!==1){ambiguousBase=true;continue;}
       collect(choices[0]);
     }
@@ -415,7 +469,7 @@ export function verifyAcquiredReceiverMethods(
   };
   collect(concrete);
   if(ambiguousBase)return {ok:false,missing:["ambiguous_or_missing_inheritance"]};
-  const implemented=new Map<string,{returns:string[]|null}>();
+  const implemented=new Map<string,{returns:string[]|null}>(packageMethods);
   const inheritedDeclarations=new Set<string>();
   for(const entry of chain){
     for(const fn of (entry.node.subNodes||[]).filter((n:any)=>
@@ -429,8 +483,8 @@ export function verifyAcquiredReceiverMethods(
     }
     for(const v of (entry.node.subNodes||[]).filter((n:any)=>
       n.type==="StateVariableDeclaration").flatMap((n:any)=>n.variables||[])){
-      if(v.visibility==="public"&&v.name&&v.typeName?.type==="ElementaryTypeName")
-        implemented.set(v.name+"()",{returns:callableTypes([{typeName:v.typeName}])});
+      const getter=publicGetter(v);
+      if(getter)implemented.set(getter.identity,{returns:getter.returns});
     }
   }
   const missing:string[]=[];
