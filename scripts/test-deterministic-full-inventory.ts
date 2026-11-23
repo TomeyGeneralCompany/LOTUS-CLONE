@@ -235,7 +235,7 @@ async function run(){
       {path:'source-1/contracts/Token.sol',sha256:hash(tokenSource),content:tokenSource},
     ];
     const fixture=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',fixtureSources);
-    assert.equal(fixture.status,'resolved');
+    assert.equal(fixture.status,'resolved',JSON.stringify(fixture));
     if(fixture.status==='resolved'){
       assert.equal(fixture.deployments.length,2);
       assert.deepEqual(fixture.deployments.map(x=>x.contract),['Token','Adapter']);
