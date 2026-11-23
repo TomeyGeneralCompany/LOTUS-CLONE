@@ -536,10 +536,13 @@ export function resolveAcquiredConcreteImplementations(
   const rootEntry:ContractEntry={source:abstractSource,node:root};
   const targetDeclarations:Array<{entry:ContractEntry;fn:any}>=[];
   let targetInvalid=false;
-  const visitTarget=(entry:ContractEntry,visited=new Set<string>(),depth=0):void=>{
+  const seenTargetEntries=new Set<string>();
+  const visitTarget=(entry:ContractEntry,ancestors=new Set<string>(),depth=0):void=>{
     const identity=entry.source.path+":"+entry.node.name;
-    if(visited.has(identity)||depth>12){targetInvalid=true;return;}
-    visited.add(identity);
+    if(ancestors.has(identity)||depth>12){targetInvalid=true;return;}
+    if(seenTargetEntries.has(identity))return;
+    seenTargetEntries.add(identity);
+    const nextAncestors=new Set(ancestors);nextAncestors.add(identity);
     for(const fn of entry.node.subNodes||[])
       if(fn.type==="FunctionDefinition"&&fn.name===method&&!fn.isConstructor)
         targetDeclarations.push({entry,fn});
@@ -547,16 +550,20 @@ export function resolveAcquiredConcreteImplementations(
     for(let i=0;i<inherited.length;i++){
       const possibilities=parents[i]||[];
       if(possibilities.length!==1){targetInvalid=true;continue;}
-      visitTarget(possibilities[0],visited,depth+1);
+      visitTarget(possibilities[0],nextAncestors,depth+1);
     }
   };
   visitTarget(rootEntry);
   if(targetInvalid||!targetDeclarations.length)return [];
-  const targetIds=new Set<string>(targetDeclarations.map(({fn,entry})=>
-    identities(fn,entry)).filter((id:string|null):id is string=>id!==null));
-  if(targetIds.size!==targetDeclarations.length)return [];
-  const targetReturns=new Map(targetDeclarations.map(({fn,entry})=>[
-    identities(fn,entry),callableReturns(fn,entry,entries)]));
+  const targetIds=new Set<string>();
+  const targetReturns=new Map<string,string[]>();
+  for(const {fn,entry} of targetDeclarations){
+    const id=identities(fn,entry),returns=callableReturns(fn,entry,entries);
+    if(!id||!returns)return [];
+    const existing=targetReturns.get(id);
+    if(existing&&JSON.stringify(existing)!==JSON.stringify(returns))return [];
+    targetIds.add(id);targetReturns.set(id,returns);
+  }
   const result:AcquiredConcreteImplementation[]=[];
   for(const candidate of entries){
     if(candidate.node.name===abstractContract&&candidate.source.path===abstractSource.path)continue;
