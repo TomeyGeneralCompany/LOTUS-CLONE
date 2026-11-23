@@ -18,6 +18,29 @@ try {
  assert.ok(authority.some(item=>item.selector==='SettlementAuthority.operator' && item.operation==='call'),
    'Public state variable must appear as an executable ABI getter');
  assert.ok(authority.some(item=>item.selector==='SettlementAuthority.administrator' && item.operation==='call'));
+ // Public mappings, nested mappings, arrays and contract-address state
+ // are compiler-generated getters, not merely elementary scalar variables.
+ const getterSource=`pragma solidity ^0.8.20;
+ interface IUnit { function read() external view returns(uint256); }
+ contract GetterCoverage {
+   struct Rate { bool enabled; uint256 value; }
+   mapping(address=>mapping(uint64=>Rate)) public rates;
+   uint256[] public series;
+   IUnit public source;
+   mapping(address=>uint256) private balances;
+ }`;
+ const getterPath=join(root,'GetterCoverage.sol');
+ await writeFile(getterPath,getterSource);
+ const acquiredGetterMenu=await index.probeMenu(getterPath,24);
+ assert.deepEqual(acquiredGetterMenu.filter(x=>x.operation==='call')
+   .map(x=>({selector:x.selector,inputs:x.inputs})),[
+     {selector:'GetterCoverage.rates',inputs:['address','uint64']},
+     {selector:'GetterCoverage.series',inputs:['uint256']},
+     {selector:'GetterCoverage.source',inputs:[]}
+   ],'Every acquired source-exposed getter must retain its exact ABI index types');
+ assert.ok(!acquiredGetterMenu.some(x=>x.selector==='GetterCoverage.balances'),
+   'A private mapping must never be represented as an external ABI getter');
+
  const sequence=buildBaselineSequence(authority,'SettlementAuthority.rotateOperator',true);
  assert.ok(sequence,'Controller must construct an executable sequence from the selected source');
  assert.equal((sequence?.steps[1] as any)?.sender,1);
