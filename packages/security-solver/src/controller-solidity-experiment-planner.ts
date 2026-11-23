@@ -3948,25 +3948,41 @@ export function sourcePreparationGraph(
 ):{ok:true;nodes:PreparationPrerequisite[]}|{ok:false;code:string;detail:string}{
   const preparation=sequence.preparation;
   const nodes:PreparationPrerequisite[]=[];
+  const dependencies=(value:unknown):string[]=>{
+    if(Array.isArray(value))return value.flatMap(dependencies);
+    if(typeof value!=='string'||!value.startsWith('$deployment:'))return [];
+    return [value.slice('$deployment:'.length)];
+  };
+  const availableIds=new Set((preparation?.deployments||[]).map(x=>x.id));
+  const reject=(detail:string)=>({ok:false as const,code:'INVALID_PREREQUISITE',detail});
+  // The schema validates receiver IDs, but arguments and expected readbacks
+  // may also carry deployment references. Reject dangling references before
+  // constructing source-evidence obligations or executing any transactions.
+  for(const [index,step] of sequence.steps.entries()){
+    const values=step.operation==='eth_balance'?[step.account]:
+      step.operation==='send'||step.operation==='call'||step.operation==='observe'?
+        step.operation==='call'?[...step.args,step.expect]:step.args:[];
+    for(const ref of values.flatMap(dependencies))
+      if(!availableIds.has(ref))
+        return reject('Step '+index+' references unacquired deployment: '+ref);
+  }
+  for(const ref of sequence.constructorArgs.flatMap(dependencies))
+    if(!availableIds.has(ref))
+      return reject('Target constructor references unacquired deployment: '+ref);
   const appendTarget=():void=>{
     if(!target||!contract)return;
     // The target cannot exist before every declared prerequisite deployment,
     // initialization and state readback has completed in the isolated EVM.
     // Unlike orderPreparation([]), this records the real target construction.
     nodes.push({id:'target:deploy',kind:'deploy',
-      dependsOn:nodes.map(step=>step.id),
+      dependsOn:[...new Set([...nodes.map(step=>step.id),
+        ...sequence.constructorArgs.flatMap(dependencies).map(id=>'deploy:'+id)])],
       sourceEvidence:[witness(target,contract,contract.name+'.constructor')],
       parameters:{file:target.path,contract:contract.name,
         constructorArgs:sequence.constructorArgs}});
   };
   if(!preparation){appendTarget();return {ok:true,nodes};}
   const deployments=new Map<string,{source:SourceSnapshot;node:any;position:number}>();
-  const dependencies=(value:unknown):string[]=>{
-    if(Array.isArray(value))return value.flatMap(dependencies);
-    if(typeof value!=='string'||!value.startsWith('$deployment:'))return [];
-    return [value.slice('$deployment:'.length)];
-  };
-  const reject=(detail:string)=>({ok:false as const,code:'INVALID_PREREQUISITE',detail});
   for(const [position,d] of preparation.deployments.entries()){
     if(deployments.has(d.id))return reject('Duplicate source deployment '+d.id);
     const acquired=sources.get(d.file);
