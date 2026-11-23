@@ -58,6 +58,16 @@ if(currentIndex!==-1){
   }
   assert.deepEqual(actual.candidates.map(x=>x.selector).sort(),selectors.sort(),
     "Real Dell original selector multiset changed or lost leads");
+  // The selector multiset is insufficient: overloaded contracts and repeated
+  // interfaces can share selectors while referring to different acquired
+  // sources. Pin ALL 290 source identities to the actual 45191376008 artifact.
+  const identityRows=actual.candidates.map(candidate=>[
+    candidate.id,candidate.path,candidate.selector,candidate.sourceCommit,
+    candidate.sourceSha256].join("|")).sort();
+  const identityDigest=createHash("sha256").update(identityRows.join("\n")).digest("hex");
+  assert.equal(identityDigest,
+    "3f94f7941f8ed6dbf4549eeb3671bdd1b033a5ea0bcbf05b416cb622da3d8874",
+    "Original source file identity, candidate ID or 290-lead inventory changed");
   const identityDigest=createHash("sha256").update(
     [...ids].sort().join("\n")).digest("hex");
   assert.equal(identityDigest,baseline.originalCandidateIdsDigest,
