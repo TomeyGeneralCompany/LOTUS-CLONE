@@ -1137,6 +1137,26 @@ contract ClaimChild is ClaimBase {
       x.securityProperty.includes('two-step ownership claim authorization')&&
       x.sequence.steps.some(step=>step.operation==='send'&&
         step.function==='claimOwnership()'&&step.sender===2)));
+    // Inherited interface methods need not be locally redeclared.
+    // Diamond inheritance is legal when each acquired path agrees on ABI.
+    const baseInterface='pragma solidity ^0.8.20; interface IBaseView { function quote(uint256 value) external view returns(uint256); }';
+    const leftInterface='pragma solidity ^0.8.20; import "./IBaseView.sol"; interface ILeftView is IBaseView {}';
+    const rightInterface='pragma solidity ^0.8.20; import "./IBaseView.sol"; interface IRightView is IBaseView {}';
+    const diamondInterface='pragma solidity ^0.8.20; import "./ILeftView.sol"; import "./IRightView.sol"; interface IDiamondView is ILeftView, IRightView {}';
+    const diamondImpl='pragma solidity ^0.8.20; import "./IDiamondView.sol"; contract DiamondQuote is IDiamondView { function quote(uint256 value) external pure override returns(uint256) { return value; } }';
+    const inheritedSources=[
+      {path:'source-1/contracts/IBaseView.sol',content:baseInterface,sha256:hash(baseInterface)},
+      {path:'source-1/contracts/ILeftView.sol',content:leftInterface,sha256:hash(leftInterface)},
+      {path:'source-1/contracts/IRightView.sol',content:rightInterface,sha256:hash(rightInterface)},
+      {path:'source-1/contracts/IDiamondView.sol',content:diamondInterface,sha256:hash(diamondInterface)},
+      {path:'source-1/contracts/DiamondQuote.sol',content:diamondImpl,sha256:hash(diamondImpl)}
+    ];
+    const inheritedImpl=resolveAcquiredConcreteImplementations(inheritedSources[3],
+      'IDiamondView','quote',inheritedSources);
+    assert.deepEqual(inheritedImpl.map(x=>x.selector),['DiamondQuote.quote'],
+      'Exact acquired method inherited via diamond interfaces is a valid ABI candidate');
+    assert.equal(inheritedImpl[0].operation,'call',
+      'Recovered inherited pure implementation is read-only');
     // Transitive A <- B <- C must resolve a real inherited implementation
     // without admitting an unrelated same-named contract or an abstract leaf.
     const middleText='pragma solidity ^0.8.0; import "./IWallet.sol"; abstract contract WalletBase is IWallet { function withdraw(uint256 value) external virtual override {} }';
