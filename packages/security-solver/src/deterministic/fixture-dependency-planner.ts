@@ -2,7 +2,7 @@
 import {parse} from "@solidity-parser/parser";
 import {posix} from "node:path";
 import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
-type PreparedArg=string|string[];
+type PreparedArg=string|boolean|string[]|Array<string|boolean|string[]>;
 export interface PreparedDeployment {id:string;file:string;contract:string;constructorArgs:PreparedArg[];}
 export interface FixtureSourceWitness {file:string;line:number;contract:string;sourceSha256?:string;parameter?:string;stateVariable?:string;}
 export interface VerifiedDependencyBinding {parameter:string;receiver:string;typeName:string;deploymentId:string;file:string;sourceSha256:string;}
@@ -52,9 +52,19 @@ function descendants(node:any):any[]{
 /** Construct ABI-typed zero/one fixture values only for known elementary
  * and bounded one-dimensional array types. Solidity constructor/initializer
  * reverts remain real executor failures, never presumed successes. */
-function primitiveFixtureArg(type:any,nonzero=false):PreparedArg|null {
+function primitiveFixtureArg(type:any,nonzero=false,contract?:any):PreparedArg|null {
+  if(type?.type==="UserDefinedTypeName"&&contract){
+    const name=String(type.namePath||"").split(".").pop();
+    const declarations=(contract.subNodes||[]).filter((n:any)=>
+      n.type==="StructDefinition"&&n.name===name);
+    if(declarations.length!==1)return null;
+    const parts=(declarations[0].members||[]).map((field:any)=>
+      primitiveFixtureArg(field.typeName,nonzero,contract));
+    if(parts.some((part:any)=>part===null))return null;
+    return parts as PreparedArg;
+  }
   if(type?.type==="ArrayTypeName"){
-    const base=primitiveFixtureArg(type.baseTypeName,nonzero);
+    const base=primitiveFixtureArg(type.baseTypeName,nonzero,contract);
     if(typeof base!=="string")return null;
     if(!type.length)return [];
     const len=type.length?.type==="NumberLiteral"?Number(type.length.number):NaN;
@@ -64,13 +74,37 @@ function primitiveFixtureArg(type:any,nonzero=false):PreparedArg|null {
   if(type?.type!=="ElementaryTypeName")return null;
   const k=String(type.name||"");
   if(k==="address"||k==="address payable")return "$account0";
-  if(k==="bool")return "false";
+  if(k==="bool")return false;
   if(k==="string")return "";
   if(k==="bytes")return "0x";
   const bytes=k.match(/^bytes([1-9]|[12][0-9]|3[012])$/);
   if(bytes)return "0x"+"00".repeat(Number(bytes[1]));
   if(/^(?:u?int)(?:[0-9]{1,3})?$/.test(k))return nonzero?"1":"0";
   return null;
+}
+/** The compiler ABI represents a struct as a tuple of its acquired fields.
+ * This does not infer any business-level property or nondefault configuration. */
+function fixtureAbiType(type:any,contract:any,depth=0):string|null {
+  if(depth>5)return null;
+  if(type?.type==="ArrayTypeName"){
+    const base=fixtureAbiType(type.baseTypeName,contract,depth+1);
+    if(!base)return null;
+    const len=type.length;
+    if(len&&(!/^\\d+$/.test(String(len.number||""))))return null;
+    return base+"["+(len?String(len.number):"")+"]";
+  }
+  if(type?.type==="UserDefinedTypeName"){
+    const name=String(type.namePath||"").split(".").pop();
+    const structs=(contract.subNodes||[]).filter((n:any)=>
+      n.type==="StructDefinition"&&n.name===name);
+    if(structs.length===0)return "address";
+    if(structs.length!==1)return null;
+    const fields=(structs[0].members||[]).map((field:any)=>
+      fixtureAbiType(field.typeName,contract,depth+1));
+    return fields.every((f:any)=>typeof f==="string"&&f.length)?
+      "("+fields.join(",")+")":null;
+  }
+  return callableType(type);
 }
 function initializerStateBindings(node:any):Array<{parameter:string;receiver:string;typeName:string;line:number}>{
   const vars=new Map<string,string>();
@@ -601,7 +635,7 @@ export function resolveSourceFixtureDependencies(
         .flatMap(b=>requiredReceiverMethods.get(b.receiver)||[]),
       ...(constructorDemands.get(typ)||[])
     ])];
-    const qualified=choices.length>1&&receiverMethods.length?
+    const qualified=receiverMethods.length?
       choices.filter(choice=>verifyAcquiredReceiverMethods(typ,receiverMethods,
         choice.source.path,choice.node.name,sources).ok):choices;
     if(qualified.length!==1){missing.push(typ+(qualified.length===0?
@@ -614,11 +648,14 @@ export function resolveSourceFixtureDependencies(
     const args:PreparedArg[]=[];let valid=true;
     for(const p of ctorOf(selected.node)?.parameters||[]){
       const argType=typeOf(p.typeName);
-      if(p.typeName?.type==="UserDefinedTypeName"){
+      const struct=p.typeName?.type==="UserDefinedTypeName"&&
+        (selected.node.subNodes||[]).some((n:any)=>
+          n.type==="StructDefinition"&&n.name===String(p.typeName.namePath||"").split(".").pop());
+      if(p.typeName?.type==="UserDefinedTypeName"&&!struct){
         const dep=resolve(argType,depth+1);
         if(!dep){valid=false;break;}args.push("$deployment:"+dep);
       }else{
-        const literal=primitiveFixtureArg(p.typeName);
+        const literal=primitiveFixtureArg(p.typeName,false,selected.node);
         if(literal===null){
           missing.push(key+":unsupported_constructor_type:"+(argType||p.typeName?.type||"unknown"));
           valid=false;break;
@@ -647,7 +684,7 @@ export function resolveSourceFixtureDependencies(
           if(!dep){missing.push(key+":initializer_dependency:"+name);break;}
           initArgs.push("$deployment:"+dep);
         }else{
-          const literal=primitiveFixtureArg(p.typeName,true);
+          const literal=primitiveFixtureArg(p.typeName,true,selected.node);
           if(literal===null){
             missing.push(key+":unsupported_initializer_parameter:"+name+":"+
               (argType||p.typeName?.type||"unknown"));break;
@@ -661,8 +698,10 @@ export function resolveSourceFixtureDependencies(
         missing.push(key+":incomplete_initializer_arguments");
       }else{
         const sigTypes=(initializer.parameters||[]).map((p:any)=>
-          p.typeName?.type==="UserDefinedTypeName"?"address":callableType(p.typeName));
-        initializers.push({id:"setup"+(initializers.length+1),deploymentId:id,
+          fixtureAbiType(p.typeName,selected.node));
+        if(sigTypes.some((value:any)=>value===null))
+          missing.push(key+":unsupported_initializer_abi");
+        else initializers.push({id:"setup"+(initializers.length+1),deploymentId:id,
           function:String(initializer.name)+"("+sigTypes.join(",")+")",args:initArgs,sender:0});
       }
     }

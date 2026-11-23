@@ -287,6 +287,30 @@ async function run(){
     if(unbound.status==='unresolved')
       assert.ok(unbound.missingDependencies.some(x=>x.includes('unsupported_initializer_parameter')||
         x.includes('incomplete_initializer_arguments')));
+    // Struct fields are compiler ABI tuples. A successful typed fixture still
+    // requires a real local EVM deployment and successful initializer receipt.
+    const tupleContract=`pragma solidity ^0.8.0;
+contract TupleDependency {
+  struct Options { uint256 threshold; bool enabled; }
+  Options public options;
+  constructor(Options memory first) { options=first; }
+}`;
+    const tupleConsumer=`pragma solidity ^0.8.0;
+contract TupleConsumer {
+  TupleDependency public dependency;
+  function initialize(address chosen) external {
+    dependency=TupleDependency(chosen);
+  }
+}`;
+    const tupleSources=[
+      {path:'source-1/contracts/TupleDependency.sol',content:tupleContract,sha256:hash(tupleContract)},
+      {path:'source-1/contracts/TupleConsumer.sol',content:tupleConsumer,sha256:hash(tupleConsumer)}
+    ];
+    const tupleResolved=resolveSourceFixtureDependencies(tupleSources[1],'TupleConsumer',tupleSources);
+    assert.equal(tupleResolved.status,'resolved','Acquired struct constructor ABI must be constructible');
+    if(tupleResolved.status==='resolved')
+      assert.deepEqual(tupleResolved.deployments[0].constructorArgs,[['0',false]],
+        'Struct ABI must encode bool as false, not as truthy string');
     const ambiguousSource='pragma solidity ^0.8.0; contract AdapterTwo is IAdapter {}';
     const ambiguous=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
       ...fixtureSources,{path:'source-1/contracts/AdapterTwo.sol',content:ambiguousSource,sha256:hash(ambiguousSource)}]);
