@@ -163,10 +163,16 @@ export function resolveAcquiredConcreteImplementations(
         reachable.has(e.source.path)&&e.node!==entry.node);
     });
   };
-  const scalarAbi=(p:any):string|null=>{
-    const type=p?.typeName;
-    if(type?.type==="UserDefinedTypeName")return "address";
-    const kind=String(type?.name||"");
+  const typeAbi=(type:any):string|null=>{
+    if(!type)return null;
+    if(type.type==="ArrayTypeName"){
+      const base=typeAbi(type.baseTypeName);
+      if(!base)return null;
+      const len=type.length?.type==="NumberLiteral"?String(type.length.number):"";
+      return base+"["+len+"]";
+    }
+    if(type.type==="UserDefinedTypeName")return "address";
+    const kind=String(type.name||"");
     if(kind==="uint")return "uint256";
     if(kind==="int")return "int256";
     if(kind==="address"||kind==="bool"||kind==="string"||kind==="bytes"||
@@ -174,6 +180,7 @@ export function resolveAcquiredConcreteImplementations(
       return kind;
     return null;
   };
+  const scalarAbi=(p:any):string|null=>typeAbi(p?.typeName);
   const identities=(fn:any):string|null=>{
     const types=(fn.parameters||[]).map(scalarAbi);
     return types.some((type:string|null)=>type===null)?null:
@@ -214,7 +221,7 @@ export function resolveAcquiredConcreteImplementations(
       for(const fn of (entry.node.subNodes||[]).filter((n:any)=>
         n.type==="FunctionDefinition"&&!n.isConstructor&&n.name)){
         const id=identities(fn);
-        if(!id){invalid=true;continue;}
+        if(!id){if(!fn.body)invalid=true;continue;}
         declarations.add(id);
         if(fn.body)implemented.set(id,{entry,fn});
         else implemented.delete(id);
@@ -223,10 +230,23 @@ export function resolveAcquiredConcreteImplementations(
         .filter((n:any)=>n.type==="StateVariableDeclaration")
         .flatMap((n:any)=>n.variables||[])){
         if(variable.visibility==="public"&&variable.name){
-          // A public scalar generates a getter satisfying a base declaration.
+          // Public scalar, contract/interface reference, and mapping state variables
+          // generate ABI getters satisfying matching base interface/abstract declarations.
           const typ=variable.typeName;
-          if(typ?.type==="ElementaryTypeName")implemented.set(
-            variable.name+"()",{entry,fn:variable});
+          if(typ?.type==="ElementaryTypeName"||typ?.type==="UserDefinedTypeName"){
+            implemented.set(variable.name+"()",{entry,fn:variable});
+          } else if(typ?.type==="Mapping"){
+            const keyTypes:string[]=[];
+            let cur:any=typ,ok=true;
+            while(cur?.type==="Mapping"){
+              const kt=typeAbi(cur.keyType);
+              if(!kt){ok=false;break;}
+              keyTypes.push(kt);
+              cur=cur.valueType;
+            }
+            if(ok&&keyTypes.length)implemented.set(
+              variable.name+"("+keyTypes.join(",")+")",{entry,fn:variable});
+          }
         }
       }
     }

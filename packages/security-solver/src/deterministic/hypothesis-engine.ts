@@ -144,8 +144,25 @@ const FIXTURE_CALL_TARGET_RE =
 const TOKEN_ONLY_FIXTURE_RE =
   /(?:^|:)(?:ERC20|IERC20|SafeERC20|token|stablecoin|underlying|asset)(?:\.(?:transfer|transferFrom|safeTransfer|safeTransferFrom|approve|safeApprove|safeIncreaseAllowance|safeDecreaseAllowance|balanceOf|allowance))?$/i;
 
-function isAccountingStateVar(stateVar: string): boolean {
+function isNonNumericAddressOrConfigType(
+  stateVar: string,
+  stateVarSymbols?: ReadonlyMap<string, ProgramSymbol>,
+): boolean {
+  const rt = stateVarSymbols?.get(stateVar)?.returnType?.trim();
+  if (!rt) return false;
+  // Only integer counters and mappings can represent numeric financial accounting state.
+  // An `address public rewards` or contract reference is configuration/recipient state.
+  return !/^(?:u?int(?:[0-9]{1,3})?|mapping)$/i.test(rt);
+}
+
+function isAccountingStateVar(
+  stateVar: string,
+  stateVarSymbols?: ReadonlyMap<string, ProgramSymbol>,
+): boolean {
   if (CONFIG_OR_ADDRESS_STATE_RE.test(stateVar) || ROLE_STATE_RE.test(stateVar)) {
+    return false;
+  }
+  if (isNonNumericAddressOrConfigType(stateVar, stateVarSymbols)) {
     return false;
   }
   return (
@@ -156,8 +173,11 @@ function isAccountingStateVar(stateVar: string): boolean {
   );
 }
 
-function classifyRelationalProperty(stateVars: readonly string[]): RelationalPropertyKind {
-  const accountingVars = stateVars.filter(isAccountingStateVar);
+function classifyRelationalProperty(
+  stateVars: readonly string[],
+  stateVarSymbols?: ReadonlyMap<string, ProgramSymbol>,
+): RelationalPropertyKind {
+  const accountingVars = stateVars.filter((v) => isAccountingStateVar(v, stateVarSymbols));
   if (accountingVars.some((v) => INTEREST_STATE_RE.test(v))) return "interest-accrual";
   if (accountingVars.some((v) => SHARE_STATE_RE.test(v))) return "share-accounting";
   if (accountingVars.some((v) => SUPPLY_STATE_RE.test(v))) return "supply-accounting";
@@ -385,10 +405,12 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
 
   for (const pair of pairStates.values()) {
     const rawStateDeps = [...pair.vars].sort();
-    const accountingDeps = rawStateDeps.filter(isAccountingStateVar);
+    const accountingDeps = rawStateDeps.filter((v) => isAccountingStateVar(v, stateVarSymbols));
     const roleDeps = rawStateDeps.filter((v) => ROLE_STATE_RE.test(v));
-    const nonConfigDeps = rawStateDeps.filter((v) => !CONFIG_OR_ADDRESS_STATE_RE.test(v));
-    const propertyKind = classifyRelationalProperty(rawStateDeps);
+    const nonConfigDeps = rawStateDeps.filter(
+      (v) => !CONFIG_OR_ADDRESS_STATE_RE.test(v) && !isNonNumericAddressOrConfigType(v, stateVarSymbols),
+    );
+    const propertyKind = classifyRelationalProperty(rawStateDeps, stateVarSymbols);
     const isFinancial = isFinancialRelationalKind(propertyKind);
 
     // Do not elevate ordinary configuration/address references (e.g. initialize + withdraw

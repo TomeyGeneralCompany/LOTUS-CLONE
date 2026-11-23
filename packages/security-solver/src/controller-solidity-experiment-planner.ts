@@ -1283,7 +1283,7 @@ function authorityTransferExperiment(
   snapshot:SourceSnapshot,contract:any,method:string,
   sources:ReadonlyMap<string,SourceSnapshot>,menu:readonly SolidityProbeDeclaration[]
 ):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
-  if(!['transferOwnership','renounceOwnership','grantRole'].includes(method))return null;
+  if(!['transferOwnership','renounceOwnership','grantRole','claimOwnership'].includes(method))return null;
   const {chain,oz,localOwnables}=resolveInheritance(snapshot,contract,sources);
   const setup=resolveVerifiedSetup(snapshot,contract,chain,oz,localOwnables,menu);
   if(!setup)return null;
@@ -1301,7 +1301,13 @@ function authorityTransferExperiment(
   }
 
   if(declaredFn){
-    if(!hasAuthorizationGuard(declaredFn.node,setup.kind,chain))return null;
+    if(method==='claimOwnership'){
+      const claimBody=body(declaredFn.snapshot.content,declaredFn.node);
+      const pendingAliases=[...claimBody.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*pendingOwner\b/g)].map(m=>m[1]);
+      const targets=['pendingOwner',...pendingAliases];
+      const checksPending=targets.some(t=>new RegExp(`\\bmsg\\.sender\\s*==\\s*${t}\\b|\\b${t}\\s*==\\s*msg\\.sender\\b`).test(claimBody));
+      if(!checksPending)return null;
+    } else if(!hasAuthorizationGuard(declaredFn.node,setup.kind,chain))return null;
   } else {
     const ozOwnerProven=setup.kind==='owner'&&(oz.has('ownable')||oz.has('ownable_upgradeable'))&&
       (method==='transferOwnership'||method==='renounceOwnership');
@@ -1350,6 +1356,35 @@ function authorityTransferExperiment(
       ]},
       witnesses
     };
+  }
+  if(setup.kind==='owner'&&method==='claimOwnership'&&abiEntry.inputs.length===0&&hasPendingOwner){
+    const boringTransfer=menu.find(m=>m.selector===`${contract.name}.transferOwnership`&&m.operation==='send'&&
+      JSON.stringify(m.inputs)===JSON.stringify(['address','bool','bool']));
+    const twoStepTransfer=menu.find(m=>m.selector===`${contract.name}.transferOwnership`&&m.operation==='send'&&
+      JSON.stringify(m.inputs)===JSON.stringify(['address']));
+    const initiateStep:SoliditySequence['steps'][number]|null=boringTransfer
+      ? {operation:'send',function:'transferOwnership(address,bool,bool)',args:['$account2',false,false],sender:0,requiredSetup:true}
+      : twoStepTransfer
+        ? {operation:'send',function:'transferOwnership(address)',args:['$account2'],sender:0,requiredSetup:true}
+        : null;
+    if(initiateStep){
+      return {
+        hypothesis:`Unauthorized caller ($account1) must not claim pending ${contract.name} ownership; designated pendingOwner ($account2) may.`,
+        property:'source-proven two-step ownership claim authorization',
+        sequence:{constructorArgs:setup.constructorArgs,steps:[
+          ...baseSteps,
+          initiateStep,
+          {operation:'call',function:'pendingOwner()',args:[],expect:'$account2'},
+          {operation:'send',function:'claimOwnership()',args:[],sender:1,expectRevert:true},
+          {operation:'call',function:'owner()',args:[],expect:'$account0'},
+          {operation:'call',function:'pendingOwner()',args:[],expect:'$account2'},
+          {operation:'send',function:'claimOwnership()',args:[],sender:2},
+          {operation:'call',function:'owner()',args:[],expect:'$account2'},
+          {operation:'call',function:'pendingOwner()',args:[],expect:ZERO_ADDRESS}
+        ]},
+        witnesses
+      };
+    }
   }
   if(setup.kind==='owner'&&method==='renounceOwnership'&&abiEntry.inputs.length===0){
     return {
@@ -1660,13 +1695,17 @@ function resolveFlexibleSetup(
   if(ctor){
     const cParams:any[]=ctor.parameters||[];
     if(cParams.length>12)return null;
+    const ctorParamNames=new Set<string>(cParams.map((p:any)=>p.name).filter((n:any)=>identifier.test(n||'')));
+    const ctorConstraints=collectParamConstraints(ctor,ctorParamNames);
     for(const cp of cParams){
       const abi=canonicalAbiType(cp.typeName);
       if(!abi)return null;
       const tokenRef=mockToken?'$deployment:token':undefined;
       const bound=dependencyBindings[cp.name||''];
+      if(abi==='address'&&ctorConstraints.get(cp.name||'')?.has('contract')&&!bound&&!tokenRef)return null;
       const arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,cp.name||'',{ownerAccount,tokenRef});
       if(arg===null)return null;
+      if(abi==='address'&&ctorConstraints.get(cp.name||'')?.has('contract')&&arg!=='$deployment:token'&&arg!==bound)return null;
       if(arg==='$deployment:token')usesToken=true;
       constructorArgs.push(arg);
     }
@@ -1679,6 +1718,8 @@ function resolveFlexibleSetup(
   if(initFn){
     const iParams:any[]=initFn.parameters||[];
     if(iParams.length<=12){
+      const initParamNames=new Set<string>(iParams.map((p:any)=>p.name).filter((n:any)=>identifier.test(n||'')));
+      const initConstraints=collectParamConstraints(initFn,initParamNames);
       const abiTypes:string[]=[];
       let ok=true;
       for(const ip of iParams){
@@ -1686,7 +1727,11 @@ function resolveFlexibleSetup(
         if(!abi){ok=false;break;}
         const tokenRef=mockToken?'$deployment:token':undefined;
         const bound=dependencyBindings[ip.name||''];
-        const arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,ip.name||'',{ownerAccount,tokenRef});
+        let arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,ip.name||'',{ownerAccount,tokenRef});
+        if(abi==='address'&&initConstraints.get(ip.name||'')?.has('contract')&&
+          arg!=='$deployment:token'&&arg!==bound){
+          arg='$contract';
+        }
         if(arg===null){ok=false;break;}
         if(arg==='$deployment:token'){usesToken=true;tokenInitNeeded=true;}
         abiTypes.push(abi);
@@ -1803,7 +1848,11 @@ function unprotectedFundDrainOrMintExperiment(
   const hasEthOut=/\.\s*(?:transfer|send)\s*\(|\.\s*call\s*\{[^}]*\bvalue\b/i.test(fnBody);
   if(hasEthOut && !/^(?:deposit|stake|mint)$/i.test(method)){
     const ctor=members.find(n=>n.type==='FunctionDefinition'&&n.isConstructor);
-    const payableFundFn=members.find(n=>n.type==='FunctionDefinition'&&['public','external'].includes(n.visibility)&&
+    // Require a named payable function; unnamed receive()/fallback() have name===null
+    // and would otherwise emit an invalid "null()" ABI selector.
+    const payableFundFn=members.find(n=>n.type==='FunctionDefinition'&&
+      typeof n.name==='string'&&n.name.length>0&&!n.isReceiveEther&&!n.isFallback&&
+      ['public','external'].includes(n.visibility)&&
       n.stateMutability==='payable'&&(n.parameters||[]).length===0&&n.name!==method&&n.body);
     const canFund=(ctor&&ctor.stateMutability==='payable')||!!payableFundFn;
     if(canFund){

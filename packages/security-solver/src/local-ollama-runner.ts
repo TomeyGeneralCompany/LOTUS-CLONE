@@ -363,9 +363,26 @@ export async function runLocalAudit(
       catch{implementationRevision="unversioned";}
     }
     const strategy="source-fixture-property-engine-v2:"+implementationRevision+":"+phase;
+    const relationalUnresolvedBySelector=new Map<string,Set<string>>();
+    if(deterministicProgramGraph){
+      for(const rel of generateRelationalHypotheses(deterministicProgramGraph)){
+        for(const ep of rel.entrypoints){
+          const bucket=relationalUnresolvedBySelector.get(ep)||new Set<string>();
+          for(const prereq of rel.unresolvedPrerequisites)bucket.add(prereq);
+          relationalUnresolvedBySelector.set(ep,bucket);
+        }
+      }
+    }
     let repairAdded=0,repairBlocked=0;
     for(const lead of sourceRepairBatch){
       const record=analysisProgressStore.records.get(lead.id)!;
+      if(deterministicProgramGraph){
+        const freshRel=relationalUnresolvedBySelector.get(lead.selector)||new Set<string>();
+        if(analysisProgressStore.reconcileRelationalPrerequisites(lead.id,freshRel)&&
+          analysisProgressStore.records.get(lead.id)?.lifecycle==="experiment_completed"){
+          continue;
+        }
+      }
       if(record.repairAttempts?.some(x=>x.strategy===strategy&&
           x.sourceSha256===record.sourceSha256))continue;
       const declarations=deterministicDeclarationsCache.get(lead.path)||[];
@@ -574,9 +591,10 @@ export async function runLocalAudit(
           const witnesses=candidate
             ?candidate.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(':'))
             :(inventoryEntry?[inventoryEntry.sourceEvidence]:[]);
-          // Source evidence for this selector, not evidence for an unrelated
-          // function, is required for pre-ANALYZE staged experiments.
-          if(!witnesses.length||witnesses.some(x=>!x.includes(lead.sourceSha256)))return [];
+          // The target lead's own acquired source SHA must be witnessed; valid
+          // inherited/imported dependency witnesses retain their own 64-hex SHA.
+          if(!witnesses.length||!witnesses.some(x=>x.includes(lead.sourceSha256))||
+            witnesses.some(x=>!/\b[a-f0-9]{64}\b/.test(x)))return [];
           const property=candidate?.securityProperty||entry.plan.hypothesis;
           return [{id:createHash('sha256').update(JSON.stringify([
               lead.id,property,witnesses])).digest('hex'),

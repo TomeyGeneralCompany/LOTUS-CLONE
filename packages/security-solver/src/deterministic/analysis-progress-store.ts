@@ -100,9 +100,13 @@ export class AnalysisProgressStore {
         r.repairAttempts=[];
         r.inconclusiveAttempts=[];
         r.lastError="checkpoint_requires_source_bound_replay";
-      } else if(!store.isConclusive(r)&&
-        ["experiment_completed","analysis_exhausted","blocked"].includes(r.lifecycle)){
-        r.lifecycle="dependencies_pending";
+      } else {
+        store.pruneSubsumedWitnesslessProperties(r);
+        if(store.isConclusive(r)){
+          r.lifecycle="experiment_completed";
+        } else if(["experiment_completed","analysis_exhausted","blocked"].includes(r.lifecycle)){
+          r.lifecycle="dependencies_pending";
+        }
       }
       store.records.set(r.id,r);
     }
@@ -133,15 +137,43 @@ export class AnalysisProgressStore {
         .map(r=>[r.id,[...new Set(r.properties.flatMap(p=>p.unresolvedPrerequisites))]])),
     };
   }
+  private hasValidWitnesses(record:CandidateProgress,witnesses:readonly string[]):boolean {
+    return witnesses.length>0 &&
+      witnesses.some(x=>x.includes(record.sourceSha256)) &&
+      !witnesses.some(x=>!/\b[a-f0-9]{64}\b/.test(x));
+  }
+  private hasValidEvidence(record:CandidateProgress,experimentId:string):boolean {
+    return (record.experimentEvidence||[]).some(e=>
+      e.experimentId===experimentId&&e.leadId===record.id&&
+      e.sourceCommit===record.sourceCommit&&e.sourceSha256===record.sourceSha256&&
+      /^[a-f0-9]{64}$/.test(e.verifierDigest)&&e.evidenceId.length>0&&
+      (e.result==="observed"||e.result==="not_observed"));
+  }
+  // Remove a legacy witnessless duplicate property ONLY when another property
+  // on the same lead already carries valid source witnesses AND verified EVM
+  // evidence for the exact same experiment ID(s). Never removes unresolved
+  // prerequisites or properties with distinct/unverified experiments.
+  private pruneSubsumedWitnesslessProperties(record:CandidateProgress):void {
+    const witnessedVerifiedIds=new Set<string>();
+    for(const p of record.properties){
+      if(p.state==="test_completed"&&this.hasValidWitnesses(record,p.sourceWitnesses)&&
+        p.experimentIds.length>0&&p.experimentIds.every(id=>this.hasValidEvidence(record,id))){
+        for(const id of p.experimentIds)witnessedVerifiedIds.add(id);
+      }
+    }
+    if(!witnessedVerifiedIds.size)return;
+    record.properties=record.properties.filter(p=>!(
+      p.sourceWitnesses.length===0&&
+      p.unresolvedPrerequisites.length===0&&
+      p.experimentIds.length>0&&
+      p.experimentIds.every(id=>witnessedVerifiedIds.has(id))
+    ));
+  }
   private isConclusive(record:CandidateProgress):boolean {
     return record.properties.length>0 &&
       record.properties.every(p=>p.state==="test_completed"&&p.sourceWitnesses.length>0&&
         p.experimentIds.length>0 &&
-        p.experimentIds.every(id=>(record.experimentEvidence||[]).some(e=>
-          e.experimentId===id&&e.leadId===record.id&&
-          e.sourceCommit===record.sourceCommit&&e.sourceSha256===record.sourceSha256&&
-          /^[a-f0-9]{64}$/.test(e.verifierDigest)&&e.evidenceId.length>0&&
-          (e.result==="observed"||e.result==="not_observed"))));
+        p.experimentIds.every(id=>this.hasValidEvidence(record,id)));
   }
   get experimentCertificate():LeadExperimentCertificate {
     const entries=[...this.records.values()].sort((a,b)=>a.id.localeCompare(b.id));
@@ -250,7 +282,9 @@ export class AnalysisProgressStore {
       const successfulProperties=new Set(r.properties.filter(p=>p.state==="test_completed"&&
         p.experimentIds.length>0).map(p=>p.id));
       r.properties=r.properties.filter(p=>!(p.supersededBy&&successfulProperties.has(p.supersededBy)));
-      if(r.experimentIds.every(x=>this.completedExperimentIds.has(x)) &&
+      this.pruneSubsumedWitnesslessProperties(r);
+      if(this.isConclusive(r))r.lifecycle="experiment_completed";
+      else if(r.experimentIds.every(x=>this.completedExperimentIds.has(x)) &&
         !r.properties.some(p=>p.state==="prerequisites_pending"))
         r.lifecycle="experiment_completed";
     }
@@ -305,8 +339,47 @@ export class AnalysisProgressStore {
       sourceWitnesses:witnesses,unresolvedPrerequisites:[],experimentIds:[experimentId]});
     const successful=new Set(record.properties.filter(p=>p.state==="test_completed").map(p=>p.id));
     record.properties=record.properties.filter(p=>!(p.supersededBy&&successful.has(p.supersededBy)));
+    this.pruneSubsumedWitnesslessProperties(record);
     record.lifecycle=this.isConclusive(record)?"experiment_completed":
       record.properties.some(p=>p.state==="prerequisites_pending")?"dependencies_pending":"experiment_pending";
+  }
+  // Reconcile persisted relational-call blockers against a freshly computed
+  // ProgramFactsGraph for the exact same acquired sourceSha256. Only stale
+  // unresolved_call/unresolved_external_call/ambiguous_call blockers that are
+  // no longer present in the fresh graph may be pruned, and only when the lead
+  // retains at least one witnessed property.
+  reconcileRelationalPrerequisites(leadId:string,currentRelationalUnresolved:ReadonlySet<string>):boolean {
+    const record=this.records.get(leadId);
+    if(!record)return false;
+    const isRelationalCall=(reason:string)=>/^(?:unresolved_call|unresolved_external_call|ambiguous_call):/.test(reason);
+    const hasRetainedWitnessedProperty=record.properties.some(p=>
+      p.state!=="prerequisites_pending"&&this.hasValidWitnesses(record,p.sourceWitnesses)&&
+      p.experimentIds.length>0);
+    if(!hasRetainedWitnessedProperty)return false;
+    let changed=false;
+    const nextProperties:CandidatePropertyProgress[]=[];
+    for(const p of record.properties){
+      if(p.state==="prerequisites_pending"&&p.unresolvedPrerequisites.length>0&&
+        p.unresolvedPrerequisites.every(isRelationalCall)){
+        const stillRelevant=p.unresolvedPrerequisites.filter(r=>currentRelationalUnresolved.has(r));
+        if(stillRelevant.length===0){
+          changed=true;
+          continue;
+        }
+        if(stillRelevant.length<p.unresolvedPrerequisites.length){
+          changed=true;
+          nextProperties.push({...p,unresolvedPrerequisites:stillRelevant});
+          continue;
+        }
+      }
+      nextProperties.push(p);
+    }
+    if(!changed||!nextProperties.length)return false;
+    record.properties=nextProperties;
+    this.pruneSubsumedWitnesslessProperties(record);
+    record.lifecycle=this.isConclusive(record)?"experiment_completed":
+      record.properties.some(p=>p.state==="prerequisites_pending")?"dependencies_pending":"experiment_pending";
+    return true;
   }
   recordInconclusive(id:string,status:string,evidenceId:string,reason:string){
     if(!this.records.size)throw new Error("EMPTY_ANALYSIS_INVENTORY");

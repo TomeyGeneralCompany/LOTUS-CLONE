@@ -14,6 +14,8 @@ import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/dete
 import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {constructSolidityExperiments} from '../packages/security-solver/src/controller-solidity-experiment-planner';
+import {buildProgramFactsGraph} from '../packages/security-solver/src/deterministic/program-facts';
+import {generateRelationalHypotheses} from '../packages/security-solver/src/deterministic/hypothesis-engine';
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
 const path='source-1/contracts/Finance.sol';
@@ -765,6 +767,188 @@ contract ChildLedger is ParentLedger {
     if(ledgerExperiment.ok)
       assert.equal(ledgerExperiment.experiments.length,2,
         'Credit and reward are independent opposing transitions for debit');
+    // Regression 1: receive() external payable has AST name===null; never emit "null()"
+    // or pass an EOA into an isContract()-checked initializer parameter.
+    const benqiLikeText=`pragma solidity ^0.8.0;
+interface IComp { function claimReward(uint8 rewardType, address holder) external; }
+contract EthReceiveMarket {
+  IComp public comptroller;
+  address payable public rewards;
+  function initialize(address _comptroller, address payable _rewards) external {
+    require(_comptroller.code.length > 0);
+    comptroller = IComp(_comptroller);
+    rewards = _rewards;
+  }
+  function claimRewards() external {
+    comptroller.claimReward(0, address(this));
+    rewards.transfer(address(this).balance);
+  }
+  receive() external payable {}
+}`;
+    const benqiLike={path:'source-1/contracts/EthReceiveMarket.sol',
+      content:benqiLikeText,sha256:hash(benqiLikeText)};
+    const benqiBuilt=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:benqiLike.path,
+      targetSelector:'EthReceiveMarket.claimRewards',sources:[benqiLike],
+      declarations:[
+        {selector:'EthReceiveMarket.initialize',operation:'send',inputs:['address','address']},
+        {selector:'EthReceiveMarket.claimRewards',operation:'send',inputs:[]},
+      ] as any,skipLegacy:true
+    });
+    if(benqiBuilt.ok){
+      for(const exp of benqiBuilt.experiments){
+        assert.ok(!exp.sequence.steps.some(s=>'function' in s && String(s.function).includes('null(')),
+          'Unnamed receive() must never produce an invalid null() ABI selector');
+      }
+    }
+
+    // Regression 2: v4 checkpoint reconciliation must prune a legacy witnessless
+    // duplicate property ONLY when a source-witnessed property with verified EVM
+    // evidence already covers the exact same experimentId(s).
+    const witnesslessFile=join(dir,'v4-witnessless.json');
+    const singleLead=candidates.slice(0,1);
+    const wlStore=await AnalysisProgressStore.open(witnesslessFile,singleLead);
+    const wlExpId=hash('verified-init-exp');
+    const wlBatch=wlStore.nextBatch(1,1);
+    wlStore.recordAssessment(wlBatch[0].id,[hash('legacy-hyp')],[],[wlExpId]);
+    wlStore.markExperimentCompleted(wlExpId,{result:'not_observed',
+      evidenceId:hash('ev:'+wlExpId),verifierDigest:hash('digest:'+wlExpId)});
+    // Without source witnesses, the lead MUST remain inconclusive.
+    assert.equal(wlStore.experimentCertificate.conclusive,0,
+      'A witnessless test_completed property alone must never certify a lead');
+    // Adding a verified source-witnessed property for the exact same experimentId
+    // supersedes the legacy witnessless duplicate and certifies the lead.
+    wlStore.addRepairExperiment(wlBatch[0].id,hash('witnessed-prop'),wlExpId,
+      [singleLead[0].path+':'+singleLead[0].sourceSha256+':0:10',
+       'source-1/contracts/Base.sol:'+hash('base-source')+':0:10']);
+    assert.equal(wlStore.experimentCertificate.conclusive,1,
+      'Verified source-witnessed property for exact same experimentId must supersede witnessless duplicate');
+    assert.equal(wlStore.records.get(wlBatch[0].id)!.lifecycle,'experiment_completed');
+    // Also verify open() heals an already-persisted v4 checkpoint carrying both properties.
+    await wlStore.save();
+    const rawWl=JSON.parse(await readFile(witnesslessFile,'utf8')) as any;
+    rawWl.records[0].properties.unshift({id:hash('stale-legacy-dup'),state:'test_completed',
+      sourceWitnesses:[],unresolvedPrerequisites:[],experimentIds:[wlExpId]});
+    rawWl.records[0].lifecycle='dependencies_pending';
+    await writeFile(witnesslessFile,JSON.stringify(rawWl,null,2),'utf8');
+    const healedWl=await AnalysisProgressStore.open(witnesslessFile,singleLead);
+    assert.equal(healedWl.experimentCertificate.conclusive,1,
+      'Opening a v4 checkpoint with a subsumed witnessless duplicate must heal cleanly');
+    assert.equal(healedWl.records.get(wlBatch[0].id)!.lifecycle,'experiment_completed');
+
+    // Regression 3: non-numeric `address public rewards` must NOT be misclassified
+    // as a numeric interest-accrual accounting counter attaching ERC20 calls to setRewards.
+    const rewardsMarketText=`pragma solidity ^0.8.0;
+interface IERC20 { function balanceOf(address a) external view returns (uint256); function transfer(address to, uint256 amt) external returns (bool); }
+contract RewardsMarket {
+  address public owner;
+  address public rewards;
+  IERC20 public token;
+  modifier onlyOwner() { require(msg.sender == owner); _; }
+  function setRewards(address newRewards) external onlyOwner { rewards = newRewards; }
+  function claimRewards() external { token.transfer(rewards, token.balanceOf(address(this))); }
+}`;
+    const rewardsGraph=buildProgramFactsGraph({sources:[{path:'source-1/contracts/RewardsMarket.sol',content:rewardsMarketText}]});
+    const rewardsRels=generateRelationalHypotheses(rewardsGraph);
+    assert.ok(!rewardsRels.some(r=>r.entrypoints.includes('RewardsMarket.setRewards')&&
+      r.unresolvedPrerequisites.some(u=>u.includes('IERC20')||u.includes('balanceOf')||u.includes('transfer'))),
+      'address public rewards must not attach claimRewards ERC20 calls to setRewards');
+    // Reconciling stale relational blockers against fresh graph preserves genuine blockers.
+    const relFile=join(dir,'v4-relational.json');
+    const relStore=await AnalysisProgressStore.open(relFile,singleLead);
+    relStore.nextBatch(1,1);
+    relStore.recordAssessment(singleLead[0].id,[],[
+      'unresolved_call:ERC20.balanceOf','unresolved_external_call:ERC20.safeTransfer'
+    ],[wlExpId],[],[{id:hash('set-rewards-prop'),experimentIds:[wlExpId],
+      sourceWitnesses:[singleLead[0].path+':'+singleLead[0].sourceSha256+':0:10']}]);
+    relStore.markExperimentCompleted(wlExpId,{result:'not_observed',
+      evidenceId:hash('ev2:'+wlExpId),verifierDigest:hash('digest2:'+wlExpId)});
+    assert.equal(relStore.experimentCertificate.conclusive,0);
+    assert.equal(relStore.reconcileRelationalPrerequisites(singleLead[0].id,
+      new Set(['unresolved_call:ERC20.balanceOf'])),true);
+    assert.equal(relStore.experimentCertificate.conclusive,0,
+      'Still-present relational unresolved calls must remain blocking');
+    assert.equal(relStore.reconcileRelationalPrerequisites(singleLead[0].id,new Set()),true);
+    assert.equal(relStore.experimentCertificate.conclusive,1,
+      'Once fresh graph confirms zero relational blockers, verified lead becomes conclusive');
+
+    // Regression 4: resolveAcquiredConcreteImplementations must support ArrayTypeName
+    // parameters (ERC1155 mintBatch) and UserDefinedTypeName public getters (MoneyMarket.stablecoin).
+    const arrayBaseText=`pragma solidity ^0.8.0;
+interface IToken {}
+abstract contract BatchMarketBase {
+  function stablecoin() external view virtual returns (IToken);
+  function mint(address to, uint256 id, uint256 amt) external virtual;
+  function mintBatch(address to, uint256[] memory ids, uint256[] memory amts) external virtual;
+}`;
+    const arrayChildText=`pragma solidity ^0.8.0;
+import "./BatchMarketBase.sol";
+contract ConcreteBatchMarket is BatchMarketBase {
+  IToken public override stablecoin;
+  function mint(address to, uint256 id, uint256 amt) external override {}
+  function mintBatch(address to, uint256[] memory ids, uint256[] memory amts) external override {}
+}`;
+    const arrayBase={path:'source-1/contracts/BatchMarketBase.sol',
+      content:arrayBaseText,sha256:hash(arrayBaseText)};
+    const arrayChild={path:'source-1/contracts/ConcreteBatchMarket.sol',
+      content:arrayChildText,sha256:hash(arrayChildText)};
+    const arrayImpls=resolveAcquiredConcreteImplementations(
+      arrayBase,'BatchMarketBase','mint',[arrayBase,arrayChild]);
+    assert.deepEqual(arrayImpls.map(x=>x.selector),['ConcreteBatchMarket.mint'],
+      'Concrete subclasses with array-typed methods and contract-typed public getters must resolve');
+    const batchImpls=resolveAcquiredConcreteImplementations(
+      arrayBase,'BatchMarketBase','mintBatch',[arrayBase,arrayChild]);
+    assert.deepEqual(batchImpls.map(x=>x.selector),['ConcreteBatchMarket.mintBatch']);
+    assert.deepEqual(batchImpls[0].inputs,['address','uint256[]','uint256[]']);
+
+    // Regression 5: BoringOwnable two-step claimOwnership authorization experiment.
+    const boringOwnableText=`pragma solidity ^0.8.0;
+contract TwoStepOwnable {
+  address public owner;
+  address public pendingOwner;
+  constructor() { owner = msg.sender; }
+  modifier onlyOwner() { require(msg.sender == owner); _; }
+  function transferOwnership(address newOwner, bool direct, bool renounce) public onlyOwner {
+    if (direct) {
+      require(newOwner != address(0) || renounce);
+      owner = newOwner;
+      pendingOwner = address(0);
+    } else {
+      pendingOwner = newOwner;
+    }
+  }
+  function claimOwnership() public {
+    address _pendingOwner = pendingOwner;
+    require(msg.sender == _pendingOwner);
+    owner = _pendingOwner;
+    pendingOwner = address(0);
+  }
+}`;
+    const boringSnap={path:'source-1/contracts/TwoStepOwnable.sol',
+      content:boringOwnableText,sha256:hash(boringOwnableText)};
+    const boringClaim=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:boringSnap.path,
+      targetSelector:'TwoStepOwnable.claimOwnership',sources:[boringSnap],
+      declarations:[
+        {selector:'TwoStepOwnable.owner',operation:'call',inputs:[]},
+        {selector:'TwoStepOwnable.pendingOwner',operation:'call',inputs:[]},
+        {selector:'TwoStepOwnable.transferOwnership',operation:'send',inputs:['address','bool','bool']},
+        {selector:'TwoStepOwnable.claimOwnership',operation:'send',inputs:[]},
+      ] as any,skipLegacy:true
+    });
+    assert.equal(boringClaim.ok,true,
+      'Two-step BoringOwnable.claimOwnership must construct a source-proven ownership claim guard');
+    if(boringClaim.ok){
+      const claimExp=boringClaim.experiments.find(e=>e.securityProperty.includes('two-step ownership claim'));
+      assert.ok(claimExp,'Must produce two-step ownership claim property');
+      const sends=claimExp.sequence.steps.filter(s=>s.operation==='send') as any[];
+      assert.deepEqual(sends.map(s=>s.function),[
+        'transferOwnership(address,bool,bool)','claimOwnership()','claimOwnership()']);
+      assert.equal(sends[1].sender,1);
+      assert.equal(sends[1].expectRevert,true);
+      assert.equal(sends[2].sender,2);
+    }
+
     const changed=candidates.map(c=>({...c}));
     changed[0].sourceSha256=hash('changed source');
     await assert.rejects(AnalysisProgressStore.open(file,changed),/SOURCE_MISMATCH/);
