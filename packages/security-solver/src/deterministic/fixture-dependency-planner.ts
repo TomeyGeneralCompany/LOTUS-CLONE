@@ -107,9 +107,14 @@ function fixtureAbiType(type:any,contract:any,depth=0):string|null {
   return callableType(type);
 }
 function initializerStateBindings(node:any):Array<{parameter:string;receiver:string;typeName:string;line:number}>{
+  // Only a compiler AST user-defined contract/interface reference can create a
+  // deployment edge. Elementary types (including uint256 casts), arrays,
+  // mappings and value types belong to ordinary initializer argument binding.
+  // The downstream resolver will still prove the acquired implementation.
   const vars=new Map<string,string>();
   for(const item of node.subNodes||[])if(item.type==="StateVariableDeclaration")
-    for(const v of item.variables||[])if(v.name&&typeOf(v.typeName))vars.set(v.name,typeOf(v.typeName));
+    for(const v of item.variables||[])if(v.name&&v.typeName?.type==="UserDefinedTypeName"&&
+      typeOf(v.typeName))vars.set(v.name,typeOf(v.typeName));
   const out:Array<{parameter:string;receiver:string;typeName:string;line:number}>=[];
   for(const fn of (node.subNodes||[]).filter((x:any)=>x.type==="FunctionDefinition"&&x.body&&
     /^(?:initialize|init|__.*init.*)$/i.test(x.name||""))){
