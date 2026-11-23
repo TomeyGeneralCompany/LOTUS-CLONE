@@ -109,6 +109,20 @@ export function resolveAcquiredConcreteImplementations(
     }
     return paths;
   };
+  // Standard package inheritance may be compiled from the installed lockfile
+  // even when the third-party source is not part of the audited 91-file source
+  // inventory. Such an edge is eligible for CONCRETE CANDIDATE DISCOVERY only:
+  // it never supplies a behavioral witness or bypasses EVM compilation.
+  const hasCanonicalPackageBase=(entry:ContractEntry,name:string):boolean=>
+    (astOf(entry.source)?.children||[]).some((imp:any)=>{
+      if(imp.type!=="ImportDirective"||typeof imp.path!=="string"||
+        !/^@openzeppelin\/contracts(?:-upgradeable)?\/.+\.sol$/.test(imp.path))return false;
+      const declared=posix.basename(imp.path,".sol");
+      if(Array.isArray(imp.symbolAliases)&&imp.symbolAliases.length)
+        return imp.symbolAliases.some(([original,alias]:[string,string|null])=>
+          original===declared&&(alias||original)===name);
+      return declared===name;
+    });
   const basesOf=(entry:ContractEntry):ContractEntry[][]=>{
     const reachable=importedPaths(entry.source);
     return (entry.node.baseContracts||[]).map((b:any)=>{
@@ -147,8 +161,14 @@ export function resolveAcquiredConcreteImplementations(
       const key=entry.source.path+":"+entry.node.name;
       if(traversed.has(key))return;
       traversed.add(key);chain.push(entry);
-      for(const choices of basesOf(entry)){
-        // Ambiguous names cannot prove an inheritance edge.
+      const inherited=entry.node.baseContracts||[];
+      const resolved=basesOf(entry);
+      for(let i=0;i<inherited.length;i++){
+        const choices=resolved[i]||[];
+        // Only explicit canonical package imports may lack an acquired
+        // source node. Never fabricate user-defined or ambiguous ancestors.
+        const name=String(inherited[i]?.baseName?.namePath||"").split(".").pop();
+        if(choices.length===0&&name&&hasCanonicalPackageBase(entry,name))continue;
         if(choices.length!==1){invalid=true;continue;}
         walk(choices[0]);
       }

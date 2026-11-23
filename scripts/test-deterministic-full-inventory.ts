@@ -497,6 +497,38 @@ contract TransitiveMarket {
     assert.equal(transitiveCallers[0].sourceSha256,transitiveSnap.sha256);
     assert.equal(resolveAcquiredInterfaceCallers(icSnap,'ICToken','burn',
       [icSnap,callerSnap]).length,0,'No invented interface method');
+    // A source-acquired concrete child must remain discoverable even when
+    // its unrelated standard parent comes from an installed OpenZeppelin
+    // package. This does not certify that child as deployable; the EVM must.
+    const acquiredBaseText=`pragma solidity ^0.8.0;
+abstract contract AcquiredBase {
+  function mint(uint256 amount) public virtual { require(amount>0); }
+}`;
+    const acquiredChildText=`pragma solidity ^0.8.0;
+import "./AcquiredBase.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+contract AcquiredChild is AcquiredBase, OwnableUpgradeable {
+  function checkpoint() public {}
+}`;
+    const acquiredBase={path:'source-1/contracts/AcquiredBase.sol',
+      content:acquiredBaseText,sha256:hash(acquiredBaseText)};
+    const acquiredChild={path:'source-1/contracts/AcquiredChild.sol',
+      content:acquiredChildText,sha256:hash(acquiredChildText)};
+    const acquiredImpl=resolveAcquiredConcreteImplementations(
+      acquiredBase,'AcquiredBase','mint',[acquiredBase,acquiredChild]);
+    assert.equal(acquiredImpl.length,1,
+      'An actual acquired child may inherit a separately installed canonical OpenZeppelin base');
+    assert.equal(acquiredImpl[0].selector,'AcquiredChild.mint');
+    assert.ok(acquiredImpl[0].witness.includes(acquiredBase.sha256),
+      'The implementation method witness must remain the acquired project source');
+    const unprovenChildText=acquiredChildText.replace(
+      '@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol',
+      './UnacquiredOwner.sol');
+    const unprovenChild={...acquiredChild,content:unprovenChildText,
+      sha256:hash(unprovenChildText)};
+    assert.equal(resolveAcquiredConcreteImplementations(
+      acquiredBase,'AcquiredBase','mint',[acquiredBase,unprovenChild]).length,0,
+      'An arbitrary missing parent must never be assumed to exist');
     // One target can have multiple independently source-proven opposing
     // transitions. Neither the companion order nor names justify dropping one.
     // A burn test without a valid minted token is a meaningless dual-revert.
