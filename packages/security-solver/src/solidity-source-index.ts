@@ -152,7 +152,7 @@ export class SoliditySourceIndex {
               const knownStruct=(node.subNodes||[]).find((d:any)=>
                 d.type==='StructDefinition'&&d.name===name);
               if(knownStruct){
-                available=(knownStruct.members||[]).some((m:any)=>!!canonical(m.typeName));
+                available=(((knownStruct as any).members)||[]).some((m:any)=>!!canonical(m.typeName));
               }else available=true; // compiler confirms the acquired contract/type
             }
             if(!available)continue;
