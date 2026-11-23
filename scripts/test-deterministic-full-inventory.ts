@@ -650,10 +650,13 @@ contract MathLedger {
       targetSelector:'MathLedger.debit',sources:[falsePairSource],
       declarations:mathLedgerDecls as any,skipLegacy:true
     });
-    if(falseBuilt.ok)assert.ok(falseBuilt.experiments.every(e=>
-      !e.securityProperty.startsWith('financial ')||
-      !e.hypothesis.includes('total')),
-      'An unrelated right-hand ledger must not establish a total-balance decrement');
+    assert.equal(falseBuilt.ok,true,
+      'A broken total ledger must remain an executable falsification candidate');
+    if(falseBuilt.ok)assert.ok(falseBuilt.experiments.some(e=>
+      e.securityProperty.startsWith('financial ')&&
+      e.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='total()'&&step.expect==='600')),
+      'The invariant must test total conservation even if only the balance ledger has an opposing write');
     const ledgerExperiment=constructSolidityExperiments({
       repositoryCommit:'b'.repeat(40),targetPath:ledgerSource.path,
       targetSelector:'Ledger.debit',sources:[ledgerSource],
