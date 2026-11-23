@@ -1307,6 +1307,31 @@ contract StateChild is StateBase {
     assert.deepEqual(inheritedCallers.map(x=>x.selector),['StateChild.deposit'],
       'An acquired inherited source state receiver is a valid concrete caller');
     assert.equal(inheritedCallers[0].receiver,'cToken');
+    // The selected interface may inherit its actual ABI without a local
+    // declaration. Accept only the acquired unique parent and callsite.
+    const inheritedTokenBase='pragma solidity ^0.8.20; interface IBaseToken { function mint(uint256 amount) external returns(uint256); }';
+    const inheritedTokenChild='pragma solidity ^0.8.20; import "./IBaseToken.sol"; interface IChildToken is IBaseToken {}';
+    const inheritedTokenCaller=`pragma solidity ^0.8.20;
+import "./IChildToken.sol";
+contract ChildTokenConsumer {
+ IChildToken public token;
+ function use(uint256 amount) external { require(token.mint(amount)==0); }
+}`;
+    const inheritedTokenSnapshots=[
+      {path:'source-1/contracts/IBaseToken.sol',content:inheritedTokenBase,
+        sha256:hash(inheritedTokenBase)},
+      {path:'source-1/contracts/IChildToken.sol',content:inheritedTokenChild,
+        sha256:hash(inheritedTokenChild)},
+      {path:'source-1/contracts/ChildTokenConsumer.sol',content:inheritedTokenCaller,
+        sha256:hash(inheritedTokenCaller)}
+    ];
+    assert.deepEqual(resolveAcquiredInterfaceCallers(inheritedTokenSnapshots[1],
+      'IChildToken','mint',inheritedTokenSnapshots).map(x=>x.selector),
+      ['ChildTokenConsumer.use'],
+      'Inherited ABI method and actual parsed caller must reconstruct a valid route');
+    assert.deepEqual(resolveAcquiredInterfaceCallers(inheritedTokenSnapshots[1],
+      'IChildToken','mint',inheritedTokenSnapshots.slice(1)),[],
+      'An unacquired parent cannot invent an inherited ABI method');
     assert.equal(resolveAcquiredInterfaceCallers(icSnap,'ICToken','burn',
       [icSnap,callerSnap]).length,0,'No invented interface method');
     // A source-acquired concrete child must remain discoverable even when
