@@ -97,10 +97,12 @@ contract Consumer {
     orphanStore.recordAssessment(orphanLead.id,[],
       ['UNKNOWN_ASSERTION(missing_fixture):interface lacks runtime'],[]);
     assert.throws(()=>orphanStore.recordSourceUnavailable(orphanLead.id,{
-      ...reviewedOrphan!,sourceWitnesses:['invented:bad-source']}),
-      /SOURCE_UNAVAILABLE_INDEPENDENT_EVIDENCE_REQUIRED/,
+      ...reviewedOrphan!,sourceWitnesses:['invented:bad-source']},
+      orphanSources,[orphanSource.path]),
+      /SOURCE_UNAVAILABLE_REPLAY_VERIFICATION_FAILED/,
       'Unverified witness strings cannot close an interface lead');
-    orphanStore.recordSourceUnavailable(orphanLead.id,reviewedOrphan!);
+    orphanStore.recordSourceUnavailable(orphanLead.id,reviewedOrphan!,
+      orphanSources,[orphanSource.path]);
     assert.equal(orphanStore.experimentCertificate.conclusive,0,
       'A source-unavailable lead is NEVER counted as experimentally verified');
     assert.equal(orphanStore.experimentCertificate.sourceUnavailable,1);
