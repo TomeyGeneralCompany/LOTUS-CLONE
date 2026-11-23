@@ -60,6 +60,15 @@ if(currentIndex!==-1){
     "Real Dell original selector multiset changed or lost leads");
   // Pin the acquired original candidate and source identifiers from the
   // verified frozen baseline; never substitute a guessed identity digest.
+  // SHA-256 computed directly from the original 290 candidate ID/path/
+  // selector/source-commit/source-SHA tuples in artifact 14831250048.
+  // Individual set hashes alone cannot detect reassignment of a candidate
+  // identity to another originally acquired file.
+  const originalTuples=actual.candidates.map(c=>[
+    c.id,c.path,c.selector,c.sourceCommit,c.sourceSha256].join("|")).sort();
+  assert.equal(createHash("sha256").update(originalTuples.join("\n")).digest("hex"),
+    "3f94f7941f8ed6dbf4549eeb3671bdd1b033a5ea0bcbf05b416cb622da3d8874",
+    "Original acquired lead-to-source binding changed");
   const identityDigest=createHash("sha256").update(
     [...ids].sort().join("\n")).digest("hex");
   assert.equal(identityDigest,baseline.originalCandidateIdsDigest,
