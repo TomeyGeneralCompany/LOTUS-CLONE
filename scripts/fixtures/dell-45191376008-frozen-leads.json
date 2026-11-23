@@ -301,5 +301,7 @@
       "DInterest.topupDeposit",
       "DInterest.withdraw"
     ]
-  }
+  },
+  "originalCandidateIdsDigest": "d16cf1cf94e373bc2103a4f35e180ff9adb3198d3845e41b32b837fb3f44196f",
+  "originalSourceIdentitiesDigest": "e7e58ce95c91c28de4af11998928ec75ad0aae99d963b06949f6a774409119c9"
 }
