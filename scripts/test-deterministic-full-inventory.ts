@@ -1691,6 +1691,55 @@ contract DirectScalar {
       'Unrelated RHS storage cannot prove an exact scalar delta');
     // State relationships must be derived from exact mapping keys, not from
     // lexical similarity or a generic "balance" variable name.
+    const fundedMappingText=`pragma solidity ^0.8.20;
+contract FundedMapping {
+  mapping(address=>uint256) public credit;
+  uint256 public totalCredit;
+  address public operator;
+  constructor(){operator=msg.sender;}
+  function fund(address recipient,uint256 amount) external {
+    credit[recipient]+=amount;totalCredit+=amount;
+  }
+  function settle(address recipient,uint256 amount) external {
+    require(msg.sender==operator,"operator");
+    require(amount>0&&amount<=totalCredit,"balance");
+    credit[recipient]+=amount;totalCredit-=amount;
+  }
+}`;
+    const fundedSource={path:'source-1/contracts/FundedMapping.sol',
+      content:fundedMappingText,sha256:hash(fundedMappingText)};
+    const fundedMenu=[
+      {selector:'FundedMapping.fund',operation:'send',inputs:['address','uint256']},
+      {selector:'FundedMapping.settle',operation:'send',inputs:['address','uint256']},
+      {selector:'FundedMapping.operator',operation:'call',inputs:[]}
+    ];
+    const fundedPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:fundedSource.path,
+      targetSelector:'FundedMapping.settle',sources:[fundedSource],
+      declarations:fundedMenu as any,skipLegacy:true});
+    assert.equal(fundedPlan.ok,true,
+      'Acquired balance precondition must trigger source-derived funding preparation');
+    if(fundedPlan.ok)assert.ok(fundedPlan.experiments.some(e=>
+      e.securityProperty.startsWith('source-funded mapping balance')&&
+      e.sequence.steps.some(step=>step.operation==='send'&&
+        step.function==='fund(address,uint256)'&&step.requiredSetup===true)&&
+      e.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='totalCredit()'&&step.expect==='4')&&
+      e.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='credit(address)'&&step.expect==='6')),
+      'Bounded settlement must have actual acquired funding and independent numeric postconditions');
+    const unfundedText=fundedMappingText.replace(
+      'credit[recipient]+=amount;totalCredit+=amount;',
+      'require(amount<0);');
+    const unfundedSource={...fundedSource,content:unfundedText,
+      sha256:hash(unfundedText)};
+    const refusedFunding=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:unfundedSource.path,
+      targetSelector:'FundedMapping.settle',sources:[unfundedSource],
+      declarations:fundedMenu as any,skipLegacy:true});
+    assert.ok(!refusedFunding.ok||!refusedFunding.experiments.some(e=>
+      e.securityProperty.startsWith('source-funded mapping balance')),
+      'Without a real source-backed funding edge the controller must not invent one');
     const directMapSourceText=`pragma solidity ^0.8.0;
 contract DirectMap {
   mapping(address => uint256) public ledger;
