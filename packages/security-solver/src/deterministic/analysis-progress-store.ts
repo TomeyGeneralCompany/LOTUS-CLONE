@@ -49,7 +49,7 @@ export interface CandidateProgress {
 }
 export interface CandidateCoverage {
   total:number; queued:number; admitted:number; dependenciesPending:number;
-  experimentsPending:number; experimentsCompleted:number; terminalExhausted:number;
+  experimentsPending:number; experimentsCompleted:number; sourceUnavailable:number; terminalExhausted:number;
   blocked:number; unresolvedIds:string[]; unresolvedPrerequisites:Record<string,string[]>;
 }
 
@@ -142,6 +142,7 @@ export class AnalysisProgressStore {
       dependenciesPending:count("dependencies_pending"),
       experimentsPending:count("experiment_pending"),
       experimentsCompleted:count("experiment_completed"),
+      sourceUnavailable:records.filter(r=>this.hasSourceUnavailableEvidence(r)).length,
       terminalExhausted:count("analysis_exhausted"),blocked:count("blocked"),
       unresolvedIds:unresolved.map(r=>r.id).sort(),
       unresolvedPrerequisites:Object.fromEntries(unresolved
