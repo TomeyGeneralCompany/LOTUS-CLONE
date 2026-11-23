@@ -80,16 +80,16 @@ contract Implementer is IOrphan {
       [...orphanSources,implementingSource],
       [orphanSource.path,implementingSource.path]),null,
       'Acquired deployable implementation forbids source-unavailable closure');
-    const consumerText=`pragma solidity ^0.8.20;
+    const orphanConsumerText=`pragma solidity ^0.8.20;
 import "./IOrphan.sol";
 contract Consumer {
   IOrphan public target;
   function relay(uint256 amount) external { target.act(amount); }
 }`;
-    const consumerSource={path:'source-1/contracts/Consumer.sol',content:consumerText,
-      sha256:hash(consumerText)};
+    const orphanConsumerSource={path:'source-1/contracts/Consumer.sol',content:orphanConsumerText,
+      sha256:hash(orphanConsumerText)};
     assert.equal(proposeInterfaceUnavailability(orphanLead,
-      [...orphanSources,consumerSource],[orphanSource.path,consumerSource.path]),null,
+      [...orphanSources,orphanConsumerSource],[orphanSource.path,orphanConsumerSource.path]),null,
       'An acquired actual typed caller must remain eligible for recovery');
     const orphanStore=await AnalysisProgressStore.open(
       join(dir,'orphan-source-unavailable.json'),[orphanLead]);
