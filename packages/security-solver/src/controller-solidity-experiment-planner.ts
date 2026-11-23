@@ -3533,6 +3533,100 @@ function sourcePureExpressionExperiment(
   return out;
 }
 
+/** Two independently source-proven state transitions form an executable
+ * conservation property even when the state is private. Every readback must
+ * be an acquired exact-return view; do not guess economic intent by names.
+ */
+function sourcePairedScalarConservationExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const stateVars=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      identifier.test(v.name||'')&&!v.expression&&
+      v.typeName?.type==='ElementaryTypeName'&&
+      /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||''));
+  if(!stateVars.length)return [];
+  const observations=extractAccountingObservations(snapshot,contract.name,declarations);
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,
+    sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const ctor=nodes.find(n=>n.type==='FunctionDefinition'&&n.isConstructor);
+  const init=nodes.find(n=>n.type==='FunctionDefinition'&&
+    /^(?:initialize|init)$/.test(n.name||'')&&n.body);
+  const entries=nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&
+    n.name&&['public','external'].includes(n.visibility)&&
+    !['view','pure'].includes(n.stateMutability||'')&&
+    !(n.modifiers||[]).length&&
+    (n.parameters||[]).length===1&&
+    identifier.test(n.parameters[0]?.name||'')&&
+    /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(n.parameters[0]?.typeName)||''))
+    .filter(n=>declarations.some(d=>d.selector===contract.name+'.'+n.name&&
+      d.operation==='send'&&
+      JSON.stringify(d.inputs)===JSON.stringify([canonicalAbiType(n.parameters[0].typeName)])))
+    .filter(n=>{
+      const text=body(snapshot.content,n);
+      return !hasAnySourceAuthGuard(n,text)&&
+        !/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(text)&&
+        !/\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(text);
+    });
+  if(!entries.some(n=>n.name===method))return [];
+  const results:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const state of stateVars){
+    const getter=state.visibility==='public'?state.name+'()':
+      observations.find(o=>o.kind==='scalar'&&o.stateVariable===state.name)?.getter;
+    if(!getter)continue;
+    const mutation=new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)');
+    if((ctor&&mutation.test(body(snapshot.content,ctor)))||
+      (init&&mutation.test(body(snapshot.content,init))))continue;
+    const readback=nodes.find(n=>n.type==='FunctionDefinition'&&
+      n.name===getter.split('(')[0]&&n.body);
+    for(const increase of entries){
+      const inParam=increase.parameters[0].name;
+      if(!sourceExactAccountingDelta(body(snapshot.content,increase),
+        state.name,inParam,'increase'))continue;
+      for(const decrease of entries){
+        if(increase===decrease||!
+          [increase.name,decrease.name].includes(method))continue;
+        const outParam=decrease.parameters[0].name;
+        if(!sourceExactAccountingDelta(body(snapshot.content,decrease),
+          state.name,outParam,'decrease'))continue;
+        const inSig=canonicalFunctionIdentity(increase),
+          outSig=canonicalFunctionIdentity(decrease);
+        const steps:SoliditySequence['steps']=[];
+        if(setup.initSignature)steps.push({operation:'send',
+          function:setup.initSignature,args:setup.initArgs,sender:0,
+          requiredSetup:true});
+        steps.push({operation:'call',function:getter,args:[],expect:'0'});
+        steps.push({operation:'send',function:inSig,args:['1'],sender:0});
+        steps.push({operation:'call',function:getter,args:[],expect:'1'});
+        steps.push({operation:'send',function:outSig,args:['1'],sender:0});
+        steps.push({operation:'call',function:getter,args:[],expect:'0'});
+        results.push({
+          hypothesis:'Acquired increase and decrease transitions of '+
+            state.name+' must restore the independently observable prestate',
+          property:'source-paired scalar conservation '+contract.name+'.'+
+            inSig+'->'+outSig+':'+state.name,
+          sequence:{constructorArgs:setup.constructorArgs,
+            ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+            steps},
+          witnesses:[witness(snapshot,increase,contract.name+'.'+inSig),
+            witness(snapshot,decrease,contract.name+'.'+outSig),
+            witness(snapshot,state,contract.name+'.'+state.name),
+            ...(readback?[witness(snapshot,readback,contract.name+'.'+getter)]:[])],
+        });
+      }
+    }
+  }
+  return results;
+}
+
 /** Convert a verified initializer setup into the actual source-declared
  * factory clone pathway when the acquired Factory implementation provides one.
  * No inferred clone behavior, guessed parameter order, arbitrary initializer,
@@ -3776,6 +3870,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     input.declarations,indexed))choices.push(assignment);
   for(const struct of sourceStructOverrideExperiments(target,contract,method,
     input.declarations,indexed))choices.push(struct);
+  for(const pair of sourcePairedScalarConservationExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(pair);
   const vestingCreation=groundedVestingCreationExperiment(target,contract,method,input.declarations);
   if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
