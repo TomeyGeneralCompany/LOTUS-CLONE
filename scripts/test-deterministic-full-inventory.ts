@@ -1007,6 +1007,25 @@ contract TransitiveMarket {
     assert.deepEqual(transitiveCallers.map(x=>x.selector),['TransitiveMarket.deposit'],
       'An acquired transitive import must preserve a real interface call witness');
     assert.equal(transitiveCallers[0].sourceSha256,transitiveSnap.sha256);
+    // An acquired concrete consumer may inherit the typed interface receiver
+    // from a parent instead of declaring the state variable in its own file.
+    const stateBaseText=`pragma solidity ^0.8.20;
+import "./ICToken.sol";
+contract StateBase { ICToken public cToken; }`;
+    const stateChildText=`pragma solidity ^0.8.20;
+import "./StateBase.sol";
+contract StateChild is StateBase {
+  function deposit(uint256 amount) external { require(cToken.mint(amount)==0); }
+}`;
+    const stateBaseSnap={path:'source-1/contracts/StateBase.sol',
+      content:stateBaseText,sha256:hash(stateBaseText)};
+    const stateChildSnap={path:'source-1/contracts/StateChild.sol',
+      content:stateChildText,sha256:hash(stateChildText)};
+    const inheritedCallers=resolveAcquiredInterfaceCallers(icSnap,'ICToken','mint',
+      [icSnap,stateBaseSnap,stateChildSnap,fakeSnap]);
+    assert.deepEqual(inheritedCallers.map(x=>x.selector),['StateChild.deposit'],
+      'An acquired inherited source state receiver is a valid concrete caller');
+    assert.equal(inheritedCallers[0].receiver,'cToken');
     assert.equal(resolveAcquiredInterfaceCallers(icSnap,'ICToken','burn',
       [icSnap,callerSnap]).length,0,'No invented interface method');
     // A source-acquired concrete child must remain discoverable even when
