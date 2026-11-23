@@ -2122,6 +2122,24 @@ function accountingDirections(text:string,state:string):{increase:boolean;decrea
   };
 }
 
+/** Exact source-lvalue delta with a source-proven amount, including SafeMath.
+ * A shared symbol or a different mapping index is never enough for admission. */
+function sourceExactAccountingDelta(
+  text:string,state:string,amount:string,direction:"increase"|"decrease",
+  accountKey:""|"msg.sender"=""
+):boolean {
+  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state)||
+    !/^(?:[A-Za-z_][A-Za-z0-9_]*|msg\.value)$/.test(amount))return false;
+  const key=accountKey==="msg.sender"?"\\s*\\[\\s*msg\\.sender\\s*\\]":"";
+  const ref="\\b"+state+key;
+  const value=amount==="msg.value"?"msg\\.value":amount;
+  const op=direction==="increase"?"\\+":"-";
+  const method=direction==="increase"?"add":"sub";
+  return new RegExp(ref+"\\s*"+op+"=\\s*"+value+"\\b").test(text)||
+    new RegExp(ref+"\\s*=\\s*"+ref+"\\s*(?:"+op+"\\s*"+value+
+      "\\b|\\.\\s*"+method+"\\s*\\(\\s*"+value+"\\s*\\))").test(text);
+}
+
 export function extractSourceInvariantDescriptor(
   snapshot: SourceSnapshot,
   contract: any,
@@ -2505,8 +2523,8 @@ export function extractSourceInvariantDescriptor(
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(accountingTarget)&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(inflowParameter)&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(outflowParameter)&&
-    new RegExp("\\b"+accountingTarget+"\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
-    new RegExp("\\b"+accountingTarget+"\\s*-="+ "\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
+    sourceExactAccountingDelta(inflowEffects,accountingTarget,inflowParameter,"increase")&&
+    sourceExactAccountingDelta(outflowEffects,accountingTarget,outflowParameter,"decrease")&&
     !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
   // A payable deposit and ETH withdrawal can independently establish
   // conservation from the caller balance and the actual transferred value.
@@ -2514,12 +2532,12 @@ export function extractSourceInvariantDescriptor(
   // instead of demanding the correct decrement already exist in the source.
   const matchingBalance=balanceReferenced&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(balanceVarName)&&
-    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*\\+=\\s*msg\\.value").test(inflowEffects)&&
-    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*-=\\s*"+outflowParameter+"\\b").test(outflowEffects);
+    sourceExactAccountingDelta(inflowEffects,balanceVarName,"msg.value","increase","msg.sender")&&
+    sourceExactAccountingDelta(outflowEffects,balanceVarName,outflowParameter,"decrease","msg.sender");
   const coupledPayableConservation=totalReferenced&&
     inflowFn.stateMutability==='payable'&&inflowFn.parameters.length===0&&
     outflowFn.parameters.length===1&&/^uint/.test(String(outflowFn.parameters[0]?.typeName?.name||''))&&
-    new RegExp("\\b"+totalVarName+"\\s*\\+=\\s*msg\\.value").test(inflowEffects)&&
+    sourceExactAccountingDelta(inflowEffects,totalVarName,"msg.value","increase")&&
     matchingBalance&&
     new RegExp("\\bvalue\\s*:\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
     !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
@@ -2531,13 +2549,21 @@ export function extractSourceInvariantDescriptor(
     inflowFn.parameters.length===1&&outflowFn.parameters.length===1&&
     /^uint/.test(String(inflowFn.parameters[0]?.typeName?.name||''))&&
     /^uint/.test(String(outflowFn.parameters[0]?.typeName?.name||''))&&
-    new RegExp("\\b"+totalVarName+"\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
-    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
-    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*-=\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
+    sourceExactAccountingDelta(inflowEffects,totalVarName,inflowParameter,"increase")&&
+    sourceExactAccountingDelta(inflowEffects,balanceVarName,inflowParameter,"increase","msg.sender")&&
+    sourceExactAccountingDelta(outflowEffects,balanceVarName,outflowParameter,"decrease","msg.sender")&&
     /\.\s*(?:safeTransferFrom|transferFrom)\s*\(/.test(inflowEffects)&&
     /\.\s*(?:safeTransfer|transfer)\s*\(/.test(outflowEffects)&&
     !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
-  if(!directlyProven&&!coupledPayableConservation&&!matchedTokenPrincipal){
+  // A source-proven per-user debit must reduce the shared aggregate when
+  // both ledgers were increased together. Its omission remains falsifiable.
+  const matchedInternalPrincipal=totalReferenced&&balanceReferenced&&!usesErc20Transfer&&
+    !!inflowParameter&&!!outflowParameter&&
+    sourceExactAccountingDelta(inflowEffects,totalVarName,inflowParameter,"increase")&&
+    sourceExactAccountingDelta(inflowEffects,balanceVarName,inflowParameter,"increase","msg.sender")&&
+    sourceExactAccountingDelta(outflowEffects,balanceVarName,outflowParameter,"decrease","msg.sender")&&
+    !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
+  if(!directlyProven&&!coupledPayableConservation&&!matchedTokenPrincipal&&!matchedInternalPrincipal){
     return {ok:false,category:'no_supported_property',
       reason:'Fixed-value conservation was not source-proven for '+contract.name+'.'+
         inflowFn.name+'/'+outflowFn.name+'; requires a property-specific measured scenario.',
