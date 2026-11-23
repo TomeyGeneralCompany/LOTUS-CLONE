@@ -411,6 +411,37 @@ contract ValueBindings {
       assert.deepEqual(valueFixture.bindings,[]);
       assert.deepEqual(valueFixture.substitutions,{});
     }
+    // A Solidity user-defined type may be a struct or enum, not an address.
+    // Exact imported ABI identities are required for concrete receivers.
+    const shapeTypes=`pragma solidity ^0.8.0;
+library Shapes { struct Config { uint256 amount; bool enabled; } enum Mode { Off, On } }`;
+    const shapeIface=`pragma solidity ^0.8.0;
+import "./Shapes.sol";
+interface IShape { function quote(Shapes.Config calldata cfg) external returns(uint256); }`;
+    const shapeGood=`pragma solidity ^0.8.0;
+import "./IShape.sol";
+contract ShapeGood is IShape {
+  function quote(Shapes.Config calldata cfg) external override returns(uint256) {
+    return cfg.amount;
+  }
+}`;
+    const shapeBad=`pragma solidity ^0.8.0;
+import "./IShape.sol";
+contract ShapeBad {
+  function quote(address cfg) external returns(uint256) { return 1; }
+}`;
+    const shapeSnapshots=[
+      {path:'source-1/contracts/Shapes.sol',content:shapeTypes,sha256:hash(shapeTypes)},
+      {path:'source-1/contracts/IShape.sol',content:shapeIface,sha256:hash(shapeIface)},
+      {path:'source-1/contracts/ShapeGood.sol',content:shapeGood,sha256:hash(shapeGood)},
+      {path:'source-1/contracts/ShapeBad.sol',content:shapeBad,sha256:hash(shapeBad)}
+    ];
+    assert.deepEqual(verifyAcquiredReceiverMethods('IShape',['quote'],
+      shapeSnapshots[2].path,'ShapeGood',shapeSnapshots),{ok:true,missing:[]},
+      'Imported source struct must encode the correct ABI tuple');
+    assert.equal(verifyAcquiredReceiverMethods('IShape',['quote'],
+      shapeSnapshots[3].path,'ShapeBad',shapeSnapshots).ok,false,
+      'Address arguments must not impersonate ABI structs');
     const ambiguousSource='pragma solidity ^0.8.0; contract AdapterTwo is IAdapter {}';
     const ambiguous=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
       ...fixtureSources,{path:'source-1/contracts/AdapterTwo.sol',content:ambiguousSource,sha256:hash(ambiguousSource)}]);
