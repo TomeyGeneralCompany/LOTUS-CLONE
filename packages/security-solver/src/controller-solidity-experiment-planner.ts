@@ -3040,9 +3040,8 @@ function sourceFactoryCloneExperiment(
  * executable predecessor graph. Previously orderPreparation([]) validated no
  * nodes even when the sequence contained deployments and initialization. The
  * executor remains authoritative for actual receipts and ABI compatibility. */
-function sourcePreparationGraph(
-  sequence:SoliditySequence,target:SourceSnapshot,contract:any,
-  sources:ReadonlyMap<string,SourceSnapshot>
+export function sourcePreparationGraph(
+  sequence:SoliditySequence,sources:ReadonlyMap<string,SourceSnapshot>
 ):{ok:true;nodes:PreparationPrerequisite[]}|{ok:false;code:string;detail:string}{
   const preparation=sequence.preparation;
   if(!preparation)return {ok:true,nodes:[]};
@@ -3267,7 +3266,7 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   const seen=new Set<string>(),out:PreparedSecurityExperiment[]=[];
   for(const original of choices) {
     const c=sourceFactoryCloneExperiment(original,target,contract,indexed);
-    const planned=sourcePreparationGraph(c.sequence,target,contract,indexed);
+    const planned=sourcePreparationGraph(c.sequence,indexed);
     if(!planned.ok)return {ok:false,code:planned.code,detail:planned.detail};
     const graph=orderPreparation(planned.nodes);
     if(!graph.ok)return {ok:false,code:graph.code,detail:graph.detail};
