@@ -382,6 +382,15 @@ async function run(){
     missingStepRef.steps[0].args=['$deployment:unknown-source'];
     assert.equal(sourcePreparationGraph(missingStepRef,prepSources).ok,false,
       'A readback must not resolve a deployment that was never constructed');
+    const badCheckExpect=JSON.parse(JSON.stringify(prepSequence));
+    badCheckExpect.preparation.checks[0].expect='$deployment:missing-receiver';
+    assert.equal(sourcePreparationGraph(badCheckExpect,prepSources).ok,false,
+      'Preparation readbacks cannot claim an unconstructed deployment');
+    const badFactoryRef=JSON.parse(JSON.stringify(prepSequence));
+    badFactoryRef.factoryClone={deploymentId:'token',function:'clone(address)',
+      args:['$deployment:missing-factory-argument'],sender:0};
+    assert.equal(sourcePreparationGraph(badFactoryRef,prepSources).ok,false,
+      'Source factory clone arguments cannot bind absent contracts');
     const goodTargetRef=JSON.parse(JSON.stringify(prepSequence));
     goodTargetRef.constructorArgs=['$deployment:token'];
     const validatedTarget=sourcePreparationGraph(goodTargetRef,prepSources,
