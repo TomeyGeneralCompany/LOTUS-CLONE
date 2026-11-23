@@ -991,6 +991,35 @@ contract DirectMap {
       e.securityProperty.endsWith(':recipient')),
       'Crediting msg.sender must not prove a credit to recipient');
 
+    const sourcePureText=`pragma solidity ^0.8.0;
+contract PureArithmetic {
+  function calc(uint256 value) external pure returns(uint256) { return (value * 3) + 2; }
+  function larger(uint256 value) external pure returns(bool) { return value > 4; }
+  function unsafe(uint256 value) external pure returns(uint256) { return remote(value); }
+  function remote(uint256 value) internal pure returns(uint256) { return value; }
+}`;
+    const pureSnapshot={path:'source-1/contracts/PureArithmetic.sol',
+      content:sourcePureText,sha256:hash(sourcePureText)};
+    const pureMenu=['calc','larger','unsafe'].map(selector=>({
+      selector:'PureArithmetic.'+selector,operation:'call' as const,inputs:['uint256']}));
+    const pureConstruct=(method:string)=>constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:pureSnapshot.path,
+      targetSelector:'PureArithmetic.'+method,sources:[pureSnapshot],
+      declarations:pureMenu as any,skipLegacy:true});
+    const pureSuccess=pureConstruct('calc');
+    assert.equal(pureSuccess.ok,true,'Exact pure expression must construct an executable oracle');
+    if(pureSuccess.ok)assert.ok(pureSuccess.experiments.some(exp=>
+      exp.securityProperty.startsWith('source-exact pure return')&&
+      exp.sequence.steps.some(step=>step.operation==='call'&&step.expect==='23')));
+    const pureBoolean=pureConstruct('larger');
+    assert.equal(pureBoolean.ok,true,'Typed boolean comparison must construct an executable oracle');
+    if(pureBoolean.ok)assert.ok(pureBoolean.experiments.some(exp=>
+      exp.securityProperty.startsWith('source-exact pure return')&&
+      exp.sequence.steps.some(step=>step.operation==='call'&&step.expect===true)));
+    const pureUnknown=pureConstruct('unsafe');
+    assert.ok(!pureUnknown.ok||!pureUnknown.experiments.some(exp=>
+      exp.securityProperty.startsWith('source-exact pure return')),
+      'Unexpanded source helper calls are not a trustworthy independent return oracle');
     const ledgerText=`pragma solidity ^0.8.0;
 contract Ledger {
   uint256 public total;
