@@ -1333,10 +1333,10 @@ contract ChildTokenConsumer {
       'IChildToken','mint',inheritedTokenSnapshots.slice(1)),[],
       'An unacquired parent cannot invent an inherited ABI method');
     const aliasedTokenChild='pragma solidity ^0.8.20; import {IBaseToken as TokenBase} from "./IBaseToken.sol"; interface IChildToken is TokenBase {}';
-    const aliasedChild={...inheritedTokenSnapshots[1],
+    const aliasedTokenSnapshot={...inheritedTokenSnapshots[1],
       content:aliasedTokenChild,sha256:hash(aliasedTokenChild)};
-    const aliasedRoutes=resolveAcquiredInterfaceCallers(aliasedChild,'IChildToken','mint',
-      [inheritedTokenSnapshots[0],aliasedChild,inheritedTokenSnapshots[2]]);
+    const aliasedRoutes=resolveAcquiredInterfaceCallers(aliasedTokenSnapshot,'IChildToken','mint',
+      [inheritedTokenSnapshots[0],aliasedTokenSnapshot,inheritedTokenSnapshots[2]]);
     assert.deepEqual(aliasedRoutes.map(x=>x.selector),['ChildTokenConsumer.use'],
       'Actual acquired Solidity import aliases must resolve inherited interface methods');
     const unboundSecondParent='pragma solidity ^0.8.20; import "./IBaseToken.sol"; interface IChildToken is IBaseToken, IMissingBase {}';
