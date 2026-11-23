@@ -1572,7 +1572,7 @@ function hasAnySourceAuthGuard(fn:any,fnBody:string):boolean {
   return false;
 }
 
-function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAccount?:string;tokenRef?:string;amount?:string}={}):SolidityArgValue|null {
+export function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAccount?:string;tokenRef?:string;amount?:string}={}):SolidityArgValue|null {
   const t=abiType.trim();
   const name=paramName||'';
   if(t==='address'||t==='address payable'){
@@ -1584,10 +1584,21 @@ function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAccount?:
   }
   if(t==='bool')return false;
   if(t==='string')return 'LOTUS-Test';
-  if(/^u?int(?:[0-9]{1,3})?$/.test(t)){
-    if(/(?:period|duration|epoch|lock|interval|delay|window|time)/i.test(name))return '86400';
-    if(/(?:fee|bps|rate|ratio|percent)/i.test(name))return '100';
-    return options.amount ?? '1000';
+  const intType=t.match(/^(u?int)([0-9]{0,3})$/);
+  if(intType){
+    const bits=intType[2]?Number(intType[2]):256;
+    if(bits<8||bits>256||bits%8!==0)return null;
+    // EVM ABI widths are authoritative. A generic 1000-unit fixture
+    // cannot be passed as uint8: the encoder rejects it before any actual
+    // experiment. Choose a bounded nonzero input, NEVER a passing receipt.
+    const maximum=intType[1]==='uint'?(1n<<BigInt(bits))-1n:
+      (1n<<BigInt(bits-1))-1n;
+    const preferred=/(?:decimal|precision|scale)/i.test(name)?'18':
+      /(?:period|duration|epoch|lock|interval|delay|window|time)/i.test(name)?'86400':
+      /(?:fee|bps|rate|ratio|percent)/i.test(name)?'100':options.amount??'1000';
+    if(!/^[0-9]+$/.test(preferred))return null;
+    const requested=BigInt(preferred);
+    return (requested>maximum?maximum:requested).toString();
   }
   if(t==='bytes32')return ZERO_BYTES32;
   if(t==='bytes')return '0x4142';
