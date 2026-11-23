@@ -132,7 +132,7 @@ function primitiveFixtureArg(type:any,nonzero=false,contract?:any,source?:Source
     const declaration=found.node;
     if(declaration.type==="EnumDefinition")return (declaration.members||[]).length>0?"0":null;
     if(["UserDefinedValueTypeDefinition","TypeDefinition"].includes(declaration.type))
-      return primitiveFixtureArg(declaration.underlyingType||declaration.typeName,
+      return primitiveFixtureArg(declaration.underlyingType||declaration.typeName||declaration.definition,
         nonzero,found.owner,found.source,acquired,depth+1);
     const parts=(declaration.members||[]).map((field:any)=>
       primitiveFixtureArg(field.typeName,nonzero,found.owner,found.source,acquired,depth+1));
@@ -774,7 +774,7 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
           "("+fields.join(",")+")":null;
       }
       if(def.type==="EnumDefinition")return (def.members||[]).length<=256?"uint8":null;
-      return callableType(def.underlyingType||def.typeName,owner,entries,depth+1);
+      return callableType(def.underlyingType||def.typeName||def.definition,owner,entries,depth+1);
     }
     // solidity-parser releases used by the offline index can omit the
     // Solidity 0.8.8+ top-level "type X is T" AST. Preserve the *exact
