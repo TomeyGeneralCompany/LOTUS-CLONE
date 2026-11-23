@@ -723,6 +723,19 @@ contract PlugConsumer {
     assert.equal(available[0].sourceSha256,targetImpl.sha256);
     assert.equal(resolveAcquiredConcreteImplementations(targetInterface,'IWallet','borrow',
       [targetInterface,targetImpl]).length,0,'Do not invent an unimplemented method');
+    // The acquired compiler ABI must preserve the selected operation's view
+    // mutability and return types. A name/input match alone is insufficient.
+    const viewIface='pragma solidity ^0.8.0; interface IView { function read(uint256 amount) external view returns(uint256); }';
+    const viewGood='pragma solidity ^0.8.0; import "./IView.sol"; contract ConcreteView is IView { function read(uint256 amount) external pure override returns(uint256) { return amount; } }';
+    const viewBad='pragma solidity ^0.8.0; import "./IView.sol"; contract WrongView is IView { function read(uint256 amount) external pure returns(bool) { return true; } }';
+    const viewSource={path:'source-1/contracts/IView.sol',content:viewIface,sha256:hash(viewIface)};
+    const viewCorrect={path:'source-1/contracts/ConcreteView.sol',content:viewGood,sha256:hash(viewGood)};
+    const viewWrong={path:'source-1/contracts/WrongView.sol',content:viewBad,sha256:hash(viewBad)};
+    const concreteView=resolveAcquiredConcreteImplementations(viewSource,'IView','read',
+      [viewSource,viewCorrect,viewWrong]);
+    assert.deepEqual(concreteView.map(x=>x.selector),['ConcreteView.read']);
+    assert.equal(concreteView[0].operation,'call',
+      'A pure inherited interface method must use a read-only EVM step');
     // Transitive A <- B <- C must resolve a real inherited implementation
     // without admitting an unrelated same-named contract or an abstract leaf.
     const middleText='pragma solidity ^0.8.0; import "./IWallet.sol"; abstract contract WalletBase is IWallet { function withdraw(uint256 value) external virtual override {} }';
