@@ -623,8 +623,28 @@ contract WrongRate { address public amount; }`;
       {path:'source-1/contracts/Rate.sol',content:rateImpl,sha256:hash(rateImpl)},
       {path:'source-1/contracts/WrongRate.sol',content:wrongRateImpl,sha256:hash(wrongRateImpl)}
     ];
-    assert.deepEqual(verifyAcquiredReceiverMethods('IRate',['amount'],
-      rateSources[2].path,'Rate',rateSources),{ok:true,missing:[]},
+    // Emit a bounded compiler-parser diagnosis only when this real ABI
+    // regression fails, so missing type namespaces are distinguishable from
+    // missing public storage getter declarations.
+    const rateVerification=verifyAcquiredReceiverMethods('IRate',['amount'],
+      rateSources[2].path,'Rate',rateSources);
+    if(!rateVerification.ok){
+      const parser=(await import('@solidity-parser/parser')).parse;
+      const outlines=rateSources.map(source=>{
+        try{
+          const tree=parser(source.content,{tolerant:true}) as any;
+          return {path:source.path,children:(tree.children||[]).map((n:any)=>({
+            type:n.type,name:n.name,
+            variables:(n.subNodes||[]).filter((v:any)=>v.type==='StateVariableDeclaration')
+              .flatMap((v:any)=>v.variables||[]).map((v:any)=>({
+                name:v.name,visibility:v.visibility,type:v.typeName?.type,
+                typePath:v.typeName?.namePath,override:v.override})),
+          }))};
+        }catch(error){return {path:source.path,parseFailure:String(error)};}
+      });
+      console.error('GLOBAL_VALUE_TYPE_DIAGNOSTICS',JSON.stringify(outlines).slice(0,2500));
+    }
+    assert.deepEqual(rateVerification,{ok:true,missing:[]},
       'Compiler-equivalent global custom value type must retain its exact uint128 ABI');
     assert.equal(verifyAcquiredReceiverMethods('IRate',['amount'],
       rateSources[3].path,'WrongRate',rateSources).ok,false,
