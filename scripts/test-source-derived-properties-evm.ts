@@ -140,4 +140,36 @@ assert.ok(internalActual.steps.every((step:any)=>step.passed!==false),
   'Actual private nested-mapping helper readback failed: '+JSON.stringify(internalActual));
 assert.ok(internalActual.steps.some((step:any)=>step.operation==='call'&&
   step.function==='allowance(address,address)'&&step.actual==='7'));
+const delegatedScalarSource=[
+  'pragma solidity ^0.8.20;',
+  'contract DelegatedScalar {',
+  ' uint256 private held;',
+  ' function amount() external view returns(uint256) { return held; }',
+  ' function update(uint256 value) external { _set(value); }',
+  ' function _set(uint256 next) internal { held = next; }',
+  '}'
+].join('\n');
+const delegatedFile='source-1/contracts/DelegatedScalar.sol';
+const delegated=constructSolidityExperiments({
+  repositoryCommit:'d'.repeat(40),targetPath:delegatedFile,
+  targetSelector:'DelegatedScalar.update',
+  sources:[{path:delegatedFile,content:delegatedScalarSource,
+    sha256:sha(delegatedScalarSource)}],
+  declarations:[
+    {selector:'DelegatedScalar.update',operation:'send',inputs:['uint256']},
+    {selector:'DelegatedScalar.amount',operation:'call',inputs:[]}
+  ],skipLegacy:true
+});
+assert.equal(delegated.ok,true,JSON.stringify(delegated));
+if(!delegated.ok)throw new Error('Delegated scalar state property missing');
+const delegatedProperty=delegated.experiments.find(e=>
+  e.securityProperty.startsWith('source internal state assignment'));
+assert.ok(delegatedProperty,'Acquired internal setter must produce executable source property');
+const delegatedEvm=await execute(
+  compile(delegatedFile,delegatedScalarSource,'DelegatedScalar'),
+  delegatedProperty.sequence);
+assert.ok(delegatedEvm.steps.every((step:any)=>step.passed!==false),
+  'Acquired interprocedural source witness failed in actual EVM: '+JSON.stringify(delegatedEvm));
+assert.ok(delegatedEvm.steps.some((step:any)=>step.operation==='call'&&
+  step.function==='amount()'&&step.actual==='7'));
 console.log('SOURCE_DERIVED_FINANCIAL_EVM_ORACLES_PASSED');
