@@ -3048,8 +3048,8 @@ function sourceMappingDeltaExperiments(
             v.typeName?.type==='ElementaryTypeName'&&
             /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||''));
         const constrained=totals.find(total=>{
-          const amount=amountParam.name.replace(/[.*+?^{}$()|[\]\\]/g,'\\        const steps:SoliditySequence['steps']=[];');
-          const state=total.name.replace(/[.*+?^{}$()|[\]\\]/g,'\\        const steps:SoliditySequence['steps']=[];');
+          const amount=String(amountParam.name);
+          const state=String(total.name);
           return new RegExp(String.raw`\b`+amount+
             String.raw`\s*>\s*0\s*&&\s*`+amount+
             String.raw`\s*<=\s*`+state).test(methodSource)&&
