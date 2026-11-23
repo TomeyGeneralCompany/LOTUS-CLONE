@@ -531,6 +531,36 @@ contract ShapeBad {
     assert.equal(verifyAcquiredReceiverMethods('IShape',['quote'],
       shapeSnapshots[3].path,'ShapeBad',shapeSnapshots).ok,false,
       'Address arguments must not impersonate ABI structs');
+    // Solidity enum is a value with a numeric ABI, not a contract reference.
+    // Transitive dependency constructors must receive the source enum zero.
+    const enumInterface='pragma solidity ^0.8.0; interface IEnumService { function ping() external; }';
+    const enumService=`pragma solidity ^0.8.0;
+import "./IEnumService.sol";
+contract EnumService is IEnumService {
+ enum Tier { Basic, Premium }
+ Tier public tier;
+ constructor(Tier initialTier) { tier = initialTier; }
+ function ping() external override {}
+}`;
+    const enumConsumer=`pragma solidity ^0.8.0;
+import "./IEnumService.sol";
+contract EnumConsumer {
+ IEnumService public service;
+ function initialize(address chosen) external { service = IEnumService(chosen); }
+ function callService() external { service.ping(); }
+}`;
+    const enumSources=[
+      {path:'source-1/contracts/IEnumService.sol',content:enumInterface,sha256:hash(enumInterface)},
+      {path:'source-1/contracts/EnumService.sol',content:enumService,sha256:hash(enumService)},
+      {path:'source-1/contracts/EnumConsumer.sol',content:enumConsumer,sha256:hash(enumConsumer)}
+    ];
+    const enumFixture=resolveSourceFixtureDependencies(enumSources[2],'EnumConsumer',enumSources);
+    assert.equal(enumFixture.status,'resolved',
+      'Enum constructor state is a source value, not a dependency deployment');
+    if(enumFixture.status==='resolved'){
+      assert.deepEqual(enumFixture.deployments.map(d=>d.contract),['EnumService']);
+      assert.deepEqual(enumFixture.deployments[0].constructorArgs,['0']);
+    }
     const ambiguousSource='pragma solidity ^0.8.0; contract AdapterTwo is IAdapter {}';
     const ambiguous=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
       ...fixtureSources,{path:'source-1/contracts/AdapterTwo.sol',content:ambiguousSource,sha256:hash(ambiguousSource)}]);
