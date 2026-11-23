@@ -813,6 +813,51 @@ export function resolveSourceFixtureDependencies(
   const scanned:ContractEntry[]=sources.flatMap(source=>{const parsed=astOf(source);
     return (parsed?.children||[]).filter((node:any)=>node.type==="ContractDefinition").map((node:any)=>({source,node}));
   });
+  // UserDefinedTypeName includes contracts, libraries, structs, enums and
+  // user-defined value types. Resolve the actual declaration class before
+  // constructing an EVM deployment edge. A missing/ambiguous symbol stays
+  // unresolved rather than silently becoming an implementation request.
+  const acquiredByPath=new Map(sources.map(src=>[src.path,src]));
+  const classifyUserType=(source:SourceSnapshot,node:any,typ:string):
+    "contract"|"value"|"unknown"=>{
+    const segments=String(typ||"").split(".");
+    const name=segments.pop()||"";
+    if(!/^[A-Za-z_]\\w*$/.test(name))return "unknown";
+    const local=(node.subNodes||[]).filter((n:any)=>n.name===name&&
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type));
+    if(local.length)return local.length===1?"value":"unknown";
+    const reachable=new Set<string>(),pending=[source.path];
+    while(pending.length&&reachable.size<=256){
+      const current=pending.shift()!;
+      if(reachable.has(current))continue;
+      reachable.add(current);
+      const src=acquiredByPath.get(current);
+      if(!src)continue;
+      for(const imp of (astOf(src)?.children||[]).filter((n:any)=>
+        n.type==="ImportDirective"&&typeof n.path==="string")){
+        const candidate=imp.path.startsWith(".")?
+          posix.normalize(posix.join(posix.dirname(current),imp.path)):imp.path;
+        if(acquiredByPath.has(candidate)&&!reachable.has(candidate))pending.push(candidate);
+      }
+    }
+    const declarations:("contract"|"value")[]=[];
+    for(const path of reachable){
+      const src=acquiredByPath.get(path)!;
+      for(const declaration of astOf(src)?.children||[]){
+        if(declaration.type==="ContractDefinition"){
+          if(!segments.length&&declaration.name===name)declarations.push("contract");
+          if(segments.length&&segments.join(".")===declaration.name)
+            for(const sub of declaration.subNodes||[])
+              if(sub.name===name&&["StructDefinition","EnumDefinition",
+                "UserDefinedValueTypeDefinition"].includes(sub.type))
+                declarations.push("value");
+        }else if(!segments.length&&declaration.name===name&&
+          ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(declaration.type))
+          declarations.push("value");
+      }
+    }
+    return declarations.length===1?declarations[0]:"unknown";
+  };
   const entryByName=new Map<string,ContractEntry[]>();
   for(const entry of scanned){const group=entryByName.get(entry.node.name)||[];group.push(entry);entryByName.set(entry.node.name,group);}
   const extendsType=(node:any,typ:string,seen=new Set<string>()):boolean=>{
@@ -893,11 +938,14 @@ export function resolveSourceFixtureDependencies(
       const struct=p.typeName?.type==="UserDefinedTypeName"&&
         (selected.node.subNodes||[]).some((n:any)=>
           n.type==="StructDefinition"&&n.name===String(p.typeName.namePath||"").split(".").pop());
-      if(p.typeName?.type==="UserDefinedTypeName"&&!struct){
+      const typeClass=p.typeName?.type==="UserDefinedTypeName"?
+        classifyUserType(selected.source,selected.node,argType):"value";
+      if(p.typeName?.type==="UserDefinedTypeName"&&!struct&&typeClass==="contract"){
         const dep=resolve(argType,depth+1);
         if(!dep){valid=false;break;}args.push("$deployment:"+dep);
       }else{
-        const literal=constrainedFixtureArg(p.typeName,String(p.name||""),ctorOf(selected.node),false,selected.node);
+        const literal=typeClass==="unknown"?null:
+          constrainedFixtureArg(p.typeName,String(p.name||""),ctorOf(selected.node),false,selected.node);
         if(literal===null){
           missing.push(key+":unsupported_constructor_type:"+(argType||p.typeName?.type||"unknown"));
           valid=false;break;
@@ -952,7 +1000,8 @@ export function resolveSourceFixtureDependencies(
   // Constructor and initializer parameter-to-state assignments establish a
   // binding edge. Arbitrary address arguments are never treated as dependencies.
   const params=[...(ctorOf(targetNode)?.parameters||[])];
-  for(const p of params)if(p.typeName?.type==="UserDefinedTypeName"){
+  for(const p of params)if(p.typeName?.type==="UserDefinedTypeName"&&
+    classifyUserType(target,targetNode,typeOf(p.typeName))==="contract"){
     const name=String(p.name||""),typ=typeOf(p.typeName),dep=resolve(typ,0);
     if(dep){substitutions[name]="$deployment:"+dep;bindings.push({parameter:name,receiver:name,typeName:typ,
       deploymentId:dep,file:target.path,sourceSha256:target.sha256});}
