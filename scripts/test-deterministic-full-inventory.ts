@@ -13,7 +13,7 @@ import {AnalysisProgressStore} from '../packages/security-solver/src/determinist
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
-import {constructSolidityExperiments} from '../packages/security-solver/src/controller-solidity-experiment-planner';
+import {constructSolidityExperiments,sourcePreparationGraph} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 import {buildProgramFactsGraph} from '../packages/security-solver/src/deterministic/program-facts';
 import {generateRelationalHypotheses} from '../packages/security-solver/src/deterministic/hypothesis-engine';
 
@@ -243,6 +243,34 @@ async function run(){
       assert.equal(fixture.bindings[0].receiver,'adapter');
       assert.ok(fixture.witnesses.some(x=>x.sourceSha256===fixtureSources[0].sha256));
     }
+    // The planner's prerequisite graph cannot be empty when an acquired
+    // Solidity sequence actually deploys dependencies and initializes them.
+    // Constructor dependencies MUST already exist at deployment time.
+    const prepSequence={constructorArgs:[],steps:[{operation:'call',function:'owner()',
+      args:[],expect:'0x0000000000000000000000000000000000000000'}],
+      preparation:{deployments:[
+        {id:'token',file:fixtureSources[2].path,contract:'Token',constructorArgs:[]},
+        {id:'adapter',file:fixtureSources[1].path,contract:'Adapter',
+          constructorArgs:['$deployment:token']}],
+        operations:[{id:'configure',deploymentId:'adapter',function:'ping()',
+          args:[],sender:0}],checks:[{id:'readback',deploymentId:'adapter',
+          function:'ping()',args:[],sender:0,expect:'0'}]}} as any;
+    const prepSources=new Map(fixtureSources.map(x=>[x.path,x]));
+    const prepGraph=sourcePreparationGraph(prepSequence,prepSources);
+    assert.equal(prepGraph.ok,true,'A real preparation DAG needs acquired source witnesses');
+    if(prepGraph.ok){
+      assert.deepEqual(prepGraph.nodes.map(x=>x.id),[
+        'deploy:token','deploy:adapter','operation:configure','check:readback']);
+      assert.ok(prepGraph.nodes.every(x=>x.sourceEvidence.length>0&&
+        x.sourceEvidence.every(w=>w.sourceSha256.length===64)));
+      assert.ok(prepGraph.nodes.find(x=>x.id==='deploy:adapter')!
+        .dependsOn.includes('deploy:token'));
+    }
+    const badPrep=JSON.parse(JSON.stringify(prepSequence));
+    badPrep.preparation.deployments.reverse();
+    const rejected=sourcePreparationGraph(badPrep,prepSources);
+    assert.equal(rejected.ok,false,
+      'A constructor cannot reference a deployment scheduled later');
     // Initializer-only dependencies can be discovered after the consumer was
     // registered. Execution must deploy the producer before the consumer.
     const initializedAdapter='pragma solidity ^0.8.0; contract Adapter is IAdapter { Token public token; function initialize(address _token) external { token = Token(_token); } }';
