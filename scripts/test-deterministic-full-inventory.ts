@@ -16,7 +16,7 @@ import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailabilit
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
-import {constructSolidityExperiments,sourcePreparationGraph} from '../packages/security-solver/src/controller-solidity-experiment-planner';
+import {constructSolidityExperiments,sourcePreparationGraph,pickFlexibleArg} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 import {buildProgramFactsGraph} from '../packages/security-solver/src/deterministic/program-facts';
 import {generateRelationalHypotheses} from '../packages/security-solver/src/deterministic/hypothesis-engine';
 
@@ -46,6 +46,15 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // ABI width and signedness constrain all source-derived fixture literals,
+    // including the exact uint8 _decimals failure observed on the Dell.
+    assert.equal(pickFlexibleArg('uint8','_decimals'),'18');
+    assert.equal(pickFlexibleArg('uint8','_amount'),'255');
+    assert.equal(pickFlexibleArg('int8','_amount'),'127');
+    assert.equal(pickFlexibleArg('uint16','_duration'),'65535');
+    assert.equal(pickFlexibleArg('uint64','_duration'),'86400');
+    assert.equal(pickFlexibleArg('uint8','_amount',{amount:'1000'}),'255');
+    assert.equal(pickFlexibleArg('uint7','_amount'),null);
     // A changed property engine must reopen unresolved checkpoints, never
     // reuse the old blocked assessment as proof that it was reevaluated.
     // Preserve the old source-bound property and attempt history for audit.
