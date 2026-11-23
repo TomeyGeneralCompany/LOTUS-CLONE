@@ -1425,6 +1425,60 @@ export async function runLocalAudit(
           maxAdmitted:analysisBatchSize,
           maxPerFile:analysisPerFileCap,
         });
+        // Diagnose actual source-family applicability over the ORIGINAL
+        // immutable lead inventory, not over whichever 78 names happen to
+        // look easy. These are only CONSTRUCTED hypotheses, not EVM results.
+        // Empty/failed construction is recorded without fabricating a hit.
+        const propertyFamilies=new Map<string,Set<string>>();
+        const constructedLeadIds=new Set<string>();
+        const propertyConstructionFailures:Record<string,number>={};
+        for(const lead of candidateQueue.inventory){
+          const menu=deterministicDeclarationsCache.get(lead.path)||[];
+          try{
+            const built=constructSolidityExperiments({
+              repositoryCommit:lead.sourceCommit,
+              targetPath:lead.path,targetSelector:lead.selector,
+              sources:deterministicSourceSnapshots,declarations:menu,
+              skipLegacy:true,
+            });
+            if(!built.ok){
+              const key=String(built.unresolvedCategory||built.code||"unknown");
+              propertyConstructionFailures[key]=(propertyConstructionFailures[key]||0)+1;
+              continue;
+            }
+            constructedLeadIds.add(lead.id);
+            for(const exp of built.experiments){
+              const name=exp.securityProperty.replace(/[:].*$/,"")
+                .replace(/\b[A-Za-z_]\w*\.[A-Za-z_]\w*(?:\([^)]*\))?.*$/,"")
+                .trim()||"other_source_witnessed_property";
+              const members=propertyFamilies.get(name)||new Set<string>();
+              members.add(lead.id);propertyFamilies.set(name,members);
+            }
+          }catch(error){
+            const key="source_construction_exception";
+            propertyConstructionFailures[key]=(propertyConstructionFailures[key]||0)+1;
+            await appendFile(logFile,"[SOURCE_PROPERTY_FAMILY_ERROR] "+
+              JSON.stringify({leadId:lead.id,selector:lead.selector,
+                sourceSha256:lead.sourceSha256,error:String(error).slice(0,240)})+"\n");
+          }
+        }
+        const familyCoverage={
+          totalOriginalLeads:candidateQueue.inventory.length,
+          sourceConstructedLeads:constructedLeadIds.size,
+          unresolvedConstruction:candidateQueue.inventory.length-constructedLeadIds.size,
+          families:Object.fromEntries([...propertyFamilies].sort(([a],[b])=>a.localeCompare(b))
+            .map(([name,ids])=>[name,{count:ids.size,leadIds:[...ids].sort()}])),
+          failures:propertyConstructionFailures,
+          sourceBoundExperimentVerified:0,
+          note:"Static family construction only; no experiment or source-unavailability evidence is inferred",
+        };
+        await writeFile(logFile+".property-family-coverage.json",
+          JSON.stringify(familyCoverage,null,2),{mode:0o600});
+        await appendFile(logFile,"[SOURCE_PROPERTY_FAMILY_COVERAGE] "+
+          JSON.stringify({originalLeads:familyCoverage.totalOriginalLeads,
+            sourceConstructedLeads:familyCoverage.sourceConstructedLeads,
+            families:Object.fromEntries([...propertyFamilies].map(([name,ids])=>[name,ids.size])),
+            failures:propertyConstructionFailures})+"\n");
         analysisInventoryMeta={
           inventoryTotal:candidateQueue.inventory.length,
           admittedCount:0,
