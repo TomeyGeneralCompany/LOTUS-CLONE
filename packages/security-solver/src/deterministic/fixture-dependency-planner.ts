@@ -584,9 +584,10 @@ export function resolveSourceFixtureDependencies(
   // Keep stable deployment IDs so substitutions and proof bindings remain valid.
   const byId=new Map(deployments.map(d=>[d.id,d]));
   const dependencies=(id:string):string[]=>{
-    const deployment=byId.get(id);
-    const args=[...(deployment?.constructorArgs||[]),
-      ...initializers.filter(op=>op.deploymentId===id).flatMap(op=>op.args)];
+    // Only constructors establish deployment-before-deployment edges.
+    // The isolated executor deploys the entire graph before sending ANY
+    // initializer; cross-referencing initializer parameters are legal.
+    const args=byId.get(id)?.constructorArgs||[];
     return [...new Set(args.filter(arg=>arg.startsWith("$deployment:"))
       .map(arg=>arg.slice("$deployment:".length)))];
   };

@@ -276,6 +276,28 @@ async function run(){
       'Two ABI-compatible implementations remain ambiguous without stronger binding evidence');
     if(unresolvedChoice.status==='unresolved')
       assert.ok(unresolvedChoice.missingDependencies.some(x=>x.includes('ambiguous_implementation')));
+    // Cyclic initializer references are not cyclic constructors. Deploy both
+    // bytecodes first, then send the two source-backed initializer calls.
+    const initA='pragma solidity ^0.8.0; contract InitA { InitB public peer; function initialize(address b) external { peer = InitB(b); } }';
+    const initB='pragma solidity ^0.8.0; contract InitB { InitA public peer; function initialize(address a) external { peer = InitA(a); } }';
+    const initConsumer='pragma solidity ^0.8.0; contract InitConsumer { InitA public a; InitB public b; function initialize(address first,address second) external { a=InitA(first); b=InitB(second); } }';
+    const initCycleSources=[
+      {path:'source-1/contracts/InitA.sol',content:initA,sha256:hash(initA)},
+      {path:'source-1/contracts/InitB.sol',content:initB,sha256:hash(initB)},
+      {path:'source-1/contracts/InitConsumer.sol',content:initConsumer,sha256:hash(initConsumer)}
+    ];
+    const initCycle=resolveSourceFixtureDependencies(initCycleSources[2],
+      'InitConsumer',initCycleSources);
+    assert.equal(initCycle.status,'resolved',
+      'Mutually referencing initializer args cannot create a fake deployment cycle');
+    if(initCycle.status==='resolved'){
+      assert.deepEqual(initCycle.deployments.map(d=>d.contract).sort(),['InitA','InitB'],
+        'Both actual acquired contracts are prepared before initializer calls');
+      assert.equal(initCycle.initializerOperations.length,2);
+      for(const operation of initCycle.initializerOperations)
+        assert.ok(operation.args[0].startsWith('$deployment:'),
+          'Initializer references must resolve to real deployed addresses');
+    }
     const cycA='pragma solidity ^0.8.0; contract CycA { constructor(CycB dependency) {} }';
     const cycB='pragma solidity ^0.8.0; contract CycB { constructor(CycA dependency) {} }';
     const cycleSources=[
