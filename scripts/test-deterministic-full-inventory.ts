@@ -12,6 +12,7 @@ import {ControllerStageLock} from '../packages/security-solver/src/controller-st
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
 import {sourceRepairRoutes} from '../packages/security-solver/src/deterministic/typed-repair-routes';
 import {repairAttemptIdentity} from '../packages/security-solver/src/deterministic/repair-attempt-identity';
+import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from '../packages/security-solver/src/deterministic/source-unavailability-verifier';
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
@@ -45,6 +46,81 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // A nondeployable interface is NOT automatically source-unavailable.
+    // The entire acquired inventory must prove the absence of any executable
+    // implementer and any typed callsite, with a second independent check.
+    const orphanText='pragma solidity ^0.8.20; interface IOrphan { function act(uint256 amount) external; }';
+    const orphanSource={path:'source-1/contracts/IOrphan.sol',content:orphanText,
+      sha256:hash(orphanText)};
+    const orphanLead:AnalysisCandidate={...candidates[0],id:hash('orphan-lead'),
+      path:orphanSource.path,selector:'IOrphan.act',
+      sourceSha256:orphanSource.sha256,sourceExcerpt:orphanText};
+    const orphanSources=[orphanSource];
+    const orphanProposal=proposeInterfaceUnavailability(orphanLead,
+      orphanSources,[orphanSource.path]);
+    assert.ok(orphanProposal,'Unacquired interface implementation requires typed source review');
+    const reviewedOrphan=independentlyReviewInterfaceUnavailability(
+      orphanProposal!,orphanSources,[orphanSource.path]);
+    assert.ok(reviewedOrphan,'An independent acquired-source review must verify the missing implementation');
+    assert.equal(reviewedOrphan?.kind,'interface_without_acquired_implementation');
+    assert.equal(proposeInterfaceUnavailability(orphanLead,orphanSources,
+      [orphanSource.path,'source-1/contracts/Uninspected.sol']),null,
+      'An incomplete expected source inventory is not evidence of unavailability');
+    assert.equal(proposeInterfaceUnavailability(orphanLead,
+      [{...orphanSource,content:orphanText+'  '}],[orphanSource.path]),null,
+      'Source SHA mismatches cannot produce reviewed terminal evidence');
+    const implementingText=`pragma solidity ^0.8.20;
+import "./IOrphan.sol";
+contract Implementer is IOrphan {
+  function act(uint256 amount) external override {}
+}`;
+    const implementingSource={path:'source-1/contracts/Implementer.sol',
+      content:implementingText,sha256:hash(implementingText)};
+    assert.equal(proposeInterfaceUnavailability(orphanLead,
+      [...orphanSources,implementingSource],
+      [orphanSource.path,implementingSource.path]),null,
+      'Acquired deployable implementation forbids source-unavailable closure');
+    const consumerText=`pragma solidity ^0.8.20;
+import "./IOrphan.sol";
+contract Consumer {
+  IOrphan public target;
+  function relay(uint256 amount) external { target.act(amount); }
+}`;
+    const consumerSource={path:'source-1/contracts/Consumer.sol',content:consumerText,
+      sha256:hash(consumerText)};
+    assert.equal(proposeInterfaceUnavailability(orphanLead,
+      [...orphanSources,consumerSource],[orphanSource.path,consumerSource.path]),null,
+      'An acquired actual typed caller must remain eligible for recovery');
+    const orphanStore=await AnalysisProgressStore.open(
+      join(dir,'orphan-source-unavailable.json'),[orphanLead]);
+    orphanStore.nextBatch(1,1);
+    orphanStore.recordAssessment(orphanLead.id,[],
+      ['UNKNOWN_ASSERTION(missing_fixture):interface lacks runtime'],[]);
+    assert.throws(()=>orphanStore.recordSourceUnavailable(orphanLead.id,{
+      ...reviewedOrphan!,sourceWitnesses:['invented:bad-source']}),
+      /SOURCE_UNAVAILABLE_INDEPENDENT_EVIDENCE_REQUIRED/,
+      'Unverified witness strings cannot close an interface lead');
+    orphanStore.recordSourceUnavailable(orphanLead.id,reviewedOrphan!);
+    assert.equal(orphanStore.experimentCertificate.conclusive,0,
+      'A source-unavailable lead is NEVER counted as experimentally verified');
+    assert.equal(orphanStore.experimentCertificate.sourceUnavailable,1);
+    assert.deepEqual(orphanStore.experimentCertificate.sourceUnavailableIds,[orphanLead.id]);
+    assert.deepEqual(orphanStore.experimentCertificate.unresolvedIds,[]);
+    assert.equal(orphanStore.nextRepairBatch(2).length,0,
+      'Reviewed terminal state should not waste the deterministic repair budget');
+    await orphanStore.save();
+    const resumedOrphan=await AnalysisProgressStore.open(
+      join(dir,'orphan-source-unavailable.json'),[orphanLead]);
+    assert.equal(resumedOrphan.experimentCertificate.sourceUnavailable,1,
+      'Typed unavailable source evidence survives checkpoint/resume');
+    const orphanGate=await stage([orphanLead]);
+    orphanGate.restoreResolvedAnalysisCandidate(orphanLead.id);
+    orphanGate.completeAnalysis();
+    orphanGate.completeExperiments(resumedOrphan.experimentCertificate);
+    assert.equal(orphanGate.currentStage,'REVIEW',
+      'Fully evidenced unavailable lead completes inventory WITHOUT an invented experiment');
+    orphanGate.completeReviews();
+    assert.equal(orphanGate.currentStage,'REPORT');
     // Repair attempts have a real fixed-point identity. An audit history
     // append alone cannot trigger another identical retry, whereas a genuine
     // independently failed EVM execution must open a new recovery generation.
