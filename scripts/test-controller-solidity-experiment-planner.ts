@@ -32,7 +32,17 @@ assert.deepEqual(constructSolidityExperiments(changed).ok,false,'Source hash mus
 const unguarded={...input,sources:[{...input.sources[0],
  content:content.replace('require(msg.sender == owner, "owner only");','')}]};
 unguarded.sources[0].sha256=createHash('sha256').update(unguarded.sources[0].content).digest('hex');
-assert.equal(constructSolidityExperiments(unguarded).ok,false,'No authorization proof, no scenario');
+const unguardedResult=constructSolidityExperiments(unguarded);
+assert.equal(unguardedResult.ok,true,
+  'An unguarded direct setter still has a source-witnessed, getter-verifiable state property');
+if(unguardedResult.ok) {
+ assert.ok(unguardedResult.experiments.some(x=>
+   x.securityProperty.startsWith('source-defined direct state assignment')),
+   'Direct write is only admissible as a state transition, never an invented authorization guard');
+ assert.ok(unguardedResult.experiments.every(x=>
+   !/role mutation|owner-gated|authorization guard/i.test(x.securityProperty)),
+   'Removing the actual owner guard must remove all owner-authorization experiments');
+}
 
 // Regression derived from the 88mphV3 run's actual Vesting02 / BoringOwnable
 // initialization, owner guard and MPHMinter setter. Standalone; no reader.
