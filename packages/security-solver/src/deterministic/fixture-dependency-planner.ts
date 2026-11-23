@@ -125,8 +125,40 @@ export function resolveAcquiredConcreteImplementations(
     });
   const basesOf=(entry:ContractEntry):ContractEntry[][]=>{
     const reachable=importedPaths(entry.source);
+    const imports=(astOf(entry.source)?.children||[]).filter((n:any)=>
+      n.type==="ImportDirective"&&typeof n.path==="string");
     return (entry.node.baseContracts||[]).map((b:any)=>{
       const baseName=String(b.baseName?.namePath||"").split(".").pop();
+      // Solidity resolves a declaration in the current compilation unit
+      // before considering imports, even if other imported files expose the
+      // same identifier. Never discard a real concrete child for this.
+      const local=entries.filter(e=>e.source.path===entry.source.path&&
+        e.node.name===baseName&&e.node!==entry.node);
+      if(local.length)return local;
+      // Imported aliases are source identities: import {Base as Renamed}
+      // cannot be resolved by looking for a contract named Renamed.
+      const directlyImported:ContractEntry[]=[];
+      for(const imp of imports){
+        const referenced=String(imp.path);
+        const importPath=referenced.startsWith(".")?
+          posix.normalize(posix.join(posix.dirname(entry.source.path),referenced)):referenced;
+        if(!reachable.has(importPath))continue;
+        const aliases=imp.symbolAliases;
+        if(Array.isArray(aliases)&&aliases.length){
+          for(const [original,alias] of aliases as [string,string|null][]){
+            if((alias||original)!==baseName)continue;
+            directlyImported.push(...entries.filter(e=>e.source.path===importPath&&
+              e.node.name===original));
+          }
+        }else{
+          directlyImported.push(...entries.filter(e=>e.source.path===importPath&&
+            e.node.name===baseName));
+        }
+      }
+      if(directlyImported.length)return [...new Map(directlyImported.map(e=>[
+        e.source.path+":"+e.node.name,e])).values()];
+      // An explicitly acquired transitive re-export can still establish a
+      // base, but ambiguity must remain unresolved, not arbitrarily selected.
       return entries.filter(e=>e.node.name===baseName&&
         reachable.has(e.source.path)&&e.node!==entry.node);
     });

@@ -529,6 +529,35 @@ contract AcquiredChild is AcquiredBase, OwnableUpgradeable {
     assert.equal(resolveAcquiredConcreteImplementations(
       acquiredBase,'AcquiredBase','mint',[acquiredBase,unprovenChild]).length,0,
       'An arbitrary missing parent must never be assumed to exist');
+    // A named import alias must resolve to the actual acquired base AST.
+    // Another same-named base in a transitive import must not create a false
+    // ambiguous inheritance rejection or a synthetic source witness.
+    const aliasedBaseText=`pragma solidity ^0.8.0;
+abstract contract BaseLedger {
+  function debit(uint256 amount) external virtual;
+}`;
+    const aliasedChildText=`pragma solidity ^0.8.0;
+import {BaseLedger as LedgerRoot} from "./BaseLedger.sol";
+contract LedgerChild is LedgerRoot {
+  function debit(uint256 amount) external override {}
+}`;
+    const aliasedBase={path:'source-1/contracts/BaseLedger.sol',
+      content:aliasedBaseText,sha256:hash(aliasedBaseText)};
+    const aliasedChild={path:'source-1/contracts/LedgerChild.sol',
+      content:aliasedChildText,sha256:hash(aliasedChildText)};
+    const aliasedImpl=resolveAcquiredConcreteImplementations(
+      aliasedBase,'BaseLedger','debit',[aliasedBase,aliasedChild]);
+    assert.equal(aliasedImpl.length,1,
+      'An explicitly aliased base must resolve to the acquired parent contract');
+    assert.equal(aliasedImpl[0].selector,'LedgerChild.debit');
+    const unrelatedBaseText=`pragma solidity ^0.8.0;
+contract BaseLedger { function debit(uint256 amount) external {} }`;
+    const unrelatedBase={path:'source-1/contracts/OtherBase.sol',
+      content:unrelatedBaseText,sha256:hash(unrelatedBaseText)};
+    assert.equal(resolveAcquiredConcreteImplementations(
+      aliasedBase,'BaseLedger','debit',
+      [aliasedBase,aliasedChild,unrelatedBase]).length,1,
+      'Unrelated same-name symbols cannot displace an explicit import alias');
     // One target can have multiple independently source-proven opposing
     // transitions. Neither the companion order nor names justify dropping one.
     // A burn test without a valid minted token is a meaningless dual-revert.
