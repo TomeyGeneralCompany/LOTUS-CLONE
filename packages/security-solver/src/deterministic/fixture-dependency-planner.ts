@@ -151,7 +151,12 @@ function fixtureAbiType(type:any,contract:any,depth=0):string|null {
     return fields.every((f:any)=>typeof f==="string"&&f.length)?
       "("+fields.join(",")+")":null;
   }
-  return callableType(type);
+  if(type?.type!=="ElementaryTypeName")return null;
+  const raw=String(type.name||"");
+  const standard=raw==="uint"?"uint256":raw==="int"?"int256":
+    raw==="address payable"?"address":raw;
+  return /^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(standard)?
+    standard:null;
 }
 function initializerStateBindings(node:any,source:SourceSnapshot):Array<{parameter:string;receiver:string;typeName:string;line:number}>{
   // UserDefinedTypeName also denotes struct, enum and user-defined value types.
