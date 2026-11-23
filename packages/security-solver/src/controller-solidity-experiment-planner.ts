@@ -2965,6 +2965,93 @@ function sourceScalarDeltaExperiments(
 }
 
 
+/** Construct falsifiable source-grounded mapping/account state transitions.
+ * Exact storage-key identity prevents claiming a credit to Alice from an
+ * update to Bob's entry. EVM receipts and readbacks remain mandatory. */
+function sourceMappingDeltaExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const maps=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      v.visibility==='public'&&identifier.test(v.name||'')&&
+      v.typeName?.type==='Mapping'&&v.typeName.keyType?.name==='address'&&
+      v.typeName.valueType?.type==='ElementaryTypeName'&&
+      /^uint(?:[0-9]{1,3})?$/.test(String(v.typeName.valueType.name||'')));
+  if(!maps.length)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&
+    n.name===method&&['public','external'].includes(n.visibility)&&
+    !['view','pure'].includes(n.stateMutability||''))){
+    if((fn.modifiers||[]).length)continue;
+    const params:any[]=fn.parameters||[];
+    if(!params.length||params.length>5)continue;
+    const types=params.map(p=>canonicalAbiType(p.typeName));
+    if(types.some(x=>!x)||!declarations.some(d=>
+      d.selector===contract.name+'.'+fn.name&&d.operation==='send'&&
+      JSON.stringify(d.inputs)===JSON.stringify(types)))continue;
+    const methodSource=body(snapshot.content,fn);
+    // Calls into an external protocol need a separately proven receiver and
+    // preparation. Pure SafeMath operations on the same lvalue are allowed.
+    if(/\b(?!msg\b|block\b|abi\b|SafeMath\b)[A-Za-z_]\w*\s*\.\s*(?!add\b|sub\b)[A-Za-z_]\w*\s*\(/.test(methodSource)||
+      /\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(methodSource))continue;
+    const numeric=params.filter((p,i)=>
+      identifier.test(p.name||'')&&/^uint(?:[0-9]{1,3})?$/.test(types[i]||''));
+    const accountKeys=params.filter((p,i)=>
+      identifier.test(p.name||'')&&types[i]==='address').map(p=>p.name);
+    for(const variable of maps)for(const key of ['msg.sender',...accountKeys]){
+      for(const amountParam of numeric){
+        if(!sourceExactAccountingDelta(methodSource,variable.name,
+          amountParam.name,'increase',key))continue;
+        const args:SolidityArgValue[]=[];
+        let supported=true;
+        for(let i=0;i<params.length;i++){
+          const p=params[i];
+          const value:SolidityArgValue|null=
+            p.name===amountParam.name?'1':p.name===key?'$account2':
+              pickFlexibleArg(types[i]||'',p.name||'',
+                {ownerAccount:'$account0',amount:'1'});
+          if(value===null){supported=false;break;}
+          args.push(value);
+        }
+        if(!supported)continue;
+        const targetKey=key==='msg.sender'?'$account0':'$account2';
+        const signature=canonicalFunctionIdentity(fn);
+        const steps:SoliditySequence['steps']=[];
+        if(setup.initSignature)steps.push({
+          operation:'send',function:setup.initSignature,args:setup.initArgs,
+          sender:0,requiredSetup:true});
+        steps.push({operation:'call',function:variable.name+'(address)',
+          args:[targetKey],expect:'0'});
+        steps.push({operation:'send',function:signature,args,sender:0});
+        steps.push({operation:'call',function:variable.name+'(address)',
+          args:[targetKey],expect:'1'});
+        out.push({
+          hypothesis:'Source-declared update must add 1 to the exact '+
+            variable.name+'['+key+'] storage entry',
+          property:'source-backed mapping conservation '+contract.name+'.'+
+            signature+':'+variable.name+':'+key,
+          sequence:{
+            constructorArgs:setup.constructorArgs,
+            ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+            steps},
+          witnesses:[
+            witness(snapshot,fn,contract.name+'.'+signature),
+            witness(snapshot,variable,contract.name+'.'+variable.name)],
+        });
+      }
+    }
+  }
+  return out;
+}
+
 /** Convert a verified initializer setup into the actual source-declared
  * factory clone pathway when the acquired Factory implementation provides one.
  * No inferred clone behavior, guessed parameter order, arbitrary initializer,
@@ -3185,6 +3272,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   }
   for(const scalar of sourceScalarDeltaExperiments(target,contract,method,
     input.declarations,indexed))choices.push(scalar);
+  for(const mapping of sourceMappingDeltaExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(mapping);
   const vestingCreation=groundedVestingCreationExperiment(target,contract,method,input.declarations);
   if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
