@@ -3065,6 +3065,106 @@ function sourceMappingDeltaExperiments(
   return out;
 }
 
+/** Source-exact interprocedural scalar state update. The external entrypoint
+ * passes its only ABI parameter to a unique acquired internal helper that
+ * assigns that parameter directly to a concrete storage variable. Readback
+ * must be compiler-public or an exact source-returning view, never guessed.
+ */
+function sourceInternalScalarSetterExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>{
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const states=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      identifier.test(v.name||'')&&v.typeName?.type==='ElementaryTypeName'&&
+      /^(?:address|bool|uint(?:[0-9]{1,3})?)$/.test(v.typeName.name||''));
+  if(!states.length)return [];
+  const views=extractAccountingObservations(snapshot,contract.name,declarations);
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const functions=nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name);
+  const results:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const entry of functions.filter(n=>n.name===method&&
+    ['public','external'].includes(n.visibility)&&!(n.modifiers||[]).length&&
+    !['pure','view'].includes(n.stateMutability||''))){
+    const params:any[]=entry.parameters||[];
+    if(params.length!==1||!identifier.test(params[0].name||''))continue;
+    const type=canonicalAbiType(params[0].typeName);
+    if(!type||!['bool','address'].includes(type)&&!
+      /^uint(?:[0-9]{1,3})?$/.test(type))continue;
+    if(!declarations.some(d=>d.selector===contract.name+'.'+method&&
+      d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify([type])))
+      continue;
+    const statements:any[]=entry.body.statements||[];
+    const callStmt=statements[0];
+    if(statements.length<1||statements.length>2||
+      callStmt?.type!=='ExpressionStatement'||
+      callStmt.expression?.type!=='FunctionCall'||
+      callStmt.expression.expression?.type!=='Identifier')continue;
+    if(statements.length===2&&(statements[1].type!=='ReturnStatement'||
+      statements[1].expression?.type!=='BooleanLiteral'||
+      statements[1].expression.value!==true))continue;
+    const invoke=callStmt.expression;
+    if(invoke.arguments?.length!==1||invoke.arguments[0]?.type!=='Identifier'||
+      invoke.arguments[0]?.name!==params[0].name)continue;
+    const helperName=String(invoke.expression.name||'');
+    const helpers=functions.filter(n=>n.name===helperName&&
+      ['internal','private'].includes(n.visibility)&&
+      !(n.modifiers||[]).length&&(n.parameters||[]).length===1&&
+      canonicalAbiType(n.parameters[0].typeName)===type);
+    if(helpers.length!==1)continue;
+    const helper=helpers[0],hp=helper.parameters[0];
+    if(!identifier.test(hp.name||''))continue;
+    const writes:any[]=helper.body.statements||[];
+    if(writes.length!==1||writes[0]?.type!=='ExpressionStatement'||
+      writes[0].expression?.type!=='BinaryOperation'||
+      writes[0].expression.operator!=='='||
+      writes[0].expression.left?.type!=='Identifier'||
+      writes[0].expression.right?.type!=='Identifier'||
+      writes[0].expression.right.name!==hp.name)continue;
+    const state=states.find((v:any)=>v.name===writes[0].expression.left.name&&
+      canonicalAbiType(v.typeName)===type);
+    if(!state)continue;
+    const readback=state.visibility==='public'?state.name+'()':
+      views.find(o=>o.kind==='scalar'&&o.stateVariable===state.name)?.getter;
+    if(!readback)continue;
+    const readFn=functions.find(n=>n.name===readback.split('(')[0]&&n.body);
+    const value:SolidityArgValue=type==='bool'?true:
+      type==='address'?'$account2':'7';
+    const steps:SoliditySequence['steps']=[];
+    if(setup.initSignature)steps.push({
+      operation:'send',function:setup.initSignature,
+      args:setup.initArgs,sender:0,requiredSetup:true});
+    steps.push({operation:'observe',function:readback,args:[]});
+    steps.push({operation:'send',function:canonicalFunctionIdentity(entry),
+      args:[value],sender:0});
+    steps.push({operation:'call',function:readback,args:[],expect:value});
+    results.push({
+      hypothesis:'Exact source helper '+helperName+' writes the input to '+
+        state.name+' and its independently source-proven getter must return it',
+      property:'source internal state assignment '+contract.name+'.'+
+        canonicalFunctionIdentity(entry)+':'+state.name,
+      sequence:{constructorArgs:setup.constructorArgs,
+        ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+        steps},
+      witnesses:[
+        witness(snapshot,entry,contract.name+'.'+canonicalFunctionIdentity(entry)),
+        witness(snapshot,helper,contract.name+'.'+helperName),
+        witness(snapshot,writes[0],contract.name+'.'+helperName+'.assignment'),
+        witness(snapshot,state,contract.name+'.'+state.name),
+        ...(readFn?[witness(snapshot,readFn,contract.name+'.'+readback)]:[])
+      ]
+    });
+  }
+  return results;
+}
+
 /** Generalized externally observable source-state assignment. Exact AST
  * lvalue=parameter identity provides an independent postcondition; the
  * pre-state is observed, not assumed to be zero. This deliberately excludes
@@ -3883,6 +3983,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     target,contract,method,input.declarations,indexed))choices.push(internalMapping);
   for(const assignment of sourceDirectAssignmentExperiments(target,contract,method,
     input.declarations,indexed))choices.push(assignment);
+  for(const internal of sourceInternalScalarSetterExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(internal);
   for(const struct of sourceStructOverrideExperiments(target,contract,method,
     input.declarations,indexed))choices.push(struct);
   for(const pair of sourcePairedScalarConservationExperiments(target,contract,method,
