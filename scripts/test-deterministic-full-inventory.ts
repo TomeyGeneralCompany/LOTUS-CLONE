@@ -378,6 +378,38 @@ contract ReceiverWithAbi is OwnableUpgradeable {
         assert.ok(operation.args[0].startsWith('$deployment:'),
           'Initializer references must resolve to real deployed addresses');
     }
+    const extendedIface=`pragma solidity ^0.8.0;
+interface IPlug { function ping() external returns(uint256); }`;
+    const extendedPlug=`pragma solidity ^0.8.0;
+import "./IPlug.sol";
+contract Plug is IPlug {
+  function ping() external override returns(uint256){return 1;}
+  function initialize(string memory label,bytes memory data,uint256[] memory entries) external {}
+}`;
+    const extendedConsumer=`pragma solidity ^0.8.0;
+import "./IPlug.sol";
+contract PlugConsumer {
+  IPlug public plug;
+  function initialize(IPlug implementation) external { plug=implementation; }
+  function read() external {plug.ping();}
+}`;
+    const extendedSources=[
+      {path:'source-1/contracts/IPlug.sol',content:extendedIface,sha256:hash(extendedIface)},
+      {path:'source-1/contracts/Plug.sol',content:extendedPlug,sha256:hash(extendedPlug)},
+      {path:'source-1/contracts/PlugConsumer.sol',content:extendedConsumer,sha256:hash(extendedConsumer)},
+    ];
+    const extended=resolveSourceFixtureDependencies(extendedSources[2],
+      'PlugConsumer',extendedSources);
+    assert.equal(extended.status,'resolved',
+      'Direct interface-typed initializer bindings must resolve to source-proven implementations');
+    if(extended.status==='resolved'){
+      assert.deepEqual(extended.deployments.map(d=>d.contract),['Plug']);
+      assert.equal(extended.initializerOperations[0].function,
+        'initialize(string,bytes,uint256[])',
+        'String, bytes and array fixture parameters must retain exact ABI');
+      assert.deepEqual(extended.initializerOperations[0].args,['','0x',[]]);
+      assert.equal(extended.bindings[0].receiver,'plug');
+    }
     const cycA='pragma solidity ^0.8.0; contract CycA { constructor(CycB dependency) {} }';
     const cycB='pragma solidity ^0.8.0; contract CycB { constructor(CycA dependency) {} }';
     const cycleSources=[
