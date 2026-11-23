@@ -268,6 +268,38 @@ async function run(){
       assert.deepEqual(selectedFixture.deployments.map(x=>x.contract),['CorrectAdapter']);
       assert.equal(selectedFixture.bindings[0].receiver,'adapter');
     }
+    // A source-linked standard dependency is not an absent implementation;
+    // compiler-backed OpenZeppelin and compiler-generated getters are valid.
+    const abiInterface=`pragma solidity ^0.8.0;
+interface ISourceReceiver {
+  function balances(address account) external view returns(uint256);
+  function coin() external view returns(address);
+  function batch(uint256[] calldata values) external returns(uint256[] memory);
+  function owner() external view returns(address);
+}`;
+    const abiReceiver=`pragma solidity ^0.8.0;
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+contract ReceiverWithAbi is OwnableUpgradeable {
+  mapping(address=>uint256) public balances;
+  ISourceReceiver public coin;
+  function batch(uint256[] calldata values) external returns(uint256[] memory) {
+    return values;
+  }
+}`;
+    const abiSrc=[
+      {path:'source-1/contracts/ISourceReceiver.sol',content:abiInterface,sha256:hash(abiInterface)},
+      {path:'source-1/contracts/ReceiverWithAbi.sol',content:abiReceiver,sha256:hash(abiReceiver)}
+    ];
+    assert.deepEqual(verifyAcquiredReceiverMethods('ISourceReceiver',
+      ['balances','coin','batch','owner'],abiSrc[1].path,'ReceiverWithAbi',abiSrc),
+      {ok:true,missing:[]},
+      'Canonical OZ inheritance, mapping getter, address-valued UDT getter and array ABI are executable candidates');
+    const noOZ=abiReceiver.replace('@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol',
+      './UnknownOwner.sol');
+    assert.equal(verifyAcquiredReceiverMethods('ISourceReceiver',['owner'],
+      abiSrc[1].path,'ReceiverWithAbi',
+      [abiSrc[0],{...abiSrc[1],content:noOZ,sha256:hash(noOZ)}]).ok,false,
+      'An unacquired, noncanonical owner class cannot be credited with inherited methods');
     const bothCompatible='pragma solidity ^0.8.0; import "./IAdapter.sol"; contract AlsoCorrect is IAdapter { function quote(uint256 amount) external override returns (uint256) { return amount; } }';
     const unresolvedChoice=resolveSourceFixtureDependencies(typedSources[1],'Consumer',[
       ...typedSources,{path:'source-1/contracts/AlsoCorrect.sol',
