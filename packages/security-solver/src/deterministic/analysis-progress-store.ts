@@ -31,7 +31,7 @@ export interface CandidateProgress {
   properties:CandidatePropertyProgress[];
   experimentIds:string[]; lastError?:string;
   experimentEvidence?:ExperimentEvidence[];
-  inconclusiveAttempts?:Array<{experimentId:string;status:string;evidenceId:string;reason:string}>;
+  inconclusiveAttempts?:Array<{experimentId:string;status:string;evidenceId:string;reason:string;replacedBy?:string}>;
   repairAttempts?:Array<{strategy:string;sourceSha256:string;result:string}>;
   specialistAttempts?:Array<{adapter:string;status:string;reason:string;detail?:string}>;
 }
@@ -171,7 +171,8 @@ export class AnalysisProgressStore {
   }
   private isConclusive(record:CandidateProgress):boolean {
     return record.properties.length>0 &&
-      record.properties.every(p=>p.state==="test_completed"&&p.sourceWitnesses.length>0&&
+      record.properties.every(p=>p.state==="test_completed"&&p.unresolvedPrerequisites.length===0&&
+        p.sourceWitnesses.length>0&&
         p.experimentIds.length>0 &&
         p.experimentIds.every(id=>this.hasValidEvidence(record,id)));
   }
@@ -277,7 +278,7 @@ export class AnalysisProgressStore {
             sourceCommit:r.sourceCommit,sourceSha256:r.sourceSha256,...evidence});
       }
       for(const p of r.properties)if(p.experimentIds.includes(id)&&
-        (r.experimentEvidence||[]).some(e=>e.experimentId===id))
+        p.unresolvedPrerequisites.length===0&&this.hasValidEvidence(r,id))
         p.state="test_completed";
       const successfulProperties=new Set(r.properties.filter(p=>p.state==="test_completed"&&
         p.experimentIds.length>0).map(p=>p.id));
@@ -314,9 +315,26 @@ export class AnalysisProgressStore {
     // when the exact source-identified experiment and witnesses match.
     const wasScheduled=record.experimentIds.includes(experimentId);
     if(!wasScheduled)record.experimentIds.push(experimentId);
-    if(record.properties.some(p=>p.id===propertyId)){
-      if(record.properties.find(p=>p.id===propertyId)?.experimentIds.includes(experimentId))return;
-      throw new Error("REPAIR_PROPERTY_ID_CONFLICT: "+propertyId);
+    const existing=record.properties.find(p=>p.id===propertyId);
+    if(existing){
+      if(existing.experimentIds.includes(experimentId))return;
+      const inconclusive=(record.inconclusiveAttempts||[]).filter(a=>
+        existing.experimentIds.includes(a.experimentId)&&!a.replacedBy);
+      if(existing.state!=="prerequisites_pending"||!inconclusive.length||
+        !existing.unresolvedPrerequisites.some(x=>/^experiment_/.test(x)))
+        throw new Error("REPAIR_PROPERTY_ID_CONFLICT: "+propertyId);
+      // Retain every old attempt in durable history; only a new sourced
+      // experiment may replace its active obligation. No outcome is presumed.
+      for(const attempt of inconclusive)attempt.replacedBy=experimentId;
+      existing.experimentIds=[experimentId];
+      existing.sourceWitnesses=[...new Set(witnesses)];
+      existing.unresolvedPrerequisites=existing.unresolvedPrerequisites
+        .filter(x=>!/^experiment_/.test(x));
+      existing.state=existing.unresolvedPrerequisites.length?
+        "prerequisites_pending":"test_constructed";
+      record.lifecycle=existing.unresolvedPrerequisites.length?
+        "dependencies_pending":"experiment_pending";
+      return;
     }
     // Only a missing-property/missing-observable refusal may be superseded
     // by an executable property with verified source witnesses. External calls,
@@ -380,6 +398,23 @@ export class AnalysisProgressStore {
     record.lifecycle=this.isConclusive(record)?"experiment_completed":
       record.properties.some(p=>p.state==="prerequisites_pending")?"dependencies_pending":"experiment_pending";
     return true;
+  }
+  /** Old failed attempts remain durable. Only a verified replacement for
+   * every affected lead can release an obsolete inconclusive queue outcome. */
+  retirableInconclusiveExperiments(replacementId:string):string[] {
+    const oldIds=new Set<string>();
+    for(const record of this.records.values()){
+      if(!this.hasValidEvidence(record,replacementId))continue;
+      for(const attempt of record.inconclusiveAttempts||[])
+        if(attempt.replacedBy===replacementId)oldIds.add(attempt.experimentId);
+    }
+    return [...oldIds].filter(oldId=>{
+      const affected=[...this.records.values()].filter(r=>r.experimentIds.includes(oldId));
+      return affected.length>0&&affected.every(r=>
+        !r.properties.some(p=>p.experimentIds.includes(oldId))&&
+        (r.inconclusiveAttempts||[]).some(a=>a.experimentId===oldId&&
+          !!a.replacedBy&&this.hasValidEvidence(r,a.replacedBy!)));
+    });
   }
   recordInconclusive(id:string,status:string,evidenceId:string,reason:string){
     if(!this.records.size)throw new Error("EMPTY_ANALYSIS_INVENTORY");

@@ -3790,11 +3790,16 @@ export async function runLocalAudit(
             }catch{detail='unparseable_verifier_evidence';}
             const evidenceId=createHash('sha256').update(JSON.stringify([
               activeStageCandidate,caseId,verifierDigest])).digest('hex');
-            if(outcome==='observed'||outcome==='not_observed')
+            if(outcome==='observed'||outcome==='not_observed'){
               analysisProgressStore.markExperimentCompleted(activeStageCandidate,{
                 result:outcome,verifierDigest,evidenceId,
               });
-            else analysisProgressStore.recordInconclusive(activeStageCandidate,
+              // Do not erase an inconclusive queue outcome until the progress
+              // store proves its new, source-identified verifier replacement.
+              for(const previous of analysisProgressStore
+                .retirableInconclusiveExperiments(activeStageCandidate))
+                stageLock.retireVerifiedInconclusive(previous,activeStageCandidate);
+            }else analysisProgressStore.recordInconclusive(activeStageCandidate,
               outcome,evidenceId,sourceMismatch||detail||'no_conclusive_falsifier');
             await analysisProgressStore.save();
             limits.onCandidateCoverage?.(analysisProgressStore.counts);

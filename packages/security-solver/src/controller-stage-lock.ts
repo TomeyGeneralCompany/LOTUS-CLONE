@@ -216,6 +216,17 @@ export class ControllerStageLock {
    this.candidates.set(id,result);
    this.reviews.set(id,false);
  }
+ /** The caller must have independently validated source-bound evidence for
+  * the replacement across every lead sharing the original experiment. */
+ retireVerifiedInconclusive(oldId:string,replacementId:string){
+   if(this.stage!=='EXPERIMENT'||oldId===replacementId||
+     !['observation_only','incomplete','unsupported','rejected']
+       .includes(String(this.candidates.get(oldId)))||
+     !['observed','not_observed'].includes(String(this.candidates.get(replacementId))))
+     throw new Error('INCONCLUSIVE_RETIREMENT_REQUIRES_VERIFIED_REPLACEMENT');
+   this.candidates.delete(oldId);
+   this.reviews.delete(oldId);
+ }
  completeExperiments(certificate?:import('./deterministic/analysis-progress-store').LeadExperimentCertificate){
    if(this.stage!=='EXPERIMENT'||this.completedCount!==this.candidateCount)
      throw new Error('EXPERIMENTS_INCOMPLETE');
