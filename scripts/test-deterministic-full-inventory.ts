@@ -1715,8 +1715,9 @@ contract ChildLedger is ParentLedger {
     assert.equal(ledgerExperiment.ok,true,
       'Distinct source-proven accounting companions must each be executable');
     if(ledgerExperiment.ok)
-      assert.equal(ledgerExperiment.experiments.length,2,
-        'Credit and reward are independent opposing transitions for debit');
+      assert.equal(ledgerExperiment.experiments.filter(e=>
+        e.securityProperty.startsWith('financial ')).length,2,
+        'Credit and reward must each produce a separate verified financial pair, even when additional source-grounded properties are constructed');
     // Regression 1: receive() external payable has AST name===null; never emit "null()"
     // or pass an EOA into an isContract()-checked initializer parameter.
     const benqiLikeText=`pragma solidity ^0.8.0;
