@@ -572,6 +572,31 @@ contract ImportedEnumInitializable is IEnumService {
         'initialize(uint8)');
       assert.deepEqual(enumInitializerPlan.initializerOperations[0].args,['0']);
     }
+    // A global Solidity custom value type can live in a source unit with no
+    // ContractDefinition. The importer must resolve its precise ABI primitive.
+    const globalValueType='pragma solidity ^0.8.20; type Price is uint128;';
+    const rateIface=`pragma solidity ^0.8.20;
+import "./GlobalPrice.sol";
+interface IRate { function amount() external view returns(Price); }`;
+    const rateImpl=`pragma solidity ^0.8.20;
+import "./GlobalPrice.sol";
+import "./IRate.sol";
+contract Rate is IRate { Price public override amount; }`;
+    const wrongRateImpl=`pragma solidity ^0.8.20;
+import "./IRate.sol";
+contract WrongRate { address public amount; }`;
+    const rateSources=[
+      {path:'source-1/contracts/GlobalPrice.sol',content:globalValueType,sha256:hash(globalValueType)},
+      {path:'source-1/contracts/IRate.sol',content:rateIface,sha256:hash(rateIface)},
+      {path:'source-1/contracts/Rate.sol',content:rateImpl,sha256:hash(rateImpl)},
+      {path:'source-1/contracts/WrongRate.sol',content:wrongRateImpl,sha256:hash(wrongRateImpl)}
+    ];
+    assert.deepEqual(verifyAcquiredReceiverMethods('IRate',['amount'],
+      rateSources[2].path,'Rate',rateSources),{ok:true,missing:[]},
+      'Compiler-equivalent global custom value type must retain its exact uint128 ABI');
+    assert.equal(verifyAcquiredReceiverMethods('IRate',['amount'],
+      rateSources[3].path,'WrongRate',rateSources).ok,false,
+      'An address getter cannot impersonate a global uint128 value-type return');
     // A Solidity user-defined type may be a struct or enum, not an address.
     // Exact imported ABI identities are required for concrete receivers.
     const shapeTypes=`pragma solidity ^0.8.0;
