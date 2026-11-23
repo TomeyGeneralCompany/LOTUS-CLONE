@@ -2086,17 +2086,39 @@ export function accountingTransitionPatterns(variable: string, field: string): {
     fieldDecrement:new RegExp(prefix+'\\[\\s*0\\s*\\]\\s*\\.\\s*'+escape(field)+'\\s*-='),
   };
 }
-/** Cycle-safe intra-contract effect closure, from acquired source AST spans. */
-function reachableAccountingSource(snapshot:SourceSnapshot,contract:any,seed:any):string {
-  const functions=(contract.subNodes||[]).filter((fn:any)=>fn.type==="FunctionDefinition"&&fn.body&&fn.name);
-  const byName=new Map<string,any[]>();
-  for(const fn of functions){const items=byName.get(fn.name)||[];items.push(fn);byName.set(fn.name,items);}
+/** Follow authenticated, inherited local source helpers without applying a
+ * parent AST's byte offsets to the child's unrelated source text. */
+function reachableAccountingSource(
+  snapshot:SourceSnapshot,contract:any,seed:any,
+  sources:ReadonlyMap<string,SourceSnapshot>
+):string {
+  const {chain}=resolveInheritance(snapshot,contract,sources);
+  const byName=new Map<string,Array<{source:SourceSnapshot;fn:any}>>();
+  const sourceOf=new Map<any,SourceSnapshot>();
+  for(const entry of chain){
+    for(const fn of (entry.contract.subNodes||[]).filter((n:any)=>
+      n.type==="FunctionDefinition"&&n.body&&n.name)){
+      sourceOf.set(fn,entry.snapshot);
+      const list=byName.get(fn.name)||[];
+      list.push({source:entry.snapshot,fn});
+      byName.set(fn.name,list);
+    }
+  }
   const pending=[seed],visited=new Set<any>(),parts:string[]=[];
   while(pending.length&&visited.size<48){
-    const fn=pending.shift()!;if(visited.has(fn))continue;visited.add(fn);
-    const text=body(snapshot.content,fn);parts.push(text);
-    for(const match of text.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g))
-      for(const next of byName.get(match[1])||[])if(!visited.has(next))pending.push(next);
+    const fn=pending.shift()!;
+    if(visited.has(fn))continue;
+    visited.add(fn);
+    const origin=sourceOf.get(fn);
+    if(!origin)continue; // no unverified cross-file text or synthetic helper
+    const text=body(origin.content,fn);parts.push(text);
+    for(const match of text.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)){
+      const candidates=byName.get(match[1])||[];
+      // Without parameter resolution, an overloaded helper is ambiguous.
+      // Never invent a particular call target based on the function name.
+      if(candidates.length===1&&!visited.has(candidates[0].fn))
+        pending.push(candidates[0].fn);
+    }
   }
   return parts.join("\n");
 }
@@ -2179,6 +2201,8 @@ export function extractSourceInvariantDescriptor(
   }
 
   const allNodes: any[] = [contract, ...chain.map((c) => c.contract)].flatMap((c) => c.subNodes || []);
+  const sourceOfFunction=(fn:any):SourceSnapshot=>
+    chain.find(entry=>(entry.contract.subNodes||[]).includes(fn))?.snapshot||snapshot;
   const fns = [...new Set(allNodes)].filter(
     (n: any) =>
       n.type === 'FunctionDefinition' &&
@@ -2209,7 +2233,7 @@ export function extractSourceInvariantDescriptor(
   // Do not choose the first function simply because of its name.
   const effects=new Map<any,{plus:string[];minus:string[]}>();
   for(const fn of fns){
-    const text=reachableAccountingSource(snapshot,contract,fn);
+    const text=reachableAccountingSource(snapshot,contract,fn,sources);
     const plus:string[]=[],minus:string[]=[];
     for(const state of accountingStates){
       const direction=accountingDirections(text,state);
@@ -2233,7 +2257,7 @@ export function extractSourceInvariantDescriptor(
         (counterparts.length?'ambiguous: ':'not established for ')+
         contract.name+'.'+canonicalFunctionIdentity(targetFn)+': '+
         counterparts.map(x=>canonicalFunctionIdentity(x.fn)).join(', '),
-      witnesses:[witness(snapshot,targetFn,contract.name+'.'+canonicalFunctionIdentity(targetFn))],
+      witnesses:[witness(sourceOfFunction(targetFn),targetFn,contract.name+'.'+canonicalFunctionIdentity(targetFn))],
       companionCandidates:[...new Set(counterparts.map(x=>canonicalFunctionIdentity(x.fn)))]};
   }
   const counterpart=selected[0];
@@ -2249,19 +2273,19 @@ export function extractSourceInvariantDescriptor(
     };
   }
 
-  const inflowBody = body(snapshot.content, inflowFn);
-  const outflowBody = body(snapshot.content, outflowFn);
+  const inflowBody = body(sourceOfFunction(inflowFn).content, inflowFn);
+  const outflowBody = body(sourceOfFunction(outflowFn).content, outflowFn);
   // Pair discovery already follows reachable local helper bodies. Observation
   // and external-dependency validation must inspect that SAME witnessed call
   // closure, otherwise source-visible accounting state written by a helper
   // is incorrectly dismissed as an unobservable property.
   const combinedBody = [
-    reachableAccountingSource(snapshot,contract,inflowFn),
-    reachableAccountingSource(snapshot,contract,outflowFn),
+    reachableAccountingSource(snapshot,contract,inflowFn,sources),
+    reachableAccountingSource(snapshot,contract,outflowFn,sources),
   ].join("\n");
   const pairWitnesses: SourceWitness[] = [
-    witness(snapshot, inflowFn, `${contract.name}.${inflowFn.name}`),
-    witness(snapshot, outflowFn, `${contract.name}.${outflowFn.name}`),
+    witness(sourceOfFunction(inflowFn), inflowFn, `${contract.name}.${inflowFn.name}`),
+    witness(sourceOfFunction(outflowFn), outflowFn, `${contract.name}.${outflowFn.name}`),
   ];
 
   // Classify external contract/interface/token calls inside the inflow/outflow pair.
@@ -2517,8 +2541,8 @@ export function extractSourceInvariantDescriptor(
     /^uint(?:[0-9]+)?$/.test(String(param.typeName?.name||'')))?.name||'');
   const inflowParameter=amountParameter(inflowFn);
   const outflowParameter=amountParameter(outflowFn);
-  const inflowEffects=reachableAccountingSource(snapshot,contract,inflowFn);
-  const outflowEffects=reachableAccountingSource(snapshot,contract,outflowFn);
+  const inflowEffects=reachableAccountingSource(snapshot,contract,inflowFn,sources);
+  const outflowEffects=reachableAccountingSource(snapshot,contract,outflowFn,sources);
   const directlyProven=accountingTarget&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(accountingTarget)&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(inflowParameter)&&

@@ -689,6 +689,44 @@ contract MathLedger {
       e.sequence.steps.some(step=>step.operation==='call'&&
         step.function==='total()'&&step.expect==='600')),
       'The invariant must test total conservation even if only the balance ledger has an opposing write');
+    // Inherited methods use their ORIGINAL file's AST offsets; applying
+    // those offsets to the child file falsely erases source-backed effects.
+    const parentLedgerText=`pragma solidity ^0.8.0;
+contract ParentLedger {
+  uint256 public total;
+  mapping(address=>uint256) public balances;
+  function _credit(uint256 amount) internal {
+    total += amount;
+    balances[msg.sender] += amount;
+  }
+  function debit(uint256 amount) external {
+    total -= amount;
+    balances[msg.sender] -= amount;
+  }
+}`;
+    const childLedgerText=`pragma solidity ^0.8.0;
+import "./ParentLedger.sol";
+contract ChildLedger is ParentLedger {
+  function credit(uint256 amount) external { _credit(amount); }
+}`;
+    const parentLedger={path:'source-1/contracts/ParentLedger.sol',
+      content:parentLedgerText,sha256:hash(parentLedgerText)};
+    const childLedger={path:'source-1/contracts/ChildLedger.sol',
+      content:childLedgerText,sha256:hash(childLedgerText)};
+    const inheritedLedgerBuilt=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:childLedger.path,
+      targetSelector:'ChildLedger.credit',sources:[childLedger,parentLedger],
+      declarations:[
+        {selector:'ChildLedger.credit',operation:'send',inputs:['uint256']},
+        {selector:'ChildLedger.debit',operation:'send',inputs:['uint256']}
+      ] as any,skipLegacy:true
+    });
+    assert.equal(inheritedLedgerBuilt.ok,true,
+      'Source-file-backed inherited accounting methods must create an executable experiment');
+    if(inheritedLedgerBuilt.ok)assert.ok(inheritedLedgerBuilt.experiments.some(e=>
+      e.securityProperty.startsWith('financial ')&&
+      e.witnesses.some(w=>w.path===parentLedger.path&&w.sourceSha256===parentLedger.sha256)),
+      'Inherited function evidence must cite the original parent source and SHA');
     const ledgerExperiment=constructSolidityExperiments({
       repositoryCommit:'b'.repeat(40),targetPath:ledgerSource.path,
       targetSelector:'Ledger.debit',sources:[ledgerSource],
