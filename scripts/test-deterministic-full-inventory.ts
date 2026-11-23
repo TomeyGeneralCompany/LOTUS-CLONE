@@ -359,6 +359,30 @@ contract BoundedConsumer {
       assert.deepEqual(boundedFixture.deployments.find(d=>d.contract==='Bounded')?.constructorArgs,
         ['101'],'Derive a satisfying value from require(minimum > 100)');
     }
+    // A user-defined AST type is not automatically a deployable contract.
+    // Local struct/enum constructors are typed values, never contract fixtures.
+    const localValues=`pragma solidity ^0.8.0;
+contract ValueBindings {
+  struct Choice { uint256 amount; }
+  enum Mode { Idle, Active }
+  Choice public choice;
+  Mode public mode;
+  function initialize(uint256 amount, uint256 selected) external {
+    choice = Choice(amount);
+    mode = Mode(selected);
+  }
+}`;
+    const valueSnapshot={path:'source-1/contracts/ValueBindings.sol',
+      content:localValues,sha256:hash(localValues)};
+    const valueFixture=resolveSourceFixtureDependencies(valueSnapshot,'ValueBindings',
+      [valueSnapshot]);
+    assert.equal(valueFixture.status,'resolved',
+      'Struct/enum initializer casts must not be treated as deployable contracts');
+    if(valueFixture.status==='resolved'){
+      assert.deepEqual(valueFixture.deployments,[]);
+      assert.deepEqual(valueFixture.bindings,[]);
+      assert.deepEqual(valueFixture.substitutions,{});
+    }
     const ambiguousSource='pragma solidity ^0.8.0; contract AdapterTwo is IAdapter {}';
     const ambiguous=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
       ...fixtureSources,{path:'source-1/contracts/AdapterTwo.sol',content:ambiguousSource,sha256:hash(ambiguousSource)}]);
