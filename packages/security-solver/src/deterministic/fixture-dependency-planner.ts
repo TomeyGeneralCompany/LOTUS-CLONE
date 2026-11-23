@@ -816,7 +816,12 @@ export function resolveSourceFixtureDependencies(
     const selected=qualified[0],key=selected.source.path+":"+selected.node.name;
     if(stack.has(key)){missing.push(typ+":dependency_cycle");return null;}
     if(visited.has(key))return visited.get(key)!;
-    if(deployments.length>=MAX_NODES){missing.push(typ+":max_dependency_nodes");return null;}
+    // Constructors resolve their transitive arguments BEFORE the parent is
+    // inserted into deployments. Count active recursion nodes as reserved
+    // deployment capacity, or an 11-node chain bypasses an eight-node budget.
+    if(deployments.length+stack.size>=MAX_NODES){
+      missing.push(typ+":max_dependency_nodes");return null;
+    }
     stack.add(key);
     const args:PreparedArg[]=[];let valid=true;
     for(const p of ctorOf(selected.node)?.parameters||[]){
