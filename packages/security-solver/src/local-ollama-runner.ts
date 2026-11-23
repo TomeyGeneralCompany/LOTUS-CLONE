@@ -406,8 +406,14 @@ export async function runLocalAudit(
       const failureCategory=!constructed.ok?constructed.unresolvedCategory:null;
       const rootSource=!constructed.ok?deterministicSourceSnapshots.find(source=>
         source.path===lead.path&&source.sha256===lead.sourceSha256):undefined;
+      // Inherited concrete targets may provide the initializer and executable
+      // property that a standalone abstract OR uninitialized base lacks.
+      // Every such candidate still requires a complete acquired inheritance
+      // witness, successful construction and independent local EVM evidence.
       const recoverConcrete=failureCategory==="missing_fixture"||
-        failureCategory==="unresolved_dependency";
+        failureCategory==="unresolved_dependency"||
+        failureCategory==="no_supported_property"||
+        failureCategory==="missing_observable_state";
       const recoverCaller=recoverConcrete||
         failureCategory==="no_supported_property"||
         failureCategory==="missing_observable_state";
