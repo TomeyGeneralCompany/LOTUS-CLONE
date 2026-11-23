@@ -30,6 +30,7 @@ import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
 import {sourceRepairRoutes} from "./deterministic/typed-repair-routes";
+import {repairAttemptIdentity} from "./deterministic/repair-attempt-identity";
 import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,enumerateAcquiredInheritedAbi} from "./deterministic/fixture-dependency-planner";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
@@ -363,7 +364,7 @@ export async function runLocalAudit(
         {cwd:process.cwd(),encoding:"utf8",timeout:5000}).trim();}
       catch{implementationRevision="unversioned";}
     }
-    const strategy="source-fixture-property-engine-v2:"+implementationRevision+":"+phase;
+    const strategyBase="source-fixture-property-engine-v3:"+implementationRevision+":"+phase;
     const relationalUnresolvedBySelector=new Map<string,Set<string>>();
     if(deterministicProgramGraph){
       for(const rel of generateRelationalHypotheses(deterministicProgramGraph)){
@@ -377,6 +378,11 @@ export async function runLocalAudit(
     let repairAdded=0,repairBlocked=0;
     for(const lead of sourceRepairBatch){
       const record=analysisProgressStore.records.get(lead.id)!;
+      // Re-enter repair when independently observed EVM evidence, an actual
+      // inconclusive attempt or a newly identified source obligation changes
+      // the state. A repeated no-op with identical source/obligations remains
+      // suppressed; controller responses cannot manufacture the fingerprint.
+      const strategy=strategyBase+":"+repairAttemptIdentity(record);
       if(deterministicProgramGraph){
         const freshRel=relationalUnresolvedBySelector.get(lead.selector)||new Set<string>();
         if(analysisProgressStore.reconcileRelationalPrerequisites(lead.id,freshRel)&&
@@ -567,7 +573,7 @@ export async function runLocalAudit(
     }
     await analysisProgressStore.save();
     await appendFile(logFile,"[EXPERIMENT_REPAIR_RECONCILIATION] "+JSON.stringify({
-      strategy,phase,examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
+      strategy:strategyBase,phase,examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
       unresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
     return repairAdded;
   };
