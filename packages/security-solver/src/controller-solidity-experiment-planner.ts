@@ -2900,12 +2900,16 @@ function sourceScalarDeltaExperiments(
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
   const nodes:any[]=contract.subNodes||[];
-  const publicCounters=nodes.filter(n=>n.type==='StateVariableDeclaration')
+  const counters=nodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>
-      v.visibility==='public'&&identifier.test(v.name||'')&&
+      identifier.test(v.name||'')&&
       v.typeName?.type==='ElementaryTypeName'&&
       /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||'')&&!v.expression);
-  if(!publicCounters.length)return [];
+  if(!counters.length)return [];
+  // A private/internal scalar can be measured only when the acquired source
+  // explicitly declares an independent view/pure return of that same state.
+  // Arbitrary functions with related names are not accepted as readbacks.
+  const observations=extractAccountingObservations(snapshot,contract.name,declarations);
   const setup=resolveFlexibleSetup(snapshot,contract,
     resolveInheritance(snapshot,contract,sources).chain,
     sources,declarations,null);
@@ -2931,7 +2935,7 @@ function sourceScalarDeltaExperiments(
     // their actual implementations and preconditions have been connected.
     if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText)||
       /\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText))continue;
-    for(const state of publicCounters){
+    for(const state of counters){
       if(constructor&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,constructor)))continue;
       if(setup.initSignature){
         const init=nodes.find(n=>n.type==='FunctionDefinition'&&
@@ -2941,7 +2945,10 @@ function sourceScalarDeltaExperiments(
       // Reuse exact-lvalue source accounting proof for assignment and SafeMath
       // forms. Never equate a different storage key or symbol with this state.
       if(!sourceExactAccountingDelta(fnText,state.name,param.name,'increase'))continue;
-      const getter=state.name+'()';
+      const observed=observations.find(o=>o.kind==='scalar'&&
+        o.stateVariable===state.name);
+      const getter=state.visibility==='public'?state.name+'()':observed?.getter;
+      if(!getter)continue;
       const width=Number(inputs[0].replace(/\D/g,''))||256;
       const amount=width<=8?'100':'1000';
       const steps:SoliditySequence['steps']=[];
@@ -2960,7 +2967,10 @@ function sourceScalarDeltaExperiments(
             parameter:param.name,amount,direction:'increase',sourceSha256:snapshot.sha256},
           steps},
         witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
-          witness(snapshot,state,contract.name+'.'+state.name)],
+          witness(snapshot,state,contract.name+'.'+state.name),
+          ...(state.visibility==='public'?[]:(nodes.filter((n:any)=>
+            n.type==='FunctionDefinition'&&n.name===getter.split('(')[0]&&n.body)
+            .map((n:any)=>witness(snapshot,n,contract.name+'.'+getter))))],
       });
     }
   }
