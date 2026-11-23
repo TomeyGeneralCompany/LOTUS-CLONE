@@ -850,8 +850,19 @@ function guardedErc721BurnExperiment(
   const has=(selector:string,operation:'send'|'call',inputs:string[])=>
     menu.some(item=>item.selector===contract.name+'.'+selector&&
       item.operation===operation&&JSON.stringify(item.inputs)===JSON.stringify(inputs));
+  // Inherited compiler ABI entries can be absent from the source-index menu:
+  // the acquired NFT source declares only its own functions. Admit the known
+  // inherited getters solely when BOTH the canonical OpenZeppelin import and
+  // corresponding explicit Solidity base contract are source-proven.
+  const inheritedNames=new Set((contract.baseContracts||[])
+    .map((base:any)=>String(base.baseName?.namePath||'')));
+  const inheritedOwnerGetter=oz.has('ownable_upgradeable')&&
+    inheritedNames.has('OwnableUpgradeable');
+  const inheritedBalanceGetter=oz.has('erc721')&&
+    [...inheritedNames].some(name=>/^ERC721(?:URIStorage)?Upgradeable$/.test(name));
   if(!has('burn','send',['uint256'])||!has('mint','send',['address','uint256'])||
-    !has('balanceOf','call',['address'])||!has('owner','call',[]))return null;
+    !(has('balanceOf','call',['address'])||inheritedBalanceGetter)||
+    !(has('owner','call',[])||inheritedOwnerGetter))return null;
   const steps:SoliditySequence['steps']=[];
   if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
     args:setup.initArgs,sender:0,requiredSetup:true});

@@ -518,8 +518,8 @@ contract GuardedNFT is ERC721URIStorageUpgradeable, OwnableUpgradeable {
     const nftDeclarations=[
       {selector:'GuardedNFT.mint',operation:'send',inputs:['address','uint256']},
       {selector:'GuardedNFT.burn',operation:'send',inputs:['uint256']},
-      {selector:'GuardedNFT.owner',operation:'call',inputs:[]},
-      {selector:'GuardedNFT.balanceOf',operation:'call',inputs:['address']},
+      // Inherited owner() and balanceOf(address) are intentionally omitted:
+      // production source menus need not enumerate compiler-inherited ABI.
     ];
     const nftBurn=constructSolidityExperiments({
       repositoryCommit:'b'.repeat(40),targetPath:nftSource.path,
@@ -540,6 +540,21 @@ contract GuardedNFT is ERC721URIStorageUpgradeable, OwnableUpgradeable {
       assert.notEqual(operations[3].expectRevert,true,
         'Authorized comparison must succeed rather than accepting a dual revert');
     }
+    // Removing the canonical acquired OpenZeppelin import must NOT permit
+    // an inferred getter ABI merely because the base class has a familiar name.
+    const unlinkedNftText=nftText.replace(
+      'import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";',
+      ''); 
+    const unlinkedNftSource={...nftSource,content:unlinkedNftText,
+      sha256:hash(unlinkedNftText)};
+    const unlinkedNftBurn=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:unlinkedNftSource.path,
+      targetSelector:'GuardedNFT.burn',sources:[unlinkedNftSource],
+      declarations:nftDeclarations as any,skipLegacy:true
+    });
+    assert.ok(!unlinkedNftBurn.ok||!unlinkedNftBurn.experiments.some(x=>
+      x.securityProperty.includes('owner-gated burn')),
+      'An unacquired ownership import cannot be treated as verified inherited ABI');
     const ledgerText=`pragma solidity ^0.8.0;
 contract Ledger {
   uint256 public total;
