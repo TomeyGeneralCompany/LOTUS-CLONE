@@ -950,6 +950,46 @@ contract DirectScalar {
     assert.ok(!unrelatedScalar.ok||!unrelatedScalar.experiments.some(x=>
       x.sequence.sourceProperty?.kind==='scalar_delta'),
       'Unrelated RHS storage cannot prove an exact scalar delta');
+    // State relationships must be derived from exact mapping keys, not from
+    // lexical similarity or a generic "balance" variable name.
+    const directMapSourceText=`pragma solidity ^0.8.0;
+contract DirectMap {
+  mapping(address => uint256) public ledger;
+  function credit(uint256 amount) external { ledger[msg.sender] += amount; }
+  function creditFor(address recipient,uint256 amount) external {
+    ledger[recipient] = ledger[recipient] + amount;
+  }
+  function creditOther(address recipient,uint256 amount) external {
+    ledger[msg.sender] += amount;
+  }
+}`;
+    const directMapSnapshot={path:'source-1/contracts/DirectMap.sol',
+      content:directMapSourceText,sha256:hash(directMapSourceText)};
+    const mapDecls=[{selector:'DirectMap.credit',operation:'send' as const,inputs:['uint256']},
+      {selector:'DirectMap.creditFor',operation:'send' as const,inputs:['address','uint256']},
+      {selector:'DirectMap.creditOther',operation:'send' as const,inputs:['address','uint256']}];
+    const compileMap=(name:string)=>constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:directMapSnapshot.path,
+      targetSelector:'DirectMap.'+name,sources:[directMapSnapshot],
+      declarations:mapDecls as any,skipLegacy:true});
+    const mapCredit=compileMap('credit');
+    assert.equal(mapCredit.ok,true,'Source-grounded msg.sender mapping credit must be constructible');
+    if(mapCredit.ok)assert.ok(mapCredit.experiments.some(e=>
+      e.securityProperty.includes('mapping conservation')&&
+      e.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='ledger(address)'&&step.args[0]==='$account0')));
+    const mapRecipient=compileMap('creditFor');
+    assert.equal(mapRecipient.ok,true,'Source-grounded named-recipient credit must be constructible');
+    if(mapRecipient.ok)assert.ok(mapRecipient.experiments.some(e=>
+      e.securityProperty.includes('mapping conservation')&&
+      e.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='ledger(address)'&&step.args[0]==='$account2')));
+    const mapWrong=compileMap('creditOther');
+    assert.ok(!mapWrong.ok||!mapWrong.experiments.some(e=>
+      e.securityProperty.includes('mapping conservation')&&
+      e.securityProperty.endsWith(':recipient')),
+      'Crediting msg.sender must not prove a credit to recipient');
+
     const ledgerText=`pragma solidity ^0.8.0;
 contract Ledger {
   uint256 public total;
