@@ -10,6 +10,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
+import {sourceRepairRoutes} from '../packages/security-solver/src/deterministic/typed-repair-routes';
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
@@ -43,6 +44,28 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // A valid completed property does not close a different unmet obligation.
+    // The dispatcher must choose authenticated alternative routes even when
+    // direct construction succeeded for a different security property.
+    assert.deepEqual(sourceRepairRoutes(null,[],true),{
+      categories:[],concrete:false,callers:false,hasUnresolved:false});
+    assert.deepEqual(sourceRepairRoutes(null,[
+      'UNKNOWN_ASSERTION(missing_fixture):unbound constructor',
+      'UNKNOWN_ASSERTION(no_supported_property):missing price invariant',
+      'missing_public_getter:Accounting.accrued'
+    ],true),{
+      categories:['missing_fixture','missing_observable_state','no_supported_property'],
+      concrete:true,callers:true,hasUnresolved:true
+    },'Partially completed lead must explore unresolved fixture and property routes');
+    assert.deepEqual(sourceRepairRoutes(null,[
+      'unresolved_external_call:Oracle.poke'
+    ],true),{
+      categories:['unresolved_dependency'],concrete:true,callers:true,
+      hasUnresolved:true
+    },'External call blockers remain separate obligations; no invented results');
+    assert.deepEqual(sourceRepairRoutes(null,['unrelated_readonly_comment'],true),{
+      categories:[],concrete:false,callers:false,hasUnresolved:true
+    },'Unrecognized text must not manufacture a new authorized recovery route');
     // A property blocker must have an invariant source-bound identity even
     // when a fresh analysis enumerates the same independent failures in the
     // opposite order. Otherwise later repairs can supplant the wrong property.
