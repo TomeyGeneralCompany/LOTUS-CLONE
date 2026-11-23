@@ -777,7 +777,7 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
     // ABI from the name alone. The actual compiler must still approve it.
     const matchingValueTypes:Array<{underlying:string;path:string}>=[];
     if(parts.length===0){
-      const escapedName=name.replace(/[.*+?^$()|[\]{}\\]/g,"\\    const contractDefs=entries.filter(e=>e.node.name===name&&");
+      const escapedName=name;
       const typePattern=new RegExp("(?:^|\\n)\\s*type\\s+"+escapedName+
         "\\s+is\\s+(u?int(?:[0-9]{1,3})?|address|bool|bytes(?:[0-9]{1,2})?)\\s*;","g");
       for(const path of reachable){
