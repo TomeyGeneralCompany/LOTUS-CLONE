@@ -840,7 +840,7 @@ export function resolveSourceFixtureDependencies(
     "contract"|"value"|"unknown"=>{
     const segments=String(typ||"").split(".");
     const name=segments.pop()||"";
-    if(!/^[A-Za-z_]\\w*$/.test(name))return "unknown";
+    if(!/^[A-Za-z_]\w*$/.test(name))return "unknown";
     const local=(node.subNodes||[]).filter((n:any)=>n.name===name&&
       ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type));
     if(local.length)return local.length===1?"value":"unknown";
