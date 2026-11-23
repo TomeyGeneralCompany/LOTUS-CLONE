@@ -88,7 +88,9 @@ export interface PreparedSecurityExperiment {
 }
 export type ConstructionResult =
   | {ok:true;experiments:PreparedSecurityExperiment[]}
-  | {ok:false;code:string;detail:string;unresolvedCategory?:InvariantUnresolvedCategory};
+  | {ok:false;code:string;detail:string;unresolvedCategory?:InvariantUnresolvedCategory;
+      /** An independently executable alternative does not discharge another blocked source obligation. */
+      partialExperiments?:PreparedSecurityExperiment[]};
 
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
 const identifier=/^[A-Za-z_]\w*$/;
@@ -4310,12 +4312,19 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     };
   }
   const seen=new Set<string>(),out:PreparedSecurityExperiment[]=[];
+  const failures:Array<{property:string;code:string;detail:string}>=[];
   for(const original of choices) {
     const c=sourceFactoryCloneExperiment(original,target,contract,indexed);
     const planned=sourcePreparationGraph(c.sequence,indexed,target,contract);
-    if(!planned.ok)return {ok:false,code:planned.code,detail:planned.detail};
+    if(!planned.ok){
+      failures.push({property:c.property,code:planned.code,detail:planned.detail});
+      continue;
+    }
     const graph=orderPreparation(planned.nodes);
-    if(!graph.ok)return {ok:false,code:graph.code,detail:graph.detail};
+    if(!graph.ok){
+      failures.push({property:c.property,code:graph.code,detail:graph.detail});
+      continue;
+    }
     const payload={sourceCommit:input.repositoryCommit,path:input.targetPath,
       selector:input.targetSelector,property:c.property,sequence:c.sequence};
     const id=hash(JSON.stringify(payload));
@@ -4324,6 +4333,15 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       path:input.targetPath,selector:input.targetSelector,
       hypothesis:c.hypothesis,securityProperty:c.property,witnesses:c.witnesses,
       prerequisites:graph.ordered,sequence:c.sequence});
+  }
+  if(failures.length){
+    // Preserve *all* source-derived obligations. A constructible property
+    // may yield real verifier evidence, but cannot certify an independent
+    // property whose transitive prerequisites failed construction.
+    return {ok:false,code:failures[0].code,
+      detail:failures.map(x=>x.property+":"+x.code+":"+x.detail)
+        .slice(0,16).join("; ").slice(0,3000),
+      unresolvedCategory:"missing_fixture",partialExperiments:out};
   }
   return {ok:true,experiments:out};
 }

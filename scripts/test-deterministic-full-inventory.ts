@@ -55,6 +55,24 @@ async function run(){
     assert.equal(pickFlexibleArg('uint64','_duration'),'86400');
     assert.equal(pickFlexibleArg('uint8','_amount',{amount:'1000'}),'255');
     assert.equal(pickFlexibleArg('uint7','_amount'),null);
+    // Partial executable properties retain real evidence without pretending
+    // that their separately blocked source property was also verified.
+    const partialLead=candidates[1];
+    const partialStore=await AnalysisProgressStore.open(
+      join(dir,'partial-source-properties.json'),[partialLead]);
+    partialStore.nextBatch(1,1);
+    partialStore.recordAssessment(partialLead.id,[],
+      ['source_grounded_falsifier_missing'],[]);
+    const partialWitness=partialLead.path+':'+partialLead.sourceSha256+':method';
+    partialStore.addRepairExperiment(partialLead.id,'partial-property',
+      'partial-experiment',[partialWitness],false,false);
+    partialStore.markExperimentCompleted('partial-experiment',{
+      evidenceId:'synthetic-checkpoint-regression-transcript',
+      result:'not_observed',verifierDigest:hash('synthetic-evidence-digest')});
+    assert.equal(partialStore.experimentCertificate.conclusive,0,
+      'Partial proof cannot supersede another unmet property');
+    assert.deepEqual(partialStore.experimentCertificate.unresolvedIds,[partialLead.id]);
+
     // A changed property engine must reopen unresolved checkpoints, never
     // reuse the old blocked assessment as proof that it was reevaluated.
     // Preserve the old source-bound property and attempt history for audit.

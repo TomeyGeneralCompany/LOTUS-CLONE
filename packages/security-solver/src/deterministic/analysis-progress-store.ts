@@ -412,7 +412,8 @@ export class AnalysisProgressStore {
       result:result.slice(0,500)});
     return true;
   }
-  addRepairExperiment(leadId:string,propertyId:string,experimentId:string,witnesses:string[],resolvedAbstractFixture=false){
+  addRepairExperiment(leadId:string,propertyId:string,experimentId:string,witnesses:string[],
+    resolvedAbstractFixture=false,maySupersedePriorBlockers=true){
     const record=this.records.get(leadId);
     // The lead's original source must be witnessed; the concrete imported
     // implementation necessarily has a different SHA and must retain its
@@ -451,7 +452,8 @@ export class AnalysisProgressStore {
     // Only a missing-property/missing-observable refusal may be superseded
     // by an executable property with verified source witnesses. External calls,
     // ambiguous dependencies and unrelated prerequisites remain unresolved.
-    for(const p of record.properties)if(p.state==="prerequisites_pending" &&
+    for(const p of record.properties)if(maySupersedePriorBlockers &&
+      p.state==="prerequisites_pending" &&
       p.unresolvedPrerequisites.length>0 &&
       p.unresolvedPrerequisites.every(reason=>
         /UNKNOWN_ASSERTION\((?:no_supported_property|missing_observable_state)\)/.test(reason)||

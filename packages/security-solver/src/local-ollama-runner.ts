@@ -410,7 +410,16 @@ export async function runLocalAudit(
         targetSelector:lead.selector,sources:deterministicSourceSnapshots,
         declarations,staticLeads:limits.staticLeads||[],
       });
+      const partialIds=new Set<string>();
       const successful=constructed.ok?[constructed]:[];
+      if(!constructed.ok&&constructed.partialExperiments?.length){
+        successful.push({ok:true as const,experiments:constructed.partialExperiments});
+        for(const exp of constructed.partialExperiments)partialIds.add(exp.id);
+        await appendFile(logFile,"[EXPERIMENT_PARTIAL_CONSTRUCTION] "+
+          JSON.stringify({leadId:lead.id,path:lead.path,selector:lead.selector,
+            executable:constructed.partialExperiments.length,
+            blocked:constructed.code,detail:constructed.detail.slice(0,420)})+"\n");
+      }
       const callerOnly=new Set<string>();
       const altFailures:string[]=[];
       // A lead may have one completed source-grounded property while another
@@ -475,7 +484,13 @@ export async function runLocalAudit(
               declarations:implMenu,staticLeads:limits.staticLeads||[],
             });
             if(candidate.ok)successful.push(candidate);
-            else altFailures.push(target.selector+":"+candidate.code+":"+candidate.detail.slice(0,180));
+            else {
+              if(candidate.partialExperiments?.length){
+                successful.push({ok:true as const,experiments:candidate.partialExperiments});
+                for(const exp of candidate.partialExperiments)partialIds.add(exp.id);
+              }
+              altFailures.push(target.selector+":"+candidate.code+":"+candidate.detail.slice(0,180));
+            }
           }
           await appendFile(logFile,"[EXPERIMENT_CONCRETE_RESOLUTION] "+JSON.stringify({
             leadId:lead.id,abstractSelector:lead.selector,
@@ -506,8 +521,12 @@ export async function runLocalAudit(
               targetSelector:caller.selector,sources:deterministicSourceSnapshots,
               declarations:menu,staticLeads:limits.staticLeads||[],
             });
-            if(candidate.ok){
-              successful.push(candidate);
+            if(candidate.ok||candidate.partialExperiments?.length){
+              if(candidate.ok)successful.push(candidate);
+              else {
+                successful.push({ok:true as const,experiments:candidate.partialExperiments!});
+                for(const exp of candidate.partialExperiments!)partialIds.add(exp.id);
+              }
               callerOnly.add(caller.path+":"+caller.selector);
             }else altFailures.push(caller.selector+":"+candidate.code+":"+candidate.detail.slice(0,160));
           }
@@ -556,7 +575,7 @@ export async function runLocalAudit(
         // production implementation. Only source-proven concrete inheritance
         // may replace that missing-fixture obligation.
         analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses,
-          exp.path!==lead.path&&!limitedToCaller);
+          exp.path!==lead.path&&!limitedToCaller,!partialIds.has(exp.id));
         added++;
         if(!preexisting)repairAdded++;
         await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
