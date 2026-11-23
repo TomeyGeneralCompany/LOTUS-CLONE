@@ -3052,6 +3052,133 @@ function sourceMappingDeltaExperiments(
   return out;
 }
 
+/** Deterministic source-expression oracle for directly executable pure entrypoints.
+ * The output is derived only from an acquired expression AST and concrete ABI
+ * arguments; arbitrary helper calls, external dependencies, unknown symbols
+ * and unreachable/ambiguous branches are never guessed.
+ */
+function sourcePureExpressionExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const fn of nodes.filter((n:any)=>n.type==='FunctionDefinition'&&n.body&&
+    n.name===method&&n.stateMutability==='pure'&&
+    ['public','external'].includes(n.visibility)&&!(n.modifiers||[]).length)){
+    const statements:any[]=fn.body.statements||[];
+    if(statements.length!==1||statements[0].type!=='ReturnStatement')continue;
+    const inputs=(fn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
+    const outputs=(fn.returnParameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
+    if(inputs.some(t=>!t)||outputs.length!==1||!outputs[0]||
+      !/^(?:u?int(?:[0-9]{1,3})?|bool)$/.test(outputs[0]))continue;
+    if(!declarations.some(d=>d.selector===contract.name+'.'+method&&
+      d.operation==='call'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
+    const params=new Map<string,bigint|boolean>();
+    const args:SolidityArgValue[]=[];
+    let compatible=true;
+    for(let i=0;i<inputs.length;i++){
+      const name=String(fn.parameters[i]?.name||'');
+      const type=inputs[i]||'';
+      if(!identifier.test(name)){compatible=false;break;}
+      if(type==='bool'){params.set(name,true);args.push(true);}
+      else if(/^u?int(?:[0-9]{1,3})?$/.test(type)){
+        params.set(name,7n+BigInt(i));args.push((7+i).toString());
+      }else{compatible=false;break;}
+    }
+    if(!compatible)continue;
+    type Scalar=bigint|boolean;
+    const evaluate=(n:any,depth=0):Scalar|null=>{
+      if(!n||depth>16)return null;
+      if(n.type==='NumberLiteral'){
+        const raw=String(n.number||'').replace(/_/g,'');
+        if(!/^(?:0x[0-9a-fA-F]+|[0-9]+)$/.test(raw))return null;
+        try{return BigInt(raw);}catch{return null;}
+      }
+      if(n.type==='BooleanLiteral')return n.value===true;
+      if(n.type==='Identifier')return params.get(String(n.name||''))??null;
+      if(n.type==='UnaryOperation'){
+        const operand=evaluate(n.subExpression,depth+1);
+        if(operand===null)return null;
+        if(n.operator==='!'&&typeof operand==='boolean')return !operand;
+        if(n.operator==='-'&&typeof operand==='bigint')return -operand;
+        if(n.operator==='+'&&typeof operand==='bigint')return operand;
+        return null;
+      }
+      if(n.type==='Conditional'){
+        const condition=evaluate(n.condition,depth+1);
+        return typeof condition==='boolean'?
+          evaluate(condition?n.trueExpression:n.falseExpression,depth+1):null;
+      }
+      if(n.type!=='BinaryOperation')return null;
+      const left=evaluate(n.left,depth+1),right=evaluate(n.right,depth+1);
+      if(left===null||right===null)return null;
+      if(typeof left==='boolean'&&typeof right==='boolean'){
+        if(n.operator==='&&')return left&&right;
+        if(n.operator==='||')return left||right;
+        if(n.operator==='==')return left===right;
+        if(n.operator==='!=')return left!==right;
+        return null;
+      }
+      if(typeof left!=='bigint'||typeof right!=='bigint')return null;
+      switch(n.operator){
+        case '+':return left+right;
+        case '-':return left-right;
+        case '*':return left*right;
+        case '/':return right!==0n?left/right:null;
+        case '%':return right!==0n?left%right:null;
+        case '**':return right>=0n&&right<=64n?left**right:null;
+        case '==':return left===right;
+        case '!=':return left!==right;
+        case '>':return left>right;
+        case '>=':return left>=right;
+        case '<':return left<right;
+        case '<=':return left<=right;
+        default:return null;
+      }
+    };
+    const answer=evaluate(statements[0].expression);
+    if(answer===null)continue;
+    const output=outputs[0];
+    if(output==='bool'&&typeof answer!=='boolean')continue;
+    if(output!=='bool'){
+      if(typeof answer!=='bigint')continue;
+      const signed=output.startsWith('int');
+      const bits=Number(output.replace(/\D/g,''))||256;
+      if(bits<8||bits>256||bits%8!==0)continue;
+      const lower=signed?-(1n<<BigInt(bits-1)):0n;
+      const upper=signed?(1n<<BigInt(bits-1))-1n:(1n<<BigInt(bits))-1n;
+      if(answer<lower||answer>upper)continue;
+    }
+    const setup=resolveFlexibleSetup(snapshot,contract,
+      resolveInheritance(snapshot,contract,sources).chain,
+      sources,declarations,null);
+    if(!setup||setup.usesToken)continue;
+    const signature=canonicalFunctionIdentity(fn);
+    const steps:SoliditySequence['steps']=[];
+    if(setup.initSignature)steps.push({
+      operation:'send',function:setup.initSignature,
+      args:setup.initArgs,sender:0,requiredSetup:true});
+    steps.push({operation:'call',function:signature,args,
+      expect:typeof answer==='bigint'?answer.toString():answer});
+    out.push({
+      hypothesis:'The exact source pure expression of '+contract.name+'.'+signature+
+        ' evaluates to '+String(answer)+' for concrete ABI inputs',
+      property:'source-exact pure return '+contract.name+'.'+signature,
+      sequence:{constructorArgs:setup.constructorArgs,
+        ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+        steps},
+      witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
+        witness(snapshot,statements[0],contract.name+'.'+signature+'.return')],
+    });
+  }
+  return out;
+}
+
 /** Convert a verified initializer setup into the actual source-declared
  * factory clone pathway when the acquired Factory implementation provides one.
  * No inferred clone behavior, guessed parameter order, arbitrary initializer,
@@ -3274,6 +3401,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     input.declarations,indexed))choices.push(scalar);
   for(const mapping of sourceMappingDeltaExperiments(target,contract,method,
     input.declarations,indexed))choices.push(mapping);
+  for(const scalarPure of sourcePureExpressionExperiment(target,contract,method,
+    input.declarations,indexed))choices.push(scalarPure);
   const vestingCreation=groundedVestingCreationExperiment(target,contract,method,input.declarations);
   if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
