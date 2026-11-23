@@ -8,7 +8,7 @@ import {dirname} from "node:path";
 import type {AnalysisCandidate} from "./analysis-candidate-queue";
 
 export type CandidateLifecycle="queued"|"admitted"|"analyzing"|"dependencies_pending"|
-  "experiment_pending"|"experiment_completed"|"analysis_exhausted"|"blocked";
+  "experiment_pending"|"experiment_completed"|"source_unavailable"|"analysis_exhausted"|"blocked";
 export type PropertyResolution="unexamined"|"analyzing"|"prerequisites_pending"|
   "test_constructed"|"test_completed"|"contradicted"|"unsupported"|"blocked";
 
@@ -20,9 +20,17 @@ export interface ExperimentEvidence {
   experimentId:string; leadId:string; sourceCommit:string; sourceSha256:string;
   evidenceId:string; result:'observed'|'not_observed'; verifierDigest:string;
 }
+export interface SourceUnavailableEvidence {
+  kind:"interface_without_acquired_implementation";
+  leadId:string; sourceCommit:string; sourceSha256:string;
+  sourceWitnesses:string[]; acquiredInventoryDigest:string;
+  verifierDigest:string; independentReviewDigest:string;
+  evidenceId:string; detail:string;
+}
 export interface LeadExperimentCertificate {
-  version:1; manifestDigest:string; evidenceDigest:string;
-  total:number; conclusive:number; unresolvedIds:string[];
+  version:1|2; manifestDigest:string; evidenceDigest:string;
+  total:number; conclusive:number; sourceUnavailable:number; sourceUnavailableIds:string[];
+  unavailabilityEvidenceDigest:string; unresolvedIds:string[];
   pendingReasons:Record<string,string[]>; evidenceCount:number;
 }
 export interface CandidateProgress {
@@ -32,6 +40,7 @@ export interface CandidateProgress {
   experimentIds:string[]; lastError?:string;
   experimentEvidence?:ExperimentEvidence[];
   inconclusiveAttempts?:Array<{experimentId:string;status:string;evidenceId:string;reason:string;replacedBy?:string}>;
+  sourceUnavailable?:SourceUnavailableEvidence;
   repairAttempts?:Array<{strategy:string;sourceSha256:string;result:string}>;
   specialistAttempts?:Array<{adapter:string;status:string;reason:string;detail?:string}>;
 }
@@ -123,7 +132,7 @@ export class AnalysisProgressStore {
     const records=[...this.records.values()];
     const count=(state:CandidateLifecycle)=>records.filter(r=>r.lifecycle===state).length;
     // Source-reading or an unsupported analytical disposition is not experiment proof.
-    const unresolved=records.filter(r=>!this.isConclusive(r));
+    const unresolved=records.filter(r=>!this.isConclusive(r)&&!this.hasSourceUnavailableEvidence(r));
     return {
       total:records.length,queued:count("queued"),
       admitted:count("admitted")+count("analyzing"),
@@ -176,17 +185,50 @@ export class AnalysisProgressStore {
         p.experimentIds.length>0 &&
         p.experimentIds.every(id=>this.hasValidEvidence(record,id)));
   }
+  private hasSourceUnavailableEvidence(record:CandidateProgress):boolean {
+    const e=record.sourceUnavailable;
+    return !!e&&e.kind==="interface_without_acquired_implementation"&&
+      e.leadId===record.id&&e.sourceCommit===record.sourceCommit&&
+      e.sourceSha256===record.sourceSha256&&
+      this.hasValidWitnesses(record,e.sourceWitnesses)&&
+      /^[a-f0-9]{64}$/.test(e.acquiredInventoryDigest)&&
+      /^[a-f0-9]{64}$/.test(e.verifierDigest)&&
+      /^[a-f0-9]{64}$/.test(e.independentReviewDigest)&&
+      e.verifierDigest!==e.independentReviewDigest&&
+      e.evidenceId.length>0&&e.detail.length>0&&
+      !record.properties.some(p=>p.state==="test_completed");
+  }
+  recordSourceUnavailable(id:string,evidence:SourceUnavailableEvidence):void {
+    const record=this.records.get(id);
+    if(!record||record.lifecycle==="queued"||record.lifecycle==="admitted"||
+      record.lifecycle==="analyzing")throw new Error("SOURCE_UNAVAILABLE_LEAD_NOT_ASSESSED: "+id);
+    if(record.sourceUnavailable)throw new Error("SOURCE_UNAVAILABLE_ALREADY_RECORDED: "+id);
+    if(record.lifecycle==="experiment_completed"&&this.isConclusive(record))
+      throw new Error("SOURCE_UNAVAILABLE_HAS_EXECUTED_EXPERIMENT: "+id);
+    const next={...record,sourceUnavailable:evidence};
+    if(!this.hasSourceUnavailableEvidence(next))
+      throw new Error("SOURCE_UNAVAILABLE_INDEPENDENT_EVIDENCE_REQUIRED: "+id);
+    record.sourceUnavailable={...evidence,sourceWitnesses:[...evidence.sourceWitnesses]};
+    record.lifecycle="source_unavailable";
+  }
   get experimentCertificate():LeadExperimentCertificate {
     const entries=[...this.records.values()].sort((a,b)=>a.id.localeCompare(b.id));
-    const unresolved=entries.filter(e=>!this.isConclusive(e));
+    const unavailable=entries.filter(e=>this.hasSourceUnavailableEvidence(e));
+    const unresolved=entries.filter(e=>!this.isConclusive(e)&&!this.hasSourceUnavailableEvidence(e));
     const evidence=entries.flatMap(e=>(e.experimentEvidence||[])
       .map(x=>[x.experimentId,x.leadId,x.sourceSha256,x.evidenceId,x.verifierDigest,x.result]))
       .sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
     return {
-      version:1,
+      version:2,
       manifestDigest:createHash("sha256").update(JSON.stringify(entries.map(e=>e.id))).digest("hex"),
       evidenceDigest:createHash("sha256").update(JSON.stringify(evidence)).digest("hex"),
-      total:entries.length,conclusive:entries.length-unresolved.length,
+      total:entries.length,conclusive:entries.filter(e=>this.isConclusive(e)).length,
+      sourceUnavailable:unavailable.length,
+      sourceUnavailableIds:unavailable.map(e=>e.id),
+      unavailabilityEvidenceDigest:createHash("sha256").update(JSON.stringify(
+        unavailable.map(e=>[e.id,e.sourceUnavailable?.evidenceId,
+          e.sourceUnavailable?.verifierDigest,e.sourceUnavailable?.independentReviewDigest,
+          e.sourceUnavailable?.acquiredInventoryDigest]))).digest("hex"),
       unresolvedIds:unresolved.map(e=>e.id),
       pendingReasons:Object.fromEntries(unresolved.map(e=>[e.id,
         e.properties.flatMap(p=>p.unresolvedPrerequisites).concat(
@@ -480,7 +522,7 @@ export class AnalysisProgressStore {
       const record=this.records.get(c.id);
       return !!record && record.lifecycle!=="queued" &&
         record.lifecycle!=="admitted" && record.lifecycle!=="analyzing" &&
-        !this.isConclusive(record);
+        !this.isConclusive(record)&&!this.hasSourceUnavailableEvidence(record);
     });
     return eligible.slice(0,max);
   }
