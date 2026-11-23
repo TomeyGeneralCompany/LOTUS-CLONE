@@ -332,6 +332,33 @@ contract PrimitiveInit {
       assert.deepEqual(primitiveInitResolved.bindings,[],
         'Primitive state bindings must never create contract bindings');
     }
+    // Use explicit source-grounded require() constraints rather than a generic
+    // zero constructor value for acquired transitive dependencies.
+    const boundedInterface='pragma solidity ^0.8.0; interface IBounded { function ping() external; }';
+    const boundedSource=`pragma solidity ^0.8.0; import "./IBounded.sol";
+contract Bounded is IBounded {
+  constructor(uint256 minimum) { require(minimum > 100); }
+  function ping() external override {}
+}`;
+    const boundedConsumer=`pragma solidity ^0.8.0; import "./IBounded.sol";
+contract BoundedConsumer {
+  IBounded public dependency;
+  function initialize(address chosen) external { dependency=IBounded(chosen); }
+  function callDependency() external { dependency.ping(); }
+}`;
+    const boundedSources=[
+      {path:'source-1/contracts/IBounded.sol',content:boundedInterface,sha256:hash(boundedInterface)},
+      {path:'source-1/contracts/Bounded.sol',content:boundedSource,sha256:hash(boundedSource)},
+      {path:'source-1/contracts/BoundedConsumer.sol',content:boundedConsumer,sha256:hash(boundedConsumer)}
+    ];
+    const boundedFixture=resolveSourceFixtureDependencies(boundedSources[2],
+      'BoundedConsumer',boundedSources);
+    assert.equal(boundedFixture.status,'resolved',
+      'A supported source literal bound must not prevent fixture construction');
+    if(boundedFixture.status==='resolved'){
+      assert.deepEqual(boundedFixture.deployments.find(d=>d.contract==='Bounded')?.constructorArgs,
+        ['101'],'Derive a satisfying value from require(minimum > 100)');
+    }
     const ambiguousSource='pragma solidity ^0.8.0; contract AdapterTwo is IAdapter {}';
     const ambiguous=resolveSourceFixtureDependencies(fixtureSources[0],'Vault',[
       ...fixtureSources,{path:'source-1/contracts/AdapterTwo.sol',content:ambiguousSource,sha256:hash(ambiguousSource)}]);
