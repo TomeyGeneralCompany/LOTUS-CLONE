@@ -13,6 +13,7 @@ const artifactPath=fileURLToPath(new URL("./fixtures/dell-45191376008-frozen-lea
   import.meta.url));
 const baseline=JSON.parse(readFileSync(artifactPath,"utf8")) as {
   baselineRun:number;artifact:number;sourceCommit:string;
+  originalCandidateIdsDigest:string;originalSourceIdentitiesDigest:string;
   groups:Record<"C"|"P"|"F"|"D",string[]>;
 };
 assert.equal(baseline.baselineRun,45191376008);
@@ -42,7 +43,7 @@ if(currentIndex!==-1){
   if(!path)throw new Error("--current requires actual Dell candidate inventory path");
   const actual=JSON.parse(readFileSync(resolve(path),"utf8")) as {
     totalCandidates:number;
-    candidates:Array<{id:string;selector:string;sourceCommit:string;sourceSha256:string}>;
+    candidates:Array<{id:string;path:string;selector:string;sourceCommit:string;sourceSha256:string;lifecycle:string}>;
   };
   assert.equal(actual.totalCandidates,290,"Real Dell inventory denominator changed");
   assert.equal(actual.candidates.length,290,"Real Dell inventory records changed");
@@ -57,6 +58,25 @@ if(currentIndex!==-1){
   }
   assert.deepEqual(actual.candidates.map(x=>x.selector).sort(),selectors.sort(),
     "Real Dell original selector multiset changed or lost leads");
+  const identityDigest=createHash("sha256").update(
+    [...ids].sort().join("\n")).digest("hex");
+  assert.equal(identityDigest,baseline.originalCandidateIdsDigest,
+    "Original lead IDs changed or the frozen original inventory was replaced");
+  const sources=[...new Set(actual.candidates.map(x=>
+    x.path+":"+x.sourceSha256))].sort();
+  const sourceDigest=createHash("sha256").update(
+    sources.join("\n")).digest("hex");
+  assert.equal(sourceDigest,baseline.originalSourceIdentitiesDigest,
+    "Original source revision, file identity, or frozen source set changed");
+  // Baseline conclusive obligations cannot silently vanish after an engine
+  // revision. This is a lifecycle regression check, not a substitute for
+  // the independently verified per-property experiment certificate.
+  const baselineConclusive=new Set(baseline.groups.C);
+  for(const lead of actual.candidates){
+    if(baselineConclusive.has(lead.selector))assert.equal(
+      lead.lifecycle,"experiment_completed",
+      "An originally completed source lead regressed: "+lead.selector);
+  }
 }
 console.log("REAL_DELL_290_ORIGINAL_LEAD_MANIFEST_PRESERVED"+
   (currentIndex===-1?":baseline_only":":actual_index_verified"));
