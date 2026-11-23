@@ -1072,6 +1072,60 @@ contract DirectState {
     assert.ok(!branchState.ok||!branchState.experiments.some(exp=>
       exp.securityProperty.startsWith('source-defined direct state assignment')),
       'Conditional writes must not be mistaken for unconditional source assignments');
+    // Acquired public mapping-of-struct getter: source-proven onlyOwner,
+    // unauthorized revert, authorized transaction and BOTH struct fields.
+    const overrideText=`pragma solidity ^0.8.4;
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+contract OverrideRates is Ownable {
+  struct Override { bool enabled; uint256 amount; }
+  mapping(address=>Override) public poolRates;
+  mapping(address=>mapping(uint64=>Override)) public depositRates;
+  uint256 public cap;
+  constructor(uint256 initialCap) { cap = initialCap; }
+  function overridePool(address pool,uint256 fee) external onlyOwner {
+    require(fee <= cap);
+    poolRates[pool] = Override({enabled:true,amount:fee});
+  }
+  function overrideDeposit(address pool,uint64 id,uint256 fee) external onlyOwner {
+    require(fee <= cap);
+    depositRates[pool][id] = Override({enabled:true,amount:fee});
+  }
+}`;
+    const overrideSource={path:'source-1/contracts/OverrideRates.sol',
+      content:overrideText,sha256:hash(overrideText)};
+    const overrideMenu=[
+      {selector:'OverrideRates.overridePool',operation:'send',inputs:['address','uint256']},
+      {selector:'OverrideRates.overrideDeposit',operation:'send',inputs:['address','uint64','uint256']}
+    ];
+    for(const [fn,getter,keyLength] of [
+      ['overridePool','poolRates(address)',1],
+      ['overrideDeposit','depositRates(address,uint64)',2]
+    ] as const){
+      const result=constructSolidityExperiments({
+        repositoryCommit:'b'.repeat(40),targetPath:overrideSource.path,
+        targetSelector:'OverrideRates.'+fn,sources:[overrideSource],
+        declarations:overrideMenu as any,skipLegacy:true});
+      assert.equal(result.ok,true,'Authenticated struct mapping is executable: '+fn);
+      if(result.ok)assert.ok(result.experiments.some(exp=>{
+        const sends=exp.sequence.steps.filter(x=>x.operation==='send');
+        return exp.securityProperty.includes('owner-gated source struct override')&&
+          sends.some(x=>x.operation==='send'&&x.sender===1&&x.expectRevert===true)&&
+          sends.some(x=>x.operation==='send'&&x.sender===0&&!x.expectRevert)&&
+          exp.sequence.steps.some(x=>x.operation==='call'&&x.function===getter&&
+            x.args.length===keyLength&&Array.isArray(x.expect)&&
+            x.expect[0]===true&&x.expect[1]==='7');
+      }),'Both source-declared fields must be independently verified');
+    }
+    const unknownOwner=overrideText.replace(
+      'import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";','');
+    const unlinkedOwner={...overrideSource,content:unknownOwner,sha256:hash(unknownOwner)};
+    const notOwned=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:unlinkedOwner.path,
+      targetSelector:'OverrideRates.overridePool',sources:[unlinkedOwner],
+      declarations:overrideMenu as any,skipLegacy:true});
+    assert.ok(!notOwned.ok||!notOwned.experiments.some(x=>
+      x.securityProperty.includes('owner-gated source struct override')),
+      'An unacquired owner implementation is not an authorization witness');
     const sourcePureText=`pragma solidity ^0.8.0;
 contract PureArithmetic {
   function calc(uint256 value) external pure returns(uint256) { return (value * 3) + 2; }
