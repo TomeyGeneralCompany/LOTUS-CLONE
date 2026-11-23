@@ -96,19 +96,68 @@ function constrainedFixtureArg(type:any,parameter:string,fn:any,nonzero:boolean,
   let lower=signed?-(1n<<BigInt(bits-1)):0n;
   let upper=signed?(1n<<BigInt(bits-1))-1n:(1n<<BigInt(bits))-1n;
   const excluded=new Set<string>();
+  const constants=new Map<string,any>();
+  for(const declaration of contract.subNodes||[])
+    if(declaration.type==="StateVariableDeclaration")
+      for(const variable of declaration.variables||[])
+        if(variable.name&&variable.isDeclaredConst&&variable.expression)
+          constants.set(variable.name,variable.expression);
+  const evaluateConstant=(expr:any,depth=0,visited=new Set<string>()):bigint|null=>{
+    if(!expr||depth>16)return null;
+    if(expr.type==="Identifier"){
+      const name=String(expr.name||"");
+      const value=constants.get(name);
+      if(!value||visited.has(name))return null;
+      const seen=new Set(visited);seen.add(name);
+      return evaluateConstant(value,depth+1,seen);
+    }
+    if(expr.type==="NumberLiteral"){
+      const num=String(expr.number||"").replace(/_/g,"");
+      const scientific=num.match(/^([0-9]+)[eE]([0-9]{1,2})$/);
+      const canonical=scientific?
+        BigInt(scientific[1])*10n**BigInt(scientific[2]):
+        /^(?:0x[0-9a-fA-F]+|[0-9]+)$/.test(num)?BigInt(num):null;
+      if(canonical===null)return null;
+      const denomination=String(expr.subdenomination||"");
+      const units:Record<string,bigint>={
+        "":1n,wei:1n,gwei:1000000000n,ether:1000000000000000000n,
+        seconds:1n,minutes:60n,hours:3600n,days:86400n,weeks:604800n};
+      const unit=units[denomination];
+      return unit===undefined?null:canonical*unit;
+    }
+    if(expr.type==="TupleExpression"&&expr.components?.length===1)
+      return evaluateConstant(expr.components[0],depth+1,visited);
+    if(expr.type==="UnaryOperation"){
+      const operand=evaluateConstant(expr.subExpression,depth+1,visited);
+      if(operand===null)return null;
+      return expr.operator==="-"?-operand:expr.operator==="+"?operand:null;
+    }
+    if(expr.type!=="BinaryOperation")return null;
+    const left=evaluateConstant(expr.left,depth+1,visited);
+    const right=evaluateConstant(expr.right,depth+1,visited);
+    if(left===null||right===null)return null;
+    switch(expr.operator){
+      case "+":return left+right;
+      case "-":return left-right;
+      case "*":return left*right;
+      case "/":return right!==0n?left/right:null;
+      case "%":return right!==0n?left%right:null;
+      case "**":return right>=0n&&right<=78n?left**right:null;
+      default:return null;
+    }
+  };
   const reverse:Record<string,string>={">":"<","<":">",">=":"<=","<=":">=","==":"==","!=":"!="};
   const apply=(expr:any):void=>{
     if(expr?.type!=="BinaryOperation")return;
     if(expr.operator==="&&"){apply(expr.left);apply(expr.right);return;}
     let op=String(expr.operator||"");
-    let literal=expr.right;
-    if(expr.left?.type==="NumberLiteral"&&expr.right?.type==="Identifier"&&
-      expr.right.name===parameter){op=reverse[op]||"";literal=expr.left;}
-    else if(expr.left?.type!=="Identifier"||expr.left.name!==parameter)return;
-    if(literal?.type!=="NumberLiteral"||!reverse[op])return;
-    const representation=String(literal.number||"").replace(/_/g,"");
-    if(!/^(?:0|[1-9][0-9]*)$/.test(representation))return;
-    const value=BigInt(representation);
+    let other=expr.right;
+    if(expr.right?.type==="Identifier"&&expr.right.name===parameter){
+      op=reverse[op]||"";other=expr.left;
+    }else if(expr.left?.type!=="Identifier"||expr.left.name!==parameter)return;
+    if(!reverse[op])return;
+    const value=evaluateConstant(other);
+    if(value===null)return;
     switch(op){
       case ">": if(value+1n>lower)lower=value+1n;break;
       case ">=": if(value>lower)lower=value;break;
