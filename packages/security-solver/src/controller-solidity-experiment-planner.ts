@@ -1303,8 +1303,11 @@ function authorityTransferExperiment(
   if(declaredFn){
     if(method==='claimOwnership'){
       const claimBody=body(declaredFn.snapshot.content,declaredFn.node);
-      const pendingAliases=[...claimBody.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*pendingOwner\b/g)].map(m=>m[1]);
-      const targets=['pendingOwner',...pendingAliases];
+      // The actual BoringOwnable source uses _pendingOwner and a local
+      // __pendingOwner alias. Both identities are linked by an exact source
+      // assignment; a bare same-name method must not count as a guard.
+      const pendingAliases=[...claimBody.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*_?pendingOwner\b/g)].map(m=>m[1]);
+      const targets=['pendingOwner','_pendingOwner',...pendingAliases];
       const checksPending=targets.some(t=>new RegExp(`\\bmsg\\.sender\\s*==\\s*${t}\\b|\\b${t}\\s*==\\s*msg\\.sender\\b`).test(claimBody));
       if(!checksPending)return null;
     } else if(!hasAuthorizationGuard(declaredFn.node,setup.kind,chain))return null;
