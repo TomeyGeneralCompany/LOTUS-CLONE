@@ -1221,6 +1221,38 @@ contract GuardedNFT is ERC721URIStorageUpgradeable, OwnableUpgradeable {
       'An unacquired ownership import cannot be treated as verified inherited ABI');
     // A source-proven scalar transition may be expressed by assignment rather
     // than +=. That is still a falsifiable getter-backed property.
+    // A private accounting scalar may still have a strictly equivalent,
+    // source-declared view readback. Getter identity must be exact.
+    const privateScalarText=`pragma solidity ^0.8.0;
+contract PrivateScalar {
+  uint256 private accumulated;
+  function total() external view returns(uint256) { return accumulated; }
+  function add(uint256 amount) external { accumulated += amount; }
+}`;
+    const privateScalarSnap={path:'source-1/contracts/PrivateScalar.sol',
+      content:privateScalarText,sha256:hash(privateScalarText)};
+    const privateScalarBuild=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:privateScalarSnap.path,
+      targetSelector:'PrivateScalar.add',sources:[privateScalarSnap],
+      declarations:[
+        {selector:'PrivateScalar.add',operation:'send',inputs:['uint256']},
+        {selector:'PrivateScalar.total',operation:'call',inputs:[]}
+      ] as any,skipLegacy:true});
+    assert.equal(privateScalarBuild.ok,true,
+      'Source-exact private-state readbacks must permit observable arithmetic properties');
+    if(privateScalarBuild.ok)assert.ok(privateScalarBuild.experiments.some(exp=>
+      exp.sequence.sourceProperty?.state==='accumulated'&&
+      exp.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='total()'&&step.expect==='1000')),
+      'Private-state obligation must use the source-equivalent total() view');
+    const missingReadback=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:privateScalarSnap.path,
+      targetSelector:'PrivateScalar.add',sources:[privateScalarSnap],
+      declarations:[{selector:'PrivateScalar.add',operation:'send',inputs:['uint256']}] as any,
+      skipLegacy:true,skipFinancialInvariants:true});
+    assert.ok(!missingReadback.ok||!missingReadback.experiments.some(exp=>
+      exp.sequence.sourceProperty?.state==='accumulated'),
+      'No acquired callable readback means no fabricated private-state assertion');
     const directScalarText=`pragma solidity ^0.8.0;
 contract DirectScalar {
   uint256 public total;
