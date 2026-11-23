@@ -876,6 +876,21 @@ contract DirectScalar {
     if(directScalar.ok)assert.ok(directScalar.experiments.some(x=>
       x.sequence.sourceProperty?.kind==='scalar_delta'),
       'Scalar assignment property must retain executable source-property metadata');
+    // A different RHS storage identity must never become a scalar invariant.
+    const unrelatedScalarText=directScalarText.replace(
+      'uint256 public total;', 'uint256 public total; uint256 public other;').replace(
+      'total = total + amount;', 'total = other + amount;');
+    const unrelatedScalarSource={...directScalarSource,
+      content:unrelatedScalarText,sha256:hash(unrelatedScalarText)};
+    const unrelatedScalar=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:unrelatedScalarSource.path,
+      targetSelector:'DirectScalar.addValue',sources:[unrelatedScalarSource],
+      declarations:[{selector:'DirectScalar.addValue',operation:'send',inputs:['uint256'],
+        outputs:[],stateMutability:'nonpayable'}] as any,skipLegacy:true
+    });
+    assert.ok(!unrelatedScalar.ok||!unrelatedScalar.experiments.some(x=>
+      x.sequence.sourceProperty?.kind==='scalar_delta'),
+      'Unrelated RHS storage cannot prove an exact scalar delta');
     const ledgerText=`pragma solidity ^0.8.0;
 contract Ledger {
   uint256 public total;
