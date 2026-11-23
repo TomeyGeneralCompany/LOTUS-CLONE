@@ -11,7 +11,7 @@ import {join} from 'node:path';
 import {ControllerStageLock} from '../packages/security-solver/src/controller-stage-lock';
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
-import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {constructSolidityExperiments,sourcePreparationGraph} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 import {buildProgramFactsGraph} from '../packages/security-solver/src/deterministic/program-facts';
@@ -795,6 +795,57 @@ contract PlugConsumer {
     assert.deepEqual(concreteView.map(x=>x.selector),['ConcreteView.read']);
     assert.equal(concreteView[0].operation,'call',
       'A pure inherited interface method must use a read-only EVM step');
+    // Source-backed inherited two-step ownership claim needs the BASE
+    // prerequisite transfer/owner/pendingOwner ABI, not just claimOwnership.
+    const claimBaseText=`pragma solidity ^0.8.0;
+contract ClaimBase {
+  address private _owner;
+  address private _pendingOwner;
+  function __Ownable_init() internal { _owner = msg.sender; }
+  function owner() external view returns(address) { return _owner; }
+  function pendingOwner() external view returns(address) { return _pendingOwner; }
+  modifier onlyOwner() { require(msg.sender == _owner); _; }
+  function transferOwnership(address next,bool direct,bool renounce) public onlyOwner {
+    if(direct) { require(next != address(0) || renounce);
+      _owner = next; _pendingOwner = address(0);
+    } else { _pendingOwner = next; }
+  }
+  function claimOwnership() public {
+    address __pendingOwner = _pendingOwner;
+    require(msg.sender == __pendingOwner);
+    _owner = __pendingOwner;
+    _pendingOwner = address(0);
+  }
+}`;
+    const claimChildText=`pragma solidity ^0.8.0;
+import "./ClaimBase.sol";
+contract ClaimChild is ClaimBase {
+  modifier initializer() { _; }
+  function initialize() external initializer { __Ownable_init(); }
+}`;
+    const claimSources=[
+      {path:'source-1/contracts/ClaimBase.sol',content:claimBaseText,sha256:hash(claimBaseText)},
+      {path:'source-1/contracts/ClaimChild.sol',content:claimChildText,sha256:hash(claimChildText)}
+    ];
+    const claimImpl=resolveAcquiredConcreteImplementations(
+      claimSources[0],'ClaimBase','claimOwnership',claimSources);
+    assert.ok(claimImpl.some(x=>x.contract==='ClaimChild'),
+      'Actual concrete inherited claimant must be discoverable');
+    const claimAbi=enumerateAcquiredInheritedAbi(claimSources[0],
+      'ClaimBase','ClaimChild',claimSources);
+    assert.ok(claimAbi.some(x=>x.selector==='ClaimChild.transferOwnership'&&
+      JSON.stringify(x.inputs)===JSON.stringify(['address','bool','bool'])));
+    assert.ok(claimAbi.some(x=>x.selector==='ClaimChild.pendingOwner'&&x.operation==='call'));
+    const claimBuilt=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:claimSources[1].path,
+      targetSelector:'ClaimChild.claimOwnership',sources:claimSources,
+      declarations:claimAbi as any,skipLegacy:true});
+    assert.equal(claimBuilt.ok,true,
+      'Claimable concrete implementation must admit the source-verified role transition');
+    if(claimBuilt.ok)assert.ok(claimBuilt.experiments.some(x=>
+      x.securityProperty.includes('two-step ownership claim authorization')&&
+      x.sequence.steps.some(step=>step.operation==='send'&&
+        step.function==='claimOwnership()'&&step.sender===2)));
     // Transitive A <- B <- C must resolve a real inherited implementation
     // without admitting an unrelated same-named contract or an abstract leaf.
     const middleText='pragma solidity ^0.8.0; import "./IWallet.sol"; abstract contract WalletBase is IWallet { function withdraw(uint256 value) external virtual override {} }';
