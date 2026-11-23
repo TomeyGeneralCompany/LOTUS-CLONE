@@ -58,6 +58,38 @@ async function run(){
     assert.deepEqual(await obligationsFrom(blockers,'stable-blockers-a.json'),
       await obligationsFrom([...blockers].reverse(),'stable-blockers-b.json'),
       'Property identity must follow source revision and blocker, not insertion order');
+    // A repeated ANALYZE pass on the same acquired source is additive. It
+    // cannot discard existing independently verified EVM evidence, erase a
+    // different unmet property, or falsely certify an incomplete lead.
+    const replayLead=[candidates[1]];
+    const replayStore=await AnalysisProgressStore.open(
+      join(dir,'property-reanalysis.json'),replayLead);
+    replayStore.nextBatch(1,1);
+    const verifiedId=hash('already-executed-property');
+    const verifiedProperty='source-proven-conservation';
+    const firstBlocker='UNKNOWN_ASSERTION(missing_fixture):token not acquired';
+    replayStore.recordAssessment(replayLead[0].id,[verifiedProperty],
+      [firstBlocker],[verifiedId],[],[{
+        id:verifiedProperty,experimentIds:[verifiedId],
+        sourceWitnesses:[replayLead[0].path+':'+replayLead[0].sourceSha256]
+      }]);
+    replayStore.markExperimentCompleted(verifiedId,{
+      evidenceId:hash('real-evm-receipt-verified'),
+      verifierDigest:hash('independent-verifier-replay'),
+      result:'not_observed'
+    });
+    assert.equal(replayStore.experimentCertificate.conclusive,0);
+    replayStore.recordAssessment(replayLead[0].id,[],
+      ['UNKNOWN_ASSERTION(no_supported_property):missing second property'],[]);
+    const replayProperties=replayStore.records.get(replayLead[0].id)!.properties;
+    assert.ok(replayProperties.some(p=>p.id===verifiedProperty&&
+      p.state==='test_completed'&&p.experimentIds.includes(verifiedId)),
+      'Source-identical reanalysis must retain genuinely verified prior property');
+    assert.ok(replayProperties.some(p=>p.unresolvedPrerequisites.includes(firstBlocker)));
+    assert.ok(replayProperties.some(p=>p.unresolvedPrerequisites.some(reason=>
+      reason.includes('missing second property'))));
+    assert.equal(replayStore.experimentCertificate.conclusive,0,
+      'Retaining evidence may never hide newly discovered independent blockers');
     // Regression from the first PR-branch 88mph cloud trial. An ordinary
     // staged source experiment must NEVER remove the originally queued
     // BenqiERC20Market.claimRewards lead from the frozen source inventory.
