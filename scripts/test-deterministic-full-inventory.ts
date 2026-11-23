@@ -1418,6 +1418,54 @@ contract OverrideRates is Ownable {
     assert.ok(!notOwned.ok||!notOwned.experiments.some(x=>
       x.securityProperty.includes('owner-gated source struct override')),
       'An unacquired owner implementation is not an authorization witness');
+    // Real ERC20Wrapper-like approval is a private mapping mutation via an
+    // authenticated internal helper, with public getter readback. No parent
+    // ERC1155 contract is required for the approval's local state assertion.
+    const nestedAllowance=`pragma solidity ^0.8.0;
+contract PrivateAllowance {
+ mapping(address=>mapping(address=>uint256)) private _allowances;
+ function allowance(address owner,address spender) external view returns(uint256) {
+   return _allowances[owner][spender];
+ }
+ function approve(address spender,uint256 amount) external returns(bool) {
+   _approve(msg.sender,spender,amount);
+   return true;
+ }
+ function _approve(address owner,address spender,uint256 amount) internal {
+   require(owner != address(0));
+   require(spender != address(0));
+   _allowances[owner][spender] = amount;
+ }
+}`;
+    const nestedAllowanceSnap={path:'source-1/contracts/PrivateAllowance.sol',
+      content:nestedAllowance,sha256:hash(nestedAllowance)};
+    const nestedAllowanceMenu=[
+      {selector:'PrivateAllowance.approve',operation:'send',inputs:['address','uint256']},
+      {selector:'PrivateAllowance.allowance',operation:'call',inputs:['address','address']}
+    ];
+    const allowancePlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:nestedAllowanceSnap.path,
+      targetSelector:'PrivateAllowance.approve',sources:[nestedAllowanceSnap],
+      declarations:nestedAllowanceMenu as any,skipLegacy:true});
+    assert.equal(allowancePlan.ok,true,
+      'Exact private mapping helper and public getter must produce an executable property');
+    if(allowancePlan.ok)assert.ok(allowancePlan.experiments.some(exp=>
+      exp.securityProperty.includes('internal setter and public mapping getter')&&
+      exp.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='allowance(address,address)'&&step.expect==='7')),
+      'Private mapping mutation must be falsified by an actual getter result');
+    const wrongAllowance=nestedAllowance.replace(
+      '_allowances[owner][spender] = amount;',
+      '_allowances[spender][owner] = amount;');
+    const wrongAllowanceSnap={...nestedAllowanceSnap,content:wrongAllowance,
+      sha256:hash(wrongAllowance)};
+    const wrongAllowancePlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:wrongAllowanceSnap.path,
+      targetSelector:'PrivateAllowance.approve',sources:[wrongAllowanceSnap],
+      declarations:nestedAllowanceMenu as any,skipLegacy:true});
+    assert.ok(!wrongAllowancePlan.ok||!wrongAllowancePlan.experiments.some(exp=>
+      exp.securityProperty.includes('internal setter and public mapping getter')),
+      'Swapped helper keys cannot establish the claimed exact owner/spender relation');
     const sourcePureText=`pragma solidity ^0.8.0;
 contract PureArithmetic {
   function calc(uint256 value) external pure returns(uint256) { return (value * 3) + 2; }
