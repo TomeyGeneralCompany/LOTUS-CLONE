@@ -1,6 +1,7 @@
 'use strict';
 // Owned synthetic contracts exercise the exact runtime executor without external services.
 const assert=require('node:assert/strict');
+const {createHash}=require('node:crypto');
 const solc=require('./reproduction-runtime/node_modules/solc');
 const ganache=require('./reproduction-runtime/node_modules/ganache');
 const {validateSequence,runSequence}=require('./reproduction-runtime/solidity-sequence.cjs');
@@ -33,12 +34,18 @@ const sequence={constructorArgs:['9007199254740993','$account0'],constructorValu
 async function execute(s) {
  const transport=ganache.provider({logging:{quiet:true},wallet:{deterministic:true,totalAccounts:3},
   chain:{hardfork:'shanghai',chainId:1337,time:new Date('2020-01-01T00:00:00Z')},miner:{blockGasLimit:12000000,timestampIncrement:1}});
- try {return await runSequence(artifact,s,transport);} finally {await transport.disconnect();}
+ try {return await runSequence(artifact,s,transport,{},{
+   abiSha256:createHash('sha256').update(JSON.stringify(artifact.abi)).digest('hex'),
+   preparationAbiSha256:{}
+ });} finally {await transport.disconnect();}
 }
 (async()=>{
  validateSequence(sequence);
  const first=await execute(sequence);
  assert.ok(first.steps.every(x=>x.passed),JSON.stringify(first));
+ assert.equal(first.diagnostics.abiSha256,
+   createHash('sha256').update(JSON.stringify(artifact.abi)).digest('hex'),
+   'Compiled ABI provenance must survive independent EVM result capture');
  assert.equal(first.steps[2].reverted,true);
  assert.deepEqual(await execute(sequence),first,'Fresh deployment replay must be deterministic');
  const mismatch=structuredClone(sequence);mismatch.steps.at(-1).expect=['22',true];
