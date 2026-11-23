@@ -3265,6 +3265,129 @@ function sourceDirectAssignmentExperiments(
   return out;
 }
 
+/** General owner-equality guard over an actual state assignment. The
+ * security property is unauthorized non-mutation AND authorized write;
+ * arbitrary similarly named methods, comments, or unproven guards do not
+ * justify an authorization conclusion. */
+function sourceOwnerGuardedAssignmentExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const states=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      v.visibility==='public'&&identifier.test(v.name||'')&&
+      v.typeName?.type==='ElementaryTypeName'&&
+      /^(?:address|bool|u?int(?:[0-9]{1,3})?)$/.test(v.typeName.name||''));
+  if(states.length<2)return [];
+  const ctor=nodes.find(n=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body);
+  if(!ctor)return [];
+  const initializedBySender=new Set<string>();
+  for(const statement of ctor.body.statements||[]){
+    const expr=statement.type==='ExpressionStatement'?statement.expression:null;
+    if(expr?.type==='BinaryOperation'&&expr.operator==='='&&
+      expr.left?.type==='Identifier'&&isMsgSender(expr.right))
+      initializedBySender.add(String(expr.left.name));
+  }
+  const owners=states.filter(v=>v.typeName.name==='address'&&
+    initializedBySender.has(v.name)&&!v.expression);
+  if(!owners.length)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,sources,declarations,null);
+  if(!setup||setup.usesToken||setup.initSignature)return [];
+  const results:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+    ['external','public'].includes(n.visibility)&&
+    !['view','pure'].includes(n.stateMutability||''))){
+    if((fn.modifiers||[]).length)continue;
+    const parameters:any[]=fn.parameters||[];
+    if(!parameters.length||parameters.length>5)continue;
+    const abi=parameters.map(p=>canonicalAbiType(p.typeName));
+    if(abi.some(x=>!x)||!declarations.some(d=>
+      d.selector===contract.name+'.'+fn.name&&d.operation==='send'&&
+      JSON.stringify(d.inputs)===JSON.stringify(abi)))continue;
+    const args:SolidityArgValue[]=[],selected=new Map<string,SolidityArgValue>();
+    let supported=true;
+    for(let i=0;i<abi.length;i++){
+      const name=String(parameters[i].name||'');
+      const type=abi[i]||'';
+      if(!identifier.test(name)){supported=false;break;}
+      const value:SolidityArgValue|null=type==='address'?'$account2':
+        type==='bool'?true:
+        /^u?int(?:[0-9]{1,3})?$/.test(type)?'7':null;
+      if(value===null){supported=false;break;}
+      args.push(value);selected.set(name,value);
+    }
+    if(!supported)continue;
+    const statements:any[]=fn.body.statements||[];
+    const first=statements[0]?.type==='ExpressionStatement'?
+      statements[0].expression:null;
+    if(first?.type!=='FunctionCall'||first.expression?.type!=='Identifier'||
+      first.expression.name!=='require'||first.arguments?.length<1)continue;
+    const condition=first.arguments[0];
+    if(condition?.type!=='BinaryOperation'||condition.operator!=='==')continue;
+    const ownerRef=isMsgSender(condition.left)?condition.right:
+      isMsgSender(condition.right)?condition.left:null;
+    if(ownerRef?.type!=='Identifier'||!
+      owners.some(owner=>owner.name===ownerRef.name))continue;
+    const owner=owners.find(v=>v.name===ownerRef.name)!;
+    // A second guard or an opaque helper can invalidate the authorized path.
+    // Neither source-inferred call effects nor arbitrary aliases are accepted.
+    if(statements.slice(1).some((n:any)=>
+      n.type!=='ExpressionStatement'||n.expression?.type!=='BinaryOperation'||
+      n.expression.operator!=='='))continue;
+    const writes=statements.slice(1).filter((n:any)=>
+      n.expression?.left?.type==='Identifier'&&
+      n.expression?.right?.type==='Identifier');
+    for(const statement of writes){
+      const destination=String(statement.expression.left.name||'');
+      const sourceParam=String(statement.expression.right.name||'');
+      const state=states.find(v=>v.name===destination&&v!==owner&&
+        !v.expression&&!initializedBySender.has(v.name));
+      const parameter=parameters.find(p=>p.name===sourceParam);
+      if(!state||!parameter||!selected.has(sourceParam)||
+        canonicalAbiType(state.typeName)!==canonicalAbiType(parameter.typeName))continue;
+      if(writes.filter(n=>n.expression.left.name===destination).length!==1)continue;
+      const stateCtorWrites=(ctor.body.statements||[]).some((n:any)=>
+        n.type==='ExpressionStatement'&&n.expression?.type==='BinaryOperation'&&
+        n.expression.left?.type==='Identifier'&&
+        n.expression.left.name===destination);
+      if(stateCtorWrites)continue;
+      const expected=selected.get(sourceParam)!;
+      const baseline:SolidityArgValue=abi[parameters.indexOf(parameter)]==='bool'?false:
+        abi[parameters.indexOf(parameter)]==='address'?
+          '0x0000000000000000000000000000000000000000':'0';
+      const signature=canonicalFunctionIdentity(fn);
+      const getter=destination+'()';
+      const steps:SoliditySequence['steps']=[
+        {operation:'call',function:owner.name+'()',args:[],expect:'$account0'},
+        {operation:'call',function:getter,args:[],expect:baseline},
+        {operation:'send',function:signature,args,sender:1,expectRevert:true},
+        {operation:'call',function:getter,args:[],expect:baseline},
+        {operation:'send',function:signature,args,sender:0},
+        {operation:'call',function:getter,args:[],expect:expected},
+      ];
+      results.push({
+        hypothesis:'Source-owned msg.sender equality rejects nonowner storage mutation and admits the owner exact state assignment',
+        property:'source-proof generic owner guard '+contract.name+'.'+signature+':'+destination,
+        sequence:{constructorArgs:setup.constructorArgs,
+          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+          steps},
+        witnesses:[witness(snapshot,ctor,contract.name+'.constructor'),
+          witness(snapshot,owner,contract.name+'.'+owner.name),
+          witness(snapshot,fn,contract.name+'.'+signature),
+          witness(snapshot,statement,contract.name+'.'+signature+'.assignment'),
+          witness(snapshot,state,contract.name+'.'+destination)],
+      });
+    }
+  }
+  return results;
+}
+
 /** Prove a cross-function mapping write from an acquired exact internal helper
  * and its independently declared public getter. This is a small source-level
  * def/use proof, NOT a heuristic inference from function or variable names.
@@ -3983,6 +4106,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     target,contract,method,input.declarations,indexed))choices.push(internalMapping);
   for(const assignment of sourceDirectAssignmentExperiments(target,contract,method,
     input.declarations,indexed))choices.push(assignment);
+  for(const guardedWrite of sourceOwnerGuardedAssignmentExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(guardedWrite);
   for(const internal of sourceInternalScalarSetterExperiments(target,contract,method,
     input.declarations,indexed))choices.push(internal);
   for(const struct of sourceStructOverrideExperiments(target,contract,method,
