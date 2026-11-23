@@ -36,7 +36,7 @@ function validateSequence(s) {
   if(s.preparation!==undefined) {
     const p=s.preparation;
     object(p,['deployments','operations','checks']);
-    if(!Array.isArray(p.deployments)||p.deployments.length>8 ||
+    if(!Array.isArray(p.deployments)||p.deployments.length>16 ||
        !Array.isArray(p.operations)||p.operations.length>24 ||
        !Array.isArray(p.checks)||p.checks.length>16)
       throw new Error('Invalid preparation bounds');
