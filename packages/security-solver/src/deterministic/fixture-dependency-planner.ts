@@ -498,34 +498,67 @@ export function resolveAcquiredInterfaceCallers(
 }
 
 /** Canonical callable identity, derived from acquired Solidity declarations. */
-function callableType(type:any):string|null {
+/** Canonical Solidity ABI from authenticated source declarations. Contract,
+ * struct, enum and value types are distinct; unresolvable names fail closed.
+ * The isolated compiler and EVM must still verify the deployed ABI and receipt. */
+function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntry[],depth=0):string|null {
+  if(depth>8)return null;
   if(type?.type==="ArrayTypeName"){
-    const item=callableType(type.baseTypeName);
+    const item=callableType(type.baseTypeName,owner,entries,depth+1);
     if(!item)return null;
-    if(type.length && (type.length.type!=="NumberLiteral"||
+    if(type.length&&(type.length.type!=="NumberLiteral"||
       !/^(?:0|[1-9][0-9]*)$/.test(String(type.length.number))))return null;
-    return item+"["+(type.length?type.length.number:"")+"]";
+    return item+"["+(type.length?String(type.length.number):"")+"]";
   }
-  if(type?.type==="UserDefinedTypeName")return "address";
+  if(type?.type==="UserDefinedTypeName"){
+    const namePath=String(type.namePath||"");
+    const parts=namePath.split("."),name=parts.pop()||"";
+    if(!/^[A-Za-z_]\w*$/.test(name))return null;
+    const local=(owner.node.subNodes||[]).filter((n:any)=>n.name===name&&
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type));
+    const nested=entries.filter(e=>e.source.path===owner.source.path&&
+      (parts.length===0||parts.join(".")===e.node.name))
+      .flatMap(e=>(e.node.subNodes||[]).filter((n:any)=>n.name===name&&
+        ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type)));
+    const defs=local.length?local:nested;
+    if(defs.length!==0){
+      if(defs.length!==1)return null;
+      const def=defs[0];
+      if(def.type==="StructDefinition"){
+        const fields=(def.members||[]).map((m:any)=>
+          callableType(m.typeName,owner,entries,depth+1));
+        return fields.length&&fields.every((t:any)=>t!==null)?
+          "("+fields.join(",")+")":null;
+      }
+      if(def.type==="EnumDefinition")return (def.members||[]).length<=256?"uint8":null;
+      return callableType(def.underlyingType||def.typeName,owner,entries,depth+1);
+    }
+    const contractDefs=entries.filter(e=>e.node.name===name&&
+      (e.source.path===owner.source.path||
+       (owner.node.baseContracts||[]).some((base:any)=>
+         String(base.baseName?.namePath||"").split(".").pop()===name)));
+    return contractDefs.length===1?"address":null;
+  }
   if(type?.type!=="ElementaryTypeName")return null;
   const t=String(type.name||"");
-  const canonical=t==="uint"?"uint256":t==="int"?"int256":t==="address payable"?"address":t;
+  const canonical=t==="uint"?"uint256":t==="int"?"int256":
+    t==="address payable"?"address":t;
   return /^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(canonical)?
     canonical:null;
 }
-function callableTypes(parameters:readonly any[]):string[]|null {
-  const types=parameters.map(p=>callableType(p.typeName));
+function callableTypes(parameters:readonly any[],owner:ContractEntry,
+  entries:readonly ContractEntry[]):string[]|null {
+  const types=parameters.map(p=>callableType(p.typeName,owner,entries));
   return types.some(x=>x===null)?null:types as string[];
 }
-/** Compiler-generated public getter signature for scalar, mapping and array
- * state. The source type, not a symbol-name guess, determines its ABI. */
-function publicGetter(variable:any):{identity:string;returns:string[]}|null {
+function publicGetter(variable:any,owner:ContractEntry,
+  entries:readonly ContractEntry[]):{identity:string;returns:string[]}|null {
   if(variable.visibility!=="public"||!variable.name)return null;
   let type=variable.typeName;
   const inputs:string[]=[];
   while(type?.type==="Mapping"||type?.type==="ArrayTypeName"){
     if(type.type==="Mapping"){
-      const key=callableType(type.keyType);
+      const key=callableType(type.keyType,owner,entries);
       if(!key)return null;
       inputs.push(key);
       type=type.valueType;
@@ -534,15 +567,15 @@ function publicGetter(variable:any):{identity:string;returns:string[]}|null {
       type=type.baseTypeName;
     }
   }
-  const output=callableType(type);
+  const output=callableType(type,owner,entries);
   return output?{identity:variable.name+"("+inputs.join(",")+")",returns:[output]}:null;
 }
-function callableIdentity(fn:any):string|null {
-  const types=callableTypes(fn.parameters||[]);
+function callableIdentity(fn:any,owner:ContractEntry,entries:readonly ContractEntry[]):string|null {
+  const types=callableTypes(fn.parameters||[],owner,entries);
   return types===null?null:String(fn.name||"")+"("+types.join(",")+")";
 }
-function callableReturns(fn:any):string[]|null {
-  return callableTypes(fn.returnParameters||[]);
+function callableReturns(fn:any,owner:ContractEntry,entries:readonly ContractEntry[]):string[]|null {
+  return callableTypes(fn.returnParameters||[],owner,entries);
 }
 /** A receiver can be substituted only if the actual deployed acquired contract
  * supplies every source-declared interface call, including its return ABI.
@@ -606,16 +639,16 @@ export function verifyAcquiredReceiverMethods(
   for(const entry of chain){
     for(const fn of (entry.node.subNodes||[]).filter((n:any)=>
       n.type==="FunctionDefinition"&&!n.isConstructor&&n.name)){
-      const identity=callableIdentity(fn);
+      const identity=callableIdentity(fn,entry,entries);
       if(!identity)continue;
       if(["public","external"].includes(fn.visibility))inheritedDeclarations.add(identity);
       if(fn.body&&["public","external"].includes(fn.visibility))
-        implemented.set(identity,{returns:callableReturns(fn)});
+        implemented.set(identity,{returns:callableReturns(fn,entry,entries)});
       else if(!fn.body)implemented.delete(identity);
     }
     for(const v of (entry.node.subNodes||[]).filter((n:any)=>
       n.type==="StateVariableDeclaration").flatMap((n:any)=>n.variables||[])){
-      const getter=publicGetter(v);
+      const getter=publicGetter(v,entry,entries);
       if(getter)implemented.set(getter.identity,{returns:getter.returns});
     }
   }
@@ -630,8 +663,10 @@ export function verifyAcquiredReceiverMethods(
     // If no interface ABI is acquired, the receiver cannot be authenticated.
     if(!required.length){missing.push(method+":interface_abi_not_acquired");continue;}
     for(const fn of required){
-      const identity=callableIdentity(fn);
-      const expected=callableReturns(fn);
+      const origin=declared.find(e=>(e.node.subNodes||[]).includes(fn));
+      if(!origin){missing.push(method+":declaring_contract_missing");continue;}
+      const identity=callableIdentity(fn,origin,entries);
+      const expected=callableReturns(fn,origin,entries);
       const actual=identity?implemented.get(identity):undefined;
       if(!identity||expected===null||!actual||actual.returns===null||
         JSON.stringify(actual.returns)!==JSON.stringify(expected))
