@@ -49,26 +49,75 @@ function descendants(node:any):any[]{
     out.push(v);for(const [k,value] of Object.entries(v))if(k!=="loc"&&k!=="range")walk(value);};
   walk(node);return out;
 }
+/** Resolve a UDT declaration only through an actual local declaration or
+ * acquired relative import. Prevent a same-named type in an unrelated file
+ * from masquerading as a constructor value. */
+function acquiredValueDeclaration(type:any,owner:any,source?:SourceSnapshot,
+  acquired:readonly SourceSnapshot[]=[]):
+  {node:any;owner:any;source?:SourceSnapshot}|null {
+  if(type?.type!=="UserDefinedTypeName")return null;
+  const qualified=String(type.namePath||"").split(".");
+  const name=qualified.pop()||"";
+  if(!/^[A-Za-z_]\w*$/.test(name))return null;
+  const kinds=new Set(["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"]);
+  const local=(owner.subNodes||[]).filter((node:any)=>
+    node.name===name&&kinds.has(node.type));
+  if(local.length===1&&(qualified.length===0||qualified.join(".")===owner.name))
+    return {node:local[0],owner,source};
+  if(local.length!==0)return null;
+  if(!source)return null;
+  const byPath=new Map(acquired.map(s=>[s.path,s]));
+  byPath.set(source.path,source);
+  const candidates:Array<{node:any;owner:any;source:SourceSnapshot}>=[];
+  const paths=new Set<string>(),pending=[source.path];
+  while(pending.length&&paths.size<256){
+    const path=pending.shift()!;
+    if(paths.has(path))continue;
+    paths.add(path);
+    const src=byPath.get(path);
+    if(!src)continue;
+    for(const top of (astOf(src)?.children||[])){
+      if(top.type==="ContractDefinition"&&
+        (qualified.length===0||qualified.join(".")===top.name))
+        for(const inner of top.subNodes||[])
+          if(inner.name===name&&kinds.has(inner.type))
+            candidates.push({node:inner,owner:top,source:src});
+      else if(qualified.length===0&&top.name===name&&kinds.has(top.type))
+        candidates.push({node:top,owner:top,source:src});
+    }
+    for(const imp of (astOf(src)?.children||[]).filter((x:any)=>
+      x.type==="ImportDirective"&&typeof x.path==="string")){
+      const next=imp.path.startsWith(".")?
+        posix.normalize(posix.join(posix.dirname(path),imp.path)):imp.path;
+      if(byPath.has(next)&&!paths.has(next))pending.push(next);
+    }
+  }
+  // An unqualified local type takes precedence. Imported ambiguities do not.
+  const exact=candidates.filter(c=>qualified.length!==0?
+    c.owner.name===qualified.join("."):true);
+  return exact.length===1?exact[0]:null;
+}
 /** Construct ABI-typed zero/one fixture values only for known elementary
  * and bounded one-dimensional array types. Solidity constructor/initializer
  * reverts remain real executor failures, never presumed successes. */
-function primitiveFixtureArg(type:any,nonzero=false,contract?:any):PreparedArg|null {
+function primitiveFixtureArg(type:any,nonzero=false,contract?:any,source?:SourceSnapshot,
+  acquired:readonly SourceSnapshot[]=[],depth=0):PreparedArg|null {
+  if(depth>8)return null;
   if(type?.type==="UserDefinedTypeName"&&contract){
-    const name=String(type.namePath||"").split(".").pop();
-    const declarations=(contract.subNodes||[]).filter((n:any)=>
-      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type)&&n.name===name);
-    if(declarations.length!==1)return null;
-    const declaration=declarations[0];
+    const found=acquiredValueDeclaration(type,contract,source,acquired);
+    if(!found)return null;
+    const declaration=found.node;
     if(declaration.type==="EnumDefinition")return (declaration.members||[]).length>0?"0":null;
     if(declaration.type==="UserDefinedValueTypeDefinition")
-      return primitiveFixtureArg(declaration.underlyingType||declaration.typeName,nonzero,contract);
+      return primitiveFixtureArg(declaration.underlyingType||declaration.typeName,
+        nonzero,found.owner,found.source,acquired,depth+1);
     const parts=(declaration.members||[]).map((field:any)=>
-      primitiveFixtureArg(field.typeName,nonzero,contract));
+      primitiveFixtureArg(field.typeName,nonzero,found.owner,found.source,acquired,depth+1));
     if(parts.some((part:any)=>part===null))return null;
     return parts as PreparedArg;
   }
   if(type?.type==="ArrayTypeName"){
-    const base=primitiveFixtureArg(type.baseTypeName,nonzero,contract);
+    const base=primitiveFixtureArg(type.baseTypeName,nonzero,contract,source,acquired,depth+1);
     if(typeof base!=="string")return null;
     if(!type.length)return [];
     const len=type.length?.type==="NumberLiteral"?Number(type.length.number):NaN;
@@ -89,8 +138,9 @@ function primitiveFixtureArg(type:any,nonzero=false,contract?:any):PreparedArg|n
 /** Derive a scalar fixture value from literal require() bounds in the exact
  * acquired constructor/initializer AST. Unknown or relational conditions are
  * still checked by the executor; this never certifies a deployment receipt. */
-function constrainedFixtureArg(type:any,parameter:string,fn:any,nonzero:boolean,contract:any):PreparedArg|null {
-  const fallback=primitiveFixtureArg(type,nonzero,contract);
+function constrainedFixtureArg(type:any,parameter:string,fn:any,nonzero:boolean,contract:any,
+  source?:SourceSnapshot,acquired:readonly SourceSnapshot[]=[]):PreparedArg|null {
+  const fallback=primitiveFixtureArg(type,nonzero,contract,source,acquired);
   if(type?.type!=="ElementaryTypeName"||!parameter||!fn?.body)return fallback;
   const match=String(type.name||"").match(/^(u?int)([0-9]{0,3})$/);
   if(!match)return fallback;
@@ -1001,7 +1051,7 @@ export function resolveSourceFixtureDependencies(
         if(!dep){valid=false;break;}args.push("$deployment:"+dep);
       }else{
         const literal=typeClass==="unknown"?null:
-          constrainedFixtureArg(p.typeName,String(p.name||""),ctorOf(selected.node),false,selected.node);
+          constrainedFixtureArg(p.typeName,String(p.name||""),ctorOf(selected.node),false,selected.node,selected.source,sources);
         if(literal===null){
           missing.push(key+":unsupported_constructor_type:"+(argType||p.typeName?.type||"unknown"));
           valid=false;break;
@@ -1030,7 +1080,7 @@ export function resolveSourceFixtureDependencies(
           if(!dep){missing.push(key+":initializer_dependency:"+name);break;}
           initArgs.push("$deployment:"+dep);
         }else{
-          const literal=constrainedFixtureArg(p.typeName,name,initializer,true,selected.node);
+          const literal=constrainedFixtureArg(p.typeName,name,initializer,true,selected.node,selected.source,sources);
           if(literal===null){
             missing.push(key+":unsupported_initializer_parameter:"+name+":"+
               (argType||p.typeName?.type||"unknown"));break;
