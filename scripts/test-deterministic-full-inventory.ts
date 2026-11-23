@@ -1454,13 +1454,13 @@ contract DirectScalar {
       'total = total + amount;', 'total = other + amount;');
     const unrelatedScalarSource={...directScalarSource,
       content:unrelatedScalarText,sha256:hash(unrelatedScalarText)};
-    const unrelatedScalar=constructSolidityExperiments({
+    const unrelatedScalarBaseline=constructSolidityExperiments({
       repositoryCommit:'b'.repeat(40),targetPath:unrelatedScalarSource.path,
       targetSelector:'DirectScalar.addValue',sources:[unrelatedScalarSource],
       declarations:[{selector:'DirectScalar.addValue',operation:'send',inputs:['uint256'],
         outputs:[],stateMutability:'nonpayable'}] as any,skipLegacy:true
     });
-    assert.ok(!unrelatedScalar.ok||!unrelatedScalar.experiments.some(x=>
+    assert.ok(!unrelatedScalarBaseline.ok||!unrelatedScalarBaseline.experiments.some(x=>
       x.sequence.sourceProperty?.kind==='scalar_delta'),
       'Unrelated RHS storage cannot prove an exact scalar delta');
     // State relationships must be derived from exact mapping keys, not from
