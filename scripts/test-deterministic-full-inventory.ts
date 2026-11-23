@@ -411,6 +411,36 @@ contract ValueBindings {
       assert.deepEqual(valueFixture.bindings,[]);
       assert.deepEqual(valueFixture.substitutions,{});
     }
+    // Solidity literal bounds can refer to source-declared immutable compile
+    // constants, including exponentiation and time units.
+    const constantBoundedIface='pragma solidity ^0.8.0; interface IConstrained { function ready() external; }';
+    const constantBoundedImpl=`pragma solidity ^0.8.0;
+import "./IConstrained.sol";
+contract ConstantBounded is IConstrained {
+  uint256 internal constant MINIMUM = 10 ** 9;
+  constructor(uint256 amount) { require(amount > MINIMUM); }
+  function ready() external override {}
+}`;
+    const constantBoundedCaller=`pragma solidity ^0.8.0;
+import "./IConstrained.sol";
+contract ConstantBoundedCaller {
+  IConstrained public implementation;
+  function initialize(address chosen) external { implementation = IConstrained(chosen); }
+  function callReady() external { implementation.ready(); }
+}`;
+    const constSources=[
+      {path:'source-1/contracts/IConstrained.sol',content:constantBoundedIface,sha256:hash(constantBoundedIface)},
+      {path:'source-1/contracts/ConstantBounded.sol',content:constantBoundedImpl,sha256:hash(constantBoundedImpl)},
+      {path:'source-1/contracts/ConstantBoundedCaller.sol',content:constantBoundedCaller,sha256:hash(constantBoundedCaller)}
+    ];
+    const sourceConstrained=resolveSourceFixtureDependencies(constSources[2],
+      'ConstantBoundedCaller',constSources);
+    assert.equal(sourceConstrained.status,'resolved',
+      'Source-defined MINIMUM must produce a bounded constructor fixture');
+    if(sourceConstrained.status==='resolved'){
+      assert.deepEqual(sourceConstrained.deployments.find(x=>x.contract==='ConstantBounded')?.constructorArgs,
+        ['1000000001'],'10**9 constant precondition must be evaluated precisely');
+    }
     // A Solidity user-defined type may be a struct or enum, not an address.
     // Exact imported ABI identities are required for concrete receivers.
     const shapeTypes=`pragma solidity ^0.8.0;
