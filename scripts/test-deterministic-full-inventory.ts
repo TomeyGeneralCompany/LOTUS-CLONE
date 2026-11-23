@@ -856,6 +856,26 @@ contract GuardedNFT is ERC721URIStorageUpgradeable, OwnableUpgradeable {
     assert.ok(!unlinkedNftBurn.ok||!unlinkedNftBurn.experiments.some(x=>
       x.securityProperty.includes('owner-gated burn')),
       'An unacquired ownership import cannot be treated as verified inherited ABI');
+    // A source-proven scalar transition may be expressed by assignment rather
+    // than +=. That is still a falsifiable getter-backed property.
+    const directScalarText=`pragma solidity ^0.8.0;
+contract DirectScalar {
+  uint256 public total;
+  function addValue(uint256 amount) external { total = total + amount; }
+}`;
+    const directScalarSource={path:'source-1/contracts/DirectScalar.sol',
+      content:directScalarText,sha256:hash(directScalarText)};
+    const directScalar=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:directScalarSource.path,
+      targetSelector:'DirectScalar.addValue',sources:[directScalarSource],
+      declarations:[{selector:'DirectScalar.addValue',operation:'send',inputs:['uint256'],
+        outputs:[],stateMutability:'nonpayable'}] as any,skipLegacy:true
+    });
+    assert.equal(directScalar.ok,true,
+      'Exact same-lvalue scalar assignment must construct a source-bound experiment');
+    if(directScalar.ok)assert.ok(directScalar.experiments.some(x=>
+      x.sequence.sourceProperty?.kind==='scalar_delta'),
+      'Scalar assignment property must retain executable source-property metadata');
     const ledgerText=`pragma solidity ^0.8.0;
 contract Ledger {
   uint256 public total;
