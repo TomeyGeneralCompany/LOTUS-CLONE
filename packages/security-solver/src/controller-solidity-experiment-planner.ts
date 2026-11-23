@@ -3463,11 +3463,23 @@ function sourceFactoryCloneExperiment(
  * nodes even when the sequence contained deployments and initialization. The
  * executor remains authoritative for actual receipts and ABI compatibility. */
 export function sourcePreparationGraph(
-  sequence:SoliditySequence,sources:ReadonlyMap<string,SourceSnapshot>
+  sequence:SoliditySequence,sources:ReadonlyMap<string,SourceSnapshot>,
+  target?:SourceSnapshot,contract?:any
 ):{ok:true;nodes:PreparationPrerequisite[]}|{ok:false;code:string;detail:string}{
   const preparation=sequence.preparation;
-  if(!preparation)return {ok:true,nodes:[]};
   const nodes:PreparationPrerequisite[]=[];
+  const appendTarget=():void=>{
+    if(!target||!contract)return;
+    // The target cannot exist before every declared prerequisite deployment,
+    // initialization and state readback has completed in the isolated EVM.
+    // Unlike orderPreparation([]), this records the real target construction.
+    nodes.push({id:'target:deploy',kind:'deploy',
+      dependsOn:nodes.map(step=>step.id),
+      sourceEvidence:[witness(target,contract,contract.name+'.constructor')],
+      parameters:{file:target.path,contract:contract.name,
+        constructorArgs:sequence.constructorArgs}});
+  };
+  if(!preparation){appendTarget();return {ok:true,nodes};}
   const deployments=new Map<string,{source:SourceSnapshot;node:any;position:number}>();
   const dependencies=(value:unknown):string[]=>{
     if(Array.isArray(value))return value.flatMap(dependencies);
@@ -3534,6 +3546,7 @@ export function sourcePreparationGraph(
       parameters:{deploymentId:check.deploymentId,signature:check.function,
         args:check.args,expect:check.expect}});
   }
+  appendTarget();
   return {ok:true,nodes};
 }
 
@@ -3696,7 +3709,7 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   const seen=new Set<string>(),out:PreparedSecurityExperiment[]=[];
   for(const original of choices) {
     const c=sourceFactoryCloneExperiment(original,target,contract,indexed);
-    const planned=sourcePreparationGraph(c.sequence,indexed);
+    const planned=sourcePreparationGraph(c.sequence,indexed,target,contract);
     if(!planned.ok)return {ok:false,code:planned.code,detail:planned.detail};
     const graph=orderPreparation(planned.nodes);
     if(!graph.ok)return {ok:false,code:graph.code,detail:graph.detail};
