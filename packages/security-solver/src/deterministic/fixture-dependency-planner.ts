@@ -56,9 +56,13 @@ function primitiveFixtureArg(type:any,nonzero=false,contract?:any):PreparedArg|n
   if(type?.type==="UserDefinedTypeName"&&contract){
     const name=String(type.namePath||"").split(".").pop();
     const declarations=(contract.subNodes||[]).filter((n:any)=>
-      n.type==="StructDefinition"&&n.name===name);
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type)&&n.name===name);
     if(declarations.length!==1)return null;
-    const parts=(declarations[0].members||[]).map((field:any)=>
+    const declaration=declarations[0];
+    if(declaration.type==="EnumDefinition")return (declaration.members||[]).length>0?"0":null;
+    if(declaration.type==="UserDefinedValueTypeDefinition")
+      return primitiveFixtureArg(declaration.underlyingType||declaration.typeName,nonzero,contract);
+    const parts=(declaration.members||[]).map((field:any)=>
       primitiveFixtureArg(field.typeName,nonzero,contract));
     if(parts.some((part:any)=>part===null))return null;
     return parts as PreparedArg;
@@ -191,13 +195,17 @@ function fixtureAbiType(type:any,contract:any,depth=0):string|null {
   }
   if(type?.type==="UserDefinedTypeName"){
     const name=String(type.namePath||"").split(".").pop();
-    const structs=(contract.subNodes||[]).filter((n:any)=>
-      n.type==="StructDefinition"&&n.name===name);
-    if(structs.length===0)return "address";
-    if(structs.length!==1)return null;
-    const fields=(structs[0].members||[]).map((field:any)=>
+    const values=(contract.subNodes||[]).filter((n:any)=>
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type)&&n.name===name);
+    if(values.length>1)return null;
+    if(values.length===0)return "address";
+    const definition=values[0];
+    if(definition.type==="EnumDefinition")return (definition.members||[]).length<=256?"uint8":null;
+    if(definition.type==="UserDefinedValueTypeDefinition")
+      return fixtureAbiType(definition.underlyingType||definition.typeName,contract,depth+1);
+    const fields=(definition.members||[]).map((field:any)=>
       fixtureAbiType(field.typeName,contract,depth+1));
-    return fields.every((f:any)=>typeof f==="string"&&f.length)?
+    return fields.length>0&&fields.every((f:any)=>typeof f==="string"&&f.length)?
       "("+fields.join(",")+")":null;
   }
   if(type?.type!=="ElementaryTypeName")return null;
