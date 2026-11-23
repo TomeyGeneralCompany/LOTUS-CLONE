@@ -371,6 +371,27 @@ async function run(){
     const rejected=sourcePreparationGraph(badPrep,prepSources);
     assert.equal(rejected.ok,false,
       'A constructor cannot reference a deployment scheduled later');
+    // A well-formed Solidity sequence can still carry a deployment placeholder
+    // as an argument. It must resolve to an acquired prior deployment.
+    const missingConstructorRef=JSON.parse(JSON.stringify(prepSequence));
+    missingConstructorRef.constructorArgs=['$deployment:not-acquired'];
+    const rejectedTarget=sourcePreparationGraph(missingConstructorRef,prepSources);
+    assert.equal(rejectedTarget.ok,false,
+      'Target constructor placeholders cannot reference absent source deployments');
+    const missingStepRef=JSON.parse(JSON.stringify(prepSequence));
+    missingStepRef.steps[0].args=['$deployment:unknown-source'];
+    assert.equal(sourcePreparationGraph(missingStepRef,prepSources).ok,false,
+      'A readback must not resolve a deployment that was never constructed');
+    const goodTargetRef=JSON.parse(JSON.stringify(prepSequence));
+    goodTargetRef.constructorArgs=['$deployment:token'];
+    const validatedTarget=sourcePreparationGraph(goodTargetRef,prepSources,
+      fixtureSources[0],{name:'Vault',loc:{start:{line:1},end:{line:1}}});
+    assert.equal(validatedTarget.ok,true,'Source-backed target dependency must be admissible');
+    if(validatedTarget.ok){
+      assert.ok(validatedTarget.nodes.some(n=>n.id==='target:deploy'&&
+        n.dependsOn.includes('deploy:token')),
+        'Target deploy must explicitly depend on acquired constructor fixture');
+    }
     // Initializer-only dependencies can be discovered after the consumer was
     // registered. Execution must deploy the producer before the consumer.
     const initializedAdapter='pragma solidity ^0.8.0; contract Adapter is IAdapter { Token public token; function initialize(address _token) external { token = Token(_token); } }';
