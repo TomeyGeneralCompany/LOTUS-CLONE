@@ -255,11 +255,41 @@ export class AnalysisProgressStore {
     }
     if(!properties.length)properties.push({id:id+":needs_property",state:"prerequisites_pending",
       sourceWitnesses:[],unresolvedPrerequisites:["source_grounded_falsifier_missing"],experimentIds:[]});
-    record.properties=properties;
+    // A repeated analysis of the identical immutable source must not erase
+    // earlier independently verified properties, EVM transcripts or unrelated
+    // outstanding obligations. New discovery is additive; source/identity
+    // changes are rejected by the checkpoint inventory fingerprint.
+    const prior=new Map(record.properties.map(p=>[p.id,p]));
+    const merged=new Map<string,CandidatePropertyProgress>();
+    for(const p of record.properties)merged.set(p.id,{...p,
+      sourceWitnesses:[...p.sourceWitnesses],
+      unresolvedPrerequisites:[...p.unresolvedPrerequisites],
+      experimentIds:[...p.experimentIds]});
+    for(const p of properties){
+      const previous=prior.get(p.id);
+      if(!previous){merged.set(p.id,p);continue;}
+      const unresolved=[...new Set([
+        ...previous.unresolvedPrerequisites,...p.unresolvedPrerequisites])];
+      const experimentIds=[...new Set([...previous.experimentIds,...p.experimentIds])];
+      const witnesses=[...new Set([...previous.sourceWitnesses,...p.sourceWitnesses])];
+      const verified=experimentIds.length>0&&
+        experimentIds.every(exp=>this.hasValidEvidence(record,exp))&&
+        this.hasValidWitnesses(record,witnesses);
+      merged.set(p.id,{...previous,
+        unresolvedPrerequisites:unresolved,experimentIds,
+        sourceWitnesses:witnesses,
+        state:unresolved.length?"prerequisites_pending":
+          verified?"test_completed":
+          experimentIds.length?"test_constructed":"prerequisites_pending"});
+    }
+    record.properties=[...merged.values()];
     record.experimentIds=[...new Set([...record.experimentIds,...uniqueExperiments])];
-    record.specialistAttempts=specialistAttempts.map(x=>({...x}));
-    record.lifecycle=(unresolved.length||!uniqueExperiments.length)?"dependencies_pending":
-      "experiment_pending";
+    record.specialistAttempts=[...new Map([
+      ...(record.specialistAttempts||[]),...specialistAttempts]
+      .map(x=>[x.adapter+":"+x.status+":"+x.reason,{...x}])).values()];
+    record.lifecycle=this.isConclusive(record)?"experiment_completed":
+      record.properties.some(p=>p.state==="prerequisites_pending")?"dependencies_pending":
+      record.experimentIds.length?"experiment_pending":"dependencies_pending";
   }
   markTerminalAssessment(id:string,reason?:string){
     const record=this.records.get(id);
