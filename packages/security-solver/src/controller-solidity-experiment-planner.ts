@@ -3052,6 +3052,104 @@ function sourceMappingDeltaExperiments(
   return out;
 }
 
+/** Generalized externally observable source-state assignment. Exact AST
+ * lvalue=parameter identity provides an independent postcondition; the
+ * pre-state is observed, not assumed to be zero. This deliberately excludes
+ * guarded branches, modifiers and unproven external effects. */
+function sourceDirectAssignmentExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const stateVariables=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      v.visibility==='public'&&identifier.test(v.name||'')&&
+      v.typeName?.type==='ElementaryTypeName'&&
+      /^(?:bool|address|u?int(?:[0-9]{1,3})?)$/.test(v.typeName.name||''));
+  if(!stateVariables.length)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,
+    sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+    ['public','external'].includes(n.visibility)&&
+    !['view','pure'].includes(n.stateMutability||''))){
+    if((fn.modifiers||[]).length)continue;
+    const args:SolidityArgValue[]=[];
+    const inputs:string[]=[];
+    const selected=new Map<string,SolidityArgValue>();
+    const parameters:any[]=fn.parameters||[];
+    if(!parameters.length||parameters.length>5)continue;
+    let valid=true;
+    for(const param of parameters){
+      const type=canonicalAbiType(param.typeName);
+      const name=String(param.name||'');
+      if(!type||!identifier.test(name)){valid=false;break;}
+      let value:SolidityArgValue|null;
+      if(type==='bool')value=true;
+      else if(type==='address')value='$account2';
+      else if(/^u?int(?:[0-9]{1,3})?$/.test(type))value='7';
+      else value=null;
+      if(value===null){valid=false;break;}
+      inputs.push(type);args.push(value);selected.set(name,value);
+    }
+    if(!valid||!declarations.some(d=>d.selector===contract.name+'.'+method&&
+      d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
+    const statements:any[]=fn.body.statements||[];
+    // Only a top-level direct assignment is considered unconditional. A
+    // branch-sensitive store or helper call requires deeper symbolic analysis.
+    const writes=statements.filter((n:any)=>n.type==='ExpressionStatement'&&
+      n.expression?.type==='BinaryOperation'&&n.expression.operator==='='&&
+      n.expression.left?.type==='Identifier'&&n.expression.right?.type==='Identifier');
+    for(const stmt of writes){
+      const lhs=String(stmt.expression.left.name||'');
+      const rhs=String(stmt.expression.right.name||'');
+      if(!selected.has(rhs))continue;
+      const state=stateVariables.find((v:any)=>v.name===lhs);
+      if(!state)continue;
+      const stateType=canonicalAbiType(state.typeName);
+      const param=parameters.find((p:any)=>p.name===rhs);
+      if(!param||stateType!==canonicalAbiType(param.typeName))continue;
+      // A later write to the same state invalidates this exact postcondition.
+      const position=statements.indexOf(stmt);
+      const remaining=statements.slice(position+1);
+      const overwritten=remaining.some((n:any)=>
+        n.type==='ExpressionStatement'&&n.expression?.type==='BinaryOperation'&&
+        n.expression.left?.type==='Identifier'&&n.expression.left.name===lhs);
+      if(overwritten)continue;
+      const text=body(snapshot.content,fn);
+      if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(text))continue;
+      const signature=canonicalFunctionIdentity(fn);
+      const getter=lhs+'()';
+      const expected=selected.get(rhs)!;
+      const steps:SoliditySequence['steps']=[];
+      if(setup.initSignature)steps.push({
+        operation:'send',function:setup.initSignature,
+        args:setup.initArgs,sender:0,requiredSetup:true});
+      steps.push({operation:'observe',function:getter,args:[]});
+      steps.push({operation:'send',function:signature,args,sender:0});
+      steps.push({operation:'call',function:getter,args:[],expect:expected});
+      out.push({
+        hypothesis:'Acquired direct assignment '+lhs+' = '+rhs+
+          ' must produce the exact public getter value after a successful call',
+        property:'source-defined direct state assignment '+contract.name+'.'+
+          signature+':'+lhs,
+        sequence:{constructorArgs:setup.constructorArgs,
+          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+          steps},
+        witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
+          witness(snapshot,stmt,contract.name+'.'+signature+'.assignment'),
+          witness(snapshot,state,contract.name+'.'+lhs)],
+      });
+    }
+  }
+  return out;
+}
+
 /** Deterministic source-expression oracle for directly executable pure entrypoints.
  * The output is derived only from an acquired expression AST and concrete ABI
  * arguments; arbitrary helper calls, external dependencies, unknown symbols
@@ -3407,6 +3505,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     input.declarations,indexed))choices.push(mapping);
   for(const scalarPure of sourcePureExpressionExperiment(target,contract,method,
     input.declarations,indexed))choices.push(scalarPure);
+  for(const assignment of sourceDirectAssignmentExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(assignment);
   const vestingCreation=groundedVestingCreationExperiment(target,contract,method,input.declarations);
   if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
