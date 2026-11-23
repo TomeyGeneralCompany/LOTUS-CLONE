@@ -288,6 +288,45 @@ const standardInheritedAbi:Readonly<Record<string,Readonly<Record<string,readonl
     'getApproved(uint256)':['address'],'isApprovedForAll(address,address)':['bool'],
     'transferFrom(address,address,uint256)':[]},
 };
+/** ABI entries from EXACT acquired source declarations. The caller must first
+ * establish a real inheritance/import path before adding these methods to
+ * the compiled subclass menu; this never fabricates an inherited function. */
+export interface AcquiredInheritedAbiEntry {
+  selector:string;operation:"call"|"send";inputs:string[];outputs:string[];
+  sourceSha256:string;sourceFile:string;
+}
+export function enumerateAcquiredInheritedAbi(
+  source:SourceSnapshot,contractName:string,derivedContract:string,
+  allSources:readonly SourceSnapshot[]
+):AcquiredInheritedAbiEntry[]{
+  const root=(astOf(source)?.children||[]).find((n:any)=>
+    n.type==="ContractDefinition"&&n.name===contractName);
+  if(!root||!/^[A-Za-z_]\w*$/.test(derivedContract))return [];
+  const entries:ContractEntry[]=allSources.flatMap(s=>
+    (astOf(s)?.children||[]).filter((node:any)=>
+      node.type==="ContractDefinition").map((node:any)=>({source:s,node})));
+  const context={source,node:root};
+  const output:AcquiredInheritedAbiEntry[]=[];
+  for(const declaration of root.subNodes||[]){
+    if(declaration.type==="FunctionDefinition"&&declaration.name&&
+      ["public","external"].includes(declaration.visibility)){
+      const inputs=callableTypes(declaration.parameters||[],context,entries);
+      const returns=callableReturns(declaration,context,entries);
+      if(inputs===null||returns===null)continue;
+      output.push({selector:derivedContract+"."+declaration.name,
+        operation:["pure","view"].includes(declaration.stateMutability)?"call":"send",
+        inputs,outputs:returns,sourceSha256:source.sha256,sourceFile:source.path});
+    }
+    if(declaration.type==="StateVariableDeclaration")for(const v of declaration.variables||[]){
+      const getter=publicGetter(v,context,entries);
+      if(getter)output.push({selector:derivedContract+"."+v.name,operation:"call",
+        inputs:getter.identity.slice(getter.identity.indexOf("(")+1,-1).split(",").filter(Boolean),
+        outputs:getter.returns,sourceSha256:source.sha256,sourceFile:source.path});
+    }
+  }
+  return output;
+}
+
 export interface AcquiredConcreteImplementation {
   path:string;contract:string;selector:string;sourceSha256:string;
   inputs:string[];operation:"call"|"send";witness:string;
