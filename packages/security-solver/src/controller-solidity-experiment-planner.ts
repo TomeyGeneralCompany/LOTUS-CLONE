@@ -3036,6 +3036,86 @@ function sourceFactoryCloneExperiment(
   return candidate;
 }
 
+/** Every acquired preparation node must have a real source witness and an
+ * executable predecessor graph. Previously orderPreparation([]) validated no
+ * nodes even when the sequence contained deployments and initialization. The
+ * executor remains authoritative for actual receipts and ABI compatibility. */
+function sourcePreparationGraph(
+  sequence:SoliditySequence,target:SourceSnapshot,contract:any,
+  sources:ReadonlyMap<string,SourceSnapshot>
+):{ok:true;nodes:PreparationPrerequisite[]}|{ok:false;code:string;detail:string}{
+  const preparation=sequence.preparation;
+  if(!preparation)return {ok:true,nodes:[]};
+  const nodes:PreparationPrerequisite[]=[];
+  const deployments=new Map<string,{source:SourceSnapshot;node:any;position:number}>();
+  const dependencies=(value:unknown):string[]=>{
+    if(Array.isArray(value))return value.flatMap(dependencies);
+    if(typeof value!=='string'||!value.startsWith('$deployment:'))return [];
+    return [value.slice('$deployment:'.length)];
+  };
+  const reject=(detail:string)=>({ok:false as const,code:'INVALID_PREREQUISITE',detail});
+  for(const [position,d] of preparation.deployments.entries()){
+    if(deployments.has(d.id))return reject('Duplicate source deployment '+d.id);
+    const acquired=sources.get(d.file);
+    if(!acquired)return reject('Preparation deployment source not acquired: '+d.file);
+    let parsed:any;
+    try{parsed=parseAstCached(acquired);}catch{return reject('Unparseable preparation source: '+d.file);}
+    const declared=(parsed.children||[]).find((n:any)=>
+      n.type==='ContractDefinition'&&n.name===d.contract&&
+      n.kind!=='interface'&&n.kind!=='library');
+    if(!declared)return reject('Preparation contract not declared in acquired file: '+d.file+':'+d.contract);
+    deployments.set(d.id,{source:acquired,node:declared,position});
+  }
+  for(const [position,d] of preparation.deployments.entries()){
+    const entry=deployments.get(d.id)!;
+    const predecessors=[...new Set(d.constructorArgs.flatMap(dependencies))];
+    if(predecessors.includes(d.id))return reject('Self-referential constructor dependency '+d.id);
+    for(const prior of predecessors){
+      const dependency=deployments.get(prior);
+      if(!dependency||dependency.position>=position)return reject(
+        'Constructor dependency not deployed before '+d.id+': '+prior);
+    }
+    nodes.push({id:'deploy:'+d.id,kind:'deploy',
+      dependsOn:predecessors.map(id=>'deploy:'+id),
+      sourceEvidence:[witness(entry.source,entry.node,entry.node.name+'.constructor')],
+      parameters:{file:d.file,contract:d.contract,constructorArgs:d.constructorArgs}});
+  }
+  let previousOperation:string|null=null;
+  for(const op of preparation.operations){
+    const entry=deployments.get(op.deploymentId);
+    if(!entry)return reject('Initializer receiver has no acquired deployment: '+op.deploymentId);
+    const refs=[...new Set(op.args.flatMap(dependencies))];
+    if(refs.some(id=>!deployments.has(id)))return reject('Initializer has unacquired deployment reference: '+op.id);
+    const dependsOn=[...new Set(['deploy:'+op.deploymentId,
+      ...refs.map(id=>'deploy:'+id),
+      ...(previousOperation?[previousOperation]:[])])];
+    const fnName=op.function.split('(')[0];
+    const declared=(entry.node.subNodes||[]).find((n:any)=>
+      n.type==='FunctionDefinition'&&n.name===fnName&&n.body);
+    // For inherited ABI, the contract declaration witnesses the receiver,
+    // while the actual executor must still prove callable bytecode and receipt.
+    const origin=declared||entry.node;
+    nodes.push({id:'operation:'+op.id,kind:'initialize',dependsOn,
+      sourceEvidence:[witness(entry.source,origin,entry.node.name+'.'+op.function)],
+      parameters:{deploymentId:op.deploymentId,signature:op.function,args:op.args}});
+    previousOperation='operation:'+op.id;
+  }
+  for(const check of preparation.checks){
+    const entry=deployments.get(check.deploymentId);
+    if(!entry)return reject('Readback receiver has no acquired deployment: '+check.deploymentId);
+    const refs=[...new Set(check.args.flatMap(dependencies))];
+    if(refs.some(id=>!deployments.has(id)))return reject('Readback has unacquired deployment reference: '+check.id);
+    nodes.push({id:'check:'+check.id,kind:'assert_state',
+      dependsOn:[...new Set(['deploy:'+check.deploymentId,
+        ...refs.map(id=>'deploy:'+id),
+        ...preparation.operations.map(op=>'operation:'+op.id)])],
+      sourceEvidence:[witness(entry.source,entry.node,entry.node.name+'.'+check.function)],
+      parameters:{deploymentId:check.deploymentId,signature:check.function,
+        args:check.args,expect:check.expect}});
+  }
+  return {ok:true,nodes};
+}
+
 export function constructSolidityExperiments(input:ConstructionInput):ConstructionResult {
   if(!/^[a-f0-9]{40}$/.test(input.repositoryCommit))
     return {ok:false,code:'INVALID_COMMIT',detail:'Expected a source commit SHA'};
@@ -3187,8 +3267,9 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   const seen=new Set<string>(),out:PreparedSecurityExperiment[]=[];
   for(const original of choices) {
     const c=sourceFactoryCloneExperiment(original,target,contract,indexed);
-    const prereqs:PreparationPrerequisite[]=[];
-    const graph=orderPreparation(prereqs);
+    const planned=sourcePreparationGraph(c.sequence,target,contract,indexed);
+    if(!planned.ok)return {ok:false,code:planned.code,detail:planned.detail};
+    const graph=orderPreparation(planned.nodes);
     if(!graph.ok)return {ok:false,code:graph.code,detail:graph.detail};
     const payload={sourceCommit:input.repositoryCommit,path:input.targetPath,
       selector:input.targetSelector,property:c.property,sequence:c.sequence};
