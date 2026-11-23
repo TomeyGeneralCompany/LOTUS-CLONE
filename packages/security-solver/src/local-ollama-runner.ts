@@ -429,9 +429,11 @@ export async function runLocalAudit(
             // they aren't declared in the subclass file. The verified base's
             // AST signature is still in the compiled subclass ABI.
             const discovered=deterministicDeclarationsCache.get(target.path)||[];
-            const implMenu=discovered.some(d=>d.selector===target.selector&&d.operation==="send")
-              ?discovered:[...discovered,{selector:target.selector,operation:"send" as const,
-                inputs:target.inputs}];
+            const implMenu=discovered.some(d=>
+              d.selector===target.selector&&d.operation===target.operation&&
+              JSON.stringify(d.inputs)===JSON.stringify(target.inputs))
+              ?discovered:[...discovered,{selector:target.selector,
+                operation:target.operation,inputs:target.inputs}];
             const candidate=constructSolidityExperiments({
               repositoryCommit:lead.sourceCommit,targetPath:target.path,
               targetSelector:target.selector,sources:deterministicSourceSnapshots,
