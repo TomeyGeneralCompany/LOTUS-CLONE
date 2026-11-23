@@ -22,7 +22,7 @@ function acquiredTypeEntries(sources:readonly SourceSnapshot[]):ContractEntry[]{
     const contracts=children.filter(node=>node.type==="ContractDefinition")
       .map(node=>({source,node}));
     const globals=children.filter(node=>
-      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(node.type));
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(node.type));
     // The installed parser may reject the 0.8.8+ global UDVT syntax
     // altogether. Keep that exact source in the acquired namespace so the
     // validated lexical declaration can resolve through real import edges.
@@ -82,7 +82,7 @@ function acquiredValueDeclaration(type:any,owner:any,source?:SourceSnapshot,
   const qualified=String(type.namePath||"").split(".");
   const name=qualified.pop()||"";
   if(!/^[A-Za-z_]\w*$/.test(name))return null;
-  const kinds=new Set(["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"]);
+  const kinds=new Set(["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"]);
   const local=(owner.subNodes||[]).filter((node:any)=>
     node.name===name&&kinds.has(node.type));
   if(local.length===1&&(qualified.length===0||qualified.join(".")===owner.name))
@@ -131,7 +131,7 @@ function primitiveFixtureArg(type:any,nonzero=false,contract?:any,source?:Source
     if(!found)return null;
     const declaration=found.node;
     if(declaration.type==="EnumDefinition")return (declaration.members||[]).length>0?"0":null;
-    if(declaration.type==="UserDefinedValueTypeDefinition")
+    if(["UserDefinedValueTypeDefinition","TypeDefinition"].includes(declaration.type))
       return primitiveFixtureArg(declaration.underlyingType||declaration.typeName,
         nonzero,found.owner,found.source,acquired,depth+1);
     const parts=(declaration.members||[]).map((field:any)=>
@@ -279,7 +279,7 @@ function fixtureAbiType(type:any,contract:any,depth=0,source?:SourceSnapshot,
   if(type?.type==="UserDefinedTypeName"){
     const name=String(type.namePath||"").split(".").pop();
     const values=(contract.subNodes||[]).filter((n:any)=>
-      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type)&&n.name===name);
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(n.type)&&n.name===name);
     if(values.length>1)return null;
     if(values.length===0)return "address";
     const definition=values[0];
@@ -319,12 +319,12 @@ function initializerStateBindings(
     for(const declaration of ast?.children||[]){
       if(declaration.type==="ContractDefinition"){
         for(const nested of declaration.subNodes||[]){
-          if(!["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"]
+          if(!["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"]
             .includes(nested.type)||!nested.name)continue;
           nonDeployable.add(String(nested.name));
           nonDeployable.add(String(declaration.name)+"."+nested.name);
         }
-      }else if(["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"]
+      }else if(["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"]
         .includes(declaration.type)&&declaration.name)
         nonDeployable.add(String(declaration.name));
     }
@@ -743,7 +743,7 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
     const parts=namePath.split("."),name=parts.pop()||"";
     if(!/^[A-Za-z_]\w*$/.test(name))return null;
     const local=(owner.node.subNodes||[]).filter((n:any)=>n.name===name&&
-      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type));
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(n.type));
     const sourceByPath=new Map(entries.map(e=>[e.source.path,e.source]));
     const reachable=new Set<string>(),queue=[owner.source.path];
     while(queue.length&&reachable.size<=256){
@@ -762,7 +762,7 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
     const nested=entries.filter(e=>reachable.has(e.source.path)&&
       (parts.length===0||parts.join(".")===e.node.name))
       .flatMap(e=>(e.node.subNodes||[]).filter((n:any)=>n.name===name&&
-        ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type)));
+        ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(n.type)));
     const defs=local.length?local:nested;
     if(defs.length!==0){
       if(defs.length!==1)return null;
@@ -968,7 +968,7 @@ export function resolveSourceFixtureDependencies(
     const name=segments.pop()||"";
     if(!/^[A-Za-z_]\w*$/.test(name))return "unknown";
     const local=(node.subNodes||[]).filter((n:any)=>n.name===name&&
-      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(n.type));
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(n.type));
     if(local.length)return local.length===1?"value":"unknown";
     const reachable=new Set<string>(),pending=[source.path];
     while(pending.length&&reachable.size<=256){
@@ -996,7 +996,7 @@ export function resolveSourceFixtureDependencies(
                 "UserDefinedValueTypeDefinition"].includes(sub.type))
                 declarations.push("value");
         }else if(!segments.length&&declaration.name===name&&
-          ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition"].includes(declaration.type))
+          ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(declaration.type))
           declarations.push("value");
       }
     }
