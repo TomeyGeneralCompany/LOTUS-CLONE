@@ -1469,6 +1469,10 @@ contract PrivateAllowance {
    _approve(msg.sender,spender,amount);
    return true;
  }
+ function increaseAllowance(address spender,uint256 addedValue) external returns(bool) {
+   _approve(msg.sender,spender,_allowances[msg.sender][spender] + addedValue);
+   return true;
+ }
  function _approve(address owner,address spender,uint256 amount) internal {
    require(owner != address(0));
    require(spender != address(0));
@@ -1479,6 +1483,7 @@ contract PrivateAllowance {
       content:nestedAllowance,sha256:hash(nestedAllowance)};
     const nestedAllowanceMenu=[
       {selector:'PrivateAllowance.approve',operation:'send',inputs:['address','uint256']},
+      {selector:'PrivateAllowance.increaseAllowance',operation:'send',inputs:['address','uint256']},
       {selector:'PrivateAllowance.allowance',operation:'call',inputs:['address','address']}
     ];
     const allowancePlan=constructSolidityExperiments({
@@ -1494,6 +1499,28 @@ contract PrivateAllowance {
       'Private mapping mutation must be falsified by an actual getter result');
     // A getter whose parameter positions do not match the storage key
     // order cannot justify the assumed owner/spender mapping identity.
+    const increasePlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:nestedAllowanceSnap.path,
+      targetSelector:'PrivateAllowance.increaseAllowance',sources:[nestedAllowanceSnap],
+      declarations:nestedAllowanceMenu as any,skipLegacy:true});
+    assert.equal(increasePlan.ok,true,
+      'Source read-modify-write via internal helper must produce a falsifiable property');
+    if(increasePlan.ok)assert.ok(increasePlan.experiments.some(exp=>
+      exp.securityProperty.includes('internal setter and public mapping getter')&&
+      exp.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='allowance(address,address)'&&step.expect==='7')));
+    const wrongIncrement=nestedAllowance.replace(
+      '_allowances[msg.sender][spender] + addedValue',
+      '_allowances[spender][msg.sender] + addedValue');
+    const wrongIncrementSnap={...nestedAllowanceSnap,content:wrongIncrement,
+      sha256:hash(wrongIncrement)};
+    const wrongIncrementPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:wrongIncrementSnap.path,
+      targetSelector:'PrivateAllowance.increaseAllowance',sources:[wrongIncrementSnap],
+      declarations:nestedAllowanceMenu as any,skipLegacy:true});
+    assert.ok(!wrongIncrementPlan.ok||!wrongIncrementPlan.experiments.some(exp=>
+      exp.securityProperty.includes('internal setter and public mapping getter')),
+      'A read from reversed mapping keys must not prove same-key conservation');
     const wrongAllowance=nestedAllowance.replace(
       'return _allowances[owner][spender];',
       'return _allowances[spender][owner];');
