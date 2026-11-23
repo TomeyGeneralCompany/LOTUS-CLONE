@@ -31,6 +31,8 @@ import {homedir} from "node:os";
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
 import {sourceRepairRoutes} from "./deterministic/typed-repair-routes";
 import {repairAttemptIdentity} from "./deterministic/repair-attempt-identity";
+import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from
+  "./deterministic/source-unavailability-verifier";
 import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,enumerateAcquiredInheritedAbi} from "./deterministic/fixture-dependency-planner";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
@@ -576,6 +578,66 @@ export async function runLocalAudit(
       strategy:strategyBase,phase,examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
       unresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
     return repairAdded;
+  };
+  /** After exhausting distinct source-backed recovery routes, inspect the
+   * complete READ-verified acquired inventory for exact nondeployable
+   * interface entrypoints. This NEVER manufactures an experiment result.
+   * Only independent checked source evidence can create the separate
+   * source_unavailable disposition; every other lead remains unresolved.
+   */
+  const certifyUnavailableInterfaces=async():Promise<number>=>{
+    if(!analysisProgressStore||!stageLock||
+      stageLock.currentStage!=="EXPERIMENT"||!stageLock.coverage.allComplete)
+      return 0;
+    const expected=(limits.initialSourcePaths||[])
+      .filter(p=>p.endsWith(".sol")).sort();
+    const actual=deterministicSourceSnapshots.map(s=>s.path).sort();
+    // The acquired inventory must be complete, not the subset that happened
+    // to parse or was convenient to inspect in a given repair turn.
+    if(new Set(expected).size!==expected.length||
+      JSON.stringify(expected)!==JSON.stringify(actual)){
+      await appendFile(logFile,"[SOURCE_UNAVAILABLE_REVIEW_SKIPPED] "+
+        JSON.stringify({reason:"acquired_source_inventory_incomplete",
+          expected:expected.length,available:actual.length})+"\n");
+      return 0;
+    }
+    let verified=0,rejected=0;
+    for(const lead of analysisProgressStore.candidates){
+      const record=analysisProgressStore.records.get(lead.id);
+      if(!record||record.lifecycle==="source_unavailable"||
+        record.lifecycle==="queued"||record.lifecycle==="admitted"||
+        record.lifecycle==="analyzing"||record.lifecycle==="experiment_completed"||
+        record.properties.some(p=>p.state==="test_completed"))continue;
+      const proposed=proposeInterfaceUnavailability(
+        lead,deterministicSourceSnapshots,expected);
+      if(!proposed)continue;
+      const reviewed=independentlyReviewInterfaceUnavailability(
+        proposed,deterministicSourceSnapshots,expected);
+      if(!reviewed){rejected++;continue;}
+      try{
+        analysisProgressStore.recordSourceUnavailable(lead.id,reviewed,
+          deterministicSourceSnapshots,expected);
+      }catch(e){
+        rejected++;
+        await appendFile(logFile,"[SOURCE_UNAVAILABLE_REVIEW_REJECTED] "+
+          JSON.stringify({leadId:lead.id,error:String(e)})+"\n");
+        continue;
+      }
+      verified++;
+      await appendFile(logFile,"[SOURCE_UNAVAILABLE_INDEPENDENTLY_VERIFIED] "+
+        JSON.stringify({leadId:lead.id,selector:lead.selector,
+          sourceSha256:lead.sourceSha256,
+          acquiredInventoryDigest:reviewed.acquiredInventoryDigest,
+          verifierDigest:reviewed.verifierDigest,
+          independentReviewDigest:reviewed.independentReviewDigest,
+          evidenceId:reviewed.evidenceId})+"\n");
+    }
+    if(verified)await analysisProgressStore.save();
+    await appendFile(logFile,"[SOURCE_UNAVAILABLE_RECONCILIATION] "+
+      JSON.stringify({verified,rejected,experimentConclusive:
+        analysisProgressStore.experimentCertificate.conclusive,
+        stillUnresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
+    return verified;
   };
   const closeAnalysis=async(status:'complete'|'partial',reason='')=>{
     if(!stageLock||stageLock.currentStage!=='ANALYZE')return;
@@ -1456,20 +1518,37 @@ export async function runLocalAudit(
               continue;
             }
           }
+          // Exhaustion of additional property families is not automatically
+          // evidence of missing source. Only the independent acquired-code
+          // verifier may issue a terminal unavailability disposition.
+          await certifyUnavailableInterfaces();
+          const disposition=analysisProgressStore.experimentCertificate;
+          if(disposition.unresolvedIds.length===0&&
+            !inconclusive.observation_only&&!inconclusive.incomplete&&
+            !inconclusive.unsupported&&!inconclusive.rejected){
+            stageLock.completeExperiments(disposition);
+            await appendFile(logFile,'[EXPERIMENT_DISPOSITIONS_COMPLETE] '+
+              JSON.stringify({experimentVerified:disposition.conclusive,
+                sourceUnavailable:disposition.sourceUnavailable,
+                total:disposition.total})+'\n');
+            continue;
+          }
           await analysisProgressStore.save();
           await appendFile(logFile,'[EXPERIMENT_GATE_BLOCKED] '+JSON.stringify({
-            required:certificate.total,conclusive:certificate.conclusive,
-            unresolved:certificate.unresolvedIds.length,
-            pendingLeadIds:certificate.unresolvedIds,
-            reasons:certificate.pendingReasons,
+            required:disposition.total,conclusive:disposition.conclusive,
+            sourceUnavailable:disposition.sourceUnavailable,
+            unresolved:disposition.unresolvedIds.length,
+            pendingLeadIds:disposition.unresolvedIds,
+            reasons:disposition.pendingReasons,
             outcomes:inconclusive,
             manifestDigest:certificate.manifestDigest,
             evidenceDigest:certificate.evidenceDigest,
             checkpoint:analysisProgressStore.path,
           })+'\n');
           throw new Error('EXPERIMENT_INCOMPLETE_SUSPENDED: '+
-            certificate.conclusive+'/'+certificate.total+' leads conclusively tested, '+
-            certificate.unresolvedIds.length+' unresolved; checkpoint '+analysisProgressStore.path);
+            disposition.conclusive+'/'+disposition.total+' experimentally verified, '+
+            disposition.sourceUnavailable+' source-unavailable, '+
+            disposition.unresolvedIds.length+' unresolved; checkpoint '+analysisProgressStore.path);
         }
         stageLock.completeExperiments(certificate);
         limits.onExperimentLedger?.({selected:stageLock.candidateCount,
