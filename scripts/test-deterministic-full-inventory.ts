@@ -1582,6 +1582,47 @@ contract DirectMap {
       e.securityProperty.endsWith(':recipient')),
       'Crediting msg.sender must not prove a credit to recipient');
 
+    // An owner authorization conclusion must follow the actual source
+    // require(msg.sender == acquired owner storage) and the exact state write.
+    // The selected method name is deliberately unrelated to access control.
+    const guardedGenericText=`pragma solidity ^0.8.20;
+contract GenericGuard {
+ address public administrator;
+ uint256 public value;
+ constructor(){administrator=msg.sender;}
+ function execute(uint256 next) external {
+   require(msg.sender==administrator, "administrator");
+   value=next;
+ }
+ function inverted(uint256 next) external {
+   require(msg.sender!=administrator, "different");
+   value=next;
+ }
+}`;
+    const guardedGeneric={path:'source-1/contracts/GenericGuard.sol',
+      content:guardedGenericText,sha256:hash(guardedGenericText)};
+    const guardedMenu=[
+      {selector:'GenericGuard.execute',operation:'send',inputs:['uint256']},
+      {selector:'GenericGuard.inverted',operation:'send',inputs:['uint256']}
+    ];
+    const genericAuthorized=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:guardedGeneric.path,
+      targetSelector:'GenericGuard.execute',sources:[guardedGeneric],
+      declarations:guardedMenu as any,skipLegacy:true});
+    assert.equal(genericAuthorized.ok,true,
+      'A genuine source-verified owner-equality guard must produce an executable property');
+    if(genericAuthorized.ok)assert.ok(genericAuthorized.experiments.some(exp=>
+      exp.securityProperty.startsWith('source-proof generic owner guard')&&
+      exp.sequence.steps.some(x=>x.operation==='send'&&x.sender===1&&x.expectRevert)&&
+      exp.sequence.steps.some(x=>x.operation==='call'&&x.function==='value()'&&x.expect==='7')),
+      'Guarded state change requires both unauthorized receipt and exact authorized readback');
+    const falseGuard=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:guardedGeneric.path,
+      targetSelector:'GenericGuard.inverted',sources:[guardedGeneric],
+      declarations:guardedMenu as any,skipLegacy:true});
+    assert.ok(!falseGuard.ok||!falseGuard.experiments.some(exp=>
+      exp.securityProperty.startsWith('source-proof generic owner guard')),
+      'The logically opposite source guard must not be misclassified as owner authorization');
     const directStateText=`pragma solidity ^0.8.0;
 contract DirectState {
   uint256 public amount;
