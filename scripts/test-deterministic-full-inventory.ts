@@ -43,6 +43,21 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // A property blocker must have an invariant source-bound identity even
+    // when a fresh analysis enumerates the same independent failures in the
+    // opposite order. Otherwise later repairs can supplant the wrong property.
+    const firstLead=[candidates[0]];
+    const blockers=['UNKNOWN_ASSERTION(no_supported_property):unobserved delta',
+      'UNKNOWN_ASSERTION(missing_fixture):unbound external token'];
+    const obligationsFrom=(values:string[],fileName:string)=>AnalysisProgressStore
+      .open(join(dir,fileName),firstLead).then(store=>{
+        assert.equal(store.nextBatch(1,1).length,1);
+        store.recordAssessment(firstLead[0].id,[],values,[]);
+        return store.records.get(firstLead[0].id)!.properties.map(p=>p.id).sort();
+      });
+    assert.deepEqual(await obligationsFrom(blockers,'stable-blockers-a.json'),
+      await obligationsFrom([...blockers].reverse(),'stable-blockers-b.json'),
+      'Property identity must follow source revision and blocker, not insertion order');
     // Regression from the first PR-branch 88mph cloud trial. An ordinary
     // staged source experiment must NEVER remove the originally queued
     // BenqiERC20Market.claimRewards lead from the frozen source inventory.
