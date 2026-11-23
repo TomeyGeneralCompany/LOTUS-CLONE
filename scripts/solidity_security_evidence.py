@@ -531,6 +531,94 @@ def _asserted_source_scalar_delta(
             "source-derived bounded conservation equation. This proves only "
             "the tested input and fixture state.")
 
+def _source_witnessed_direct_assignment_negative(
+    file: Path, selector: str, requested_steps: list,
+    actual_steps: list, accounts: list | None,
+) -> tuple[str, str] | None:
+    """Complete a narrowly falsifiable exact-source storage assignment test.
+
+    This is NOT proof of authorization, absence of a vulnerability, or
+    production reachability. It verifies the selected direct assignment
+    through a real successful EVM send and the compiler-generated getter.
+    The positive unauthorized-transition classifier runs first.
+    """
+    if not isinstance(accounts, list) or len(accounts) != 3:
+        return None
+    if not isinstance(requested_steps, list) or len(requested_steps) != len(actual_steps):
+        return None
+    method = selector.rsplit(".", 1)[-1]
+    try:
+        source = _strip_comments(file.read_text(encoding="utf8"))
+    except OSError:
+        return None
+    header, body = _extract_fn_body(source, method)
+    if not header or not body:
+        return None
+    # Binding must be the actual ABI parameter, with a matching source
+    # public getter. A made-up getter or storage alias is not sufficient.
+    declared = re.search(
+        r"\bfunction\s+" + re.escape(method) +
+        r"\s*\(\s*(address|bool|u?int(?:\d{0,3})?)\s+([A-Za-z_]\w*)\s*\)"
+        r"\s*(?:external|public)\b",
+        header)
+    if not declared:
+        return None
+    param_type, parameter = declared.groups()
+    assignments = re.findall(
+        r"\b([A-Za-z_]\w*)\s*=\s*" + re.escape(parameter) + r"\s*;", body)
+    if len(assignments) != 1:
+        return None
+    state = assignments[0]
+    if not re.search(
+        r"\b" + re.escape(param_type) + r"\s+public\s+" +
+        re.escape(state) + r"\s*;", source):
+        return None
+    if len(re.findall(r"\b" + re.escape(state) + r"\s*(?:=|\+=|-=)", body)) != 1:
+        return None
+    # A direct source observation must have the exact same getter name,
+    # a real old-value observation, and a successful post-state readback.
+    getter = state + "()"
+    before = next((i for i, step in enumerate(requested_steps)
+                   if step.get("operation") in ("observe", "call")
+                   and step.get("function") == getter
+                   and actual_steps[i].get("operation") in ("observe", "call")
+                   and actual_steps[i].get("actual") is not None), None)
+    target = next((i for i, step in enumerate(requested_steps)
+                   if step.get("operation") == "send"
+                   and step.get("function", "").split("(", 1)[0] == method
+                   and step.get("sender") == 0
+                   and len(step.get("args", [])) == 1
+                   and actual_steps[i].get("passed") is True
+                   and actual_steps[i].get("reverted") is False), None)
+    if before is None or target is None or before >= target:
+        return None
+    after = next((i for i in range(target + 1, len(requested_steps))
+                  if requested_steps[i].get("operation") == "call"
+                  and requested_steps[i].get("function") == getter
+                  and actual_steps[i].get("passed") is True), None)
+    if after is None:
+        return None
+    requested_value = requested_steps[target]["args"][0]
+    if isinstance(requested_value, str) and re.fullmatch(r"\$account[0-2]", requested_value):
+        expected = accounts[int(requested_value[-1])]
+    elif isinstance(requested_value, (str, int, bool)):
+        expected = requested_value
+    else:
+        return None
+    actual = actual_steps[after].get("actual")
+    if str(actual).lower() != str(expected).lower():
+        return None
+    if str(actual_steps[before].get("actual")).lower() == str(actual).lower():
+        return None  # not a witnessed state transition
+    return (
+        "source_direct_assignment_negative",
+        "Acquired public state "+state+" was observed before and after a successful "
+        "selected EVM transaction. Exact source assignment, concrete ABI argument "
+        "and compiler getter agree. This is a bounded property test, not a "
+        "claim that other security properties or threats are absent."
+    )
+
+
 def security_experiment_disposition(
     repository: Path,
     file: Path,
@@ -559,6 +647,12 @@ def security_experiment_disposition(
     if any(step.get("passed") is not True for step in actual_steps
            if step.get("operation") not in ("observe",)):
         return "observation_only", None, explanation
+
+    direct = _source_witnessed_direct_assignment_negative(
+        file, selector, requested_steps, actual_steps, data.get("accounts")
+    )
+    if direct is not None:
+        return "behavior_not_observed", direct[0], direct[1]
 
     scalar = _asserted_source_scalar_delta(
         file, selector, requested_steps, actual_steps, specification
