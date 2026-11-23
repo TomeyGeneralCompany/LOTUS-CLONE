@@ -6,6 +6,9 @@ import {createHash} from "node:crypto";
 import {readFile,writeFile,rename,mkdir} from "node:fs/promises";
 import {dirname} from "node:path";
 import type {AnalysisCandidate} from "./analysis-candidate-queue";
+import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
+import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from
+  "./source-unavailability-verifier";
 
 export type CandidateLifecycle="queued"|"admitted"|"analyzing"|"dependencies_pending"|
   "experiment_pending"|"experiment_completed"|"source_unavailable"|"analysis_exhausted"|"blocked";
@@ -198,17 +201,29 @@ export class AnalysisProgressStore {
       e.evidenceId.length>0&&e.detail.length>0&&
       !record.properties.some(p=>p.state==="test_completed");
   }
-  recordSourceUnavailable(id:string,evidence:SourceUnavailableEvidence):void {
+  recordSourceUnavailable(id:string,evidence:SourceUnavailableEvidence,
+    acquiredSources:readonly SourceSnapshot[],expectedAcquiredPaths:readonly string[]):void {
     const record=this.records.get(id);
-    if(!record||record.lifecycle==="queued"||record.lifecycle==="admitted"||
-      record.lifecycle==="analyzing")throw new Error("SOURCE_UNAVAILABLE_LEAD_NOT_ASSESSED: "+id);
+    const candidate=this.candidates.find(c=>c.id===id);
+    if(!record||!candidate||record.lifecycle==="queued"||
+      record.lifecycle==="admitted"||record.lifecycle==="analyzing")
+      throw new Error("SOURCE_UNAVAILABLE_LEAD_NOT_ASSESSED: "+id);
     if(record.sourceUnavailable)throw new Error("SOURCE_UNAVAILABLE_ALREADY_RECORDED: "+id);
-    if(record.lifecycle==="experiment_completed"&&this.isConclusive(record))
+    if(this.isConclusive(record)||record.properties.some(p=>p.state==="test_completed"))
       throw new Error("SOURCE_UNAVAILABLE_HAS_EXECUTED_EXPERIMENT: "+id);
-    const next={...record,sourceUnavailable:evidence};
+    // An arbitrary SHA-shaped review digest is NOT a verifier. Recompute
+    // BOTH proof paths against the exact entire acquired program revision
+    // before accepting a durable terminal entry into the 290-lead ledger.
+    const proposal=proposeInterfaceUnavailability(candidate,
+      acquiredSources,expectedAcquiredPaths);
+    const reviewed=proposal&&independentlyReviewInterfaceUnavailability(
+      proposal,acquiredSources,expectedAcquiredPaths);
+    if(!reviewed||JSON.stringify(reviewed)!==JSON.stringify(evidence))
+      throw new Error("SOURCE_UNAVAILABLE_REPLAY_VERIFICATION_FAILED: "+id);
+    const next={...record,sourceUnavailable:reviewed};
     if(!this.hasSourceUnavailableEvidence(next))
       throw new Error("SOURCE_UNAVAILABLE_INDEPENDENT_EVIDENCE_REQUIRED: "+id);
-    record.sourceUnavailable={...evidence,sourceWitnesses:[...evidence.sourceWitnesses]};
+    record.sourceUnavailable={...reviewed,sourceWitnesses:[...reviewed.sourceWitnesses]};
     record.lifecycle="source_unavailable";
   }
   get experimentCertificate():LeadExperimentCertificate {
