@@ -113,6 +113,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           npx tsx scripts/test-deterministic-full-inventory.ts | tee data/repair-feedback/full-inventory-test.log
+          npx tsx scripts/test-real-dell-source-corpus.ts | tee data/repair-feedback/frozen-source-corpus.log
 
       - name: Run authorized real-world investigation
         id: hunt
@@ -120,6 +121,7 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p data/one-bounty data/repair-feedback
+          touch data/repair-feedback/hunt-start
           # GitHub's bash runner enables errexit before this script. Capture
           # an actual failed hunt instead of incorrectly labeling it SETUP_FAILED.
           set +e
@@ -167,6 +169,12 @@ jobs:
             echo "PR_LAPTOP_REAL_WORLD_UNVERIFIED: exit=$code. Inspect uploaded complete evidence." >&2
             exit 1
           fi
+          latest_index="$(find data/logs -name '*.analysis-candidates.json' -type f -newer data/repair-feedback/hunt-start -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+          if [[ -z "$latest_index" ]]; then
+            echo "PR_LAPTOP_ORIGINAL_INVENTORY_MISSING: investigation supplied no new source-index evidence" >&2
+            exit 1
+          fi
+          npx tsx scripts/test-real-dell-source-corpus.ts --current "$latest_index"
 
       - name: Open actionable repair ticket on failure
         if: always() && github.ref_name == 'main'
