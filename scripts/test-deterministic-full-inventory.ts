@@ -1213,6 +1213,35 @@ contract UnlinkedMarket {
     assert.equal(witnessedCallers[0].selector,'Market.deposit');
     assert.equal(witnessedCallers[0].receiver,'cToken');
     assert.equal(witnessedCallers[0].sourceSha256,callerSnap.sha256);
+    // Lexical lookalikes and local shadowing are NOT source-verified
+    // interface call edges even if the receiver.method string is present.
+    const commentCallerText=`pragma solidity ^0.8.20;
+import "./ICToken.sol";
+contract CommentCaller {
+  ICToken public cToken;
+  function deposit(uint256 amount) external {
+    // cToken.mint(amount) is intentionally not executed
+    revert("cToken.mint(amount)");
+  }
+}`;
+    const commentCaller={path:'source-1/contracts/CommentCaller.sol',
+      content:commentCallerText,sha256:hash(commentCallerText)};
+    assert.deepEqual(resolveAcquiredInterfaceCallers(icSnap,'ICToken','mint',
+      [icSnap,commentCaller]),[],
+      'Comments and string literals cannot establish source callsite evidence');
+    const shadowCallerText=`pragma solidity ^0.8.20;
+import "./ICToken.sol";
+contract ShadowCaller {
+  ICToken public cToken;
+  function deposit(ICToken cToken,uint256 amount) external {
+    cToken.mint(amount);
+  }
+}`;
+    const shadowCaller={path:'source-1/contracts/ShadowCaller.sol',
+      content:shadowCallerText,sha256:hash(shadowCallerText)};
+    assert.deepEqual(resolveAcquiredInterfaceCallers(icSnap,'ICToken','mint',
+      [icSnap,shadowCaller]),[],
+      'A shadowing parameter cannot prove a call through persistent source-state receiver');
     const intermediateText='pragma solidity ^0.8.20; import "./ICToken.sol";';
     const transitiveText=`pragma solidity ^0.8.20;
 import "./Intermediate.sol";
