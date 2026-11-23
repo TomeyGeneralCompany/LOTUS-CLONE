@@ -3439,7 +3439,7 @@ function sourceFactoryCloneExperiment(
     if(JSON.stringify(specifiedArgs)!==JSON.stringify(initParams.map(p=>p.name)))
       continue;
     const preparation=sequence.preparation||{deployments:[],operations:[],checks:[]};
-    if(preparation.deployments.length>=8)continue;
+    if(preparation.deployments.length>=16)continue;
     const id='sourceFactory';
     if(preparation.deployments.some(d=>d.id===id))continue;
     const cloneMethod=create.name+'('+factoryTypes.join(',')+')';
