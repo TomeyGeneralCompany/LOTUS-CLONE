@@ -1493,7 +1493,37 @@ export async function runLocalAudit(
         const progressRoot=process.env.LOTUS_ANALYSIS_CHECKPOINT_ROOT||
           join(homedir(),".lotus-clone-analysis");
         const progressFile=join(progressRoot,inventoryFingerprint+".json");
-        analysisProgressStore=await AnalysisProgressStore.open(progressFile,candidateQueue.inventory);
+        // Checkpoint assessment validity depends on the code that interprets
+        // source, builds ABI/fixtures/properties, selects repairs and verifies
+        // evidence. The acquired Solidity source SHA alone cannot detect a
+        // changed controller implementation. Hash exact installed source
+        // bytes so future repairs trigger analysis of still-unresolved leads.
+        const enginePaths=[
+          "packages/security-solver/src/local-ollama-runner.ts",
+          "packages/security-solver/src/controller-solidity-experiment-planner.ts",
+          "packages/security-solver/src/controller-stage-lock.ts",
+          "packages/security-solver/src/deterministic/analysis-progress-store.ts",
+          "packages/security-solver/src/deterministic/fixture-dependency-planner.ts",
+          "packages/security-solver/src/deterministic/typed-repair-routes.ts",
+          "packages/security-solver/src/deterministic/hypothesis-engine.ts",
+          "packages/security-solver/src/deterministic/repair-attempt-identity.ts",
+          "packages/security-solver/src/deterministic/source-unavailability-verifier.ts",
+          "packages/security-solver/src/solidity-source-index.ts",
+          "packages/security-solver/src/solidity-sequence.ts",
+          "packages/security-solver/src/source-reproduction.ts",
+          "scripts/solidity_security_evidence.py",
+          "scripts/reproduction-runtime/solidity-sequence.cjs",
+        ];
+        const engineDigest=createHash("sha256");
+        for(const enginePath of enginePaths){
+          const content=await readFile(join(root,enginePath));
+          engineDigest.update(enginePath).update("\u0000").update(content).update("\u0000");
+        }
+        const analysisEngineRevision=engineDigest.digest("hex");
+        analysisProgressStore=await AnalysisProgressStore.open(
+          progressFile,candidateQueue.inventory,analysisEngineRevision);
+        await appendFile(logFile,"[ANALYSIS_ENGINE_REVISION] "+
+          JSON.stringify({revision:analysisEngineRevision,files:enginePaths.length})+"\n");
         stageLock.registerAnalysisInventory(candidateQueue.inventory.map(c=>c.id));
         for(const record of analysisProgressStore.records.values()){
           if(record.lifecycle!=="queued")stageLock.restoreResolvedAnalysisCandidate(record.id);
