@@ -177,6 +177,55 @@ async function run(){
       'No unsupported, selected-only, or evidence-free completed candidate counts as proof');
     assert.throws(()=>pending.markExperimentCompleted(hash('unmatched')),
       /ANALYSIS_EXPERIMENT_ID_UNMATCHED/);
+    // A replacement must have different source-backed experiment identity;
+    // neither retry scheduling nor an unverified outcome can erase a failure.
+    const replacementLead={...candidates[0],id:hash('inconclusive-repair-lead')};
+    const replacementStore=await AnalysisProgressStore.open(
+      join(dir,'inconclusive-repair.json'),[replacementLead]);
+    replacementStore.nextBatch(1,1);
+    const failedId=hash('attempt-failed'),repairedId2=hash('attempt-repaired');
+    const propertyId=hash('replacement-property');
+    const proofWitness=replacementLead.path+':'+replacementLead.sourceSha256+':0:10';
+    replacementStore.recordAssessment(replacementLead.id,[propertyId],[],[failedId],[],
+      [{id:propertyId,experimentIds:[failedId],sourceWitnesses:[proofWitness]}]);
+    replacementStore.recordInconclusive(failedId,'incomplete',hash('failed-run'),'setup failed');
+    assert.equal(replacementStore.retirableInconclusiveExperiments(repairedId2).length,0);
+    replacementStore.addRepairExperiment(replacementLead.id,propertyId,repairedId2,
+      [proofWitness]);
+    const history=replacementStore.records.get(replacementLead.id)!;
+    assert.deepEqual(history.properties[0].experimentIds,[repairedId2]);
+    assert.equal(history.inconclusiveAttempts?.[0].replacedBy,repairedId2);
+    assert.equal(replacementStore.terminallyComplete,false);
+    assert.deepEqual(replacementStore.retirableInconclusiveExperiments(repairedId2),[],
+      'Replacement admission alone is never sufficient to retire failure');
+    replacementStore.markExperimentCompleted(repairedId2,{
+      result:'not_observed',evidenceId:hash('verified-evidence'),
+      verifierDigest:hash('verified-receipt')});
+    assert.deepEqual(replacementStore.retirableInconclusiveExperiments(repairedId2),[failedId]);
+    assert.equal(replacementStore.terminallyComplete,true);
+    assert.equal(history.inconclusiveAttempts?.length,1,'Failed receipt must persist');
+
+    const replacementLock=await stage([replacementLead]);
+    replacementLock.registerAnalysisInventory([replacementLead.id]);
+    replacementLock.registerAnalysisLead({id:replacementLead.id,
+      path:replacementLead.path,selector:replacementLead.selector,
+      sourceCommit:replacementLead.sourceCommit,sourceSha256:replacementLead.sourceSha256});
+    replacementLock.recordLeadAssessment(replacementLead.id,{kind:'assessed',
+      sourceEvidence:[proofWitness],hypothesis:'source-backed retry',
+      disposition:'test',reason:'same property with a different executable falsifier'},'controller');
+    replacementLock.completeAnalysisBatch();
+    replacementLock.discover(failedId);
+    replacementLock.completeAnalysis();
+    replacementLock.finishExperiment(failedId,'incomplete');
+    replacementLock.registerRepairedExperiment(repairedId2,replacementLead.id,
+      replacementLead.sourceSha256,[proofWitness]);
+    assert.throws(()=>replacementLock.retireVerifiedInconclusive(failedId,repairedId2),
+      /INCONCLUSIVE_RETIREMENT_REQUIRES_VERIFIED_REPLACEMENT/);
+    replacementLock.finishExperiment(repairedId2,'not_observed');
+    replacementLock.retireVerifiedInconclusive(failedId,repairedId2);
+    assert.equal(replacementLock.candidateCount,1);
+    assert.equal(replacementLock.outcomeCounts.incomplete,0);
+    replacementLock.completeExperiments(replacementStore.experimentCertificate);
     // Source-typed, recursive fixture chain: Vault -> Adapter -> Token.
     const vaultSource='pragma solidity ^0.8.0; contract Vault { IAdapter public adapter; function initialize(address _adapter) external { adapter = IAdapter(_adapter); } }';
     const adapterSource='pragma solidity ^0.8.0; contract Adapter is IAdapter { constructor(Token token) {} }';
@@ -227,7 +276,7 @@ async function run(){
       assert.equal(shortInit.initializerOperations[0].function,'init(address)',
         'Never fabricate initialize(address) when the acquired source declares init(address)');
       assert.equal(shortInit.initializerOperations[0].args[0],
-        '$deployment:'+shortInit.deployments[0].id);
+        '$deployment:'+shortInit.deployments.find(d=>d.contract==='Token')!.id);
     }
     // An acquired dependency whose initializer cannot be completely bound
     // must not be reported as an executable fixture.
