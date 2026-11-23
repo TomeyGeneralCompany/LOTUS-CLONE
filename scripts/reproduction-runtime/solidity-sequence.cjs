@@ -146,6 +146,8 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       contractName:metadata.contractName||null,compilerVersion:metadata.compilerVersion||null,
       evmVersion:metadata.evmVersion||null,cacheHit:metadata.cacheHit??null,
       bytecodeSha256:metadata.bytecodeSha256||null,
+      abiSha256:metadata.abiSha256||null,
+      preparationAbiSha256:metadata.preparationAbiSha256||{},
       constructorTypes:metadata.constructorTypes||[],stepIndex:runtimeStepIndex,
       receiptStatus:typeof status==='number'?status:null,
       receiptTo:receipt?.to??null,
@@ -380,7 +382,9 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         sourceSha256:metadata.sourceSha256||null,bytecodeSha256:metadata.bytecodeSha256||null,
         compilerVersion:metadata.compilerVersion||null,evmVersion:metadata.evmVersion||null,
         selectedFile:metadata.selectedFile||null,contractName:metadata.contractName||null,
-        constructorTypes:metadata.constructorTypes||[]}};
+        constructorTypes:metadata.constructorTypes||[],
+        abiSha256:metadata.abiSha256||null,
+        preparationAbiSha256:metadata.preparationAbiSha256||{}}};
     if(JSON.stringify(observations).length>64000)throw new Error('Sequence observations exceed 64KB');
     return observations;
   } catch(error) {throw diagnosticError(error);}
