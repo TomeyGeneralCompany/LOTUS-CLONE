@@ -59,10 +59,10 @@ async function run(){
     const quoteSource=typedSrc('IQuote',intf),firstSource=typedSrc('QuoteA',implA),
       secondSource=typedSrc('QuoteB',implB),consumerSource=typedSrc('QuoteConsumer',consumer);
     const acquire=[quoteSource,firstSource,secondSource,consumerSource];
-    const ambiguous=resolveSourceFixtureDependencies(consumerSource,'QuoteConsumer',acquire);
-    assert.equal(ambiguous.status,'unresolved',
+    const quoteAmbiguity=resolveSourceFixtureDependencies(consumerSource,'QuoteConsumer',acquire);
+    assert.equal(quoteAmbiguity.status,'unresolved',
       'Ambiguous sources must not be assigned arbitrary single deployment');
-    assert.ok(ambiguous.status==='unresolved'&&ambiguous.missingDependencies
+    assert.ok(quoteAmbiguity.status==='unresolved'&&quoteAmbiguity.missingDependencies
       .some(x=>x.includes('ambiguous_implementation')));
     const resolvedChoices=enumerateSourceFixtureDependencies(
       consumerSource,'QuoteConsumer',acquire);
