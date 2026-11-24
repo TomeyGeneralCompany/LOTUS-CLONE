@@ -4073,6 +4073,120 @@ function sourcePairedScalarConservationExperiments(
   return results;
 }
 
+/** Source-derived CREATE2 clone replay: the acquired Factory source must
+ * prove the exact deterministic clone expression, the exact typed initializer
+ * and the public prediction helper. We only deploy a real acquired concrete
+ * template. Failure to deploy or initialize remains an actual EVM failure;
+ * source presence alone cannot certify the clone's behavior.
+ */
+function sourceFactoryDeterminismExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  sources:ReadonlyMap<string,SourceSnapshot>,
+  declarations:readonly SolidityProbeDeclaration[]
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(contract.name!=='Factory'||isTestOrMockPath(snapshot.path)||!method.startsWith('create'))
+    return [];
+  const fn=(contract.subNodes||[]).find((n:any)=>n.type==='FunctionDefinition'&&
+    n.name===method&&n.body&&['public','external'].includes(n.visibility));
+  if(!fn||!fn.parameters||fn.parameters.length<2)return [];
+  const params:any[]=fn.parameters;
+  if(canonicalAbiType(params[0].typeName)!=='address'||params[0].name!=='template'||
+    canonicalAbiType(params[1].typeName)!=='bytes32'||params[1].name!=='salt')
+    return [];
+  const abiTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
+  if(abiTypes.some(t=>!t)||!declarations.some(d=>d.operation==='send'&&
+    d.selector==='Factory.'+method&&
+    JSON.stringify(d.inputs)===JSON.stringify(abiTypes)))return [];
+  const predictor=(contract.subNodes||[]).find((n:any)=>
+    n.type==='FunctionDefinition'&&n.name==='predictAddress'&&n.body&&
+    ['public','external'].includes(n.visibility)&&
+    ['view','pure'].includes(n.stateMutability||''));
+  if(!predictor||!declarations.some(d=>d.operation==='call'&&
+    d.selector==='Factory.predictAddress'&&
+    JSON.stringify(d.inputs)===JSON.stringify(['address','bytes32']))||
+    !/\btemplate\s*\.\s*predictDeterministicAddress\s*\(\s*salt\s*\)/.test(
+      body(snapshot.content,predictor)))return [];
+  const text=body(snapshot.content,fn);
+  const m=text.match(/\b([A-Za-z_]\w*)\s+clone\s*=\s*\1\s*\(\s*template\s*\.\s*cloneDeterministic\s*\(\s*salt\s*\)\s*\)/);
+  if(!m)return [];
+  const templateName=m[1];
+  // A type must be imported and genuinely acquired; no guessed template
+  // deployment and no substituted mock may stand in for production bytecode.
+  const imported=(parseAstCached(snapshot).children||[]).some((n:any)=>
+    n.type==='ImportDirective'&&String(n.path||'').endsWith('/'+templateName+'.sol'));
+  if(!imported)return [];
+  const templates=[...sources.values()].filter(src=>
+    src.path.endsWith('/'+templateName+'.sol')&&!isTestOrMockPath(src.path));
+  if(templates.length!==1)return [];
+  const templateSource=templates[0];
+  const templateContract=(parseAstCached(templateSource).children||[]).find((n:any)=>
+    n.type==='ContractDefinition'&&n.name===templateName&&
+    n.kind!=='interface'&&n.kind!=='library');
+  if(!templateContract||isAbstractContractNode(templateContract,
+    resolveInheritance(templateSource,templateContract,sources).chain))return [];
+  const constructor=(templateContract.subNodes||[]).find((n:any)=>
+    n.type==='FunctionDefinition'&&n.isConstructor);
+  if(constructor&&(constructor.parameters||[]).length!==0)return [];
+  const initMatch=text.match(/\bclone\s*\.\s*initialize\s*\(([^;]*)\)\s*;/);
+  if(!initMatch)return [];
+  const initializerArgs=initMatch[1].split(',').map(x=>x.trim());
+  // Typed plan generation is confined to exact forwarded parameters: we
+  // cannot infer app-specific protocol preconditions from argument names.
+  if(!initializerArgs.length||initializerArgs.some(x=>!identifier.test(x)||
+    !params.slice(2).some((p:any)=>p.name===x)))return [];
+  const argTypes=initializerArgs.map(name=>abiTypes[params.findIndex((p:any)=>p.name===name)]);
+  if(argTypes.some(type=>!type))return [];
+  const suppliedInit=(templateContract.subNodes||[]).find((n:any)=>
+    n.type==='FunctionDefinition'&&n.name==='initialize'&&n.body);
+  const directBase=resolveInheritance(templateSource,templateContract,sources).chain;
+  const inheritedInit=directBase.flatMap(e=>(e.contract.subNodes||[])
+    .filter((n:any)=>n.type==='FunctionDefinition'&&n.name==='initialize'&&n.body)
+    .map((node:any)=>({node,source:e.snapshot})));
+  const initChoices=suppliedInit?[{node:suppliedInit,source:templateSource}]:inheritedInit;
+  if(initChoices.length!==1||JSON.stringify((initChoices[0].node.parameters||[])
+    .map((p:any)=>canonicalAbiType(p.typeName)))!==JSON.stringify(argTypes))return [];
+  // A factory with additional external calls beyond initialization requires
+  // a fully resolved fixture; this conservative replay family only handles
+  // known source-authenticated ownership transfer after initialization.
+  const rest=text.replace(/\bclone\s*\.\s*initialize\s*\([^;]*\)\s*;/,'')
+    .replace(/\bclone\s*\.\s*transferOwnership\s*\(\s*msg\.sender\s*\)\s*;/,'');
+  if(/\bclone\s*\.\s*(?:mint|fund|deposit|approve|transferFrom)\s*\(/.test(rest))
+    return [];
+  const tailArgs:SolidityArgValue[]=[];
+  for(let i=2;i<params.length;i++){
+    const type=abiTypes[i],name=String(params[i].name||'');
+    const arg=pickFlexibleArg(type,name);
+    if(arg===null||Array.isArray(arg))return [];
+    tailArgs.push(arg);
+  }
+  if(method!=='createNFT')return [];
+  const methodSignature=method+'('+abiTypes.join(',')+')';
+  return [ZERO_BYTES32,'0x'+'11'.repeat(32)].map((salt,index)=>{
+    const callArgs:SolidityArgValue[]=['$deployment:template',salt,...tailArgs];
+    const steps:SoliditySequence['steps']=[
+      {operation:'observe',function:'predictAddress(address,bytes32)',
+        args:['$deployment:template',salt]},
+      {operation:'send',function:methodSignature,args:callArgs,sender:0},
+      {operation:'observe',function:'predictAddress(address,bytes32)',
+        args:['$deployment:template',salt]},
+      {operation:'send',function:methodSignature,args:callArgs,sender:1,expectRevert:true},
+      {operation:'observe',function:'predictAddress(address,bytes32)',
+        args:['$deployment:template',salt]}
+    ];
+    return {hypothesis:'An acquired '+templateName+' template deployed by Factory.'+
+      method+' must initialize once; an identical deterministic CREATE2 salt cannot initialize a second clone',
+      property:'source-proven CREATE2 deterministic clone replay '+method+':'+index,
+      sequence:{constructorArgs:[],
+        preparation:{deployments:[{id:'template',file:templateSource.path,
+          contract:templateName,constructorArgs:[]}],operations:[],checks:[]},steps},
+      witnesses:[witness(snapshot,fn,'Factory.'+methodSignature),
+        witness(snapshot,predictor,'Factory.predictAddress(address,bytes32)'),
+        witness(templateSource,templateContract,templateName),
+        witness(initChoices[0].source,initChoices[0].node,
+          templateName+'.initialize('+argTypes.join(',')+')')]}
+  });
+}
+
 /** Convert a verified initializer setup into the actual source-declared
  * factory clone pathway when the acquired Factory implementation provides one.
  * No inferred clone behavior, guessed parameter order, arbitrary initializer,
@@ -4327,6 +4441,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   const replay=sourceInitializerReplayExperiment(target,contract,method,
     indexed,input.declarations);
   if(replay)choices.push(replay);
+  for(const clone of sourceFactoryDeterminismExperiments(target,contract,method,
+    indexed,input.declarations))choices.push(clone);
   if(!choices.length) {
     const drainOrMintExp=unprotectedFundDrainOrMintExperiment(target,contract,method,indexed,input.declarations);
     if(drainOrMintExp)choices.push(drainOrMintExp);
