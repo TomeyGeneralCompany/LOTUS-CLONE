@@ -32,6 +32,7 @@ import {fileURLToPath} from "node:url";
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
 import {sourceRepairRoutes} from "./deterministic/typed-repair-routes";
 import {repairAttemptIdentity} from "./deterministic/repair-attempt-identity";
+import {unfittedVerifierTranscript} from "./deterministic/verifier-transcript";
 import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from
   "./deterministic/source-unavailability-verifier";
 import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,enumerateAcquiredInheritedAbi} from "./deterministic/fixture-dependency-planner";
@@ -3617,6 +3618,9 @@ export async function runLocalAudit(
         controller.signal.throwIfAborted();
         await appendFile(logFile, "[TOOL] " + call.function.name + "\n");
         let output: string;
+        // The model sees a context-fitted summary; acceptance uses the exact
+        // independent verifier bytes from before fitAuditToolOutput.
+        let executedVerifierOutput:string|undefined;
         let fatalToolError:string|undefined;
         let activityCount:number|undefined;
         let completedActionKey:string|undefined;
@@ -3854,6 +3858,7 @@ export async function runLocalAudit(
               if(["behavior_observed","behavior_not_observed"].includes(result.status))
                 allowance.probe(JSON.stringify([relative(root,full),call.function.arguments?.query,kind,sequence]),turn+1);
             }catch{}
+            executedVerifierOutput=output;
           } else if (name === "list_files") {
             output = JSON.stringify(await listSourcePage(full,offset));
           } else if (name === "search_files") {
@@ -3974,11 +3979,12 @@ export async function runLocalAudit(
             if(count>=3)fatalToolError="AUDIT_STALLED: repeated missing source path after corrective feedback; inspection incomplete";
           }
         }
+        const fullVerifierOutput=unfittedVerifierTranscript(executedVerifierOutput,output);
         if(stageLock && activeStageCandidate &&
           ['verify_source','verify_python'].includes(call.function.name)){
           let outcome:Outcome='incomplete';
           try{
-            const status=String(JSON.parse(output).status||'');
+            const status=String(JSON.parse(fullVerifierOutput).status||'');
             outcome=status==='behavior_observed'?'observed':
               status==='observation_only'?'observation_only':
               status==='behavior_not_observed'?'not_observed':
@@ -3996,7 +4002,7 @@ export async function runLocalAudit(
               src.path===activeEntry.plan.path);
             let reported="";
             try{
-              const value=JSON.parse(output) as {source_sha256?:unknown};
+              const value=JSON.parse(fullVerifierOutput) as {source_sha256?:unknown};
               if(typeof value.source_sha256==="string")reported=value.source_sha256;
             }catch{}
             if(!expected||reported!==expected.sha256){
@@ -4012,11 +4018,11 @@ export async function runLocalAudit(
           stageLock.finishExperiment(activeStageCandidate,outcome);
           if(analysisProgressStore &&
             [...analysisProgressStore.records.values()].some(r=>r.experimentIds.includes(activeStageCandidate!))){
-            const verifierDigest=createHash('sha256').update(output).digest('hex');
+            const verifierDigest=createHash('sha256').update(fullVerifierOutput).digest('hex');
             let caseId='';
             let detail='';
             try{
-              const parsed=JSON.parse(output) as {caseId?:string|null;detail?:string;reason?:string};
+              const parsed=JSON.parse(fullVerifierOutput) as {caseId?:string|null;detail?:string;reason?:string};
               caseId=typeof parsed.caseId==='string'?parsed.caseId:'';
               detail=String(parsed.detail||parsed.reason||'');
             }catch{detail='unparseable_verifier_evidence';}
@@ -4041,7 +4047,9 @@ export async function runLocalAudit(
           activeStageCandidate=null;
         }
         if(['verify_source','verify_python'].includes(call.function.name) && !output.startsWith('Tool error:')) {
-          const result=JSON.parse(output);
+          // Archive the canonical verifier transcript, not an excerpted
+          // context envelope that omits the executed source identity.
+          const result=JSON.parse(fullVerifierOutput);
           const sourcePath=String(call.function.arguments?.path||'');
           const id=await controllerArchive?.append('probe',{
             path:sourcePath,function:call.function.arguments?.query,
