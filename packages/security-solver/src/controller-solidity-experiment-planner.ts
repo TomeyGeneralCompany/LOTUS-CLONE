@@ -1763,6 +1763,119 @@ function resolveFlexibleSetup(
   };
 }
 
+/**
+ * A genuine initializer replay property does not require an ownership getter.
+ * The acquired initializer must have an OpenZeppelin initializer guard, and
+ * contain only source-identifiable direct public-state assignments. Each
+ * assignment is checked against the actual generated ABI getter after the
+ * first mined transaction; an attempted replay must revert and leave those
+ * getters unchanged. An address cast does not create an external protocol.
+ *
+ * This admits ERC20Wrapper-like local initialization without asserting that
+ * an unrelated external receiver is available, or pretending that an
+ * arbitrary transaction revert proves authority.
+ */
+function sourceInitializerReplayExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  sources:ReadonlyMap<string,SourceSnapshot>,
+  declarations:readonly SolidityProbeDeclaration[]
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(!/^(?:initialize|init)$/.test(method)||isTestOrMockPath(snapshot.path))return null;
+  const {chain}=resolveInheritance(snapshot,contract,sources);
+  if(isAbstractContractNode(contract,chain))return null;
+  const ast=parseAstCached(snapshot);
+  const inheritsInitializable=(contract.baseContracts||[]).some((b:any)=>
+    /^(?:Initializable|[A-Za-z_][A-Za-z0-9_]*Upgradeable)$/.test(
+      String(b.baseName?.namePath||'')));
+  const importedInitializable=(ast.children||[]).some((n:any)=>
+    n.type==='ImportDirective'&&
+    /@openzeppelin\/contracts-upgradeable\/proxy\/utils\/Initializable\.sol$/.test(
+      String(n.path||'')));
+  if(!inheritsInitializable||!importedInitializable)return null;
+  const initialized=(contract.subNodes||[]).filter((n:any)=>
+    n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+    ['public','external'].includes(n.visibility)&&
+    (n.modifiers||[]).some((m:any)=>String(m.name?.namePath||m.name||'')==='initializer'));
+  if(initialized.length!==1)return null;
+  const fn=initialized[0],statements:any[]=fn.body?.statements||[];
+  const params:any[]=fn.parameters||[];
+  if(params.length>8||!statements.length||statements.length>10)return null;
+  const abiTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
+  if(abiTypes.some(t=>!t)||!declarations.some(d=>
+    d.operation==='send'&&d.selector===contract.name+'.'+method&&
+    JSON.stringify(d.inputs)===JSON.stringify(abiTypes)))return null;
+  const args:SolidityArgValue[]=[];
+  const replayArgs:SolidityArgValue[]=[];
+  const paramIndex=new Map<string,number>();
+  for(let i=0;i<params.length;i++){
+    const p=params[i],name=String(p.name||'');
+    if(!identifier.test(name)||paramIndex.has(name))return null;
+    paramIndex.set(name,i);
+    const a=pickFlexibleArg(abiTypes[i],name);
+    if(a===null||Array.isArray(a))return null;
+    const changed=abiTypes[i]==='address'?'$account1':
+      abiTypes[i]==='string'?'LOTUS-Replay':
+      abiTypes[i]==='bool'?!a:
+      /^(?:u?int)(?:[0-9]{0,3})$/.test(abiTypes[i])?'2':
+      abiTypes[i]==='bytes32'?('0x'+'11'.repeat(32)):null;
+    if(changed===null)return null;
+    args.push(a);replayArgs.push(changed);
+  }
+  const state=new Map<string,any>((contract.subNodes||[])
+    .filter((n:any)=>n.type==='StateVariableDeclaration')
+    .flatMap((n:any)=>n.variables||[])
+    .filter((v:any)=>v.visibility==='public'&&identifier.test(v.name||''))
+    .map((v:any)=>[v.name,v]));
+  const asserted:Array<{getter:string;expect:SolidityArgValue;node:any}>=[];
+  for(const statement of statements){
+    if(statement.type!=='ExpressionStatement')return null;
+    const expr=statement.expression;
+    if(expr?.type!=='BinaryOperation'||expr.operator!=='='||
+      expr.left?.type!=='Identifier')return null;
+    const stateName=String(expr.left.name||''),variable=state.get(stateName);
+    if(!variable)return null;
+    let parameter:string|undefined;
+    if(expr.right?.type==='Identifier')parameter=expr.right.name;
+    else if(expr.right?.type==='FunctionCall'&&
+      expr.right.arguments?.length===1&&expr.right.arguments[0]?.type==='Identifier'&&
+      expr.right.expression?.type==='Identifier'&&
+      expr.right.expression.name===String(variable.typeName?.namePath||'')){
+      parameter=expr.right.arguments[0].name;
+    }else return null;
+    const index=paramIndex.get(String(parameter||''));
+    if(index===undefined)return null;
+    const stateAbi=canonicalAbiType(variable.typeName);
+    if(stateAbi!==abiTypes[index]&&
+      !(stateAbi==='address'&&abiTypes[index]==='address'))return null;
+    if(!/^(?:address|string|bool|u?int(?:[0-9]{0,3})?)$/.test(stateAbi))return null;
+    if(asserted.some(x=>x.getter===stateName+'()'))return null;
+    if(!declarations.some(d=>d.operation==='call'&&
+      d.selector===contract.name+'.'+stateName&&d.inputs.length===0))return null;
+    asserted.push({getter:stateName+'()',expect:args[index],node:variable});
+  }
+  if(!asserted.length)return null;
+  const setup=resolveFlexibleSetup(snapshot,contract,chain,sources,declarations,null);
+  if(!setup||setup.usesToken||setup.initSignature!==method+'('+abiTypes.join(',')+')')
+    return null;
+  const steps:SoliditySequence['steps']=[
+    {operation:'send',function:setup.initSignature,args,sender:0,requiredSetup:true},
+    ...asserted.map(x=>({operation:'call' as const,function:x.getter,
+      args:[],expect:x.expect})),
+    {operation:'send',function:setup.initSignature,args:replayArgs,
+      sender:1,expectRevert:true},
+    ...asserted.map(x=>({operation:'call' as const,function:x.getter,
+      args:[],expect:x.expect})),
+  ];
+  if(steps.length>16)return null;
+  return {
+    hypothesis:'A source-initialized '+contract.name+' has typed observable state after setup; an unauthorized replay must revert without changing that state',
+    property:'source-verified initializer replay protection '+contract.name+'.'+setup.initSignature,
+    sequence:{constructorArgs:setup.constructorArgs,steps},
+    witnesses:[witness(snapshot,fn,contract.name+'.'+setup.initSignature),
+      ...asserted.map(x=>witness(snapshot,x.node,contract.name+'.'+x.getter))]
+  };
+}
+
 function reinitOrConstructorTakeoverExperiment(
   snapshot:SourceSnapshot,contract:any,method:string,
   sources:ReadonlyMap<string,SourceSnapshot>,menu:readonly SolidityProbeDeclaration[]
@@ -4211,6 +4324,9 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     const reinitExp=reinitOrConstructorTakeoverExperiment(target,contract,method,indexed,input.declarations);
     if(reinitExp)choices.push(reinitExp);
   }
+  const replay=sourceInitializerReplayExperiment(target,contract,method,
+    indexed,input.declarations);
+  if(replay)choices.push(replay);
   if(!choices.length) {
     const drainOrMintExp=unprotectedFundDrainOrMintExperiment(target,contract,method,indexed,input.declarations);
     if(drainOrMintExp)choices.push(drainOrMintExp);
