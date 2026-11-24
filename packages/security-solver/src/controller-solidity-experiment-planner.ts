@@ -93,6 +93,17 @@ export type ConstructionResult =
       partialExperiments?:PreparedSecurityExperiment[]};
 
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
+/** Resolve an acquired import without treating package imports as paths under
+ * the target file's directory. Package snapshots use the exact Solidity import
+ * specifier as their identity (for example @openzeppelin/contracts/...); local
+ * imports continue to use POSIX-normalized paths relative to the importing file.
+ */
+function importedSnapshot(sources:ReadonlyMap<string,SourceSnapshot>,fromPath:string,importPath:string):SourceSnapshot|undefined {
+  const resolved=importPath.startsWith('.')
+    ?posix.normalize(posix.join(posix.dirname(fromPath),importPath))
+    :importPath;
+  return sources.get(resolved);
+}
 const identifier=/^[A-Za-z_]\w*$/;
 const ZERO_ADDRESS='0x0000000000000000000000000000000000000000';
 const ZERO_BYTES32='0x'+'00'.repeat(32);
@@ -186,8 +197,7 @@ function inheritedOwnerExperiment(
   const ownerImport=imports.find((n:any)=>typeof n.path==='string'&&
     posix.basename(n.path)==='BoringOwnable.sol');
   if(!ownerImport)return null;
-  const ownerPath=posix.normalize(posix.join(posix.dirname(snapshot.path),ownerImport.path));
-  const peer=sources.get(ownerPath);
+  const peer=importedSnapshot(sources,snapshot.path,ownerImport.path);
   if(!peer)return null;
   let peerAst:any;
   try{peerAst=parseAstCached(peer);}catch{return null;}
@@ -367,8 +377,7 @@ function resolveInheritance(
           const matchesAlias=imp.symbolAliases.some(([orig,alias]:[string,string|null])=>(alias||orig)===baseName);
           if(!matchesAlias)continue;
         }
-        const resolved=posix.normalize(posix.join(posix.dirname(entry.snapshot.path),p));
-        const peer=sources.get(resolved);
+        const peer=importedSnapshot(sources,entry.snapshot.path,p);
         if(!peer)continue;
         let peerAst:any;
         try{peerAst=parseAstCached(peer);}catch{continue;}

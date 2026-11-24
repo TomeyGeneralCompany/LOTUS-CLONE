@@ -23,12 +23,13 @@ import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequen
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { buildAnalysisCandidateQueue, reconcileStagedLeadSelectors, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
-import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
-import { resolve, relative, sep, join, dirname } from "node:path";
+import { appendFile, mkdtemp, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { resolve, relative, sep, join, dirname, posix } from "node:path";
 import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {fileURLToPath} from "node:url";
+import {parse as parseSolidity} from '@solidity-parser/parser';
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
 import {sourceRepairRoutes} from "./deterministic/typed-repair-routes";
 import {repairAttemptIdentity} from "./deterministic/repair-attempt-identity";
@@ -965,15 +966,119 @@ export async function runLocalAudit(
       sourceRepositoryCommits.set(dir,revision);
       return revision;
     };
+    const dependencySnapshotsByRepository=new Map<string,Promise<SourceSnapshot[]>>();
+    const lockedSolidityDependencySnapshots=(repositoryRoot:string,
+      sourceEntries:ReadonlyMap<string,string>):Promise<SourceSnapshot[]>=>{
+      const cached=dependencySnapshotsByRepository.get(repositoryRoot);
+      if(cached)return cached;
+      const loading=(async()=>{
+        const imports=new Set<string>();
+        for(const content of sourceEntries.values()){
+          try{
+            const ast=parseSolidity(content);
+            for(const node of ast.children||[])
+              if(node.type==='ImportDirective'&&typeof node.path==='string'&&
+                !node.path.startsWith('.')&&node.path.endsWith('.sol'))imports.add(node.path);
+          }catch{/* The acquired source's parse failure is handled by its normal audit path. */}
+        }
+        const moduleDirectory=dirname(fileURLToPath(import.meta.url));
+        const materializerCandidates=[
+          resolve(moduleDirectory,'../../..','scripts/source_dependencies.py'),
+          resolve(moduleDirectory,'../../../..','scripts/source_dependencies.py'),
+        ];
+        let materializer:string|undefined;
+        for(const candidate of materializerCandidates){
+          try{if((await stat(candidate)).isFile()){materializer=candidate;break;}}catch{}
+        }
+        if(!materializer){
+          await appendFile(logFile,'[LOCKED_SOLIDITY_DEPENDENCY_UNAVAILABLE] '+JSON.stringify({
+            reason:'LOTUS lockfile dependency materializer is not installed beside the controller'})+'\n');
+          return [];
+        }
+        const snapshots=new Map<string,SourceSnapshot>();
+        const pending=[...imports];
+        const visited=new Set<string>();
+        let totalBytes=0;
+        while(pending.length&&visited.size<1500){
+          const batch=pending.splice(0,128).filter(specifier=>!visited.has(specifier));
+          if(!batch.length)continue;
+          for(const specifier of batch)visited.add(specifier);
+          try{
+            // The repository helper validates lockfile integrity and registry
+            // redirects, extracts only requested locked packages, and never
+            // runs package lifecycle scripts. This occurs only after complete
+            // target-source reading has unlocked experiment planning.
+            const python="import importlib.util,json,sys;from pathlib import Path;"+
+              "s=importlib.util.spec_from_file_location('lotus_source_dependencies',sys.argv[1]);"+
+              "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"+
+              "m.prepare_dependencies(Path(sys.argv[2]),json.loads(sys.argv[3]))";
+            execFileSync('python3',['-c',python,materializer,repositoryRoot,JSON.stringify(batch)],
+              {encoding:'utf8',timeout:45000,stdio:['ignore','pipe','pipe']});
+          }catch(error){
+            await appendFile(logFile,'[LOCKED_SOLIDITY_DEPENDENCY_UNAVAILABLE] '+JSON.stringify({
+              repository:relative(root,repositoryRoot),imports:batch,
+              reason:String((error as Error)?.message||error).slice(0,500)})+'\n');
+            continue;
+          }
+          let modulesRoot:string;
+          try{modulesRoot=await realpath(resolve(repositoryRoot,'node_modules'));}
+          catch{continue;}
+          for(const specifier of batch){
+            if(specifier.split('/').some(part=>!part||part==='.'||part==='..'||part.includes('\\')))continue;
+            const physical=resolve(modulesRoot,...specifier.split('/'));
+            try{
+              const actual=await realpath(physical);
+              if(actual!==modulesRoot&&!actual.startsWith(modulesRoot+sep))continue;
+              const info=await stat(actual);
+              if(!info.isFile()||info.size>256000)continue;
+              const content=await readFile(actual,'utf8');
+              totalBytes+=Buffer.byteLength(content);
+              if(totalBytes>32*1024*1024)break;
+              snapshots.set(specifier,{path:specifier,content,
+                sha256:createHash('sha256').update(content).digest('hex')});
+              try{
+                const ast=parseSolidity(content);
+                for(const node of ast.children||[]){
+                  if(node.type!=='ImportDirective'||typeof node.path!=='string'||!node.path.endsWith('.sol'))continue;
+                  const dependencyPath=node.path.startsWith('.')
+                    ?posix.normalize(posix.join(posix.dirname(specifier),node.path)):node.path;
+                  if(!dependencyPath.startsWith('/')&&
+                    !dependencyPath.split('/').some(part=>!part||part==='.'||part==='..')&&
+                    !visited.has(dependencyPath))pending.push(dependencyPath);
+                }
+              }catch{/* A malformed dependency cannot be used as source evidence. */}
+            }catch{/* Unavailable imports remain explicit planner blockers. */}
+          }
+        }
+        return [...snapshots.values()];
+      })();
+      dependencySnapshotsByRepository.set(repositoryRoot,loading);
+      return loading;
+    };
     const groundedControllerOptions=async(path:string,source:string,menu:SolidityProbeDeclaration[],options?:{skipFinancialInvariants?:boolean})=>{
       const sourceEntries=new Map(accessibleSoliditySources);
       sourceEntries.set(path,source);
       const repoPrefix=path.split('/')[0]+'/';
-      const snapshots:SourceSnapshot[]=[...sourceEntries.entries()]
+      const acquiredSnapshots:SourceSnapshot[]=[...sourceEntries.entries()]
         .filter(([candidate])=>candidate.startsWith(repoPrefix))
         .map(([candidate,content])=>({
           path:candidate,content,sha256:createHash('sha256').update(content).digest('hex')
         }));
+      const targetRoot=resolve(root,path.split('/')[0]);
+      let dependencySnapshots:SourceSnapshot[]=[];
+      try{
+        const realTargetRoot=await realpath(targetRoot);
+        if(realTargetRoot===root||!realTargetRoot.startsWith(root+sep))
+          throw new Error('Acquired repository root resolves outside the authorized workspace');
+        dependencySnapshots=await lockedSolidityDependencySnapshots(realTargetRoot,
+          new Map(acquiredSnapshots.map(snapshot=>[snapshot.path,snapshot.content])));
+      }catch(error){
+        await appendFile(logFile,'[LOCKED_SOLIDITY_DEPENDENCY_UNAVAILABLE] '+JSON.stringify({
+          repository:relative(root,targetRoot),reason:String((error as Error)?.message||error).slice(0,500)})+'\n');
+      }
+      // Package sources are dependency evidence only: planner entry points
+      // remain bound to the acquired bounty target path and indexed selector.
+      const snapshots=[...acquiredSnapshots,...dependencySnapshots];
       const revision=sourceRevision(path);
       if(!revision)await appendFile(logFile,'[CONTROLLER_SCENARIO_REVISION_UNAVAILABLE] '+
         JSON.stringify({path})+'\n');

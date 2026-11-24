@@ -117,7 +117,7 @@ const ownable='pragma solidity 0.8.4; contract BoringOwnable {'+
   'function owner() external view returns(address){return _owner;}'+
   'modifier onlyOwner(){require(msg.sender == _owner, "Ownable: caller is not the owner");_;}'+
   '}';
-const vesting='pragma solidity 0.8.4; import {BoringOwnable} from "../libs/BoringOwnable.sol";'+
+const vesting='pragma solidity 0.8.4; import {BoringOwnable} from "@lotus-acquired/boring/BoringOwnable.sol";'+
   'interface IERC20 {} interface MPHMinter {} contract Vesting02 is BoringOwnable {'+
   'IERC20 public token; MPHMinter public mphMinter;'+
   'function initialize(address _token,string calldata tokenName,string calldata tokenSymbol) external initializer {'+
@@ -132,7 +132,8 @@ const vestingInput={
  targetSelector:'Vesting02.setMPHMinter',
  sources:[
   {path:'contracts/rewards/Vesting02.sol',sha256:createHash('sha256').update(vesting).digest('hex'),content:vesting},
-  {path:'contracts/libs/BoringOwnable.sol',sha256:createHash('sha256').update(ownable).digest('hex'),content:ownable}
+  // Canonical package import specifiers are preserved as source identities.
+  {path:'@lotus-acquired/boring/BoringOwnable.sol',sha256:createHash('sha256').update(ownable).digest('hex'),content:ownable}
  ],
  declarations:[{selector:'Vesting02.setMPHMinter',operation:'send' as const,inputs:['address']}]
 };
@@ -371,12 +372,13 @@ const boringTransferLib = ownable.replace(
   'modifier onlyOwner',
   'function transferOwnership(address newOwner, bool direct, bool renounce) public onlyOwner {} modifier onlyOwner'
 );
+const relativeVesting=vesting.replace('@lotus-acquired/boring/BoringOwnable.sol','../libs/BoringOwnable.sol');
 const transferBoringRes = constructSolidityExperiments({
   repositoryCommit: 'f'.repeat(40),
   targetPath: vestingInput.targetPath,
   targetSelector: 'Vesting02.transferOwnership',
   sources: [
-    vestingInput.sources[0],
+    {path: vestingInput.targetPath, sha256: createHash('sha256').update(relativeVesting).digest('hex'), content: relativeVesting},
     {path: 'contracts/libs/BoringOwnable.sol', sha256: createHash('sha256').update(boringTransferLib).digest('hex'), content: boringTransferLib},
   ],
   declarations: [
