@@ -4,7 +4,10 @@ const assert=require('node:assert/strict');
 const {createHash}=require('node:crypto');
 const solc=require('./reproduction-runtime/node_modules/solc');
 const ganache=require('./reproduction-runtime/node_modules/ganache');
+const solc_084=require('./reproduction-runtime/node_modules/solc_0_8_4');
+const solc_076=require('./reproduction-runtime/node_modules/solc_0_7');
 const {validateSequence,runSequence}=require('./reproduction-runtime/solidity-sequence.cjs');
+const {compileSoliditySourceGroups}=require('./reproduction-runtime/solidity-compiler.cjs');
 const source=`pragma solidity ^0.8.20;
 contract Fixture {
  uint256 public value; address public owner;
@@ -57,6 +60,49 @@ async function execute(s) {
  assert.match(unexpectedResult.steps[2].gasUsed,/^[0-9]+$/);
  assert.equal(unexpectedResult.steps[3].passed,true,
    'Read after an unexpected mined revert must remain observable');
+ // Actual acquired preparation contracts can pin a different compiler than
+ // the target. Compile, deploy and execute both compiler artifacts without
+ // changing either source pragma or substituting a mock implementation.
+ const mixedSources={
+  'Target084.sol':{content:'pragma solidity 0.8.4; contract Target084 {'+
+   ' uint256 public value; function set() external { value=7; } }'},
+  'Dependency076.sol':{content:'pragma solidity 0.7.6; contract Dependency076 {'+
+   ' uint256 public value; constructor(uint256 initial){value=initial;} }'}
+ };
+ const mixed=compileSoliditySourceGroups(mixedSources,source=>{
+   if(/\b0\.7\.6\b/.test(source))return {solc:solc_076,evmVersion:'berlin'};
+   if(/\b0\.8\.4\b/.test(source))return {solc:solc_084,evmVersion:'berlin'};
+   throw new Error('Unpinned mixed-version fixture source');
+ },undefined,true,()=>({error:'No imports expected in the version-isolation regression'}));
+ assert.equal(mixed.compilerGroupCount,2,
+  'Each distinct exact compiler version must receive a separate source group');
+ assert.equal((mixed.compiled.errors||[]).filter(x=>x.severity==='error').length,0);
+ const mixedTarget=mixed.compiled.contracts['Target084.sol'].Target084;
+ const mixedDependency=mixed.compiled.contracts['Dependency076.sol'].Dependency076;
+ assert.ok(mixedTarget.evm.bytecode.object&&mixedDependency.evm.bytecode.object,
+  'Both compiler-produced deployment artifacts must be present');
+ const mixedTransport=ganache.provider({logging:{quiet:true},
+  wallet:{deterministic:true,totalAccounts:3},chain:{hardfork:'berlin',chainId:1337,
+   time:new Date('2020-01-01T00:00:00Z')},miner:{blockGasLimit:12000000}});
+ try{
+  const mixedSequence={constructorArgs:[],preparation:{deployments:[
+   {id:'legacy_dependency',file:'Dependency076.sol',contract:'Dependency076',constructorArgs:['4']}
+  ],operations:[],checks:[{id:'dependency-source-state',deploymentId:'legacy_dependency',
+   function:'value()',args:[],expect:'4',sender:0}]},steps:[
+   {operation:'send',function:'set()',args:[]},
+   {operation:'call',function:'value()',args:[],expect:'7'}
+  ]};
+  validateSequence(mixedSequence);
+  const mixedResult=await runSequence(mixedTarget,mixedSequence,mixedTransport,
+   mixed.compiled.contracts,{
+    preparationAbiSha256:{legacy_dependency:createHash('sha256')
+     .update(JSON.stringify(mixedDependency.abi)).digest('hex')}
+   });
+  assert.ok(mixedResult.steps.every(step=>step.passed),JSON.stringify(mixedResult));
+  assert.ok(mixedResult.steps.some(step=>step.operation==='setup'&&
+   step.function==='deploy:Dependency076.sol:Dependency076'));
+  assert.equal(mixedResult.steps.at(-1).actual,'7');
+ }finally{await mixedTransport.disconnect();}
  // ERC-1155-like setup: a transfer without minted balance must revert,
  // but the failed transfer and unchanged balance are both recorded.
  const tokenSource=`pragma solidity ^0.8.20;
@@ -208,7 +254,7 @@ async function execute(s) {
    'result.initialize(n); return result; } }';
  const sourceCompiled=JSON.parse(solc.compile(JSON.stringify({language:'Solidity',
    sources:{'Child.sol':{content:childSource},'Factory.sol':{content:factorySource}},
-   settings:{evmVersion:'shanghai',outputSelection:{'*':{'*':['abi','evm.bytecode.object']}}}})));
+   settings:{evmVersion:'shanghai',outputSelection:{'*':{'*':['abi','evm.bytecode.object','evm.bytecode.linkReferences']}}}})));
  assert.deepEqual((sourceCompiled.errors||[]).filter(e=>e.severity==='error'),[]);
  const childArtifact=sourceCompiled.contracts['Child.sol'].Child;
  const factoryArtifact=sourceCompiled.contracts['Factory.sol'].Factory;
@@ -232,6 +278,42 @@ async function execute(s) {
    assert.ok(actual.steps.every(x=>x.passed),JSON.stringify(actual));
    assert.equal(actual.steps.at(-1).actual,'9');
  }finally{await clonedTransport.disconnect();}
+ // A source-acquired preparation contract may require a compiler-linked
+ // Solidity library, as NFTWithSVG does through NFTDescriptor in the real
+ // source inventory. Deploy the exact compiled library and link its address
+ // into the preparation bytecode before running source-declared checks.
+ const linkedSources={
+  'NFTDescriptor.sol':{content:'pragma solidity ^0.8.20; library NFTDescriptor {'+
+    'function next(uint256 value) external pure returns(uint256){return value+1;} }'},
+  'NFTWithSVG.sol':{content:'pragma solidity ^0.8.20; import "./NFTDescriptor.sol"; '+
+    'contract NFTWithSVG { uint256 public value; constructor(uint256 initial){'+
+    'value=NFTDescriptor.next(initial);} }'},
+  'ProbeTarget.sol':{content:'pragma solidity ^0.8.20; contract ProbeTarget {'+
+    'function ping() external pure returns(uint256){return 1;} }'}
+ };
+ const linkedCompiled=JSON.parse(solc.compile(JSON.stringify({language:'Solidity',
+  sources:linkedSources,settings:{evmVersion:'shanghai',
+   outputSelection:{'*':{'*':['abi','evm.bytecode.object','evm.bytecode.linkReferences']}}}})));
+ assert.deepEqual((linkedCompiled.errors||[]).filter(e=>e.severity==='error'),[]);
+ const libraryConsumer=linkedCompiled.contracts['NFTWithSVG.sol'].NFTWithSVG;
+ assert.ok(Object.keys(libraryConsumer.evm.bytecode.linkReferences).length,
+  'Compiler must report the source library link');
+ const linkTransport=ganache.provider({logging:{quiet:true},
+  wallet:{deterministic:true,totalAccounts:3},chain:{hardfork:'shanghai'},
+  miner:{blockGasLimit:12000000}});
+ try{
+  const linkedResult=await runSequence(
+   linkedCompiled.contracts['ProbeTarget.sol'].ProbeTarget,
+   {constructorArgs:[],preparation:{deployments:[{id:'template',file:'NFTWithSVG.sol',
+      contract:'NFTWithSVG',constructorArgs:['4']}],operations:[],checks:[
+       {id:'initialized-template',deploymentId:'template',function:'value()',
+        args:[],expect:'5',sender:0}
+      ]},steps:[{operation:'call',function:'ping()',args:[],expect:'1'}]},
+   linkTransport,linkedCompiled.contracts);
+  assert.ok(linkedResult.steps.some(step=>step.operation==='setup'&&
+    step.function==='deploy-library:NFTDescriptor.sol:NFTDescriptor'));
+  assert.ok(linkedResult.steps.every(step=>step.passed),JSON.stringify(linkedResult));
+ }finally{await linkTransport.disconnect();}
  const wrongArgs=structuredClone(sequence);wrongArgs.steps[2].args=['not an integer'];
  await assert.rejects(execute(wrongArgs),/invalid|argument/i,'Invalid ABI input cannot masquerade as an expected revert');
  const readAsSend={constructorArgs:['0','$account0'],steps:[{operation:'send',function:'value()',args:[]},sequence.steps[0]]};

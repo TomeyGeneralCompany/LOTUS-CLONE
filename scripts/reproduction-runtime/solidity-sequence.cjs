@@ -123,8 +123,8 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
   validateSequence(sequence);
   const {BrowserProvider, ContractFactory, Contract}=require('ethers');
   const {createHash}=require('node:crypto');
-  if(!artifact?.evm?.bytecode?.object || !/^[0-9a-fA-F]+$/.test(artifact.evm.bytecode.object))
-    throw new Error('A deployable contract without unresolved library links is required');
+  if(!artifact?.evm?.bytecode?.object)
+    throw new Error('A deployable contract with compiler bytecode is required');
   const provider=new BrowserProvider(transport,undefined,{cacheTimeout:-1,pollingInterval:10});
   let runtimePhase='fixture_preparation';
   let runtimeStepIndex=null;
@@ -162,6 +162,52 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
     let address;
     const deployed=new Map();
     const setupSteps=[];
+    const linkedLibraries=new Map();
+    const linking=new Set();
+    const deployableArtifact=async(sourceFile,contractName,compiledArtifact)=>{
+      const bytecode=compiledArtifact?.evm?.bytecode?.object;
+      if(typeof bytecode!=='string'||!bytecode.length)
+        throw new Error('Missing compiler bytecode for '+sourceFile+':'+contractName);
+      const references=compiledArtifact.evm.bytecode.linkReferences||{};
+      let linkedBytecode=bytecode;
+      for(const [libraryFile,libraries] of Object.entries(references)){
+        for(const [libraryName,locations] of Object.entries(libraries||{})){
+          const key=libraryFile+':'+libraryName;
+          let libraryAddress=linkedLibraries.get(key);
+          if(!libraryAddress){
+            if(linking.has(key))throw new Error('Circular Solidity library link: '+key);
+            const libraryArtifact=preparationArtifacts[libraryFile]?.[libraryName];
+            if(!libraryArtifact)throw new Error('Compiler library artifact unavailable: '+key);
+            linking.add(key);
+            try {
+              const linkedLibrary=await deployableArtifact(libraryFile,libraryName,libraryArtifact);
+              const library=await new ContractFactory(linkedLibrary.abi,
+                linkedLibrary.evm.bytecode.object,signers[0]).deploy({gasLimit:10000000});
+              const receipt=await library.deploymentTransaction().wait();
+              if(!receipt||receipt.status!==1)throw new Error('Solidity library deployment failed: '+key);
+              libraryAddress=(await library.getAddress()).toLowerCase();
+              linkedLibraries.set(key,libraryAddress);
+              setupSteps.push({operation:'setup',function:'deploy-library:'+key,
+                sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),
+                purpose:'link compiler-declared source library '+libraryAddress});
+            } finally {linking.delete(key);}
+          }
+          for(const location of locations){
+            const start=location.start*2;
+            const length=location.length*2;
+            if(location.length!==20||start<0||start+length>linkedBytecode.length)
+              throw new Error('Unsupported compiler library link location: '+key);
+            const replacement=libraryAddress.slice(2).padStart(length,'0');
+            linkedBytecode=linkedBytecode.slice(0,start)+replacement+
+              linkedBytecode.slice(start+length);
+          }
+        }
+      }
+      if(!/^[0-9a-fA-F]+$/.test(linkedBytecode))
+        throw new Error('Unresolved compiler library link in '+sourceFile+':'+contractName);
+      return {...compiledArtifact,evm:{...compiledArtifact.evm,
+        bytecode:{...compiledArtifact.evm.bytecode,object:linkedBytecode}}};
+    };
     const resolve = v => {
       if(Array.isArray(v))return v.map(resolve);
       if(typeof v==='string' && /^\$account[012]$/.test(v))return accounts[Number(v.at(-1))];
@@ -181,10 +227,10 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       for(const d of preparation.deployments) {
         runtimePhase='fixture_deployment';
         const depArtifact=preparationArtifacts[d.file]?.[d.contract];
-        if(!depArtifact?.evm?.bytecode?.object ||
-           !/^[a-fA-F0-9]+$/.test(depArtifact.evm.bytecode.object))
-          throw new Error('Missing or unlinked preparation contract '+d.file+':'+d.contract);
-        const dep=await new ContractFactory(depArtifact.abi,depArtifact.evm.bytecode.object,signers[0])
+        if(!depArtifact?.evm?.bytecode?.object)
+          throw new Error('Missing preparation contract '+d.file+':'+d.contract);
+        const linkedDependency=await deployableArtifact(d.file,d.contract,depArtifact);
+        const dep=await new ContractFactory(linkedDependency.abi,linkedDependency.evm.bytecode.object,signers[0])
           .deploy(...d.constructorArgs.map(resolve),{value:d.valueWei||'0',gasLimit:10000000});
         const receipt=await dep.deploymentTransaction().wait();
         if(receipt?.status!==1)throw new Error('Preparation deployment failed: '+d.id);
@@ -230,11 +276,13 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       }
     }
     runtimePhase='target_deployment';
+    const linkedTarget=await deployableArtifact(metadata.selectedFile||metadata.file||'<target>',
+      metadata.contractName||'<target>',artifact);
     const latestBlock=await provider.getBlock('latest');
     const deployGasLimit=latestBlock?.gasLimit && latestBlock.gasLimit > 12000000n
       ? (latestBlock.gasLimit * 9n) / 10n
       : 10000000n;
-    let contract=await new ContractFactory(artifact.abi,artifact.evm.bytecode.object,signers[0])
+    let contract=await new ContractFactory(linkedTarget.abi,linkedTarget.evm.bytecode.object,signers[0])
       .deploy(...sequence.constructorArgs.map(resolve),{value:sequence.constructorValueWei||'0',gasLimit:deployGasLimit});
     const deployment=await contract.deploymentTransaction().wait();
     if(!deployment || deployment.status!==1)throw new Error('Constructor deployment failed');
@@ -270,7 +318,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         purpose:'acquired factory '+call.deploymentId+' created clone '+predicted.toLowerCase()+
           ' with runtime code sha256 '+cloneDigest});
       address=predicted;
-      contract=new Contract(address,artifact.abi,signers[0]);
+      contract=new Contract(address,linkedTarget.abi,signers[0]);
     }
     runtimePhase='target_action';
     const steps=[...setupSteps];

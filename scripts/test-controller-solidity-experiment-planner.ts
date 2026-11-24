@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {constructSolidityExperiments} from '../packages/security-solver/src/controller-solidity-experiment-planner';
+import {verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 const content=`pragma solidity ^0.8.20;
 contract Vault {
   address public owner;
@@ -20,6 +21,70 @@ const input={
  {selector:'Vault.reserve',operation:'call' as const,inputs:[]},
  {selector:'Vault.owner',operation:'call' as const,inputs:[]}
  ]};
+
+// A receiver's ABI can be declared by an acquired inherited base rather than
+// directly in the concrete contract. Keep that source chain as the ABI witness.
+const inheritedToken='pragma solidity ^0.8.20;\n'+
+  'contract ERC1155Base { function mint(address,uint256,uint256) external {} '+
+  'function burn(address,uint256,uint256) external {} '+
+  'function balanceOf(address,uint256) external view returns(uint256) { return 0; } }\n'+
+  'contract FundingMultitoken is ERC1155Base {}';
+const inheritedTokenSnapshot={path:'contracts/tokens/FundingMultitoken.sol',
+  sha256:createHash('sha256').update(inheritedToken).digest('hex'),content:inheritedToken};
+const inheritedTokenAbi=verifyAcquiredReceiverMethods('FundingMultitoken',
+  ['mint','burn','balanceOf'],inheritedTokenSnapshot.path,'FundingMultitoken',
+  [inheritedTokenSnapshot]);
+assert.equal(inheritedTokenAbi.ok,true,
+  'Acquired inherited receiver methods must satisfy the concrete receiver ABI: '+
+  JSON.stringify(inheritedTokenAbi));
+const packageTokenAbiSource='pragma solidity ^0.8.20;\n'+
+  'import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";\n'+
+  'abstract contract MoneyMarket { function stablecoin() external view virtual returns(ERC20); }\n'+
+  'contract Adapter is MoneyMarket { ERC20 public override stablecoin; }';
+const packageTokenAbiSnapshot={path:'contracts/Adapter.sol',
+  sha256:createHash('sha256').update(packageTokenAbiSource).digest('hex'),
+  content:packageTokenAbiSource};
+const packageTokenAbi=verifyAcquiredReceiverMethods('MoneyMarket',['stablecoin'],
+  packageTokenAbiSnapshot.path,'Adapter',[packageTokenAbiSnapshot]);
+assert.equal(packageTokenAbi.ok,true,
+  'Compiler package contract types use the Solidity address ABI for inherited getters: '+
+  JSON.stringify(packageTokenAbi));
+const packageAccessControlSource='pragma solidity ^0.8.20;\n'+
+  'import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";\n'+
+  'contract Minter is AccessControlUpgradeable { function hasRole(bytes32,address) public view override returns(bool) { return false; } }';
+const packageAccessControlSnapshot={path:'contracts/Minter.sol',
+  sha256:createHash('sha256').update(packageAccessControlSource).digest('hex'),
+  content:packageAccessControlSource};
+const packageAccessControlAbi=verifyAcquiredReceiverMethods('Minter',['hasRole'],
+  packageAccessControlSnapshot.path,'Minter',[packageAccessControlSnapshot]);
+assert.equal(packageAccessControlAbi.ok,true,
+  'Canonical inherited OpenZeppelin access-control ABI must validate acquired minter fixtures: '+
+  JSON.stringify(packageAccessControlAbi));
+const packageMphTokenSource='pragma solidity ^0.8.20;\n'+
+  'import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";\n'+
+  'import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";\n'+
+  'contract MPHToken is ERC20Upgradeable, OwnableUpgradeable { function ownerMint(address,uint256) external returns(bool) { return true; } }';
+const packageMphTokenSnapshot={path:'contracts/MPHToken.sol',
+  sha256:createHash('sha256').update(packageMphTokenSource).digest('hex'),
+  content:packageMphTokenSource};
+const packageMphTokenAbi=verifyAcquiredReceiverMethods('MPHToken',
+  ['ownerMint','owner','increaseAllowance','transferOwnership','renounceOwnership'],
+  packageMphTokenSnapshot.path,'MPHToken',[packageMphTokenSnapshot]);
+assert.equal(packageMphTokenAbi.ok,true,
+  'Canonical ERC20Upgradeable and OwnableUpgradeable inherited ABI must validate the acquired MPH token fixture: '+
+  JSON.stringify(packageMphTokenAbi));
+const packageVestingSource='pragma solidity 0.8.4;\n'+
+  'import {ERC721URIStorageUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721URIStorageUpgradeable.sol";\n'+
+  'contract VestingFixture is ERC721URIStorageUpgradeable {}';
+const packageVestingSnapshot={path:'contracts/VestingFixture.sol',
+  sha256:createHash('sha256').update(packageVestingSource).digest('hex'),
+  content:packageVestingSource};
+const packageVestingAbi=verifyAcquiredReceiverMethods('VestingFixture',
+  ['safeTransferFrom'],packageVestingSnapshot.path,'VestingFixture',[packageVestingSnapshot]);
+assert.equal(packageVestingAbi.ok,true,
+  'Canonical inherited ERC721 safe-transfer overloads must satisfy the acquired Vesting02 receiver ABI: '+
+  JSON.stringify(packageVestingAbi));
+
 const a=constructSolidityExperiments(input);
 assert.equal(a.ok,true,JSON.stringify(a));
 if(a.ok){

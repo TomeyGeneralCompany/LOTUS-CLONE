@@ -14,7 +14,8 @@ permissions:
 
 concurrency:
   group: lotus-laptop-feedback-${{ github.ref_name }}
-  cancel-in-progress: ${{ github.ref_name != 'main' }}
+  # A PR update must not terminate an active multi-hour laptop qualification.
+  cancel-in-progress: false
 
 jobs:
   laptop:

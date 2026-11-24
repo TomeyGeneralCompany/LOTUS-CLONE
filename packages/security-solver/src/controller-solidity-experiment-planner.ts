@@ -11,7 +11,7 @@ import type {SoliditySequence} from './solidity-sequence';
 import {sourceGroundedSolidityProbes} from './controller-solidity-security-probes';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
 import {extractAccountingObservations} from './deterministic/accounting-observations';
-import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependencies, verifyAcquiredReceiverMethods, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependenciesDetailed, verifyAcquiredReceiverMethods, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
 
 export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
@@ -4512,6 +4512,7 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   // Runs alongside authorization probes because accounting conservation is a
   // distinct security property; refuses to fabricate when prerequisites fail.
   let invariantUnresolved: {category: InvariantUnresolvedCategory; reason: string} | null = null;
+  let fixtureSearchIncompleteReason:string|null=null;
   const suppliedInvariant = (input.invariants || []).find(
     (inv) => inv.target === input.targetSelector && inv.sourceSha256 === target.sha256,
   );
@@ -4540,10 +4541,22 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     // A type's multiple acquired concrete implementations are distinct
     // candidate graphs. Never select an arbitrary first protocol: each
     // graph retains its exact source, ABI and constructor/initializer DAG.
-    const fixtureGraphs=enumerateSourceFixtureDependencies(target,contract.name,
-      [...indexed.values()],{maxAlternatives:16});
+    const fixtureEnumeration=enumerateSourceFixtureDependenciesDetailed(target,contract.name,
+      [...indexed.values()],{maxAlternatives:4096,maxSearchNodes:8192});
+    const fixtureGraphs=fixtureEnumeration.alternatives;
     const fixtureChoiceSets:Readonly<Record<string,string>|undefined>[]=
-      fixtureGraphs.length?fixtureGraphs.map(graph=>graph.implementationChoices):[undefined];
+      fixtureGraphs.length?fixtureGraphs.map(graph=>graph.implementationChoices):
+        fixtureEnumeration.complete?[undefined]:[];
+    if(!fixtureEnumeration.complete){
+      const unresolved=fixtureEnumeration.unresolvedSelections.slice(0,8).map(item=>
+        JSON.stringify(item.selection)+":"+item.missingDependencies.join(","));
+      fixtureSearchIncompleteReason=`Source fixture alternatives are incomplete after ${fixtureEnumeration.searchNodes} search nodes; `+
+        `${fixtureEnumeration.pendingSelections} selections remain unexplored; `+
+        `${fixtureEnumeration.unresolvedSelections.length} branches lack executable fixture graphs`+
+        (unresolved.length?` (${unresolved.join("; ")})`:"");
+      if(!invariantUnresolved)invariantUnresolved={
+        category:'missing_fixture',reason:fixtureSearchIncompleteReason};
+    }
     for(const targetSignature of signatures){
       for(const fixtureChoices of fixtureChoiceSets){
         const extracted=extractSourceInvariantDescriptor(target,contract,method,
@@ -4615,6 +4628,13 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       path:input.targetPath,selector:input.targetSelector,
       hypothesis:c.hypothesis,securityProperty:c.property,witnesses:c.witnesses,
       prerequisites:graph.ordered,sequence:c.sequence});
+  }
+  const targetIsFinancialEntry=/^(?:deposit|withdraw|borrow|repay|mint|burn|redeem|swap|stake|unstake|claim|liquidate|flash|vest|fund|rebalance|harvest|compound)/i
+    .test(input.targetSelector.split('.').pop()||'');
+  if(fixtureSearchIncompleteReason&&targetIsFinancialEntry){
+    return {ok:false,code:'FIXTURE_ENUMERATION_INCOMPLETE',
+      detail:fixtureSearchIncompleteReason,unresolvedCategory:'missing_fixture',
+      partialExperiments:out};
   }
   if(failures.length){
     // Preserve *all* source-derived obligations. A constructible property

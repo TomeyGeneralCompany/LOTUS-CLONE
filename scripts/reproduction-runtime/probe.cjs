@@ -188,11 +188,11 @@ contract TomeyERC1155ProbeHarness is ERC1155Upgradeable {
     }
   }
   const compileSources = {[spec.file]: {content: harnessSource}, ...(deployment ? {[deployment.file]:{content:derivedText}} : {}), ...preparationSources};
-  const compileWith = (compilerSettings) => JSON.parse(solc.compile(JSON.stringify({
-    language: 'Solidity',
-    sources: compileSources,
-    settings: {...compilerSettings, evmVersion, outputSelection: {'*': {'*': ['abi', 'evm.bytecode.object']}}}
-  }), {import: solidityImport}));
+  // Compile each acquired preparation source with the compiler version named
+  // by its own pragma. Never rewrite source or fabricate a replacement.
+  const {compileSoliditySourceGroups}=require('./solidity-compiler.cjs');
+  const compilerGroups=new Set(Object.values(compileSources).map(entry=>
+    resolveSolc(entry.content).solc.version()));
   const parts = effectiveSpec.function.split('.');
   const functionName = parts.pop();
   const contractName = deployment ? deployment.contract : parts.pop();
@@ -205,25 +205,23 @@ contract TomeyERC1155ProbeHarness is ERC1155Upgradeable {
       const prepDeploys = (sequenceMode && spec.sequence.preparation && Array.isArray(spec.sequence.preparation.deployments))
         ? spec.sequence.preparation.deployments : [];
       const targetCached = cached?.contracts?.[selectedFile]?.[contractName];
-      const hasTarget = Boolean(targetCached?.evm?.bytecode?.object && Array.isArray(targetCached?.abi));
+      const hasTarget = Boolean(targetCached?.evm?.bytecode?.object &&
+        targetCached?.evm?.bytecode?.linkReferences && Array.isArray(targetCached?.abi));
       const hasPrep = prepDeploys.every(item => Boolean(
         cached?.contracts?.[item.file]?.[item.contract]?.evm?.bytecode?.object &&
+        cached?.contracts?.[item.file]?.[item.contract]?.evm?.bytecode?.linkReferences &&
         Array.isArray(cached?.contracts?.[item.file]?.[item.contract]?.abi)
       ));
-      if (cached && cached.evmVersion === evmVersion && hasTarget && hasPrep) {
+      if (compilerGroups.size===1&&cached&&cached.evmVersion===evmVersion&&hasTarget&&hasPrep) {
         compiled = { contracts: cached.contracts, errors: [] };
         cacheHit = true;
       }
     }
   } catch {}
   if (!compiled) {
-    compiled = compileWith(spec.compilerSettings);
-    let errors = (compiled.errors || []).filter(e => e.severity === 'error');
-    if (errors.length && sequenceMode && !spec.compilerSettings?.optimizer &&
-        errors.some(e => /stack too deep/i.test(String(e.formattedMessage || e.message || '')))) {
-      compiled = compileWith({ ...(spec.compilerSettings || {}), optimizer: { enabled: true, runs: 200 } });
-      errors = (compiled.errors || []).filter(e => e.severity === 'error');
-    }
+    compiled = compileSoliditySourceGroups(compileSources,resolveSolc,
+      spec.compilerSettings,sequenceMode,solidityImport).compiled;
+    const errors = (compiled.errors || []).filter(e => e.severity === 'error');
     if (errors.length) {
       const error = new Error(errors.map(e => e.formattedMessage).join('\n').slice(0, 2000));
       error.missingImports = [...missingImports];
@@ -243,15 +241,18 @@ contract TomeyERC1155ProbeHarness is ERC1155Upgradeable {
   // In sequenceMode, Ganache runs with allowUnlimitedContractSize: true and a
   // 30M block gas limit, so unoptimized >24KB bytecode deploys directly without
   // spending 4-5x CPU optimizing large contracts inside WASM solc.
-  if (!cacheHit) {
+  if (!cacheHit&&compilerGroups.size===1) {
     try {
       if (fs.existsSync('/compile-cache-out.json')) {
         const minimalContracts = {};
         for (const [fName, fileEntry] of Object.entries(compiled.contracts || {})) {
           const outFile = {};
           for (const [cName, cEntry] of Object.entries(fileEntry || {})) {
-            if (cEntry?.evm?.bytecode?.object && Array.isArray(cEntry?.abi)) {
-              outFile[cName] = { abi: cEntry.abi, evm: { bytecode: { object: cEntry.evm.bytecode.object } } };
+            if (cEntry?.evm?.bytecode?.object && cEntry?.evm?.bytecode?.linkReferences && Array.isArray(cEntry?.abi)) {
+              outFile[cName] = { abi: cEntry.abi, evm: { bytecode: {
+                object: cEntry.evm.bytecode.object,
+                linkReferences: cEntry.evm.bytecode.linkReferences
+              } } };
             }
           }
           if (Object.keys(outFile).length) minimalContracts[fName] = outFile;

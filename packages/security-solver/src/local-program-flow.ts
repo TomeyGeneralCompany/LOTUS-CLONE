@@ -282,7 +282,8 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
       const sourceComplete=!!fullSourceIndex?.complete&&read===eligiblePaths.length;
       const candidatesResolved=!!candidateCoverage && candidateCoverage.unresolvedIds.length===0 &&
         candidateCoverage.total===candidateCoverage.experimentsCompleted+
-          candidateCoverage.terminalExhausted+candidateCoverage.blocked;
+          candidateCoverage.sourceUnavailable+candidateCoverage.terminalExhausted+
+          candidateCoverage.blocked;
       const experimentComplete=sourceComplete&&consistent&&fixtureFailed===0&&unsupported===0&&
         observationOnly===0&&unresolved===0&&candidatesResolved;
       return {sourceIndexed:eligiblePaths.length,sourceRead:read,

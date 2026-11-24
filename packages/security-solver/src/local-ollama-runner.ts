@@ -1633,13 +1633,17 @@ export async function runLocalAudit(
           // verifier may issue a terminal unavailability disposition.
           await certifyUnavailableInterfaces();
           const disposition=analysisProgressStore.experimentCertificate;
-          if(disposition.unresolvedIds.length===0&&
+          const unresolvedHaveReasons=disposition.unresolvedIds.every(id=>
+            (disposition.pendingReasons[id]||[]).length>0);
+          if(disposition.unresolvedIds.length===0&&unresolvedHaveReasons&&
             !inconclusive.observation_only&&!inconclusive.incomplete&&
             !inconclusive.unsupported&&!inconclusive.rejected){
             stageLock.completeExperiments(disposition);
             await appendFile(logFile,'[EXPERIMENT_DISPOSITIONS_COMPLETE] '+
               JSON.stringify({experimentVerified:disposition.conclusive,
                 sourceUnavailable:disposition.sourceUnavailable,
+                explicitlyUnresolved:disposition.unresolvedIds.length,
+                pendingReasons:disposition.pendingReasons,
                 total:disposition.total})+'\n');
             continue;
           }
@@ -1656,9 +1660,9 @@ export async function runLocalAudit(
             checkpoint:analysisProgressStore.path,
           })+'\n');
           throw new Error('EXPERIMENT_INCOMPLETE_SUSPENDED: '+
-            disposition.conclusive+'/'+disposition.total+' experimentally verified, '+
+            disposition.conclusive+' experimentally verified, '+
             disposition.sourceUnavailable+' source-unavailable, '+
-            disposition.unresolvedIds.length+' unresolved; checkpoint '+analysisProgressStore.path);
+            disposition.unresolvedIds.length+' explicitly unresolved; checkpoint '+analysisProgressStore.path);
         }
         stageLock.completeExperiments(certificate);
         limits.onExperimentLedger?.({selected:stageLock.candidateCount,

@@ -1,5 +1,6 @@
 /** Deterministic, source-identified preparation graph. No guessed protocol behavior. */
 import {parse} from "@solidity-parser/parser";
+import {createHash} from "node:crypto";
 import {posix} from "node:path";
 import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
 type PreparedArg=string|boolean|string[]|Array<string|boolean|string[]>;
@@ -392,18 +393,45 @@ function hasCanonicalPackageBase(entry:ContractEntry,name:string):boolean {
 const standardInheritedAbi:Readonly<Record<string,Readonly<Record<string,readonly string[]>>>>={
   Ownable:{'owner()':['address'],'transferOwnership(address)':[],'renounceOwnership()':[]},
   OwnableUpgradeable:{'owner()':['address'],'transferOwnership(address)':[],'renounceOwnership()':[]},
+  AccessControl:{'hasRole(bytes32,address)':['bool'],'getRoleAdmin(bytes32)':['bytes32'],
+    'grantRole(bytes32,address)':[],'revokeRole(bytes32,address)':[],
+    'renounceRole(bytes32,address)':[]},
+  AccessControlUpgradeable:{'hasRole(bytes32,address)':['bool'],'getRoleAdmin(bytes32)':['bytes32'],
+    'grantRole(bytes32,address)':[],'revokeRole(bytes32,address)':[],
+    'renounceRole(bytes32,address)':[]},
   ERC20:{'balanceOf(address)':['uint256'],'totalSupply()':['uint256'],
+    'decimals()':['uint8'],'name()':['string'],'symbol()':['string'],
     'allowance(address,address)':['uint256'],'transfer(address,uint256)':['bool'],
-    'approve(address,uint256)':['bool'],'transferFrom(address,address,uint256)':['bool']},
+    'approve(address,uint256)':['bool'],'transferFrom(address,address,uint256)':['bool'],
+    'increaseAllowance(address,uint256)':['bool'],'decreaseAllowance(address,uint256)':['bool']},
   ERC20Upgradeable:{'balanceOf(address)':['uint256'],'totalSupply()':['uint256'],
+    'decimals()':['uint8'],'name()':['string'],'symbol()':['string'],
     'allowance(address,address)':['uint256'],'transfer(address,uint256)':['bool'],
-    'approve(address,uint256)':['bool'],'transferFrom(address,address,uint256)':['bool']},
+    'approve(address,uint256)':['bool'],'transferFrom(address,address,uint256)':['bool'],
+    'increaseAllowance(address,uint256)':['bool'],'decreaseAllowance(address,uint256)':['bool']},
   ERC721:{'balanceOf(address)':['uint256'],'ownerOf(uint256)':['address'],
     'getApproved(uint256)':['address'],'isApprovedForAll(address,address)':['bool'],
-    'transferFrom(address,address,uint256)':[]},
+    'transferFrom(address,address,uint256)':[],
+    'safeTransferFrom(address,address,uint256)':[],
+    'safeTransferFrom(address,address,uint256,bytes)':[],
+    'approve(address,uint256)':[],'setApprovalForAll(address,bool)':[]},
   ERC721Upgradeable:{'balanceOf(address)':['uint256'],'ownerOf(uint256)':['address'],
     'getApproved(uint256)':['address'],'isApprovedForAll(address,address)':['bool'],
-    'transferFrom(address,address,uint256)':[]},
+    'transferFrom(address,address,uint256)':[],
+    'safeTransferFrom(address,address,uint256)':[],
+    'safeTransferFrom(address,address,uint256,bytes)':[],
+    'approve(address,uint256)':[],'setApprovalForAll(address,bool)':[]},
+  // ERC721URIStorageUpgradeable inherits these ABI entries from the canonical
+  // ERC721Upgradeable base. The installed package is still compiled by the
+  // isolated runtime; this table only lets the source resolver account for
+  // the compiler-defined inherited receiver ABI.
+  ERC721URIStorageUpgradeable:{'balanceOf(address)':['uint256'],
+    'ownerOf(uint256)':['address'],'getApproved(uint256)':['address'],
+    'isApprovedForAll(address,address)':['bool'],
+    'transferFrom(address,address,uint256)':[],
+    'safeTransferFrom(address,address,uint256)':[],
+    'safeTransferFrom(address,address,uint256,bytes)':[],
+    'approve(address,uint256)':[],'setApprovalForAll(address,bool)':[]},
 };
 /** ABI entries from EXACT acquired source declarations. The caller must first
  * establish a real inheritance/import path before adding these methods to
@@ -898,7 +926,23 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
     const contractDefs=entries.filter(e=>e.node.name===name&&
       reachable.has(e.source.path)&&
       (parts.length===0||parts.join(".")===e.node.name));
-    return contractDefs.length===1?"address":null;
+    if(contractDefs.length===1)return "address";
+    if(contractDefs.length>1||parts.length)return null;
+    const packageImports:string[]=[];
+    for(const path of reachable){
+      const source=sourceByPath.get(path);
+      if(!source)continue;
+      for(const imp of (astOf(source)?.children||[]).filter((n:any)=>
+        n.type==="ImportDirective"&&typeof n.path==="string"&&
+        /^@openzeppelin\/contracts(?:-upgradeable)?\/.+\.sol$/.test(n.path))){
+        const declared=posix.basename(imp.path,".sol");
+        const aliases=Array.isArray(imp.symbolAliases)&&imp.symbolAliases.length?
+          (imp.symbolAliases as [string,string|null][]).map(([original,alias])=>
+            ({original,local:alias||original})):[{original:declared,local:declared}];
+        if(aliases.some(x=>x.local===name))packageImports.push(imp.path);
+      }
+    }
+    return new Set(packageImports).size===1?"address":null;
   }
   if(type?.type!=="ElementaryTypeName")return null;
   const t=String(type.name||"");
@@ -952,16 +996,18 @@ function callableReturns(fn:any,owner:ContractEntry,entries:readonly ContractEnt
  * supplies every source-declared interface call, including its return ABI.
  * A declaration without a body is not executable; inherited bodies are eligible.
  */
-export function verifyAcquiredReceiverMethods(
+function verifyAcquiredReceiverMethodsUncached(
   interfaceType:string,methods:readonly string[],implementationFile:string,
   implementationContract:string,sources:readonly SourceSnapshot[],
+  interfaceSourcePath?:string,
 ):{ok:boolean;missing:string[]} {
   if(!methods.length)return {ok:true,missing:[]};
   const entries=acquiredTypeEntries(sources);
   const concrete=entries.find(e=>e.source.path===implementationFile&&
     e.node.name===implementationContract);
   if(!concrete||!isConcrete(concrete.node))return {ok:false,missing:["concrete_deployment_not_found"]};
-  const declared=entries.filter(e=>e.node.name===interfaceType);
+  const declared=entries.filter(e=>e.node.name===interfaceType&&
+    (!interfaceSourcePath||e.source.path===interfaceSourcePath));
   const sourcePaths=new Map(sources.map(s=>[s.path,s]));
   const reachable=new Set<string>(),pending=[implementationFile];
   while(pending.length){
@@ -1022,27 +1068,103 @@ export function verifyAcquiredReceiverMethods(
     }
   }
   const missing:string[]=[];
+  const acquiredDeclarations=new Map<string,{identity:string;returns:string[]|null}>();
+  const packageDeclarations=new Map<string,{identity:string;returns:string[]}>();
+  const declarationVisited=new Set<string>();
+  let declarationBaseAmbiguous=false;
+  const collectDeclarations=(entry:ContractEntry)=>{
+    const key=entry.source.path+":"+entry.node.name;
+    if(declarationVisited.has(key))return;
+    declarationVisited.add(key);
+    for(const base of entry.node.baseContracts||[]){
+      const name=String(base.baseName?.namePath||"").split(".").pop();
+      const local=entries.filter(e=>e.node.name===name&&
+        e.source.path===entry.source.path&&e.node!==entry.node);
+      const choices=local.length?local:entries.filter(e=>e.node.name===name&&reachable.has(e.source.path));
+      if(choices.length===0&&name&&hasCanonicalPackageBase(entry,name)){
+        for(const [signature,returns] of Object.entries(standardInheritedAbi[name]||{}))
+          packageDeclarations.set(signature,{identity:signature,returns:[...returns]});
+        continue;
+      }
+      if(choices.length!==1){declarationBaseAmbiguous=true;continue;}
+      collectDeclarations(choices[0]);
+    }
+    for(const fn of (entry.node.subNodes||[]).filter((n:any)=>
+      n.type==="FunctionDefinition"&&!n.isConstructor&&n.name&&
+      ["public","external"].includes(n.visibility))){
+      const identity=callableIdentity(fn,entry,entries);
+      const returns=callableReturns(fn,entry,entries);
+      if(identity&&returns!==null)
+        acquiredDeclarations.set(identity,{identity,returns});
+    }
+    for(const v of (entry.node.subNodes||[]).filter((n:any)=>
+      n.type==="StateVariableDeclaration").flatMap((n:any)=>n.variables||[])){
+      const getter=publicGetter(v,entry,entries);
+      if(getter)acquiredDeclarations.set(getter.identity,
+        {identity:getter.identity,returns:getter.returns});
+    }
+  };
+  for(const entry of declared)collectDeclarations(entry);
+  // Canonical external package contracts may be absent from the acquired
+  // source set. Their identity is accepted only when the concrete fixture has
+  // the exact canonical import; runtime compilation still validates the
+  // installed package ABI and bytecode.
+  if(!declared.length&&hasCanonicalPackageBase(concrete,interfaceType))
+    for(const [signature,returns] of Object.entries(standardInheritedAbi[interfaceType]||{}))
+      packageDeclarations.set(signature,{identity:signature,returns:[...returns]});
+  if(declarationBaseAmbiguous)
+    return {ok:false,missing:["ambiguous_or_missing_interface_inheritance"]};
   // An inherited abstract declaration without a surviving implementation
   // prevents deployment even when the specifically requested method exists.
   for(const identity of inheritedDeclarations)if(!implemented.has(identity))
     missing.push(identity+":unimplemented_inherited_abstract");
   for(const method of new Set(methods)){
-    const required=declared.flatMap(e=>(e.node.subNodes||[]).filter((fn:any)=>
-      fn.type==="FunctionDefinition"&&fn.name===method));
+    const required=[...acquiredDeclarations.values()].filter(item=>
+      item.identity.slice(0,item.identity.indexOf("("))===method);
+    const packageRequired=[...packageDeclarations.values()].filter(item=>
+      item.identity.slice(0,item.identity.indexOf("("))===method);
     // If no interface ABI is acquired, the receiver cannot be authenticated.
-    if(!required.length){missing.push(method+":interface_abi_not_acquired");continue;}
-    for(const fn of required){
-      const origin=declared.find(e=>(e.node.subNodes||[]).includes(fn));
-      if(!origin){missing.push(method+":declaring_contract_missing");continue;}
-      const identity=callableIdentity(fn,origin,entries);
-      const expected=callableReturns(fn,origin,entries);
-      const actual=identity?implemented.get(identity):undefined;
-      if(!identity||expected===null||!actual||actual.returns===null||
-        JSON.stringify(actual.returns)!==JSON.stringify(expected))
-        missing.push((identity||method)+":missing_or_incompatible_abi");
+    const requirements=required.length?required:packageRequired;
+    if(!requirements.length){missing.push(method+":interface_abi_not_acquired");continue;}
+    for(const requirement of requirements){
+      const actual=implemented.get(requirement.identity);
+      if(!actual||actual.returns===null||
+        JSON.stringify(actual.returns)!==JSON.stringify(requirement.returns))
+        missing.push(requirement.identity+":missing_or_incompatible_abi");
     }
   }
   return {ok:missing.length===0,missing};
+}
+
+const receiverAbiVerificationCache=new Map<string,{ok:boolean;missing:string[]}>();
+const receiverAbiInventoryDigestCache=new WeakMap<object,string>();
+export function verifyAcquiredReceiverMethods(
+  interfaceType:string,methods:readonly string[],implementationFile:string,
+  implementationContract:string,sources:readonly SourceSnapshot[],
+  interfaceSourcePath?:string,
+):{ok:boolean;missing:string[]} {
+  const normalizedMethods=[...new Set(methods)].sort();
+  if(!normalizedMethods.length)return {ok:true,missing:[]};
+  let inventoryDigest=receiverAbiInventoryDigestCache.get(sources as object);
+  if(!inventoryDigest){
+    const identity=JSON.stringify(sources.map(source=>[source.path,source.sha256])
+      .sort(([a],[b])=>String(a).localeCompare(String(b))));
+    inventoryDigest=createHash("sha256").update(identity).digest("hex");
+    receiverAbiInventoryDigestCache.set(sources as object,inventoryDigest);
+  }
+  const key=JSON.stringify([inventoryDigest,interfaceType,interfaceSourcePath||"",
+    implementationFile,implementationContract,normalizedMethods]);
+  const cached=receiverAbiVerificationCache.get(key);
+  if(cached){
+    receiverAbiVerificationCache.delete(key);receiverAbiVerificationCache.set(key,cached);
+    return {ok:cached.ok,missing:[...cached.missing]};
+  }
+  const result=verifyAcquiredReceiverMethodsUncached(interfaceType,normalizedMethods,
+    implementationFile,implementationContract,sources,interfaceSourcePath);
+  if(receiverAbiVerificationCache.size>=4096)
+    receiverAbiVerificationCache.delete(receiverAbiVerificationCache.keys().next().value!);
+  receiverAbiVerificationCache.set(key,{ok:result.ok,missing:[...result.missing]});
+  return result;
 }
 
 export function resolveSourceFixtureDependencies(
@@ -1110,10 +1232,73 @@ export function resolveSourceFixtureDependencies(
           "UserDefinedValueTypeDefinition","TypeDefinition"].includes(d.type)));
       if(compatible.length===1&&!conflicting)return "contract";
     }
+    // A canonical imported package contract can have no source in the acquired
+    // bounty corpus. Preserve its compiler-known contract identity so an
+    // acquired fixture may satisfy the exact call-site ABI below. This does
+    // not admit an arbitrary address: the selected fixture still needs a
+    // concrete acquired implementation with matching method signatures and
+    // returns.
+    const packageContractImports:string[]=[];
+    for(const path of reachable){
+      const src=acquiredByPath.get(path)!;
+      for(const imp of (astOf(src)?.children||[]).filter((n:any)=>
+        n.type==="ImportDirective"&&typeof n.path==="string"&&
+        /^@openzeppelin\/contracts(?:-upgradeable)?\/.+\.sol$/.test(n.path))){
+        const declared=posix.basename(imp.path,".sol");
+        const aliases=Array.isArray(imp.symbolAliases)&&imp.symbolAliases.length?
+          (imp.symbolAliases as [string,string|null][]).map(([original,alias])=>
+            ({original,local:alias||original})):[{original:declared,local:declared}];
+        if(aliases.some(x=>x.local===name))packageContractImports.push(imp.path);
+      }
+    }
+    if(new Set(packageContractImports).size===1)return "contract";
     return "unknown";
   };
   const entryByName=new Map<string,ContractEntry[]>();
   for(const entry of scanned){const group=entryByName.get(entry.node.name)||[];group.push(entry);entryByName.set(entry.node.name,group);}
+  const sourceTypePathCache=new Map<string,string|null>();
+  const sourceTypePath=(owner:SourceSnapshot,typeName:string):string|null=>{
+    const cacheKey=owner.path+":"+owner.sha256+":"+typeName;
+    if(sourceTypePathCache.has(cacheKey))return sourceTypePathCache.get(cacheKey)!;
+    const cleanName=String(typeName||"").split(".").pop()||"";
+    const local=scanned.filter(e=>e.source.path===owner.path&&e.node.name===cleanName);
+    if(local.length===1){sourceTypePathCache.set(cacheKey,owner.path);return owner.path;}
+    const directlyImported:string[]=[];
+    for(const imp of (astOf(owner)?.children||[]).filter((n:any)=>
+      n.type==="ImportDirective"&&typeof n.path==="string")){
+      const impPath=imp.path.startsWith(".")?
+        posix.normalize(posix.join(posix.dirname(owner.path),imp.path)):imp.path;
+      const aliases=Array.isArray(imp.symbolAliases)&&imp.symbolAliases.length?
+        (imp.symbolAliases as [string,string|null][]).map(([original,alias])=>
+          ({original,local:alias||original})):[{original:cleanName,local:cleanName}];
+      for(const alias of aliases)if(alias.local===cleanName)
+        directlyImported.push(...scanned.filter(e=>e.source.path===impPath&&
+          e.node.name===alias.original).map(e=>e.source.path));
+    }
+    const direct=[...new Set(directlyImported)];
+    if(direct.length===1){sourceTypePathCache.set(cacheKey,direct[0]);return direct[0];}
+    if(direct.length>1){sourceTypePathCache.set(cacheKey,null);return null;}
+    const reachable=new Set<string>(),pending=[owner.path];
+    while(pending.length&&reachable.size<=256){
+      const current=pending.shift()!;if(reachable.has(current))continue;reachable.add(current);
+      const src=acquiredByPath.get(current);if(!src)continue;
+      for(const imp of (astOf(src)?.children||[]).filter((n:any)=>
+        n.type==="ImportDirective"&&typeof n.path==="string")){
+        const path=imp.path.startsWith(".")?
+          posix.normalize(posix.join(posix.dirname(current),imp.path)):imp.path;
+        if(acquiredByPath.has(path)&&!reachable.has(path))pending.push(path);
+      }
+    }
+    const transitive=[...new Set(scanned.filter(e=>e.node.name===cleanName&&
+      reachable.has(e.source.path)).map(e=>e.source.path))];
+    const result=transitive.length===1?transitive[0]:null;
+    sourceTypePathCache.set(cacheKey,result);
+    return result;
+  };
+  const typeKey=(owner:SourceSnapshot,typeName:string):string=>
+    (sourceTypePath(owner,typeName)||"")+":"+String(typeName||"").split(".").pop();
+  const receiverTypeKey=(owner:SourceSnapshot,typeName:string):string=>
+    owner.path+"::"+typeKey(owner,typeName);
   const extendsType=(node:any,typ:string,seen=new Set<string>()):boolean=>{
     if(node.name===typ)return true;
     if(seen.has(node.name))return false;seen.add(node.name);
@@ -1142,7 +1327,7 @@ export function resolveSourceFixtureDependencies(
     if(p.typeName?.type!=="UserDefinedTypeName"||!p.name)continue;
     const name=String(p.name);
     if(!/^[A-Za-z_]\w*$/.test(name))continue;
-    constructorDemands.set(typeOf(p.typeName),[...new Set([...target.content.matchAll(
+    constructorDemands.set(receiverTypeKey(target,typeOf(p.typeName)),[...new Set([...target.content.matchAll(
       new RegExp("\\b"+name+"\\s*\\.\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(","g")
     )].map(m=>m[1]))]);
   }
@@ -1151,6 +1336,69 @@ export function resolveSourceFixtureDependencies(
       "\\b"+binding.receiver+"\\s*\\.\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(","g"))]
       .map(match=>match[1]);
     requiredReceiverMethods.set(binding.receiver,[...new Set(methods)]);
+  }
+  const methodsByType=new Map<string,Set<string>>();
+  const recordReceiverMethods=(source:SourceSnapshot,typeName:string,receiver:string,ownerNode?:any)=>{
+    if(!typeName||! /^[A-Za-z_]\w*$/.test(receiver))return;
+    const text=source.content.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g,"");
+    const calls=[...text.matchAll(new RegExp("\\b"+receiver+
+      "\\s*\\.\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(","g"))]
+      .map(match=>String(match[1]));
+    const extensions=new Map<string,Set<string>>();
+    for(const using of (ownerNode?.subNodes||[]).filter((n:any)=>
+      n.type==="UsingForDeclaration"&&String(n.typeName?.namePath||"").split(".").pop()===
+        String(typeName).split(".").pop())){
+      const libraryName=String(using.libraryName||"").split(".").pop();
+      const libraryPath=libraryName?sourceTypePath(source,libraryName):null;
+      const library=libraryPath?scanned.find(e=>e.source.path===libraryPath&&
+        e.node.name===libraryName):undefined;
+      if(!library||library.node.type!=="ContractDefinition"||
+        library.node.kind!=="library")continue;
+      for(const fn of (library.node.subNodes||[]).filter((n:any)=>
+        n.type==="FunctionDefinition"&&n.body&&n.name&&
+        (n.parameters||[]).length>0)){
+        const receiverName=String(fn.parameters[0]?.name||"");
+        if(!receiverName)continue;
+        const underlying=new Set<string>();
+        for(const node of descendants(fn.body))
+          if(node.type==="MemberAccess"&&node.expression?.type==="Identifier"&&
+            node.expression.name===receiverName&&typeof node.memberName==="string")
+            underlying.add(String(node.memberName));
+        if(underlying.size)extensions.set(String(fn.name),underlying);
+      }
+    }
+    const methods:string[]=[];
+    for(const called of calls){
+      const mapped=extensions.get(called);
+      if(mapped)methods.push(...mapped);else methods.push(called);
+    }
+    if(!methods.length)return;
+    // Calls from separate source owners are separate obligations. Combining
+    // every caller of one interface makes a fixture for this dependency pass
+    // methods required only by unrelated contracts.
+    const key=receiverTypeKey(source,typeName);
+    const bucket=methodsByType.get(key)||new Set<string>();
+    for(const method of methods)bucket.add(method);
+    methodsByType.set(key,bucket);
+  };
+  // Receiver obligations belong to every acquired constructor/initializer
+  // edge in the transitive fixture graph, not just the root target. Include
+  // exact state/parameter declarations and source-verified initializer casts.
+  for(const entry of scanned){
+    for(const variable of (entry.node.subNodes||[])
+      .filter((n:any)=>n.type==="StateVariableDeclaration")
+      .flatMap((n:any)=>n.variables||[]))
+      if(variable.typeName?.type==="UserDefinedTypeName")
+        recordReceiverMethods(entry.source,typeOf(variable.typeName),
+          String(variable.name||""),entry.node);
+    for(const fn of (entry.node.subNodes||[]).filter((n:any)=>
+      n.type==="FunctionDefinition"&&n.body))
+      for(const param of fn.parameters||[])
+        if(param.typeName?.type==="UserDefinedTypeName")
+          recordReceiverMethods(entry.source,typeOf(param.typeName),
+            String(param.name||""),entry.node);
+    for(const binding of initializerStateBindings(entry.node,entry.source,sources))
+      recordReceiverMethods(entry.source,binding.typeName,binding.receiver,entry.node);
   }
   // Planner resource limits are independently bounded by the execution schema
   // and local gas/sequence limits. A deep acquired dependency chain is not a
@@ -1161,21 +1409,26 @@ export function resolveSourceFixtureDependencies(
      !Number.isSafeInteger(MAX_NODES)||MAX_NODES<1||MAX_NODES>16)
     return {status:"unresolved",missingDependencies:["invalid_fixture_resource_budget"],
       attemptedResolvers:[],witnesses:[]};
-  const resolve=(typ:string,depth:number):string|null=>{
+  const resolve=(typ:string,depth:number,ownerSource:SourceSnapshot=target):string|null=>{
     attempts.push(typ);
     if(depth>MAX_DEPTH){missing.push(typ+":max_dependency_depth");return null;}
-    const choices=scanned.filter(({node,source})=>isConcrete(node)&&
-      !isDeclaredAbstract(source,node)&&extendsType(node,typ));
     // A source-proven ABI can distinguish concrete implementations. Without
     // proof, multiple candidates remain ambiguous rather than guessed.
     const receiverMethods=[...new Set([
-      ...targetBindings.filter(b=>b.typeName===typ)
+      ...targetBindings.filter(b=>b.typeName===typ&&ownerSource.path===target.path)
         .flatMap(b=>requiredReceiverMethods.get(b.receiver)||[]),
-      ...(constructorDemands.get(typ)||[])
+      ...(constructorDemands.get(receiverTypeKey(ownerSource,typ))||[]),
+      ...(methodsByType.get(receiverTypeKey(ownerSource,typ))||[])
     ])];
+    const interfaceSourcePath=sourceTypePath(ownerSource,typ)||undefined;
+    const choices=scanned.filter(({node,source})=>isConcrete(node)&&
+      !isDeclaredAbstract(source,node)&&
+      (extendsType(node,typ)||(receiverMethods.length>0&&
+        verifyAcquiredReceiverMethods(typ,receiverMethods,source.path,node.name,
+          sources,interfaceSourcePath).ok)));
     const qualified=receiverMethods.length?
       choices.filter(choice=>verifyAcquiredReceiverMethods(typ,receiverMethods,
-        choice.source.path,choice.node.name,sources).ok):choices;
+        choice.source.path,choice.node.name,sources,interfaceSourcePath).ok):choices;
     // Multiple acquired, ABI-compatible implementations are alternatives,
     // not evidence that *any one* is the production receiver. Enumerate
     // concrete source choices in a separate bounded experiment instead.
@@ -1212,7 +1465,7 @@ export function resolveSourceFixtureDependencies(
       const typeClass=p.typeName?.type==="UserDefinedTypeName"?
         classifyUserType(selected.source,selected.node,argType):"value";
       if(p.typeName?.type==="UserDefinedTypeName"&&!struct&&typeClass==="contract"){
-        const dep=resolve(argType,depth+1);
+        const dep=resolve(argType,depth+1,selected.source);
         if(!dep){valid=false;break;}args.push("$deployment:"+dep);
       }else{
         const literal=typeClass==="unknown"?null:
@@ -1241,7 +1494,7 @@ export function resolveSourceFixtureDependencies(
         const name=String(p.name||""),argType=typeOf(p.typeName);
         const matching=initBindings.find(x=>x.parameter===name);
         if(matching){
-          const dep=resolve(matching.typeName,depth+1);
+          const dep=resolve(matching.typeName,depth+1,selected.source);
           if(!dep){missing.push(key+":initializer_dependency:"+name);break;}
           initArgs.push("$deployment:"+dep);
         }else{
@@ -1273,12 +1526,12 @@ export function resolveSourceFixtureDependencies(
   const params=[...(ctorOf(targetNode)?.parameters||[])];
   for(const p of params)if(p.typeName?.type==="UserDefinedTypeName"&&
     classifyUserType(target,targetNode,typeOf(p.typeName))==="contract"){
-    const name=String(p.name||""),typ=typeOf(p.typeName),dep=resolve(typ,0);
+    const name=String(p.name||""),typ=typeOf(p.typeName),dep=resolve(typ,0,target);
     if(dep){substitutions[name]="$deployment:"+dep;bindings.push({parameter:name,receiver:name,typeName:typ,
       deploymentId:dep,file:target.path,sourceSha256:target.sha256});}
   }
   for(const binding of targetBindings){
-    const dep=resolve(binding.typeName,0);
+    const dep=resolve(binding.typeName,0,target);
     if(dep){substitutions[binding.parameter]="$deployment:"+dep;
       substitutions[binding.receiver]="$deployment:"+dep;
       bindings.push({parameter:binding.parameter,receiver:binding.receiver,typeName:binding.typeName,
@@ -1329,18 +1582,49 @@ export function resolveSourceFixtureDependencies(
  * implementation becomes its own bounded candidate and must be verified in
  * the isolated EVM. Unavailable implementations never appear as success.
  */
-export function enumerateSourceFixtureDependencies(
+export interface FixtureEnumerationResult {
+  alternatives:Extract<FixtureResolution,{status:"resolved"}>[];
+  /** False means some branches were unexplored or could not be constructed. */
+  complete:boolean;
+  searchExhausted:boolean;
+  searchNodes:number;
+  pendingSelections:number;
+  unresolvedSelections:Array<{selection:Record<string,string>;missingDependencies:string[]}>;
+}
+
+export function enumerateSourceFixtureDependenciesDetailed(
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
-  options:Readonly<{maxAlternatives?:number;maxDepth?:number;maxNodes?:number}>={},
-):Extract<FixtureResolution,{status:"resolved"}>[] {
-  const max=options.maxAlternatives??12;
-  if(!Number.isSafeInteger(max)||max<1||max>16)
+  options:Readonly<{maxAlternatives?:number;maxSearchNodes?:number;maxDepth?:number;maxNodes?:number}>={},
+):FixtureEnumerationResult {
+  const max=options.maxAlternatives??256;
+  if(!Number.isSafeInteger(max)||max<1||max>4096)
     throw new Error("INVALID_FIXTURE_ALTERNATIVE_LIMIT");
+  const maxSearchNodes=options.maxSearchNodes??2048;
+  if(!Number.isSafeInteger(maxSearchNodes)||maxSearchNodes<1||maxSearchNodes>8192)
+    throw new Error("INVALID_FIXTURE_SEARCH_LIMIT");
+  // The fixture graph depends only on this immutable source inventory and
+  // these bounds, not on the lead method being analyzed. Cache complete
+  // alternatives so a contract with many indexed entrypoints does not repeat
+  // the same bounded search hundreds of times. Include every source identity
+  // and path in the key so a refreshed bounty snapshot cannot reuse stale DAGs.
+  const cacheKey=JSON.stringify([contractName,target.path,target.sha256,
+    [...sources].map(source=>[source.path,source.sha256]).sort(([a],[b])=>
+      String(a).localeCompare(String(b))),max,maxSearchNodes,
+    options.maxDepth??null,options.maxNodes??null]);
+  const cache=fixtureEnumerationCache;
+  const cached=cache.get(cacheKey);
+  if(cached){
+    cache.delete(cacheKey);cache.set(cacheKey,cached);
+    return structuredClone(cached);
+  }
   const pending:Array<Record<string,string>>=[{}];
   const seen=new Set<string>(),results:Extract<FixtureResolution,{status:"resolved"}>[]=[];
-  // At most 16 distinct complete graphs, with an absolute 128-node
-  // exploration cap to avoid exponential source-family expansion.
-  while(pending.length&&seen.size<128&&results.length<max){
+  const unresolvedSelections:FixtureEnumerationResult["unresolvedSelections"]=[];
+  // Keep a larger explicit search budget than the number of complete graph
+  // alternatives: a valid graph may sit behind several independent concrete
+  // protocol, token, NFT, and minter branches. The caller can tune this bound;
+  // we still fail closed and never synthesize unavailable implementations.
+  while(pending.length&&seen.size<maxSearchNodes&&results.length<max){
     const selections=pending.shift()!;
     const key=JSON.stringify(Object.entries(selections).sort(([a],[b])=>a.localeCompare(b)));
     if(seen.has(key))continue;
@@ -1355,11 +1639,40 @@ export function enumerateSourceFixtureDependencies(
     }
     const ambiguity=attempt.ambiguousImplementations?.find(item=>
       selections[item.typeName]===undefined);
-    if(!ambiguity)continue;
+    if(!ambiguity){
+      unresolvedSelections.push({selection:{...selections},
+        missingDependencies:[...attempt.missingDependencies]});
+      continue;
+    }
     const choices=[...ambiguity.candidates].sort((a,b)=>
       (a.path+":"+a.contract).localeCompare(b.path+":"+b.contract));
-    for(const choice of choices)if(pending.length+seen.size<128)
+    if(!choices.length){
+      unresolvedSelections.push({selection:{...selections},
+        missingDependencies:[...attempt.missingDependencies]});
+      continue;
+    }
+    for(const choice of choices)if(pending.length+seen.size<maxSearchNodes)
       pending.push({...selections,[ambiguity.typeName]:choice.path+":"+choice.contract});
   }
-  return results;
+  const searchExhausted=pending.length===0;
+  const enumeration:FixtureEnumerationResult={alternatives:results,
+    complete:searchExhausted&&unresolvedSelections.length===0,
+    searchExhausted,searchNodes:seen.size,pendingSelections:pending.length,
+    unresolvedSelections};
+  if(cache.size>=8)cache.delete(cache.keys().next().value!);
+  cache.set(cacheKey,structuredClone(enumeration));
+  return enumeration;
+}
+
+const fixtureEnumerationCache=new Map<string,
+  FixtureEnumerationResult>();
+
+/** Compatibility view for callers that only need the observed graphs. New
+ * acceptance paths should use the detailed result and retain its completeness
+ * bit as a blocker when a bounded search leaves selections unexplored. */
+export function enumerateSourceFixtureDependencies(
+  target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
+  options:Readonly<{maxAlternatives?:number;maxSearchNodes?:number;maxDepth?:number;maxNodes?:number}>={},
+):Extract<FixtureResolution,{status:"resolved"}>[] {
+  return enumerateSourceFixtureDependenciesDetailed(target,contractName,sources,options).alternatives;
 }

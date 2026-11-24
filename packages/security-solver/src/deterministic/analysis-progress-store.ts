@@ -151,8 +151,11 @@ export class AnalysisProgressStore {
   get counts():CandidateCoverage {
     const records=[...this.records.values()];
     const count=(state:CandidateLifecycle)=>records.filter(r=>r.lifecycle===state).length;
-    // Source-reading or an unsupported analytical disposition is not experiment proof.
-    const unresolved=records.filter(r=>!this.isConclusive(r)&&!this.hasSourceUnavailableEvidence(r));
+    // Source-unavailable is a separately verified disposition, not an EVM
+    // result. Count it as accounted for while preserving its own ledger so a
+    // report can distinguish it from an experiment-backed lead.
+    const unresolved=records.filter(r=>!this.isConclusive(r)&&
+      !this.hasSourceUnavailableEvidence(r));
     return {
       total:records.length,queued:count("queued"),
       admitted:count("admitted")+count("analyzing"),
@@ -247,7 +250,10 @@ export class AnalysisProgressStore {
   get experimentCertificate():LeadExperimentCertificate {
     const entries=[...this.records.values()].sort((a,b)=>a.id.localeCompare(b.id));
     const unavailable=entries.filter(e=>this.hasSourceUnavailableEvidence(e));
-    const unresolved=entries.filter(e=>!this.isConclusive(e)&&!this.hasSourceUnavailableEvidence(e));
+    // Keep source-unavailable dispositions distinct from experiments while
+    // allowing the independently verified disposition to account for a lead.
+    const unresolved=entries.filter(e=>!this.isConclusive(e)&&
+      !this.hasSourceUnavailableEvidence(e));
     const evidence=entries.flatMap(e=>(e.experimentEvidence||[])
       .map(x=>[x.experimentId,x.leadId,x.sourceSha256,x.evidenceId,x.verifierDigest,x.result]))
       .sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
@@ -263,11 +269,16 @@ export class AnalysisProgressStore {
           e.sourceUnavailable?.verifierDigest,e.sourceUnavailable?.independentReviewDigest,
           e.sourceUnavailable?.acquiredInventoryDigest]))).digest("hex"),
       unresolvedIds:unresolved.map(e=>e.id),
-      pendingReasons:Object.fromEntries(unresolved.map(e=>[e.id,
-        e.properties.flatMap(p=>p.unresolvedPrerequisites).concat(
-          e.properties.filter(p=>p.state!=="test_completed").map(p=>p.state))
-          .concat(e.properties.length?[]:["no_executable_property"])
-          .filter((x,i,a)=>a.indexOf(x)===i)])),
+      pendingReasons:Object.fromEntries(unresolved.map(e=>{
+        const reasons=[
+          ...e.properties.flatMap(p=>p.unresolvedPrerequisites),
+          ...e.properties.filter(p=>p.state!=="test_completed").map(p=>"property_state:"+p.state),
+          ...(e.specialistAttempts||[]).map(p=>"specialist:"+p.adapter+":"+p.status+":"+p.reason),
+          ...(e.lastError?["controller_error:"+e.lastError]:[]),
+          ...(!e.properties.length?["lifecycle:"+e.lifecycle+":no_source_grounded_property_recorded"]:[]),
+        ];
+        return [e.id,[...new Set(reasons)]] as const;
+      })),
       evidenceCount:evidence.length,
     };
   }

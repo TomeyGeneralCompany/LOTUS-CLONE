@@ -15,7 +15,7 @@ import {repairAttemptIdentity} from '../packages/security-solver/src/determinist
 import {unfittedVerifierTranscript} from '../packages/security-solver/src/deterministic/verifier-transcript';
 import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from '../packages/security-solver/src/deterministic/source-unavailability-verifier';
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
-import {resolveSourceFixtureDependencies,enumerateSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies,enumerateSourceFixtureDependencies,enumerateSourceFixtureDependenciesDetailed,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {constructSolidityExperiments,sourcePreparationGraph,pickFlexibleArg} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 import {buildProgramFactsGraph} from '../packages/security-solver/src/deterministic/program-facts';
@@ -211,6 +211,14 @@ contract InitialState is Initializable {
     const quoteSource=typedSrc('IQuote',intf),firstSource=typedSrc('QuoteA',implA),
       secondSource=typedSrc('QuoteB',implB),consumerSource=typedSrc('QuoteConsumer',consumer);
     const acquire=[quoteSource,firstSource,secondSource,consumerSource];
+    const cachedAbiResult=verifyAcquiredReceiverMethods('IQuote',['quote'],
+      firstSource.path,'QuoteA',acquire,quoteSource.path);
+    assert.equal(cachedAbiResult.ok,true,
+      'Acquired interface ABI must verify the selected concrete implementation');
+    cachedAbiResult.missing.push('caller-mutated-result');
+    assert.deepEqual(verifyAcquiredReceiverMethods('IQuote',['quote'],
+      firstSource.path,'QuoteA',acquire,quoteSource.path),{ok:true,missing:[]},
+      'Mutating a returned ABI result must not poison the cached verification');
     const quoteAmbiguity=resolveSourceFixtureDependencies(consumerSource,'QuoteConsumer',acquire);
     assert.equal(quoteAmbiguity.status,'unresolved',
       'Ambiguous sources must not be assigned arbitrary single deployment');
@@ -223,11 +231,60 @@ contract InitialState is Initializable {
     assert.deepEqual(new Set(resolvedChoices.flatMap(plan=>
       plan.deployments.map(deployment=>deployment.contract))),
       new Set(['QuoteA','QuoteB']));
+    const truncatedChoices=enumerateSourceFixtureDependenciesDetailed(
+      consumerSource,'QuoteConsumer',acquire,{maxAlternatives:1});
+    assert.equal(truncatedChoices.alternatives.length,1);
+    assert.equal(truncatedChoices.complete,false,
+      'A bounded search that leaves a valid acquired alternative pending must be marked incomplete');
+    assert.ok(truncatedChoices.pendingSelections>0);
+    const fullChoices=enumerateSourceFixtureDependenciesDetailed(
+      consumerSource,'QuoteConsumer',acquire);
+    assert.equal(fullChoices.complete,true,
+      'An exhausted source-backed search must explicitly report complete coverage');
+    assert.equal(fullChoices.alternatives.length,2);
+    resolvedChoices[0].deployments[0].contract='caller-mutated-result';
+    const immutableCachedChoices=enumerateSourceFixtureDependencies(
+      consumerSource,'QuoteConsumer',acquire);
+    assert.ok(immutableCachedChoices.some(plan=>plan.deployments.some(deployment=>
+      deployment.contract==='QuoteA')),
+      'Mutating a returned fixture graph must not poison cached source alternatives');
+
+    // Receiver methods in separate source owners are separate fixture
+    // obligations even when both import the same interface. A deposit-only
+    // consumer must not inherit a withdraw requirement from an unrelated
+    // consumer elsewhere in the acquired inventory.
+    const routeInterface=typedSrc('IRoute',
+      'pragma solidity ^0.8.4; interface IRoute { function deposit() external; function withdraw() external; }');
+    const depositRoute=typedSrc('DepositRoute',
+      'pragma solidity ^0.8.4; contract DepositRoute { function deposit() external {} }');
+    const withdrawRoute=typedSrc('WithdrawRoute',
+      'pragma solidity ^0.8.4; contract WithdrawRoute { function withdraw() external {} }');
+    const depositConsumer=typedSrc('DepositConsumer',
+      'pragma solidity ^0.8.4; import "./IRoute.sol"; contract DepositConsumer { IRoute public route; function initialize(IRoute _route) external { route = _route; } function run() external { route.deposit(); } }');
+    const withdrawConsumer=typedSrc('WithdrawConsumer',
+      'pragma solidity ^0.8.4; import "./IRoute.sol"; contract WithdrawConsumer { IRoute public route; function initialize(IRoute _route) external { route = _route; } function run() external { route.withdraw(); } }');
+    const separatedConsumers=[routeInterface,depositRoute,withdrawRoute,
+      depositConsumer,withdrawConsumer];
+    const depositGraph=resolveSourceFixtureDependencies(depositConsumer,
+      'DepositConsumer',separatedConsumers);
+    assert.equal(depositGraph.status,'resolved',
+      'An unrelated consumer method must not contaminate this source owner\'s fixture ABI: '+
+      JSON.stringify(depositGraph));
+    if(depositGraph.status==='resolved')assert.ok(depositGraph.deployments.some(
+      deployment=>deployment.contract==='DepositRoute'));
     assert.deepEqual(enumerateSourceFixtureDependencies(consumerSource,
       'QuoteConsumer',[quoteSource,consumerSource]),[],
       'No acquired implementation must never become an invented fixture');
+    const missingFixtureCoverage=enumerateSourceFixtureDependenciesDetailed(
+      consumerSource,'QuoteConsumer',[quoteSource,consumerSource]);
+    assert.equal(missingFixtureCoverage.complete,false,
+      'Missing acquired fixture branches must remain explicit blockers');
+    assert.ok(missingFixtureCoverage.unresolvedSelections.some(item=>
+      item.missingDependencies.some(reason=>reason.includes('no_acquired_abi_compatible_implementation'))));
     assert.throws(()=>enumerateSourceFixtureDependencies(consumerSource,
-      'QuoteConsumer',acquire,{maxAlternatives:17}),/INVALID_FIXTURE_ALTERNATIVE_LIMIT/);
+      'QuoteConsumer',acquire,{maxAlternatives:4097}),/INVALID_FIXTURE_ALTERNATIVE_LIMIT/);
+    assert.throws(()=>enumerateSourceFixtureDependencies(consumerSource,
+      'QuoteConsumer',acquire,{maxSearchNodes:0}),/INVALID_FIXTURE_SEARCH_LIMIT/);
 
     // Real EVM transcripts may exceed the local model exchange budget. The
     // fitted model-visible summary cannot replace the canonical verifier bytes.
@@ -368,7 +425,10 @@ contract Consumer {
       'A source-unavailable lead is NEVER counted as experimentally verified');
     assert.equal(orphanStore.experimentCertificate.sourceUnavailable,1);
     assert.deepEqual(orphanStore.experimentCertificate.sourceUnavailableIds,[orphanLead.id]);
-    assert.deepEqual(orphanStore.experimentCertificate.unresolvedIds,[]);
+    assert.deepEqual(orphanStore.experimentCertificate.unresolvedIds,[],
+      'Independently reviewed source-unavailable evidence is a separate terminal lead disposition');
+    assert.equal(orphanStore.terminallyComplete,true,
+      'The lead is fully accounted for by a verified unavailable-source disposition');
     assert.equal(orphanStore.nextRepairBatch(2).length,0,
       'Reviewed terminal state should not waste the deterministic repair budget');
     await orphanStore.save();
@@ -381,9 +441,27 @@ contract Consumer {
     orphanGate.completeAnalysis();
     orphanGate.completeExperiments(resumedOrphan.experimentCertificate);
     assert.equal(orphanGate.currentStage,'REVIEW',
-      'Fully evidenced unavailable lead completes inventory WITHOUT an invented experiment');
-    orphanGate.completeReviews();
-    assert.equal(orphanGate.currentStage,'REPORT');
+      'An independently reviewed source-unavailable disposition is auditable at REVIEW without claiming an experiment');
+    const explicitlyUnresolved={...orphanLead,id:hash('explicitly-unresolved-lead')};
+    const dispositionGate=await stage([orphanLead,explicitlyUnresolved]);
+    dispositionGate.restoreResolvedAnalysisCandidate(orphanLead.id);
+    dispositionGate.restoreResolvedAnalysisCandidate(explicitlyUnresolved.id);
+    dispositionGate.completeAnalysis();
+    const partialCertificate={...resumedOrphan.experimentCertificate,
+      manifestDigest:hash(JSON.stringify([orphanLead.id,explicitlyUnresolved.id].sort())),
+      total:2,unresolvedIds:[explicitlyUnresolved.id],
+      pendingReasons:{[explicitlyUnresolved.id]:['no_source_supported_security_property']}};
+    assert.throws(()=>dispositionGate.completeExperiments(partialCertificate),
+      /EXPERIMENT_LEAD_COVERAGE_INCOMPLETE/,
+      'An explicit unresolved reason must remain visible while blocking REVIEW and REPORT');
+    assert.equal(dispositionGate.currentStage,'EXPERIMENT');
+    const reasonlessGate=await stage([orphanLead,explicitlyUnresolved]);
+    reasonlessGate.restoreResolvedAnalysisCandidate(orphanLead.id);
+    reasonlessGate.restoreResolvedAnalysisCandidate(explicitlyUnresolved.id);
+    reasonlessGate.completeAnalysis();
+    assert.throws(()=>reasonlessGate.completeExperiments({...partialCertificate,
+      pendingReasons:{}}),/EXPERIMENT_LEAD_COVERAGE_INCOMPLETE/,
+      'The stage gate must reject an unresolved disposition without its blocker reason');
     // Repair attempts have a real fixed-point identity. An audit history
     // append alone cannot trigger another identical retry, whereas a genuine
     // independently failed EVM execution must open a new recovery generation.
@@ -583,7 +661,7 @@ contract Consumer {
       'The other 180 never-experimented leads and 64 unproven results remain unresolved');
     assert.equal(lock.completedCount,65);
     assert.throws(()=>lock.completeExperiments(store.experimentCertificate),
-      /EXPERIMENT_LEAD_COVERAGE_INCOMPLETE/);
+      /EXPERIMENT_LEAD_COVERAGE_INCOMPLETE|EXPERIMENT_INCONCLUSIVE_DISPOSITIONS/);
     assert.equal(lock.currentStage,'EXPERIMENT');
     const resumed=await AnalysisProgressStore.open(file,candidates);
     assert.equal(resumed.completedExperimentIds.size,64);
@@ -597,7 +675,7 @@ contract Consumer {
     assert.equal(one.length,5);
     pending.recordAssessment(one[0].id,['negative'],[],[hash('done-negative')]);
     pending.recordAssessment(one[1].id,['positive'],[],[hash('done-positive')]);
-    pending.recordAssessment(one[2].id,['unsupported'],[],[]);
+    pending.recordAssessment(one[2].id,[],['no_source_supported_security_property'],[]);
     pending.recordAssessment(one[3].id,['money-market'],['unresolved_money_market'],[hash('completed-other')]);
     pending.recordAssessment(one[4].id,['withdraw'],[],[hash('unexecuted')]);
     pending.markExperimentCompleted(hash('done-negative'));
@@ -614,6 +692,13 @@ contract Consumer {
     assert.equal(pending.terminallyComplete,false,'checkpoint must preserve all three pending states');
     assert.equal(pending.counts.unresolvedIds.length,6,
       'No unsupported, selected-only, or evidence-free completed candidate counts as proof');
+    const pendingCertificate=pending.experimentCertificate;
+    assert.ok(pendingCertificate.pendingReasons[one[2].id].includes('no_source_supported_security_property'),
+      'A lead without a supported source-derived property must retain its exact unresolved reason');
+    assert.ok(pendingCertificate.pendingReasons[one[3].id].includes('unresolved_money_market'),
+      'A missing financial dependency must retain its source-specific blocker');
+    assert.ok(pendingCertificate.pendingReasons[one[4].id].includes('property_state:test_constructed'),
+      'A constructed but unexecuted experiment must remain explicitly pending');
     assert.throws(()=>pending.markExperimentCompleted(hash('unmatched')),
       /ANALYSIS_EXPERIMENT_ID_UNMATCHED/);
     // A replacement must have different source-backed experiment identity;
