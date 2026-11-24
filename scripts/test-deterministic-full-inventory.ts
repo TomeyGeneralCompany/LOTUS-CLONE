@@ -47,6 +47,59 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // Acquired deterministic clone source and real template are required:
+    // same salt must fail after one successful CREATE2 initialization.
+    const simpleFactoryText=`pragma solidity ^0.8.4;
+import {NFTWithSVG} from "./tokens/NFTWithSVG.sol";
+contract Factory {
+  function predictAddress(address template,bytes32 salt) external view returns(address) {
+    return template.predictDeterministicAddress(salt);
+  }
+  function createNFT(address template,bytes32 salt,string calldata name,string calldata symbol) external returns(NFTWithSVG) {
+    NFTWithSVG clone = NFTWithSVG(template.cloneDeterministic(salt));
+    clone.initialize(name,symbol);
+    clone.transferOwnership(msg.sender);
+    return clone;
+  }
+}`;
+    const simpleNftText=`pragma solidity ^0.8.4;
+contract NFTWithSVG {
+  function initialize(string memory name,string memory symbol) external {}
+}`;
+    const factorySnapshot={path:'source-1/contracts/Factory.sol',content:simpleFactoryText,
+      sha256:hash(simpleFactoryText)};
+    const nftSnapshot={path:'source-1/contracts/tokens/NFTWithSVG.sol',content:simpleNftText,
+      sha256:hash(simpleNftText)};
+    const factoryMenu=[
+      {selector:'Factory.createNFT',operation:'send' as const,
+        inputs:['address','bytes32','string','string']},
+      {selector:'Factory.predictAddress',operation:'call' as const,
+        inputs:['address','bytes32']}
+    ];
+    const factoryReplay=constructSolidityExperiments({
+      repositoryCommit:revision,targetPath:factorySnapshot.path,
+      targetSelector:'Factory.createNFT',sources:[factorySnapshot,nftSnapshot],
+      declarations:factoryMenu});
+    assert.equal(factoryReplay.ok,true,
+      'Acquired CREATE2 factory and template must generate executable replay alternatives');
+    if(factoryReplay.ok){
+      const deterministic=factoryReplay.experiments.filter(e=>
+        e.securityProperty.includes('CREATE2 deterministic clone replay'));
+      assert.equal(deterministic.length,2);
+      assert.ok(deterministic.every(e=>e.sequence.preparation?.deployments[0]?.contract==='NFTWithSVG'));
+      assert.ok(deterministic.every(e=>e.sequence.steps.some(step=>
+        step.operation==='send'&&step.expectRevert===true)));
+      assert.equal(new Set(deterministic.map(e=>e.id)).size,2);
+    }
+    const unacquiredTemplate=constructSolidityExperiments({
+      repositoryCommit:revision,targetPath:factorySnapshot.path,
+      targetSelector:'Factory.createNFT',sources:[factorySnapshot],
+      declarations:factoryMenu});
+    assert.ok(!unacquiredTemplate.ok||
+      !unacquiredTemplate.experiments.some(e=>e.securityProperty.includes(
+        'CREATE2 deterministic clone replay')),
+      'A missing template must never be replaced with invented deployable bytecode');
+
     // Initialization replay is a concrete source-state security property,
     // not an ownership-getter heuristic. Prove first setup, exact getters,
     // mined second-call revert, then unchanged getters in the real EVM.
