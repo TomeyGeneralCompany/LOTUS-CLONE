@@ -47,6 +47,52 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // Initialization replay is a concrete source-state security property,
+    // not an ownership-getter heuristic. Prove first setup, exact getters,
+    // mined second-call revert, then unchanged getters in the real EVM.
+    const initializingSourceText=`pragma solidity ^0.8.4;
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+contract InitialState is Initializable {
+  uint8 public decimals;
+  string public name;
+  function initialize(uint8 value,string memory title) external initializer {
+    decimals = value;
+    name = title;
+  }
+}`;
+    const initializingSource={path:'source-1/contracts/InitialState.sol',
+      content:initializingSourceText,sha256:hash(initializingSourceText)};
+    const initializationMenu=[
+      {selector:'InitialState.initialize',operation:'send' as const,inputs:['uint8','string']},
+      {selector:'InitialState.decimals',operation:'call' as const,inputs:[]},
+      {selector:'InitialState.name',operation:'call' as const,inputs:[]}
+    ];
+    const initializePlan=constructSolidityExperiments({
+      repositoryCommit:revision,targetPath:initializingSource.path,
+      targetSelector:'InitialState.initialize',sources:[initializingSource],
+      declarations:initializationMenu});
+    assert.equal(initializePlan.ok,true,
+      'Imported initializable with direct public state writes must yield a verifier experiment');
+    if(initializePlan.ok){
+      const replay=initializePlan.experiments.find(e=>
+        e.securityProperty.includes('initializer replay protection'));
+      assert.ok(replay,'Expect source-backed initializer replay property');
+      assert.equal(replay!.sequence.steps[0].operation,'send');
+      assert.ok(replay!.sequence.steps.some(step=>step.operation==='send'&&step.expectRevert),
+        'Second initializer must be a falsifiable failed transaction');
+      assert.ok(replay!.sequence.steps.filter(step=>step.operation==='call').length>=2,
+        'Original typed state must be verified after setup and replay');
+    }
+    const unguardedText=initializingSourceText.replace('external initializer','external');
+    const unguardedSource={...initializingSource,
+      content:unguardedText,sha256:hash(unguardedText)};
+    const noReplay=constructSolidityExperiments({
+      repositoryCommit:revision,targetPath:unguardedSource.path,
+      targetSelector:'InitialState.initialize',sources:[unguardedSource],
+      declarations:initializationMenu});
+    assert.ok(!noReplay.ok || !noReplay.experiments.some(e=>
+      e.securityProperty.includes('initializer replay protection')),
+      'An unguarded initializer cannot be mis-certified as replay protected');
     // An acquired interface may have multiple real ABI-compatible concrete
     // implementers. Enumerate distinct DAGs instead of refusing every one
     // or choosing the first arbitrarily. Never create an absent implementer.
