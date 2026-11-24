@@ -1800,8 +1800,10 @@ function sourceInitializerReplayExperiment(
   const fn=initialized[0],statements:any[]=fn.body?.statements||[];
   const params:any[]=fn.parameters||[];
   if(params.length>8||!statements.length||statements.length>10)return null;
-  const abiTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
-  if(abiTypes.some(t=>!t)||!declarations.some(d=>
+  const maybeTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
+  if(maybeTypes.some(t=>!t))return null;
+  const abiTypes:string[]=maybeTypes;
+  if(!declarations.some(d=>
     d.operation==='send'&&d.selector===contract.name+'.'+method&&
     JSON.stringify(d.inputs)===JSON.stringify(abiTypes)))return null;
   const args:SolidityArgValue[]=[];
@@ -4093,8 +4095,10 @@ function sourceFactoryDeterminismExperiments(
   if(canonicalAbiType(params[0].typeName)!=='address'||params[0].name!=='template'||
     canonicalAbiType(params[1].typeName)!=='bytes32'||params[1].name!=='salt')
     return [];
-  const abiTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
-  if(abiTypes.some(t=>!t)||!declarations.some(d=>d.operation==='send'&&
+  const maybeAbiTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
+  if(maybeAbiTypes.some(t=>!t))return [];
+  const abiTypes:string[]=maybeAbiTypes;
+  if(!declarations.some(d=>d.operation==='send'&&
     d.selector==='Factory.'+method&&
     JSON.stringify(d.inputs)===JSON.stringify(abiTypes)))return [];
   const predictor=(contract.subNodes||[]).find((n:any)=>
