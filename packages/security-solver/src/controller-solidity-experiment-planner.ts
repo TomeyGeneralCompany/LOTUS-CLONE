@@ -4640,7 +4640,21 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   }
   const targetIsFinancialEntry=/^(?:deposit|withdraw|borrow|repay|mint|burn|redeem|swap|stake|unstake|claim|liquidate|flash|vest|fund|rebalance|harvest|compound)/i
     .test(input.targetSelector.split('.').pop()||'');
-  if(fixtureSearchIncompleteReason&&targetIsFinancialEntry){
+  // A source-specialized property may carry its own complete, source-bound
+  // preparation graph (for example xMPH's ERC20Mock seed/deposit/withdraw
+  // sequence). In that case unrelated generic fixture alternatives must not
+  // suppress the independently executable property. Keep the exception exact
+  // to this property; other incomplete financial fixture graphs remain blockers.
+  const hasCompleteXmphAccountingFixture=out.some(experiment=>
+    experiment.securityProperty==="source-proven zero-reward ERC20 share conservation"&&
+    Boolean(experiment.sequence.preparation?.deployments.length&&
+      experiment.sequence.preparation.operations.length&&
+      experiment.sequence.preparation.checks.length)&&
+    ["deposit(uint256)","withdraw(uint256)"].every(signature=>
+      experiment.sequence.steps.some(step=>step.operation==="send"&&
+        step.function===signature)));
+  if(fixtureSearchIncompleteReason&&targetIsFinancialEntry&&
+    !hasCompleteXmphAccountingFixture){
     return {ok:false,code:'FIXTURE_ENUMERATION_INCOMPLETE',
       detail:fixtureSearchIncompleteReason,unresolvedCategory:'missing_fixture',
       partialExperiments:out};

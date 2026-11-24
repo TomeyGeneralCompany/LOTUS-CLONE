@@ -1317,8 +1317,6 @@ export function resolveSourceFixtureDependencies(
   const substitutions:Record<string,string>={};
   const visited=new Map<string,string>(),stack=new Set<string>();
   let nextDeploymentId=1;
-  // Prove caller demand from the acquired source, not from a guessed fixture.
-  const requiredReceiverMethods=new Map<string,string[]>();
   const targetBindings=initializerStateBindings(targetNode,target,sources);
   // Source-referenced constructor-injected dependencies must also contribute
   // receiver ABI requirements to implementation disambiguation.
@@ -1330,12 +1328,6 @@ export function resolveSourceFixtureDependencies(
     constructorDemands.set(receiverTypeKey(target,typeOf(p.typeName)),[...new Set([...target.content.matchAll(
       new RegExp("\\b"+name+"\\s*\\.\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(","g")
     )].map(m=>m[1]))]);
-  }
-  for(const binding of targetBindings){
-    const methods=[...target.content.matchAll(new RegExp(
-      "\\b"+binding.receiver+"\\s*\\.\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(","g"))]
-      .map(match=>match[1]);
-    requiredReceiverMethods.set(binding.receiver,[...new Set(methods)]);
   }
   const methodsByType=new Map<string,Set<string>>();
   const recordReceiverMethods=(source:SourceSnapshot,typeName:string,receiver:string,ownerNode?:any)=>{
@@ -1415,8 +1407,6 @@ export function resolveSourceFixtureDependencies(
     // A source-proven ABI can distinguish concrete implementations. Without
     // proof, multiple candidates remain ambiguous rather than guessed.
     const receiverMethods=[...new Set([
-      ...targetBindings.filter(b=>b.typeName===typ&&ownerSource.path===target.path)
-        .flatMap(b=>requiredReceiverMethods.get(b.receiver)||[]),
       ...(constructorDemands.get(receiverTypeKey(ownerSource,typ))||[]),
       ...(methodsByType.get(receiverTypeKey(ownerSource,typ))||[])
     ])];
