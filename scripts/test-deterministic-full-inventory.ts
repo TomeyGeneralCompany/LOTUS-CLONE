@@ -12,6 +12,7 @@ import {ControllerStageLock} from '../packages/security-solver/src/controller-st
 import {AnalysisProgressStore} from '../packages/security-solver/src/deterministic/analysis-progress-store';
 import {sourceRepairRoutes} from '../packages/security-solver/src/deterministic/typed-repair-routes';
 import {repairAttemptIdentity} from '../packages/security-solver/src/deterministic/repair-attempt-identity';
+import {unfittedVerifierTranscript} from '../packages/security-solver/src/deterministic/verifier-transcript';
 import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from '../packages/security-solver/src/deterministic/source-unavailability-verifier';
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
@@ -46,6 +47,21 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // Real EVM transcripts may exceed the local model exchange budget. The
+    // fitted model-visible summary cannot replace the canonical verifier bytes.
+    const fullEvmTranscript=JSON.stringify({status:'behavior_not_observed',
+      source_sha256:sourceSha,observations:{steps:Array.from({length:600},
+        (_,i)=>({operation:'call',value:'0'.repeat(120),index:i}))}});
+    const fitted=JSON.stringify({status:'behavior_not_observed',
+      truncated:true,excerpt:fullEvmTranscript.slice(0,280)});
+    assert.equal(unfittedVerifierTranscript(fullEvmTranscript,fitted),fullEvmTranscript,
+      'Use the actual executed, source-identifying transcript');
+    assert.equal(unfittedVerifierTranscript(undefined,fitted),fitted,
+      'Without executed raw bytes no verifier evidence can be synthesized');
+    assert.equal(unfittedVerifierTranscript('not-json',fitted),fitted);
+    const changedStatus=JSON.stringify({status:'behavior_observed',truncated:true});
+    assert.equal(unfittedVerifierTranscript(fullEvmTranscript,changedStatus),changedStatus,
+      'Divergent display status must not silently inherit a full verifier result');
     // ABI width and signedness constrain all source-derived fixture literals,
     // including the exact uint8 _decimals failure observed on the Dell.
     assert.equal(pickFlexibleArg('uint8','_decimals'),'18');
