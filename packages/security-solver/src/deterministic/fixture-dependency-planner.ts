@@ -7,8 +7,9 @@ export interface PreparedDeployment {id:string;file:string;contract:string;const
 export interface FixtureSourceWitness {file:string;line:number;contract:string;sourceSha256?:string;parameter?:string;stateVariable?:string;}
 export interface VerifiedDependencyBinding {parameter:string;receiver:string;typeName:string;deploymentId:string;file:string;sourceSha256:string;}
 export type FixtureResolution=
-  | {status:"resolved";deployments:PreparedDeployment[];substitutions:Record<string,string>;bindings:VerifiedDependencyBinding[];witnesses:FixtureSourceWitness[];initializerOperations:PreparedInitializerOperation[];}
-  | {status:"unresolved";missingDependencies:string[];attemptedResolvers:string[];witnesses:FixtureSourceWitness[];};
+  | {status:"resolved";deployments:PreparedDeployment[];substitutions:Record<string,string>;bindings:VerifiedDependencyBinding[];witnesses:FixtureSourceWitness[];initializerOperations:PreparedInitializerOperation[];implementationChoices?:Record<string,string>;}
+  | {status:"unresolved";missingDependencies:string[];attemptedResolvers:string[];witnesses:FixtureSourceWitness[];
+      ambiguousImplementations?:Array<{typeName:string;candidates:Array<{path:string;contract:string;sourceSha256:string}>}>;};
 export interface PreparedInitializerOperation {id:string;deploymentId:string;function:string;args:PreparedArg[];sender:0;}
 type ContractEntry={source:SourceSnapshot;node:any};
 /** Source-global struct, enum and value-type declarations must participate in
@@ -1046,7 +1047,7 @@ export function verifyAcquiredReceiverMethods(
 
 export function resolveSourceFixtureDependencies(
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
-  limits:Readonly<{maxDepth?:number;maxNodes?:number}>={},
+  limits:Readonly<{maxDepth?:number;maxNodes?:number;choiceByType?:Readonly<Record<string,string>>}>={},
 ):FixtureResolution {
   const ast=astOf(target);
   const targetNode=(ast?.children||[]).find((n:any)=>n.type==="ContractDefinition"&&n.name===contractName);
@@ -1125,6 +1126,8 @@ export function resolveSourceFixtureDependencies(
     return false;
   };
   const attempts:string[]=[],missing:string[]=[],witnesses:FixtureSourceWitness[]=[],bindings:VerifiedDependencyBinding[]=[];
+  const implementationChoices:Record<string,string>={};
+  const ambiguousImplementations:Array<{typeName:string;candidates:Array<{path:string;contract:string;sourceSha256:string}>}>=[];
   const deployments:PreparedDeployment[]=[],initializers:PreparedInitializerOperation[]=[];
   const substitutions:Record<string,string>={};
   const visited=new Map<string,string>(),stack=new Set<string>();
@@ -1173,9 +1176,24 @@ export function resolveSourceFixtureDependencies(
     const qualified=receiverMethods.length?
       choices.filter(choice=>verifyAcquiredReceiverMethods(typ,receiverMethods,
         choice.source.path,choice.node.name,sources).ok):choices;
-    if(qualified.length!==1){missing.push(typ+(qualified.length===0?
-      ":no_acquired_abi_compatible_implementation":":ambiguous_implementation"));return null;}
-    const selected=qualified[0],key=selected.source.path+":"+selected.node.name;
+    // Multiple acquired, ABI-compatible implementations are alternatives,
+    // not evidence that *any one* is the production receiver. Enumerate
+    // concrete source choices in a separate bounded experiment instead.
+    const forced=limits.choiceByType?.[typ];
+    const matching=forced===undefined?qualified:qualified.filter(choice=>
+      choice.source.path+":"+choice.node.name===forced);
+    if(matching.length!==1){
+      if(forced===undefined&&qualified.length>1)
+        ambiguousImplementations.push({typeName:typ,candidates:qualified.map(choice=>({
+          path:choice.source.path,contract:choice.node.name,
+          sourceSha256:choice.source.sha256}))});
+      missing.push(typ+(qualified.length===0?
+        ":no_acquired_abi_compatible_implementation":
+        forced!==undefined?":selected_implementation_not_abi_compatible":":ambiguous_implementation"));
+      return null;
+    }
+    const selected=matching[0],key=selected.source.path+":"+selected.node.name;
+    implementationChoices[typ]=key;
     if(stack.has(key)){missing.push(typ+":dependency_cycle");return null;}
     if(visited.has(key))return visited.get(key)!;
     // Constructors resolve their transitive arguments BEFORE the parent is
@@ -1272,7 +1290,7 @@ export function resolveSourceFixtureDependencies(
   // are ordered after their transitive dependencies. Missing work never becomes
   // a synthesized protocol implementation.
   if(missing.length)return {status:"unresolved",missingDependencies:[...new Set(missing)],
-    attemptedResolvers:[...new Set(attempts)],witnesses};
+    attemptedResolvers:[...new Set(attempts)],witnesses,ambiguousImplementations};
   // A consumer may acquire additional dependencies while resolving its initializer.
   // Order the entire acquired deployment graph, not just constructor recursion.
   // Keep stable deployment IDs so substitutions and proof bindings remain valid.
@@ -1303,5 +1321,45 @@ export function resolveSourceFixtureDependencies(
   const orderedInitializers=[...initializers].sort((a,b)=>
     (rank.get(a.deploymentId)??Infinity)-(rank.get(b.deploymentId)??Infinity));
   return {status:"resolved",deployments:ordered,substitutions,bindings,witnesses,
-    initializerOperations:orderedInitializers};
+    initializerOperations:orderedInitializers,implementationChoices};
+}
+
+/** Enumerate distinct REAL source-and-ABI-backed fixture graphs. An ambiguous
+ * type is not answered by guessing the first compatible protocol; each
+ * implementation becomes its own bounded candidate and must be verified in
+ * the isolated EVM. Unavailable implementations never appear as success.
+ */
+export function enumerateSourceFixtureDependencies(
+  target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
+  options:Readonly<{maxAlternatives?:number;maxDepth?:number;maxNodes?:number}>={},
+):Extract<FixtureResolution,{status:"resolved"}>[] {
+  const max=options.maxAlternatives??12;
+  if(!Number.isSafeInteger(max)||max<1||max>16)
+    throw new Error("INVALID_FIXTURE_ALTERNATIVE_LIMIT");
+  const pending:Array<Record<string,string>>=[{}];
+  const seen=new Set<string>(),results:Extract<FixtureResolution,{status:"resolved"}>[]=[];
+  // At most 16 distinct complete graphs, with an absolute 128-node
+  // exploration cap to avoid exponential source-family expansion.
+  while(pending.length&&seen.size<128&&results.length<max){
+    const selections=pending.shift()!;
+    const key=JSON.stringify(Object.entries(selections).sort(([a],[b])=>a.localeCompare(b)));
+    if(seen.has(key))continue;
+    seen.add(key);
+    const attempt=resolveSourceFixtureDependencies(target,contractName,sources,{
+      maxDepth:options.maxDepth,maxNodes:options.maxNodes,choiceByType:selections});
+    if(attempt.status==="resolved"){
+      if(!results.some(result=>
+        JSON.stringify(result.implementationChoices)===JSON.stringify(attempt.implementationChoices)))
+        results.push(attempt);
+      continue;
+    }
+    const ambiguity=attempt.ambiguousImplementations?.find(item=>
+      selections[item.typeName]===undefined);
+    if(!ambiguity)continue;
+    const choices=[...ambiguity.candidates].sort((a,b)=>
+      (a.path+":"+a.contract).localeCompare(b.path+":"+b.contract));
+    for(const choice of choices)if(pending.length+seen.size<128)
+      pending.push({...selections,[ambiguity.typeName]:choice.path+":"+choice.contract});
+  }
+  return results;
 }
