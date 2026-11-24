@@ -1801,8 +1801,8 @@ function sourceInitializerReplayExperiment(
   const params:any[]=fn.parameters||[];
   if(params.length>8||!statements.length||statements.length>10)return null;
   const maybeTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
-  if(maybeTypes.some(t=>!t))return null;
-  const abiTypes:string[]=maybeTypes;
+  const abiTypes=maybeTypes.filter((t):t is string=>t!==null);
+  if(abiTypes.length!==params.length||abiTypes.some(t=>!t))return null;
   if(!declarations.some(d=>
     d.operation==='send'&&d.selector===contract.name+'.'+method&&
     JSON.stringify(d.inputs)===JSON.stringify(abiTypes)))return null;
@@ -4096,8 +4096,8 @@ function sourceFactoryDeterminismExperiments(
     canonicalAbiType(params[1].typeName)!=='bytes32'||params[1].name!=='salt')
     return [];
   const maybeAbiTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
-  if(maybeAbiTypes.some(t=>!t))return [];
-  const abiTypes:string[]=maybeAbiTypes;
+  const abiTypes=maybeAbiTypes.filter((t):t is string=>t!==null);
+  if(abiTypes.length!==params.length||abiTypes.some(t=>!t))return [];
   if(!declarations.some(d=>d.operation==='send'&&
     d.selector==='Factory.'+method&&
     JSON.stringify(d.inputs)===JSON.stringify(abiTypes)))return [];
