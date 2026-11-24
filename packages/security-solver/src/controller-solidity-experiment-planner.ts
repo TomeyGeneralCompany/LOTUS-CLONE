@@ -299,6 +299,18 @@ const SAFE_OZ_INITS=new Set([
 
 function canonicalAbiType(typeName:any):string|null {
   if(!typeName)return null;
+  // The ABI does not collapse acquired array types to an unknown argument.
+  // In particular, a factory's address[] and a batch token operation's
+  // uint256[] are real, executable signatures rather than a scalar address.
+  if(typeName.type==='ArrayTypeName'){
+    const base=canonicalAbiType(typeName.baseTypeName);
+    if(!base)return null;
+    const size=typeName.length;
+    if(size===null||size===undefined)return base+'[]';
+    const count=String(size.number??size.value??'');
+    if(!/^[1-9][0-9]*$/.test(count)||Number(count)>32)return null;
+    return base+'['+count+']';
+  }
   if(typeName.type==='ElementaryTypeName'){
     const name=String(typeName.name||'');
     if(name==='address')return 'address';
@@ -1601,6 +1613,14 @@ export function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAc
     if(!/^[0-9]+$/.test(preferred))return null;
     const requested=BigInt(preferred);
     return (requested>maximum?maximum:requested).toString();
+  }
+  const fixedArray=t.match(/^(.*)\[([0-9]+)\]$/);
+  if(fixedArray){
+    const count=Number(fixedArray[2]);
+    if(!Number.isSafeInteger(count)||count>8)return null;
+    const element=pickFlexibleArg(fixedArray[1],name,options);
+    if(element===null||Array.isArray(element))return null;
+    return Array.from({length:count},()=>element);
   }
   if(t==='bytes32')return ZERO_BYTES32;
   if(t==='bytes')return '0x4142';
@@ -4134,12 +4154,20 @@ function sourceFactoryDeterminismExperiments(
   const initMatch=text.match(/\bclone\s*\.\s*initialize\s*\(([^;]*)\)\s*;/);
   if(!initMatch)return [];
   const initializerArgs=initMatch[1].split(',').map(x=>x.trim());
-  // Typed plan generation is confined to exact forwarded parameters: we
-  // cannot infer app-specific protocol preconditions from argument names.
-  if(!initializerArgs.length||initializerArgs.some(x=>!identifier.test(x)||
-    !params.slice(2).some((p:any)=>p.name===x)))return [];
-  const argTypes=initializerArgs.map(name=>abiTypes[params.findIndex((p:any)=>p.name===name)]);
-  if(argTypes.some(type=>!type))return [];
+  // The factory itself is the authority for argument forwarding. "msg.sender"
+  // is a source-declared address, not an invented extra constructor argument.
+  // Other expressions (including struct fields) are refused until separately
+  // represented by a real ABI-typed value and proven initialization path.
+  if(!initializerArgs.length)return [];
+  const initializerTypes:string[]=[];
+  for(const expression of initializerArgs){
+    if(expression==='msg.sender'){initializerTypes.push('address');continue;}
+    if(!identifier.test(expression))return [];
+    const parameterIndex=params.findIndex((p:any,i:number)=>
+      i>=2&&p.name===expression);
+    if(parameterIndex<0||!abiTypes[parameterIndex])return [];
+    initializerTypes.push(abiTypes[parameterIndex]);
+  }
   const suppliedInit=(templateContract.subNodes||[]).find((n:any)=>
     n.type==='FunctionDefinition'&&n.name==='initialize'&&n.body);
   const directBase=resolveInheritance(templateSource,templateContract,sources).chain;
@@ -4148,22 +4176,27 @@ function sourceFactoryDeterminismExperiments(
     .map((node:any)=>({node,source:e.snapshot})));
   const initChoices=suppliedInit?[{node:suppliedInit,source:templateSource}]:inheritedInit;
   if(initChoices.length!==1||JSON.stringify((initChoices[0].node.parameters||[])
-    .map((p:any)=>canonicalAbiType(p.typeName)))!==JSON.stringify(argTypes))return [];
+    .map((p:any)=>canonicalAbiType(p.typeName)))!==JSON.stringify(initializerTypes))return [];
   // A factory with additional external calls beyond initialization requires
-  // a fully resolved fixture; this conservative replay family only handles
-  // known source-authenticated ownership transfer after initialization.
+  // a fully resolved fixture; no arbitrary third-party protocol is inferred.
   const rest=text.replace(/\bclone\s*\.\s*initialize\s*\([^;]*\)\s*;/,'')
     .replace(/\bclone\s*\.\s*transferOwnership\s*\(\s*msg\.sender\s*\)\s*;/,'');
   if(/\bclone\s*\.\s*(?:mint|fund|deposit|approve|transferFrom)\s*\(/.test(rest))
     return [];
+  // Bind actual acquired transitive constructor and initializer dependencies.
+  // In particular, an externally cast address cannot silently become an EOA
+  // when the source requires an acquired contract receiver.
+  const fixture=resolveSourceFixtureDependencies(templateSource,templateName,
+    [...sources.values()]);
+  if(fixture.status!=='resolved')return [];
   const tailArgs:SolidityArgValue[]=[];
   for(let i=2;i<params.length;i++){
     const type=abiTypes[i],name=String(params[i].name||'');
-    const arg=pickFlexibleArg(type,name);
-    if(arg===null||Array.isArray(arg))return [];
-    tailArgs.push(arg);
+    const literal=pickFlexibleArg(type,name);
+    if(literal===null)return [];
+    const bound=fixture.substitutions[name];
+    tailArgs.push(type==='address'&&bound?bound:literal);
   }
-  if(method!=='createNFT')return [];
   const methodSignature=method+'('+abiTypes.join(',')+')';
   return [ZERO_BYTES32,'0x'+'11'.repeat(32)].map((salt,index)=>{
     const callArgs:SolidityArgValue[]=['$deployment:template',salt,...tailArgs];
@@ -4181,13 +4214,15 @@ function sourceFactoryDeterminismExperiments(
       method+' must initialize once; an identical deterministic CREATE2 salt cannot initialize a second clone',
       property:'source-proven CREATE2 deterministic clone replay '+method+':'+index,
       sequence:{constructorArgs:[],
-        preparation:{deployments:[{id:'template',file:templateSource.path,
-          contract:templateName,constructorArgs:[]}],operations:[],checks:[]},steps},
+        preparation:{deployments:[...fixture.deployments,
+          {id:'template',file:templateSource.path,
+            contract:templateName,constructorArgs:[]}],
+          operations:[...fixture.initializerOperations],checks:[]},steps},
       witnesses:[witness(snapshot,fn,'Factory.'+methodSignature),
         witness(snapshot,predictor,'Factory.predictAddress(address,bytes32)'),
         witness(templateSource,templateContract,templateName),
         witness(initChoices[0].source,initChoices[0].node,
-          templateName+'.initialize('+argTypes.join(',')+')')]}
+          templateName+'.initialize('+initializerTypes.join(',')+')')]}
   });
 }
 

@@ -91,6 +91,59 @@ contract NFTWithSVG {
         step.operation==='send'&&step.expectRevert===true)));
       assert.equal(new Set(deterministic.map(e=>e.id)).size,2);
     }
+    // A second, unrelated source family exercises real array ABI inputs,
+    // bounded uint8 construction, and exact source-forwarded msg.sender.
+    // This must be admitted by the same factory engine, not a createNFT name.
+    const multitokenFactoryText=`pragma solidity ^0.8.4;
+import {FundingMultitoken} from "./tokens/FundingMultitoken.sol";
+contract Factory {
+  function predictAddress(address template,bytes32 salt) external view returns(address) {
+    return template.predictDeterministicAddress(salt);
+  }
+  function createFundingMultitoken(address template,bytes32 salt,
+    address[] calldata dividendTokens,uint8 decimals) external returns(FundingMultitoken) {
+    FundingMultitoken clone = FundingMultitoken(template.cloneDeterministic(salt));
+    clone.initialize(msg.sender,dividendTokens,decimals);
+    return clone;
+  }
+}`;
+    const multitokenText=`pragma solidity ^0.8.4;
+contract FundingMultitoken {
+  function initialize(address owner,address[] memory tokens,uint8 decimals) external {}
+}`;
+    const multitokenFactory={path:'source-1/contracts/Factory.sol',
+      content:multitokenFactoryText,sha256:hash(multitokenFactoryText)};
+    const multitokenTemplate={path:'source-1/contracts/tokens/FundingMultitoken.sol',
+      content:multitokenText,sha256:hash(multitokenText)};
+    const multitokenReplay=constructSolidityExperiments({
+      repositoryCommit:revision,targetPath:multitokenFactory.path,
+      targetSelector:'Factory.createFundingMultitoken',
+      sources:[multitokenFactory,multitokenTemplate],
+      declarations:[
+        {selector:'Factory.createFundingMultitoken',operation:'send',
+          inputs:['address','bytes32','address[]','uint8']},
+        {selector:'Factory.predictAddress',operation:'call',
+          inputs:['address','bytes32']}
+      ],
+    });
+    assert.equal(multitokenReplay.ok,true,
+      'Array ABI, uint8 bounds and source-forwarded msg.sender admit genuine factory replay');
+    if(multitokenReplay.ok){
+      const variants=multitokenReplay.experiments.filter(e=>
+        e.securityProperty.includes('CREATE2 deterministic clone replay'));
+      assert.equal(variants.length,2);
+      for(const candidate of variants){
+        const firstCreate=candidate.sequence.steps.find(step=>
+          step.operation==='send'&&step.function.startsWith('createFundingMultitoken('));
+        assert.ok(firstCreate&&firstCreate.operation==='send');
+        if(firstCreate&&firstCreate.operation==='send'){
+          assert.deepEqual(firstCreate.args[2],[]);
+          assert.equal(firstCreate.args[3],'18');
+        }
+        assert.ok(candidate.sequence.steps.some(step=>
+          step.operation==='send'&&step.expectRevert===true));
+      }
+    }
     const unacquiredTemplate=constructSolidityExperiments({
       repositoryCommit:revision,targetPath:factorySnapshot.path,
       targetSelector:'Factory.createNFT',sources:[factorySnapshot],
