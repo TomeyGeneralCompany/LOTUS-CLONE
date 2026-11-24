@@ -15,7 +15,7 @@ import {repairAttemptIdentity} from '../packages/security-solver/src/determinist
 import {unfittedVerifierTranscript} from '../packages/security-solver/src/deterministic/verifier-transcript';
 import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from '../packages/security-solver/src/deterministic/source-unavailability-verifier';
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
-import {resolveSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies,enumerateSourceFixtureDependencies,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {constructSolidityExperiments,sourcePreparationGraph,pickFlexibleArg} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 import {buildProgramFactsGraph} from '../packages/security-solver/src/deterministic/program-facts';
@@ -47,6 +47,36 @@ async function run(){
   const dir=await mkdtemp(join(tmpdir(),'lotus-round3-'));
   const file=join(dir,'analysis.json');
   try{
+    // An acquired interface may have multiple real ABI-compatible concrete
+    // implementers. Enumerate distinct DAGs instead of refusing every one
+    // or choosing the first arbitrarily. Never create an absent implementer.
+    const intf='pragma solidity ^0.8.4; interface IQuote { function quote() external view returns(uint256); }';
+    const implA='pragma solidity ^0.8.4; import "./IQuote.sol"; contract QuoteA is IQuote { function quote() external pure override returns(uint256) { return 1; } }';
+    const implB='pragma solidity ^0.8.4; import "./IQuote.sol"; contract QuoteB is IQuote { function quote() external pure override returns(uint256) { return 2; } }';
+    const consumer='pragma solidity ^0.8.4; import "./IQuote.sol"; contract QuoteConsumer { IQuote public quoteSource; constructor(IQuote _quoteSource) { quoteSource = _quoteSource; } function run() external view returns(uint256) {return quoteSource.quote();}}';
+    const typedSrc=(name:string,solidity:string)=>({path:'source-1/contracts/'+name+'.sol',
+      content:solidity,sha256:hash(solidity)});
+    const quoteSource=typedSrc('IQuote',intf),firstSource=typedSrc('QuoteA',implA),
+      secondSource=typedSrc('QuoteB',implB),consumerSource=typedSrc('QuoteConsumer',consumer);
+    const acquire=[quoteSource,firstSource,secondSource,consumerSource];
+    const ambiguous=resolveSourceFixtureDependencies(consumerSource,'QuoteConsumer',acquire);
+    assert.equal(ambiguous.status,'unresolved',
+      'Ambiguous sources must not be assigned arbitrary single deployment');
+    assert.ok(ambiguous.status==='unresolved'&&ambiguous.missingDependencies
+      .some(x=>x.includes('ambiguous_implementation')));
+    const resolvedChoices=enumerateSourceFixtureDependencies(
+      consumerSource,'QuoteConsumer',acquire);
+    assert.equal(resolvedChoices.length,2,
+      'Both acquired concrete source and ABI alternatives remain executable');
+    assert.deepEqual(new Set(resolvedChoices.flatMap(plan=>
+      plan.deployments.map(deployment=>deployment.contract))),
+      new Set(['QuoteA','QuoteB']));
+    assert.deepEqual(enumerateSourceFixtureDependencies(consumerSource,
+      'QuoteConsumer',[quoteSource,consumerSource]),[],
+      'No acquired implementation must never become an invented fixture');
+    assert.throws(()=>enumerateSourceFixtureDependencies(consumerSource,
+      'QuoteConsumer',acquire,{maxAlternatives:17}),/INVALID_FIXTURE_ALTERNATIVE_LIMIT/);
+
     // Real EVM transcripts may exceed the local model exchange budget. The
     // fitted model-visible summary cannot replace the canonical verifier bytes.
     const fullEvmTranscript=JSON.stringify({status:'behavior_not_observed',
