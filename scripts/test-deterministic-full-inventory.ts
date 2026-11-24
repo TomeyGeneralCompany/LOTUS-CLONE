@@ -272,6 +272,25 @@ contract InitialState is Initializable {
       JSON.stringify(depositGraph));
     if(depositGraph.status==='resolved')assert.ok(depositGraph.deployments.some(
       deployment=>deployment.contract==='DepositRoute'));
+    // SafeERC20 extension calls are not token ABI requirements. Resolve the
+    // acquired library body to the underlying IERC20 selector before matching
+    // a concrete receiver; otherwise xMPH's token fixture is rejected for
+    // lacking a fictitious `safeTransferFrom` method.
+    const erc20Interface=typedSrc('IERC20',
+      'pragma solidity ^0.8.4; interface IERC20 { function transferFrom(address,address,uint256) external returns(bool); }');
+    const safeTokenLibrary=typedSrc('SafeERC20',
+      'pragma solidity ^0.8.4; import "./IERC20.sol"; library SafeERC20 { function safeTransferFrom(IERC20 token,address from,address to,uint256 amount) internal { require(token.transferFrom(from,to,amount)); } }');
+    const concreteToken=typedSrc('TokenFixture',
+      'pragma solidity ^0.8.4; import "./IERC20.sol"; contract TokenFixture is IERC20 { function transferFrom(address,address,uint256) external pure override returns(bool) { return true; } }');
+    const tokenConsumer=typedSrc('TokenConsumer',
+      'pragma solidity ^0.8.4; import "./IERC20.sol"; import "./SafeERC20.sol"; contract TokenConsumer { using SafeERC20 for IERC20; IERC20 public token; function initialize(IERC20 _token) external { token = _token; } function deposit() external { token.safeTransferFrom(msg.sender,address(this),1); } }');
+    const tokenFixtureGraph=resolveSourceFixtureDependencies(tokenConsumer,
+      'TokenConsumer',[erc20Interface,safeTokenLibrary,concreteToken,tokenConsumer]);
+    assert.equal(tokenFixtureGraph.status,'resolved',
+      'SafeERC20.safeTransferFrom must resolve to acquired IERC20.transferFrom: '+
+      JSON.stringify(tokenFixtureGraph));
+    if(tokenFixtureGraph.status==='resolved')assert.ok(tokenFixtureGraph.deployments.some(
+      deployment=>deployment.contract==='TokenFixture'));
     assert.deepEqual(enumerateSourceFixtureDependencies(consumerSource,
       'QuoteConsumer',[quoteSource,consumerSource]),[],
       'No acquired implementation must never become an invented fixture');
