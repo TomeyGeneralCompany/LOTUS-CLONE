@@ -11,7 +11,7 @@ import type {SoliditySequence} from './solidity-sequence';
 import {sourceGroundedSolidityProbes} from './controller-solidity-security-probes';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
 import {extractAccountingObservations} from './deterministic/accounting-observations';
-import {resolveSourceFixtureDependencies, verifyAcquiredReceiverMethods, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependencies, verifyAcquiredReceiverMethods, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
 
 export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
@@ -2237,6 +2237,7 @@ export function extractSourceInvariantDescriptor(
   sources: ReadonlyMap<string, SourceSnapshot>,
   selectedCompanion?:string,
   selectedTargetSignature?:string,
+  fixtureChoices?:Readonly<Record<string,string>>,
 ): InvariantExtractionResult {
   if(isTestOrMockPath(snapshot.path))
     return {ok:false,category:'no_supported_property',
@@ -2405,7 +2406,8 @@ export function extractSourceInvariantDescriptor(
       unresolvedExt.push(`${recv}.${fnCalled}`);
     }
   }
-  const dependencyPlan=resolveSourceFixtureDependencies(snapshot,contract.name,[...sources.values()]);
+  const dependencyPlan=resolveSourceFixtureDependencies(snapshot,contract.name,
+    [...sources.values()],{choiceByType:fixtureChoices});
   const unresolvedRemaining=unresolvedExt.filter(call=>{
     if(dependencyPlan.status!=="resolved")return true;
     const [recv,methodCalled]=call.split('.');
@@ -4264,30 +4266,39 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       .map(canonicalFunctionIdentity);
     const signatures=targetVariants.length?targetVariants:[undefined];
     const issues:string[]=[];
+    // A type's multiple acquired concrete implementations are distinct
+    // candidate graphs. Never select an arbitrary first protocol: each
+    // graph retains its exact source, ABI and constructor/initializer DAG.
+    const fixtureGraphs=enumerateSourceFixtureDependencies(target,contract.name,
+      [...indexed.values()],{maxAlternatives:16});
+    const fixtureChoiceSets:Readonly<Record<string,string>|undefined>[]=
+      fixtureGraphs.length?fixtureGraphs.map(graph=>graph.implementationChoices):[undefined];
     for(const targetSignature of signatures){
-      const extracted=extractSourceInvariantDescriptor(target,contract,method,
-        input.declarations,indexed,undefined,targetSignature);
-      const variants=extracted.ok?[extracted]:
-        extracted.companionCandidates?.length?
-          extracted.companionCandidates.map(companion=>
-            extractSourceInvariantDescriptor(target,contract,method,
-              input.declarations,indexed,companion,targetSignature)):[extracted];
-      for(const candidate of variants){
-        if(!candidate.ok){
-          issues.push((targetSignature||method)+':'+candidate.category+':'+candidate.reason);
-          if(!invariantUnresolved)invariantUnresolved={
-            category:candidate.category,reason:candidate.reason};
-          continue;
-        }
-        const built=constructCoreInvariantExperiment(candidate.invariant,target,
-          contract,input.declarations,indexed);
-        if(built)choices.push(built);
-        else{
-          const reason='Source-witnessed invariant failed typed fixture construction for '+
-            (targetSignature||method);
-          issues.push(reason);
-          if(!invariantUnresolved)invariantUnresolved={
-            category:'missing_fixture',reason};
+      for(const fixtureChoices of fixtureChoiceSets){
+        const extracted=extractSourceInvariantDescriptor(target,contract,method,
+          input.declarations,indexed,undefined,targetSignature,fixtureChoices);
+        const variants=extracted.ok?[extracted]:
+          extracted.companionCandidates?.length?
+            extracted.companionCandidates.map(companion=>
+              extractSourceInvariantDescriptor(target,contract,method,
+                input.declarations,indexed,companion,targetSignature,fixtureChoices)):[extracted];
+        for(const candidate of variants){
+          if(!candidate.ok){
+            issues.push((targetSignature||method)+':'+candidate.category+':'+candidate.reason);
+            if(!invariantUnresolved)invariantUnresolved={
+              category:candidate.category,reason:candidate.reason};
+            continue;
+          }
+          const built=constructCoreInvariantExperiment(candidate.invariant,target,
+            contract,input.declarations,indexed);
+          if(built)choices.push(built);
+          else{
+            const reason='Source-witnessed invariant failed typed fixture construction for '+
+              (targetSignature||method);
+            issues.push(reason);
+            if(!invariantUnresolved)invariantUnresolved={
+              category:'missing_fixture',reason};
+          }
         }
       }
     }
