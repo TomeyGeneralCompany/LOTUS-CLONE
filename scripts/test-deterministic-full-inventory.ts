@@ -272,6 +272,19 @@ contract InitialState is Initializable {
       JSON.stringify(depositGraph));
     if(depositGraph.status==='resolved')assert.ok(depositGraph.deployments.some(
       deployment=>deployment.contract==='DepositRoute'));
+    // Public getters for structs can expose nested tuple members. Preserve
+    // nested ABI boundaries instead of splitting every comma as a top-level
+    // output or rejecting source-identified state as unobservable.
+    const nestedGetter=typedSrc('NestedGetter',
+      'pragma solidity ^0.8.4; contract NestedGetter { struct Identity { uint256 id; address account; } struct Position { uint256 shares; Identity identity; uint256 debt; } Position public position; }');
+    const nestedGetterAbi=enumerateAcquiredInheritedAbi(nestedGetter,
+      'NestedGetter','NestedGetter',[nestedGetter]);
+    assert.ok(nestedGetterAbi.some(entry=>
+      entry.selector==='NestedGetter.position'&&
+      JSON.stringify(entry.outputs)===JSON.stringify([
+        'uint256','(uint256,address)','uint256'
+      ])),
+      'Nested public struct getter must retain its exact nested ABI tuple output');
     // SafeERC20 extension calls are not token ABI requirements. Resolve the
     // acquired library body to the underlying IERC20 selector before matching
     // a concrete receiver; otherwise xMPH's token fixture is rejected for

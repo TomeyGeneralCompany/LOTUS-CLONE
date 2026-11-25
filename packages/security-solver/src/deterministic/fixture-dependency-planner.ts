@@ -956,6 +956,32 @@ function callableTypes(parameters:readonly any[],owner:ContractEntry,
   const types=parameters.map(p=>callableType(p.typeName,owner,entries));
   return types.some(x=>x===null)?null:types as string[];
 }
+/** Split a canonical tuple into its immediate ABI components while
+ * preserving nested tuple and array types. Commas inside nested tuples are
+ * not separators at the current level.
+ */
+function splitCanonicalTupleFields(tuple:string):string[]|null {
+  if(!tuple.startsWith("(")||!tuple.endsWith(")"))return null;
+  const fields:string[]=[];
+  let depth=0,start=1;
+  for(let i=1;i<tuple.length-1;i++){
+    const char=tuple[i];
+    if(char==="(")depth++;
+    else if(char===")"){
+      if(depth===0)return null;
+      depth--;
+    }else if(char===","&&depth===0){
+      const field=tuple.slice(start,i).trim();
+      if(!field)return null;
+      fields.push(field);start=i+1;
+    }
+  }
+  if(depth!==0)return null;
+  const last=tuple.slice(start,-1).trim();
+  if(!last)return null;
+  fields.push(last);
+  return fields;
+}
 function publicGetter(variable:any,owner:ContractEntry,
   entries:readonly ContractEntry[]):{identity:string;returns:string[]}|null {
   if(variable.visibility!=="public"||!variable.name)return null;
@@ -979,8 +1005,8 @@ function publicGetter(variable:any,owner:ContractEntry,
   // nested mappings/tuples remain unresolved pending compiler ABI evidence.
   if(type?.type==="UserDefinedTypeName"&&
     output.startsWith("(")&&output.endsWith(")")){
-    const fields=output.slice(1,-1).split(",");
-    if(!fields.length||fields.some(t=>!t||/[()[\]]/.test(t)))return null;
+    const fields=splitCanonicalTupleFields(output);
+    if(!fields?.length)return null;
     return {identity:variable.name+"("+inputs.join(",")+")",returns:fields};
   }
   return {identity:variable.name+"("+inputs.join(",")+")",returns:[output]};
