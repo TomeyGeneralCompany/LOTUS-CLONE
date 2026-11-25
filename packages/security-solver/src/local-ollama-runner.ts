@@ -1764,10 +1764,13 @@ export async function runLocalAudit(
             evidenceDigest:certificate.evidenceDigest,
             checkpoint:analysisProgressStore.path,
           })+'\n');
+          const unresolvedSummary=JSON.stringify(disposition.unresolvedIds.map(id=>({
+            id,reasons:disposition.pendingReasons[id]||[]}))).slice(0,1400);
           throw new Error('EXPERIMENT_INCOMPLETE_SUSPENDED: '+
             disposition.conclusive+' experimentally verified, '+
             disposition.sourceUnavailable+' source-unavailable, '+
-            disposition.unresolvedIds.length+' explicitly unresolved; checkpoint '+analysisProgressStore.path);
+            disposition.unresolvedIds.length+' explicitly unresolved; pending='+unresolvedSummary+
+            '; checkpoint '+analysisProgressStore.path);
         }
         stageLock.completeExperiments(certificate);
         limits.onExperimentLedger?.({selected:stageLock.candidateCount,
