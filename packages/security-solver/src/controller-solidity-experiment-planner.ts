@@ -3608,19 +3608,88 @@ function sourceDirectAssignmentExperiments(
           }
         }return null;})();
         if(constructor&&consumer){
-          const outsiderSteps:SoliditySequence['steps']=[
+          const consumerNodes:any[]=consumer.contract.subNodes||[];
+          const publicMapping=consumerNodes.filter(n=>n.type==='StateVariableDeclaration')
+            .flatMap(n=>n.variables||[]).find((v:any)=>v.visibility==='public'&&
+              v.typeName?.type==='Mapping'&&
+              canonicalAbiType(v.typeName.keyType)==='address'&&
+              /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(v.typeName.valueType)||''));
+          const totalCredit=consumerNodes.filter(n=>n.type==='StateVariableDeclaration')
+            .flatMap(n=>n.variables||[]).find((v:any)=>v.name==='totalCredit'&&v.visibility==='public'&&
+              /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(v.typeName)||''));
+          const consumerParameters=(consumer.node.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
+          const consumerBody=body(consumer.source.content,consumer.node);
+          const consumerWritesCredit=publicMapping&&new RegExp('\\\\b'+publicMapping.name+
+            '\\\\s*\\\\[\\\\s*'+String((consumer.node.parameters||[])[0]?.name||'')+
+            '\\\\s*\\\\]\\\\s*\\\\+=').test(consumerBody);
+          const consumerDebitsTotal=totalCredit&&new RegExp('\\\\b'+totalCredit.name+
+            '\\\\s*-=').test(consumerBody);
+          const baseNames=(consumer.contract.baseContracts||[]).map((b:any)=>
+            String(b.baseName?.namePath||''));
+          const inheritsTarget=baseNames.includes(contract.name);
+          const fundFn=consumerNodes.find(n=>n.type==='FunctionDefinition'&&n.body&&
+            ['public','external'].includes(n.visibility)&&n.name&&
+            (n.parameters||[]).length===2&&
+            canonicalAbiType(n.parameters[0].typeName)==='address'&&
+            /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(n.parameters[1].typeName)||'')&&
+            new RegExp('\\\\b'+(totalCredit?.name||'totalCredit')+'\\\\s*\\\\+=')
+              .test(body(consumer.source.content,n)));
+          const fundTypes=fundFn?(fundFn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName)):[];
+          const settleTypes=consumerParameters;
+          const boundedAmount=(type:string,value:number):string|null=>{
+            const match=/^uint([0-9]{0,3})$/.exec(type);
+            if(!match)return null;
+            const bits=match[1]?Number(match[1]):256;
+            return bits>=8&&bits<=256&&bits%8===0&&BigInt(value)<(1n<<BigInt(bits))
+              ?String(value):null;
+          };
+          const seedAmount=fundTypes.length===2?boundedAmount(fundTypes[1],'1000'):null;
+          const payoutAmount=settleTypes.length===2?boundedAmount(settleTypes[1],'400'):null;
+          const impactSupported=publicMapping&&totalCredit&&consumerWritesCredit&&consumerDebitsTotal&&
+            inheritsTarget&&fundFn&&seedAmount&&payoutAmount&&
+            settleTypes[0]==='address'&&
+            /require\\s*\\([^;]*msg\\s*\\.\\s*sender\\s*==\\s*operator\\b/.test(consumerBody)&&
+            /require\\s*\\([^;]*amount\\s*>\\s*0[^;]*amount\\s*<=\\s*totalCredit/.test(consumerBody);
+          const outsiderSteps:SoliditySequence['steps']=impactSupported&&fundFn?[
+            {operation:'call',deploymentId:'roleVault',function:lhs+'()',args:[],expect:'$account0'},
+            {operation:'send',deploymentId:'roleVault',function:canonicalFunctionIdentity(fundFn),
+              args:['$account0',seedAmount!],sender:0},
+            {operation:'call',deploymentId:'roleVault',function:totalCredit.name+'()',args:[],expect:seedAmount!},
+            {operation:'send',deploymentId:'roleVault',function:signature,args,sender:2},
+            {operation:'call',deploymentId:'roleVault',function:lhs+'()',args:[],expect:'$account2'},
+            {operation:'send',deploymentId:'roleVault',function:canonicalFunctionIdentity(consumer.node),
+              args:['$account1',payoutAmount!],sender:2},
+            {operation:'call',deploymentId:'roleVault',function:publicMapping.name+'(address)',
+              args:['$account1'],expect:payoutAmount!},
+            {operation:'call',deploymentId:'roleVault',function:totalCredit.name+'()',args:[],
+              expect:String(Number(seedAmount)-Number(payoutAmount))},
+          ]:[
             {operation:'observe',function:getter,args:[]},
             {operation:'send',function:signature,args,sender:2},
             {operation:'call',function:getter,args:[],expect:'$account2'},
           ];
+          const impactWitnesses:SourceWitness[]=impactSupported&&fundFn?[
+            witness(consumer.source,fundFn,consumer.contract.name+'.'+canonicalFunctionIdentity(fundFn)+'.funding'),
+            witness(consumer.source,consumer.node,consumer.contract.name+'.'+canonicalFunctionIdentity(consumer.node)+'.role-guard-and-accounting'),
+            witness(consumer.source,publicMapping,consumer.contract.name+'.'+publicMapping.name),
+            witness(consumer.source,totalCredit,consumer.contract.name+'.'+totalCredit.name),
+          ]:[];
           out.unshift({
-            hypothesis:'An outsider can replace deployer-initialized '+lhs+
-              ', which acquired source uses to authorize '+consumer.contract.name+'.'+
-              canonicalFunctionIdentity(consumer.node),
-            property:'unauthorized source-proven privileged role mutation '+
-              contract.name+'.'+signature+':'+lhs,
+            hypothesis:impactSupported?
+              'A non-administrator can rotate the inherited operator role to itself and execute the acquired operator-only settlement, moving funded credit while reducing totalCredit':
+              'An outsider can replace deployer-initialized '+lhs+
+                ', which acquired source uses to authorize '+consumer.contract.name+'.'+
+                canonicalFunctionIdentity(consumer.node),
+            property:impactSupported?
+              'unauthorized privileged settlement through source-proven role mutation '+
+                contract.name+'.'+signature+':'+lhs:
+              'unauthorized source-proven privileged role mutation '+
+                contract.name+'.'+signature+':'+lhs,
             sequence:{constructorArgs:setup.constructorArgs,
               ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+              ...(impactSupported?{preparation:{deployments:[{id:'roleVault',
+                file:consumer.source.path,contract:consumer.contract.name,constructorArgs:[]}],
+                operations:[],checks:[]}}:{}),
               steps:outsiderSteps},
             witnesses:[
               witness(snapshot,constructor,contract.name+'.constructor.'+lhs),
@@ -3628,7 +3697,8 @@ function sourceDirectAssignmentExperiments(
               witness(snapshot,stmt,contract.name+'.'+signature+'.assignment'),
               witness(snapshot,state,contract.name+'.'+lhs),
               witness(consumer.source,consumer.node,
-                consumer.contract.name+'.'+canonicalFunctionIdentity(consumer.node)+'.role-guard')
+                consumer.contract.name+'.'+canonicalFunctionIdentity(consumer.node)+'.role-guard'),
+              ...impactWitnesses
             ]
           });
         }
