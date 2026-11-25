@@ -3592,7 +3592,7 @@ function sourceDirectAssignmentExperiments(
         declarations.some(d=>d.operation==='call'&&d.selector.startsWith(contract.name+'.')&&
           d.selector.slice(contract.name.length+1).split('(')[0]===lhs&&d.inputs.length===0)){
         const constructor=nodes.find((n:any)=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body&&
-          new RegExp('\\\\b'+lhs+'\\\\s*=\\\\s*msg\\\\s*\\\\.\\\\s*sender\\\\b')
+          new RegExp('\\b'+lhs+'\\s*=\\s*msg\\s*\\.\\s*sender\\b')
             .test(body(snapshot.content,n)));
         const consumer=(()=>{for(const peer of sources.values()){
           if(peer.path===snapshot.path)continue;
@@ -3601,7 +3601,7 @@ function sourceDirectAssignmentExperiments(
             if(peerContract.type!=='ContractDefinition')continue;
             for(const peerFn of peerContract.subNodes||[]){
               if(peerFn.type!=='FunctionDefinition'||!peerFn.body)continue;
-              if(new RegExp('\\\\brequire\\\\s*\\\\(\\\\s*msg\\\\s*\\\\.\\\\s*sender\\\\s*==\\\\s*'+lhs+'\\\\b')
+              if(new RegExp('\\brequire\\s*\\(\\s*msg\\s*\\.\\s*sender\\s*==\\s*'+lhs+'\\b')
                 .test(body(peer.content,peerFn)))
                 return {source:peer,contract:peerContract,node:peerFn};
             }
