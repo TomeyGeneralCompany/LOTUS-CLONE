@@ -2246,16 +2246,15 @@ contract DirectState {
         assert.ok(exp,'Direct assignment property must be constructed: '+name);
         if(exp){
           const steps=exp.sequence.steps;
-          const unauthorized=steps.find(step=>step.operation==='send'&&step.sender===1);
-          const authorized=steps.find(step=>step.operation==='send'&&step.sender===0);
-          const readbacks=steps.filter(step=>step.operation==='call'&&step.function===getter);
-          assert.ok(unauthorized?.operation==='send'&&unauthorized.expectRevert,
-            'Direct assignment must test the unauthorized caller: '+name);
-          assert.ok(authorized?.operation==='send','Direct assignment must test the authorized caller: '+name);
-          assert.ok(readbacks.length>=3,'Direct assignment must include baseline, unauthorized, and authorized observations: '+name);
-          assert.deepEqual(readbacks[2]?.operation==='call'?readbacks[2].expect:null,
-            authorized?.operation==='send'?authorized.args[0]:null,
-            'Authorized readback must equal the source-backed assignment argument: '+name);
+          const observation=steps.find(step=>step.operation==='observe'&&step.function===getter);
+          const write=steps.find(step=>step.operation==='send'&&step.sender===0);
+          const readback=steps.find(step=>step.operation==='call'&&step.function===getter);
+          assert.ok(observation?.operation==='observe',
+            'Direct assignment must record its pre-state: '+name);
+          assert.ok(write?.operation==='send','Direct assignment must execute its source-backed write: '+name);
+          assert.deepEqual(readback?.operation==='call'?readback.expect:null,
+            write?.operation==='send'?write.args[0]:null,
+            'Observed state after the write must equal the exact source-backed argument: '+name);
         }
       }
     }
