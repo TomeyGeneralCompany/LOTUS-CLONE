@@ -1,8 +1,22 @@
 import { z } from "zod";
 // ABI integers are decimal strings: JSON numbers cannot faithfully carry uint256.
 const scalar = z.union([z.string().max(2048), z.boolean()]);
-const abiValue = z.union([scalar, z.array(z.union([scalar,z.array(scalar).max(32)])).max(32)]);
-const args = z.array(abiValue).max(32);
+type AbiValue=string|boolean|AbiValue[];
+function isAbiValue(value:unknown,depth=0,budget={nodes:0}):value is AbiValue {
+  if(++budget.nodes>256)return false;
+  if(typeof value==="boolean"||typeof value==="string")return typeof value!=="string"||value.length<=2048;
+  if(!Array.isArray(value)||depth>=8||value.length>32)return false;
+  return value.every(item=>isAbiValue(item,depth+1,budget));
+}
+const abiValue=z.custom<AbiValue>(value=>isAbiValue(value),
+  {message:"ABI values must be bounded strings, booleans or arrays nested at most 8 levels"});
+const args=z.array(abiValue).max(32).superRefine((values,ctx)=>{
+  const budget={nodes:0};
+  for(const value of values)if(!isAbiValue(value,0,budget)){
+    ctx.addIssue({code:z.ZodIssueCode.custom,message:"ABI argument tree exceeds 256 nodes or supported nesting"});
+    break;
+  }
+});
 const sender = z.number().int().min(0).max(2);
 const wei = z.string().regex(/^(0|[1-9][0-9]{0,29})$/);
 const deployment = z.object({
@@ -79,10 +93,12 @@ Set query to Contract.function for the primary function being tested. Sequence f
 {"constructorArgs":["5"],"steps":[{"operation":"send","function":"set(uint256)","args":["7"],"sender":0},{"operation":"call","function":"value()","args":[],"expect":"7"}]}.
 Use decimal strings for ABI integers and wei, booleans for bools, arrays for ABI arrays/tuples. $account0, $account1 and $account2 resolve to three local test accounts; $contract resolves to this deployment after construction.
 Optional constructorValueWei and send valueWei transfer only local test currency. send expectRevert=true tests a required revert. At most 16 steps; include at least one call with an expected result. A single return is a scalar; multiple returns are an array. Calls must be view/pure; sends must be nonpayable/payable. Optional expectPath is a bounded array of numeric tuple/array field positions, so a structured ABI return can be checked against a typed expected field without arbitrary evaluation. Use full ABI signatures for overloads.
-For a prerequisite initializer send, requiredSetup=true means its transaction must succeed before any hypothesis test executes. For a source-declared event observation, add expectEvents to a send step as [{"signature":"EventName(address,uint256)","args":["$account1","5"]}]. The executor validates the signature against the compiled acquired-source ABI, records the complete raw receipt including logs, and checks each expected event argument. An event mismatch is a failed assertion, never standalone vulnerability evidence. Use operation=observe with a source-declared view/pure method to record actual state without fabricating expect; pair observations before and after a send to establish baseline and transition. Observe records what happened, not proof of a violated invariant. Use operation=call with expect when a source-derived property justifies an assertion. Each sequence starts from a fresh deterministic local EVM. Output records actual receipts and read/assertion results. An assertion mismatch is only a test discrepancy, not evidence that the expected value or a vulnerability claim is correct. Compile acquired sources with a locally installed compiler that satisfies their pinned pragmas; acquired ABI-compatible dependencies and linked libraries may be deployed in the local fixture graph. External-chain state and unavailable source must never be fabricated.`;
+For a prerequisite initializer send, requiredSetup=true means its transaction must succeed before any hypothesis test executes. For a source-declared event observation, add expectEvents to a send step as [{"signature":"EventName(address,uint256)","args":["$account1","5"]}]. The executor validates the signature against the compiled acquired-source ABI, records the complete raw receipt including logs, and checks each expected event argument. An event mismatch is a failed assertion, never standalone vulnerability evidence. Use operation=observe with a source-declared view/pure method to record actual state without fabricating expect; pair observations before and after a send to establish baseline and transition. Observe records what happened, not proof of a violated invariant. Use operation=call with expect when a source-derived property justifies an assertion. Each sequence starts from a fresh deterministic local EVM. Output records actual receipts and read/assertion results. An assertion mismatch is only a test discrepancy, not evidence that the expected value or a vulnerability claim is correct. Compiler remains solc 0.8.30; external-chain state, proxies requiring external deployments, and linked libraries are not supplied.`;
 
 const scalarJson = {anyOf:[{type:"string",maxLength:2048},{type:"boolean"}]};
-const valueJson = {anyOf:[...scalarJson.anyOf,{type:"array",maxItems:32,items:{anyOf:[...scalarJson.anyOf,{type:"array",maxItems:32,items:scalarJson}]}}]};
+const valueJsonAt=(depth:number):any=>({anyOf:[...scalarJson.anyOf,
+  ...(depth<8?[{type:"array",maxItems:32,items:valueJsonAt(depth+1)}]:[])]});
+const valueJson=valueJsonAt(0);
 const argsJson = {type:"array",maxItems:32,items:valueJson};
 const stepBase = {deploymentId:{type:"string",maxLength:64},function:{type:"string",maxLength:200},args:argsJson,sender:{type:"integer",minimum:0,maximum:2}};
 const weiJson = {type:"string",pattern:"^(0|[1-9][0-9]{0,29})$"};

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {fixtureDiagnosticsSchema,sequenceObservations,resultSchema} from "../packages/security-solver/src/source-reproduction";
+import {soliditySequenceSchema} from "../packages/security-solver/src/solidity-sequence";
 
 const fingerprint="a".repeat(64),dependency="b".repeat(64);
 const receipt={status:1,transactionHash:"0xabc",blockNumber:12,from:"0x0000000000000000000000000000000000000002",
@@ -9,6 +10,13 @@ const receipt={status:1,transactionHash:"0xabc",blockNumber:12,from:"0x000000000
 const eventStep={operation:"send",function:"settle()",sender:0,valueWei:"0",reverted:false,gasUsed:"45000",
   passed:true,receipt,actualEvents:[{name:"Settled",signature:"Settled()",address:"0x0000000000000000000000000000000000000001",args:[]}],
   expectedEvents:[{signature:"Settled()",expected:[],observed:[],passed:true}],eventsPassed:true};
+const nestedSequence={constructorArgs:[],steps:[{operation:"call",function:"matrix()",args:[],expect:[[[["1"]]]]}]};
+assert.equal(soliditySequenceSchema.safeParse(nestedSequence).success,true,
+  "Typed sequence schema must accept bounded nested dynamic array values");
+const oversizedArrayTree=[...Array.from({length:9},()=>Array(32).fill("x"))];
+assert.equal(soliditySequenceSchema.safeParse({constructorArgs:[],steps:[
+  {operation:"call",function:"matrix()",args:[],expect:oversizedArrayTree}
+]}).success,false,"Sequence schema must enforce a total ABI value-node budget");
 const diagnostics={
   experimentId:fingerprint,
   fixtureId:dependency,

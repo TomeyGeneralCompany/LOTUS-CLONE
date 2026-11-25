@@ -5,12 +5,13 @@ function validateSequence(s) {
     if (!o || typeof o !== 'object' || Array.isArray(o) || required.some(k=>!Object.hasOwn(o,k)) ||
         Object.keys(o).some(k=>!allowed.includes(k))) throw new Error('Invalid sequence fields');
   };
-  const value = (v, depth=0) => {
+  const value = (v, depth=0, budget={nodes:0}) => {
+    if(++budget.nodes>256)throw new Error('ABI value exceeds 256 nodes');
     if (typeof v === 'boolean' || typeof v === 'string' && v.length<=2048) return;
-    if (Array.isArray(v) && depth<2 && v.length<=32) {v.forEach(x=>value(x,depth+1));return;}
+    if (Array.isArray(v) && depth<8 && v.length<=32) {v.forEach(x=>value(x,depth+1,budget));return;}
     throw new Error('ABI values must be strings, booleans or bounded arrays; encode integers as strings');
   };
-  const args = a => {if(!Array.isArray(a)||a.length>32)throw new Error('Invalid ABI arguments');a.forEach(v=>value(v));};
+  const args = a => {if(!Array.isArray(a)||a.length>32)throw new Error('Invalid ABI arguments');const budget={nodes:0};a.forEach(v=>value(v,0,budget));};
   const wei = v => {if(v!==undefined && (typeof v!=='string'||!/^(0|[1-9][0-9]{0,29})$/.test(v)))throw new Error('Invalid wei amount');};
   object(s,['constructorArgs','steps'],['constructorArgs','constructorValueWei','steps','deployment','preparation','factoryClone','sourceProperty']);
   if(s.sourceProperty!==undefined){

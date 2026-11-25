@@ -18,6 +18,10 @@ contract Fixture {
  function deposit() external payable {value+=msg.value;}
  function balance() external view returns(uint256) {return address(this).balance;}
  function pair() external view returns(uint256,bool) {return (value,true);}
+ function triple() external pure returns(uint256[][][] memory result) {
+   result=new uint256[][][](1);result[0]=new uint256[][](1);
+   result[0][0]=new uint256[](2);result[0][0][0]=1;result[0][0][1]=2;
+ }
 }`;
 const compiled=JSON.parse(solc.compile(JSON.stringify({language:'Solidity',sources:{'Fixture.sol':{content:source}},
  settings:{evmVersion:'shanghai',outputSelection:{'*':{'*':['abi','evm.bytecode.object']}}}})));
@@ -36,6 +40,7 @@ const sequence={constructorArgs:['9007199254740993','$account0'],constructorValu
  {operation:'call',function:'balance()',args:[],expect:'15'},
  {operation:'send',function:'set(uint256,bool)',args:['20',true]},
  {operation:'call',function:'pair()',args:[],expect:['21',true]},
+ {operation:'call',function:'triple()',args:[],expect:[[['1','2']]]},
 ]};
 async function execute(s) {
  const transport=ganache.provider({logging:{quiet:true},wallet:{deterministic:true,totalAccounts:3},
@@ -350,5 +355,11 @@ async function execute(s) {
   {...sequence,steps:[{...sequence.steps[0],function:'value(); arbitrary()'}]},
   {...sequence,constructorValueWei:'-1'},
  ])assert.throws(()=>validateSequence(invalid));
+ assert.doesNotThrow(()=>validateSequence({constructorArgs:[],steps:[
+  {operation:'call',function:'triple()',args:[],expect:[[[['1']]]]}
+ ]}),"Nested ABI arrays must survive bounded runtime schema validation");
+ assert.throws(()=>validateSequence({constructorArgs:[],steps:[
+  {operation:'call',function:'triple()',args:[],expect:[[[[[[[[[['1']]]]]]]]]]}
+ ]}),/bounded arrays/,"ABI nesting beyond the supported depth must fail closed");
  console.log('Solidity constructors, exact uint256, callers, payable transactions, overloads, expected/unexpected reverts, read assertions and deterministic replay: PASSED');
 })().catch(e=>{console.error(e);process.exitCode=1;});
