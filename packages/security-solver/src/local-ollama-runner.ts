@@ -1112,7 +1112,7 @@ export async function runLocalAudit(
         await appendFile(logFile,'[CONTROLLER_ROLE_EXPERIMENT] '+JSON.stringify({
           path,selector:target?.selector||roleCandidate.selector,role:roleCandidate.role,
           outcome,options:grounded.filter(item=>item.selector===target?.selector).length
-        })+'\\n');
+        })+'\n');
       }
       return grounded;
     };
