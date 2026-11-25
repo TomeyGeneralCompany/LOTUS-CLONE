@@ -3542,7 +3542,9 @@ function sourceDirectAssignmentExperiments(
       if(value===null){valid=false;break;}
       inputs.push(type);args.push(value);selected.set(name,value);
     }
-    if(!valid||!declarations.some(d=>d.selector===contract.name+'.'+method&&
+    if(!valid||!declarations.some(d=>
+      d.selector.startsWith(contract.name+'.')&&
+      d.selector.slice(contract.name.length+1).split('(')[0]===method&&
       d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
     const fnText=body(snapshot.content,fn);
     if(hasAnySourceAuthGuard(fn,fnText))continue;
@@ -3580,6 +3582,57 @@ function sourceDirectAssignmentExperiments(
       steps.push({operation:'observe',function:getter,args:[]});
       steps.push({operation:'send',function:signature,args,sender:0});
       steps.push({operation:'call',function:getter,args:[],expect:expected});
+
+      // A public role is a security property only when acquired source proves
+      // both deployer initialization and a privileged consumer. Exercise the
+      // setter from a distinct account and require the role getter to expose
+      // that outsider, rather than treating any state assignment as a flaw.
+      if(stateType==='address'&&canonicalAbiType(param.typeName)==='address'&&
+        expected==='$account2'&&!hasAnySourceAuthGuard(fn,body(snapshot.content,fn))&&
+        declarations.some(d=>d.operation==='call'&&d.selector.startsWith(contract.name+'.')&&
+          d.selector.slice(contract.name.length+1).split('(')[0]===lhs&&d.inputs.length===0)){
+        const constructor=nodes.find((n:any)=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body&&
+          new RegExp('\\\\b'+lhs+'\\\\s*=\\\\s*msg\\\\s*\\\\.\\\\s*sender\\\\b')
+            .test(body(snapshot.content,n)));
+        const consumer=(()=>{for(const peer of sources.values()){
+          if(peer.path===snapshot.path)continue;
+          let peerAst:any;try{peerAst=parseAstCached(peer);}catch{continue;}
+          for(const peerContract of peerAst.children||[]){
+            if(peerContract.type!=='ContractDefinition')continue;
+            for(const peerFn of peerContract.subNodes||[]){
+              if(peerFn.type!=='FunctionDefinition'||!peerFn.body)continue;
+              if(new RegExp('\\\\brequire\\\\s*\\\\(\\\\s*msg\\\\s*\\\\.\\\\s*sender\\\\s*==\\\\s*'+lhs+'\\\\b')
+                .test(body(peer.content,peerFn)))
+                return {source:peer,contract:peerContract,node:peerFn};
+            }
+          }
+        }return null;})();
+        if(constructor&&consumer){
+          const outsiderSteps:SoliditySequence['steps']=[
+            {operation:'observe',function:getter,args:[]},
+            {operation:'send',function:signature,args,sender:2},
+            {operation:'call',function:getter,args:[],expect:'$account2'},
+          ];
+          out.unshift({
+            hypothesis:'An outsider can replace deployer-initialized '+lhs+
+              ', which acquired source uses to authorize '+consumer.contract.name+'.'+
+              canonicalFunctionIdentity(consumer.node),
+            property:'unauthorized source-proven privileged role mutation '+
+              contract.name+'.'+signature+':'+lhs,
+            sequence:{constructorArgs:setup.constructorArgs,
+              ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+              steps:outsiderSteps},
+            witnesses:[
+              witness(snapshot,constructor,contract.name+'.constructor.'+lhs),
+              witness(snapshot,fn,contract.name+'.'+signature),
+              witness(snapshot,stmt,contract.name+'.'+signature+'.assignment'),
+              witness(snapshot,state,contract.name+'.'+lhs),
+              witness(consumer.source,consumer.node,
+                consumer.contract.name+'.'+canonicalFunctionIdentity(consumer.node)+'.role-guard')
+            ]
+          });
+        }
+      }
       out.push({
         hypothesis:'Acquired direct assignment '+lhs+' = '+rhs+
           ' must produce the exact public getter value after a successful call',
@@ -4559,7 +4612,8 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
   const separator=input.targetSelector.lastIndexOf('.');
   if(separator<1)return {ok:false,code:'TARGET_INVALID',detail:input.targetSelector};
   const contractName=input.targetSelector.slice(0,separator);
-  const method=input.targetSelector.slice(separator+1);
+  const rawMethod=input.targetSelector.slice(separator+1);
+  const method=rawMethod.split('(')[0];
   let ast:any;
   try{ast=parseAstCached(target);}
   catch{return {ok:false,code:'UNPARSEABLE_SOURCE',detail:input.targetPath};}
