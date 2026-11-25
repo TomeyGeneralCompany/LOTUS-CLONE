@@ -149,7 +149,7 @@ function buildAbiTypeDefinitions(sources:readonly SourceSnapshot[]):Map<string,A
           if(!child.name)continue;
           const kind=child.type==="EnumDefinition"?"enum":
             child.type==="StructDefinition"?"struct":
-            child.type==="UserDefinedValueTypeDefinition"?"value":null;
+            ["UserDefinedValueTypeDefinition","TypeDefinition"].includes(child.type)?"value":null;
           if(!kind)continue;
           const definition:AbiTypeDefinition={kind,node:child,owner:node.name};
           addAbiType(result,node.name+"."+child.name,definition);
@@ -158,7 +158,7 @@ function buildAbiTypeDefinitions(sources:readonly SourceSnapshot[]):Map<string,A
       }else if(node.name){
         const kind=node.type==="EnumDefinition"?"enum":
           node.type==="StructDefinition"?"struct":
-          node.type==="UserDefinedValueTypeDefinition"?"value":null;
+          ["UserDefinedValueTypeDefinition","TypeDefinition"].includes(node.type)?"value":null;
         if(kind)addAbiType(result,node.name,{kind,node,owner:undefined});
       }
     }
