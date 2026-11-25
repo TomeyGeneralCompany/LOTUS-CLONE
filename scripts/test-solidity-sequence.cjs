@@ -225,6 +225,10 @@ async function execute(s) {
    ]},ht);
    assert.equal(h.steps[0].operation,'setup');
    assert.equal(h.steps[1].operation,'setup');
+   assert.equal(h.steps[0].receipt.status,1);
+   assert.ok(h.steps[0].receipt.transactionHash);
+   assert.equal(h.steps[1].receipt.status,1);
+   assert.ok(h.steps[1].receipt.transactionHash);
    assert.equal(h.steps[2].operation,'send');
    assert.equal(h.steps[2].reverted,false);
    assert.equal(h.steps[3].passed,true);

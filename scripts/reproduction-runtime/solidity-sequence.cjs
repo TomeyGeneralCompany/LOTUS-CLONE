@@ -173,6 +173,8 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
   const provider=new BrowserProvider(transport,undefined,{cacheTimeout:-1,pollingInterval:10});
   let runtimePhase='fixture_preparation';
   let runtimeStepIndex=null;
+  const receiptHistory=[];
+  const recordReceipt=(phase,action,receipt)=>receiptHistory.push({phase,action,receipt:receiptEvidence(receipt)});
   const diagnosticError=(error)=>{
     const cause=error instanceof Error?error:new Error(String(error));
     const receipt=cause.receipt||null;
@@ -198,7 +200,8 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       receiptTo:receipt?.to??null,
       transactionHash:receipt?.hash||null,
       gasUsed:receipt?.gasUsed?.toString?.()||null,
-      receipt:receipt?receiptEvidence(receipt):undefined
+      receipt:receipt?receiptEvidence(receipt):undefined,
+      receiptHistory
     };
     return cause;
   };
@@ -230,6 +233,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
               const library=await new ContractFactory(linkedLibrary.abi,
                 linkedLibrary.evm.bytecode.object,signers[0]).deploy({gasLimit:10000000});
               const receipt=await library.deploymentTransaction().wait();
+              if(receipt)recordReceipt(runtimePhase,'deploy-library:'+key,receipt);
               if(!receipt||receipt.status!==1)throw new Error('Solidity library deployment failed: '+key);
               libraryAddress=(await library.getAddress()).toLowerCase();
               linkedLibraries.set(key,libraryAddress);
@@ -280,6 +284,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         const dep=await new ContractFactory(linkedDependency.abi,linkedDependency.evm.bytecode.object,signers[0])
           .deploy(...d.constructorArgs.map(resolve),{value:d.valueWei||'0',gasLimit:10000000});
         const receipt=await dep.deploymentTransaction().wait();
+        if(receipt)recordReceipt(runtimePhase,'deploy:'+d.id,receipt);
         if(receipt?.status!==1)throw new Error('Preparation deployment failed: '+d.id);
         const depAddress=await dep.getAddress();
         deployed.set(d.id,{contract:dep,address:depAddress,receipt});
@@ -301,6 +306,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         let receipt;
         try {const tx=await fn.send(...values,{value:op.valueWei||'0',gasLimit:2000000});receipt=await tx.wait();}
         catch(error) {if(error.receipt?.status!==0)throw error;receipt=error.receipt;}
+        if(receipt)recordReceipt(runtimePhase,'preparation:'+op.id,receipt);
         if(!receipt||![0,1].includes(receipt.status))
           throw new Error('Preparation missing transaction receipt: '+op.id);
         const actualReverted=receipt.status===0;
@@ -334,6 +340,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
     let contract=await new ContractFactory(linkedTarget.abi,linkedTarget.evm.bytecode.object,signers[0])
       .deploy(...sequence.constructorArgs.map(resolve),{value:sequence.constructorValueWei||'0',gasLimit:deployGasLimit});
     const deployment=await contract.deploymentTransaction().wait();
+    if(deployment)recordReceipt(runtimePhase,'target-deployment',deployment);
     if(!deployment || deployment.status!==1)throw new Error('Constructor deployment failed');
     address=await contract.getAddress();
     // Source-defined 88mph Factory creates deterministic EIP-1167 clones of
@@ -356,6 +363,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         throw new Error('Factory returned no independently deployed clone address');
       const tx=await fn.send(...values,{gasLimit:deployGasLimit});
       const cloneReceipt=await tx.wait();
+      if(cloneReceipt)recordReceipt(runtimePhase,'factory-clone:'+call.deploymentId,cloneReceipt);
       if(!cloneReceipt||cloneReceipt.status!==1)
         throw new Error('Factory clone creation or initialization failed');
       const code=await provider.getCode(predicted);
@@ -398,9 +406,11 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         const mint=contract.getFunction('tomeyMintBatch(address,uint256[],uint256[])');
         const tx=await mint.send(from,pairs.map(p=>p[0]),pairs.map(p=>p[1]),{gasLimit:2000000});
         const receipt=await tx.wait();
+        if(receipt)recordReceipt(runtimePhase,'erc1155-mint-setup',receipt);
         if(receipt?.status!==1)throw new Error('ERC1155 harness mint setup failed');
         steps.push({operation:'setup',function:'tomeyMintBatch(address,uint256[],uint256[])',
-          sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),purpose:'fund transfer prerequisites'});
+          sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),receipt:receiptEvidence(receipt),
+          purpose:'fund transfer prerequisites'});
         prepared.add(key);
       }
       if(ownerIndex!==sender){
@@ -410,9 +420,11 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
           const tx=await contract.connect(signers[ownerIndex])
             .getFunction('setApprovalForAll(address,bool)').send(accounts[sender],true,{gasLimit:2000000});
           const receipt=await tx.wait();
+          if(receipt)recordReceipt(runtimePhase,'erc1155-approval-setup',receipt);
           if(receipt?.status!==1)throw new Error('ERC1155 harness approval setup failed');
           steps.push({operation:'setup',function:'setApprovalForAll(address,bool)',
-            sender:ownerIndex,passed:true,gasUsed:receipt.gasUsed.toString(),purpose:'authorize transfer sender'});
+            sender:ownerIndex,passed:true,gasUsed:receipt.gasUsed.toString(),
+            receipt:receiptEvidence(receipt),purpose:'authorize transfer sender'});
         }
       }
     }
@@ -467,6 +479,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
           if(error.receipt?.status!==0)throw error;
           receipt=error.receipt;
         }
+        if(receipt)recordReceipt(runtimePhase,'target-send:'+fragment.format('sighash'),receipt);
         if(!receipt || ![0,1].includes(receipt.status))throw new Error('No transaction receipt');
         if(receipt.status===0 && receipt.gasUsed>=2000000n)throw new Error('Transaction exhausted its gas limit');
         const reverted=receipt.status===0;

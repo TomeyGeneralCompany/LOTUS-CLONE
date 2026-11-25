@@ -64,7 +64,9 @@ export const fixtureDiagnosticsSchema=z.object({
   receiptStatus:z.number().int().min(0).max(1).nullish(),
   receiptTo:z.string().max(128).nullish(),
   transactionHash:z.string().max(128).nullish(),gasUsed:z.string().max(64).nullish(),
-  receipt:evmReceiptSchema.optional()
+  receipt:evmReceiptSchema.optional(),
+  receiptHistory:z.array(z.object({phase:z.string().max(60),action:z.string().max(200),
+    receipt:evmReceiptSchema}).strict()).max(128).optional()
 }).strict();
 const eventCheckSchema=z.object({signature:z.string(),expected:z.unknown(),
   observed:z.unknown().nullable(),passed:z.boolean()}).strict();

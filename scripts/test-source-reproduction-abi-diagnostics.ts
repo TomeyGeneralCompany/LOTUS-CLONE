@@ -26,6 +26,7 @@ const diagnostics={
   constructorTypes:["address"],
   stepIndex:null,receiptStatus:null,receiptTo:null,
   transactionHash:null,gasUsed:null,receipt,
+  receiptHistory:[{phase:"target_action",action:"send:settle()",receipt}],
 };
 assert.deepEqual(fixtureDiagnosticsSchema.parse(diagnostics),diagnostics,
   "Authenticated ABI and dependency ABI digests from actual Solidity runtime must survive validation");
