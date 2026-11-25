@@ -3039,6 +3039,9 @@ export async function runLocalAudit(
                 hypothesis:action.action==='defer_lead'?'No supported executable property':action.hypothesis!,
                 disposition:action.action==='defer_lead'?'defer':'test',
                 reason:action.answer.trim().slice(0,700)},'model');
+              // A verified disposition is real forward progress: refund the
+              // action's turn so the batch window limits retries, not work.
+              analyzeTurnsRemaining++;
               await appendFile(logFile,'['+(action.action==='defer_lead'?'ANALYSIS_LEAD_DEFERRED':'ANALYSIS_LEAD_ASSESSED')+'] '+
                 JSON.stringify({leadId:packet!.id,path:packet!.path,selector:packet!.selector,
                   reason:action.answer.trim().slice(0,300),
@@ -3098,6 +3101,9 @@ export async function runLocalAudit(
                     sourceEvidence:[proposedLead!.sourceEvidence],
                     hypothesis:plan.hypothesis,disposition:'test',
                     reason:'Accepted distinct source-derived assertion and schema-valid local experiment'},'model');
+                  // Accepted source-bound experiments replenish the batch
+                  // window; only malformed or rejected work consumes it.
+                  analyzeTurnsRemaining++;
                   await appendFile(logFile,'[ANALYSIS_MODEL_EXPERIMENT_ADDED] '+JSON.stringify({
                     leadId:proposedLead!.id,experimentId:acceptedId,path:action.path,
                      selector:action.query,remainingTurns:analyzeTurnsRemaining})+'\n');
