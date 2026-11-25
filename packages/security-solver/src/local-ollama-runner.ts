@@ -1083,7 +1083,38 @@ export async function runLocalAudit(
       if(!revision)await appendFile(logFile,'[CONTROLLER_SCENARIO_REVISION_UNAVAILABLE] '+
         JSON.stringify({path})+'\n');
       const pathLeads=(limits.staticLeads||[]).filter(l=>l.path===path);
-      return controllerGroundedSolidityOptions(path,source,menu,snapshots,revision,pathLeads,options);
+      const grounded=controllerGroundedSolidityOptions(path,source,menu,snapshots,revision,pathLeads,options);
+      const roleCandidate=privilegedSolidityCandidates.get(path);
+      if(roleCandidate){
+        const separator=roleCandidate.selector.lastIndexOf('.');
+        const contractName=roleCandidate.selector.slice(0,separator);
+        const target=menu.find(entry=>entry.operation==='send'&&
+          entry.selector.startsWith(contractName+'.')&&
+          entry.selector.slice(contractName.length+1).split('(')[0]===roleCandidate.method);
+        let outcome:{status:string;code?:string;detail?:string;experiments?:number}=
+          {status:revision&&target?'construction_failed':'missing_revision_or_abi'};
+        if(revision&&target){
+          const built=constructSolidityExperiments({
+            repositoryCommit:revision,targetPath:path,targetSelector:target.selector,
+            sources:snapshots,declarations:menu,skipLegacy:true,
+            skipFinancialInvariants:options?.skipFinancialInvariants,staticLeads:pathLeads
+          });
+          if(built.ok&&built.experiments.length){
+            const experiment=built.experiments[0];
+            if(!grounded.some(item=>item.selector===target.selector)){
+              grounded.push({selector:target.selector,probe:{hypothesis:experiment.hypothesis,
+                sequence:experiment.sequence,guardedConsumer:''}});
+            }
+            outcome={status:'planned',experiments:built.experiments.length};
+          }else outcome={status:built.ok?'no_constructed_experiments':built.code,
+            detail:built.ok?'':built.detail};
+        }
+        await appendFile(logFile,'[CONTROLLER_ROLE_EXPERIMENT] '+JSON.stringify({
+          path,selector:target?.selector||roleCandidate.selector,role:roleCandidate.role,
+          outcome,options:grounded.filter(item=>item.selector===target?.selector).length
+        })+'\\n');
+      }
+      return grounded;
     };
     // Production controller: freeze the entire authorized source inventory
     // before the first paginated source read. Indexing can inspect bytes to
