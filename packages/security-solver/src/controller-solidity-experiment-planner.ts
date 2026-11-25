@@ -3636,7 +3636,7 @@ function sourceDirectAssignmentExperiments(
               .test(body(consumer.source.content,n)));
           const fundTypes=fundFn?(fundFn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName)):[];
           const settleTypes=consumerParameters;
-          const boundedAmount=(type:string,value:number):string|null=>{
+          const boundedAmount=(type:string,value:string):string|null=>{
             const match=/^uint([0-9]{0,3})$/.exec(type);
             if(!match)return null;
             const bits=match[1]?Number(match[1]):256;
