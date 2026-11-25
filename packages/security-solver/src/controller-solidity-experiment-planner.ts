@@ -3619,11 +3619,11 @@ function sourceDirectAssignmentExperiments(
               /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(v.typeName)||''));
           const consumerParameters=(consumer.node.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
           const consumerBody=body(consumer.source.content,consumer.node);
-          const consumerWritesCredit=publicMapping&&new RegExp('\\\\b'+publicMapping.name+
-            '\\\\s*\\\\[\\\\s*'+String((consumer.node.parameters||[])[0]?.name||'')+
-            '\\\\s*\\\\]\\\\s*\\\\+=').test(consumerBody);
-          const consumerDebitsTotal=totalCredit&&new RegExp('\\\\b'+totalCredit.name+
-            '\\\\s*-=').test(consumerBody);
+          const consumerWritesCredit=publicMapping&&new RegExp('\\b'+publicMapping.name+
+            '\\s*\\[\\s*'+String((consumer.node.parameters||[])[0]?.name||'')+
+            '\\s*\\]\\s*\\+=').test(consumerBody);
+          const consumerDebitsTotal=totalCredit&&new RegExp('\\b'+totalCredit.name+
+            '\\s*-=').test(consumerBody);
           const baseNames=(consumer.contract.baseContracts||[]).map((b:any)=>
             String(b.baseName?.namePath||''));
           const inheritsTarget=baseNames.includes(contract.name);
@@ -3632,7 +3632,7 @@ function sourceDirectAssignmentExperiments(
             (n.parameters||[]).length===2&&
             canonicalAbiType(n.parameters[0].typeName)==='address'&&
             /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(n.parameters[1].typeName)||'')&&
-            new RegExp('\\\\b'+(totalCredit?.name||'totalCredit')+'\\\\s*\\\\+=')
+            new RegExp('\\b'+(totalCredit?.name||'totalCredit')+'\\s*\\+=')
               .test(body(consumer.source.content,n)));
           const fundTypes=fundFn?(fundFn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName)):[];
           const settleTypes=consumerParameters;
@@ -3648,8 +3648,8 @@ function sourceDirectAssignmentExperiments(
           const impactSupported=publicMapping&&totalCredit&&consumerWritesCredit&&consumerDebitsTotal&&
             inheritsTarget&&fundFn&&seedAmount&&payoutAmount&&
             settleTypes[0]==='address'&&
-            /require\\s*\\([^;]*msg\\s*\\.\\s*sender\\s*==\\s*operator\\b/.test(consumerBody)&&
-            /require\\s*\\([^;]*amount\\s*>\\s*0[^;]*amount\\s*<=\\s*totalCredit/.test(consumerBody);
+            new RegExp('require\\s*\\([^;]*msg\\s*\\.\\s*sender\\s*==\\s*operator\\b').test(consumerBody)&&
+            new RegExp('require\\s*\\([^;]*amount\\s*>\\s*0[^;]*amount\\s*<=\\s*totalCredit').test(consumerBody);
           const outsiderSteps:SoliditySequence['steps']=impactSupported&&fundFn?[
             {operation:'call',deploymentId:'roleVault',function:lhs+'()',args:[],expect:'$account0'},
             {operation:'send',deploymentId:'roleVault',function:canonicalFunctionIdentity(fundFn),
