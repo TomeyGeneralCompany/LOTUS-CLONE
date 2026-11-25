@@ -2185,11 +2185,27 @@ contract GenericGuard {
       declarations:guardedMenu as any,skipLegacy:true});
     assert.equal(genericAuthorized.ok,true,
       'A genuine source-verified owner-equality guard must produce an executable property');
-    if(genericAuthorized.ok)assert.ok(genericAuthorized.experiments.some(exp=>
-      exp.securityProperty.startsWith('source-proof generic owner guard')&&
-      exp.sequence.steps.some(x=>x.operation==='send'&&x.sender===1&&x.expectRevert)&&
-      exp.sequence.steps.some(x=>x.operation==='call'&&x.function==='value()'&&x.expect==='7')),
-      'Guarded state change requires both unauthorized receipt and exact authorized readback: '+JSON.stringify(genericAuthorized.experiments));
+    if(genericAuthorized.ok){
+      const guarded=genericAuthorized.experiments.find(exp=>
+        exp.securityProperty.startsWith('source-proof generic owner guard'));
+      assert.ok(guarded,'A source-verified owner equality guard must produce an executable property');
+      if(guarded){
+        const steps=guarded.sequence.steps;
+        const unauthorized=steps.find(step=>step.operation==='send'&&step.sender===1);
+        const authorized=steps.find(step=>step.operation==='send'&&step.sender===0);
+        const valueReadbacks=steps.filter(step=>step.operation==='call'&&step.function==='value()');
+        assert.ok(unauthorized?.operation==='send'&&unauthorized.expectRevert,
+          'The non-owner transaction must be required to revert');
+        assert.ok(authorized?.operation==='send','The authorized transaction must execute');
+        assert.equal(valueReadbacks[0]?.operation==='call'?valueReadbacks[0].expect:null,'0',
+          'The initial state must be observed');
+        assert.equal(valueReadbacks[1]?.operation==='call'?valueReadbacks[1].expect:null,'0',
+          'The unauthorized attempt must leave the state unchanged');
+        assert.deepEqual(valueReadbacks[2]?.operation==='call'?valueReadbacks[2].expect:null,
+          authorized?.operation==='send'?authorized.args[0]:null,
+          'Authorized readback must equal the exact value sent');
+      }
+    }
     const falseGuard=constructSolidityExperiments({
       repositoryCommit:'b'.repeat(40),targetPath:guardedGeneric.path,
       targetSelector:'GenericGuard.inverted',sources:[guardedGeneric],
