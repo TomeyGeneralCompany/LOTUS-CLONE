@@ -249,13 +249,20 @@ contract MPHConverter is PausableUpgradeable, OwnableUpgradeable {
   }
 }`;
 const convSha = createHash('sha256').update(converterSrc).digest('hex');
+const erc20InterfaceSource='pragma solidity 0.8.4; interface IERC20 {}';
+const erc20InterfaceSnapshot={path:'@openzeppelin/contracts/token/ERC20/IERC20.sol',
+  sha256:createHash('sha256').update(erc20InterfaceSource).digest('hex'),content:erc20InterfaceSource};
 for (const sel of ['MPHConverter.pause', 'MPHConverter.unpause', 'MPHConverter.setForeignTokenWhitelist']) {
   const res = constructSolidityExperiments({
     repositoryCommit: 'f'.repeat(40),
     targetPath: 'contracts/rewards/MPHConverter.sol',
     targetSelector: sel,
-    sources: [{path: 'contracts/rewards/MPHConverter.sol', sha256: convSha, content: converterSrc}],
-    declarations: [{selector: sel, operation: 'send', inputs: []}]
+    sources: [
+      {path: 'contracts/rewards/MPHConverter.sol', sha256: convSha, content: converterSrc},
+      erc20InterfaceSnapshot,
+    ],
+    declarations: [{selector: sel, operation: 'send',
+      inputs: sel==='MPHConverter.setForeignTokenWhitelist'?['address','bool']:[]}]
   });
   assert.equal(res.ok, true, sel + ': ' + JSON.stringify(res));
 }
