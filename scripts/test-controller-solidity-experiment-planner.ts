@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {constructSolidityExperiments} from '../packages/security-solver/src/controller-solidity-experiment-planner';
+import {constructSolidityExperiments,pickFlexibleArg} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 import {verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 const content=`pragma solidity ^0.8.20;
 contract Vault {
@@ -84,6 +84,48 @@ const packageVestingAbi=verifyAcquiredReceiverMethods('VestingFixture',
 assert.equal(packageVestingAbi.ok,true,
   'Canonical inherited ERC721 safe-transfer overloads must satisfy the acquired Vesting02 receiver ABI: '+
   JSON.stringify(packageVestingAbi));
+
+const typedAbiSource=`pragma solidity ^0.8.20;
+enum Stage { Open, Closed }
+type SmallAmount is uint8;
+struct Position { uint256 shares; Stage stage; }
+contract TypedAbi {
+  Stage public stage;
+  SmallAmount public amount;
+  Position public position;
+  function setStage(Stage status) external { stage = status; }
+  function setAmount(SmallAmount amountInput) external { amount = amountInput; }
+  function setPosition(Position calldata next) external { position = next; }
+}`;
+const typedAbiSnapshot={path:'contracts/TypedAbi.sol',
+  sha256:createHash('sha256').update(typedAbiSource).digest('hex'),content:typedAbiSource};
+for(const [selector,signature,output] of [
+  ['TypedAbi.setStage','setStage(uint8)','0'],
+  ['TypedAbi.setAmount','setAmount(uint8)','255'],
+  ['TypedAbi.setPosition','setPosition((uint256,uint8))',['1000','0']],
+] as const){
+  const fn=selector.split('.')[1];
+  const inputs=signature.slice(signature.indexOf('(')+1,-1)==='(uint256,uint8)'?
+    ['(uint256,uint8)']:signature.slice(signature.indexOf('(')+1,-1).split(',');
+  const result=constructSolidityExperiments({
+    repositoryCommit:'f'.repeat(40),targetPath:typedAbiSnapshot.path,targetSelector:selector,
+    sources:[typedAbiSnapshot],declarations:[
+      {selector,operation:'send' as const,inputs},
+      {selector:'TypedAbi.stage',operation:'call' as const,inputs:[]},
+      {selector:'TypedAbi.amount',operation:'call' as const,inputs:[]},
+      {selector:'TypedAbi.position',operation:'call' as const,inputs:[]},
+    ],
+  });
+  assert.equal(result.ok,true,JSON.stringify(result));
+  if(result.ok)assert.ok(result.experiments.some(experiment=>
+    experiment.sequence.steps.some(step=>step.operation==='send'&&
+      step.function===signature&&JSON.stringify(step.args[0])===JSON.stringify(output))),
+    `Exact enum, user-defined value type and struct ABI must construct: ${signature}`);
+}
+assert.equal(pickFlexibleArg('uint8','amount'),'255',
+  'uint8 probe values must fit the exact ABI width');
+assert.equal(pickFlexibleArg('uint8','status'),'0',
+  'Enum parameters use a valid zero-based ordinal rather than an out-of-range int width');
 
 const a=constructSolidityExperiments(input);
 assert.equal(a.ok,true,JSON.stringify(a));

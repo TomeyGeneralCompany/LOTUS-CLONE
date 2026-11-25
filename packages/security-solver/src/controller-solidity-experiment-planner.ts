@@ -117,6 +117,78 @@ function parseAstCached(snapshot:SourceSnapshot):any {
   astCache.set(snapshot.sha256,parsed);
   return parsed;
 }
+const abiNodeOwner=new WeakMap<object,string>();
+type AbiTypeDefinition={kind:"contract"|"enum"|"struct"|"value";node:any;owner?:string};
+let activeAbiTypeDefinitions=new Map<string,AbiTypeDefinition[]>();
+function addAbiType(map:Map<string,AbiTypeDefinition[]>,name:string,definition:AbiTypeDefinition){
+  if(!name)return;
+  const values=map.get(name)||[];
+  if(!values.some(value=>value.node===definition.node))values.push(definition);
+  map.set(name,values);
+}
+function buildAbiTypeDefinitions(sources:readonly SourceSnapshot[]):Map<string,AbiTypeDefinition[]> {
+  const result=new Map<string,AbiTypeDefinition[]>();
+  const mark=(value:any,owner?:string,depth=0):void=>{
+    if(!value||typeof value!=="object"||depth>128)return;
+    if(Array.isArray(value)){for(const item of value)mark(item,owner,depth+1);return;}
+    let current=owner;
+    if(value.type==="ContractDefinition"&&typeof value.name==="string")current=value.name;
+    if(current)abiNodeOwner.set(value,current);
+    for(const [key,child] of Object.entries(value))
+      if(key!=="loc"&&key!=="range")mark(child,current,depth+1);
+  };
+  for(const source of sources){
+    let ast:any;
+    try{ast=parseAstCached(source);}catch{continue;}
+    mark(ast);
+    for(const node of ast.children||[]){
+      if(node.type==="ContractDefinition"&&node.name){
+        const contract:AbiTypeDefinition={kind:"contract",node,owner:node.name};
+        addAbiType(result,node.name,contract);
+        for(const child of node.subNodes||[]){
+          if(!child.name)continue;
+          const kind=child.type==="EnumDefinition"?"enum":
+            child.type==="StructDefinition"?"struct":
+            child.type==="UserDefinedValueTypeDefinition"?"value":null;
+          if(!kind)continue;
+          const definition:AbiTypeDefinition={kind,node:child,owner:node.name};
+          addAbiType(result,node.name+"."+child.name,definition);
+          addAbiType(result,child.name,definition);
+        }
+      }else if(node.name){
+        const kind=node.type==="EnumDefinition"?"enum":
+          node.type==="StructDefinition"?"struct":
+          node.type==="UserDefinedValueTypeDefinition"?"value":null;
+        if(kind)addAbiType(result,node.name,{kind,node,owner:undefined});
+      }
+    }
+  }
+  return result;
+}
+function resolveUserAbiType(typeName:any,seen=new Set<any>()):string|null {
+  const name=String(typeName?.namePath||"");
+  if(!identifier.test(name)&&!/^([A-Za-z_]\\w*\\.)+[A-Za-z_]\\w*$/.test(name))return null;
+  const owner=abiNodeOwner.get(typeName);
+  const choices=activeAbiTypeDefinitions.get(owner&& !name.includes(".")?owner+"."+name:name)||
+    activeAbiTypeDefinitions.get(name)||[];
+  if(!choices.length)return null;
+  const shapes=choices.map(definition=>{
+    if(seen.has(definition.node))return null;
+    if(definition.kind==="contract")return "address";
+    if(definition.kind==="enum")return "uint8";
+    const next=new Set(seen);next.add(definition.node);
+    if(definition.kind==="value"){
+      const underlying=definition.node.underlyingType||
+        definition.node.underlyingTypeName||definition.node.typeName||definition.node.definition;
+      return canonicalAbiType(underlying,next);
+    }
+    const members=definition.node.members||[];
+    const types=members.map((member:any)=>canonicalAbiType(member.typeName,next));
+    return types.some((item:string|null)=>item===null)?null:"("+types.join(",")+")";
+  });
+  const unique=[...new Set(shapes.filter((item):item is string=>typeof item==="string"))];
+  return unique.length===1&&shapes.every((item:string|null)=>item===unique[0])?unique[0]:null;
+}
 
 const clean=(s:string)=>s.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g,'');
 const body=(text:string,node:any)=>node?.body?.range ?
@@ -307,13 +379,13 @@ const SAFE_OZ_INITS=new Set([
   '_setupRole','_grantRole','_setRoleAdmin'
 ]);
 
-function canonicalAbiType(typeName:any):string|null {
+function canonicalAbiType(typeName:any,seen=new Set<any>()):string|null {
   if(!typeName)return null;
   // The ABI does not collapse acquired array types to an unknown argument.
   // In particular, a factory's address[] and a batch token operation's
   // uint256[] are real, executable signatures rather than a scalar address.
   if(typeName.type==='ArrayTypeName'){
-    const base=canonicalAbiType(typeName.baseTypeName);
+    const base=canonicalAbiType(typeName.baseTypeName,seen);
     if(!base)return null;
     const size=typeName.length;
     if(size===null||size===undefined)return base+'[]';
@@ -329,10 +401,7 @@ function canonicalAbiType(typeName:any):string|null {
     if(/^(?:u?int[0-9]{0,3}|bool|string|bytes(?:[0-9]{1,2})?)$/.test(name))return name;
     return null;
   }
-  if(typeName.type==='UserDefinedTypeName'&&identifier.test(typeName.namePath||'')){
-    // Contract/interface parameters compile to ABI type address.
-    return 'address';
-  }
+  if(typeName.type==='UserDefinedTypeName')return resolveUserAbiType(typeName,seen);
   return null;
 }
 
@@ -1540,7 +1609,7 @@ function canonicalShapeType(node:any):string {
     const name=String(node.name||'');
     return name==='uint'?'uint256':name==='int'?'int256':name==='address payable'?'address':name;
   }
-  if(node.type==='UserDefinedTypeName')return 'address';
+  if(node.type==='UserDefinedTypeName')return canonicalAbiType(node)||'';
   if(node.type==='ArrayTypeName'){
     const base=canonicalShapeType(node.baseTypeName);
     const literal=node.length?.number;
@@ -1595,9 +1664,31 @@ function hasAnySourceAuthGuard(fn:any,fnBody:string):boolean {
   return false;
 }
 
-export function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAccount?:string;tokenRef?:string;amount?:string}={}):SolidityArgValue|null {
+function splitCanonicalTupleTypes(value:string):string[]|null {
+  if(!value.startsWith("(")||!value.endsWith(")"))return null;
+  const fields:string[]=[];let depth=0,start=1;
+  for(let index=1;index<value.length-1;index++){
+    const char=value[index];
+    if(char==="(")depth++;
+    else if(char===")"){if(depth===0)return null;depth--;}
+    else if(char===","&&depth===0){const field=value.slice(start,index).trim();
+      if(!field)return null;fields.push(field);start=index+1;}
+  }
+  if(depth!==0)return null;
+  const last=value.slice(start,-1).trim();if(!last)return null;
+  fields.push(last);return fields;
+}
+export function pickFlexibleArg(abiType:string,paramName:string,options:{
+  ownerAccount?:string;tokenRef?:string;amount?:string;tupleComponent?:boolean
+}={}):SolidityArgValue|null {
   const t=abiType.trim();
   const name=paramName||'';
+  if(t.startsWith("(")&&t.endsWith(")")){
+    const fields=splitCanonicalTupleTypes(t);
+    if(!fields)return null;
+    const values=fields.map(field=>pickFlexibleArg(field,name,{...options,tupleComponent:true}));
+    return values.some(value=>value===null)?null:values as SolidityArgValue[];
+  }
   if(t==='address'||t==='address payable'){
     if(options.tokenRef && /(?:token|stablecoin|coin|mph|asset|underlying|stake|currency|erc20|want|collateral|reward|base|quote)/i.test(name))
       return options.tokenRef;
@@ -1616,7 +1707,9 @@ export function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAc
     // experiment. Choose a bounded nonzero input, NEVER a passing receipt.
     const maximum=intType[1]==='uint'?(1n<<BigInt(bits))-1n:
       (1n<<BigInt(bits-1))-1n;
-    const preferred=/(?:decimal|precision|scale)/i.test(name)?'18':
+    const preferred=options.tupleComponent&&bits===8?'0':
+      /^(?:status|state|mode|kind|role|action|phase|stage|reason|category|strategy|operation)$/i.test(name)?'0':
+      /(?:decimal|precision|scale)/i.test(name)?'18':
       /(?:period|duration|epoch|lock|interval|delay|window|time)/i.test(name)?'86400':
       /(?:fee|bps|rate|ratio|percent)/i.test(name)?'100':options.amount??'1000';
     if(!/^[0-9]+$/.test(preferred))return null;
@@ -1628,8 +1721,9 @@ export function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAc
     const count=Number(fixedArray[2]);
     if(!Number.isSafeInteger(count)||count>8)return null;
     const element=pickFlexibleArg(fixedArray[1],name,options);
-    if(element===null||Array.isArray(element))return null;
-    return Array.from({length:count},()=>element);
+    if(element===null)return null;
+    const clone=(value:any):any=>Array.isArray(value)?value.map(clone):value;
+    return Array.from({length:count},()=>clone(element));
   }
   if(t==='bytes32')return ZERO_BYTES32;
   if(t==='bytes')return '0x4142';
@@ -4424,7 +4518,7 @@ export function sourcePreparationGraph(
   return {ok:true,nodes};
 }
 
-export function constructSolidityExperiments(input:ConstructionInput):ConstructionResult {
+function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionResult {
   if(!/^[a-f0-9]{40}$/.test(input.repositoryCommit))
     return {ok:false,code:'INVALID_COMMIT',detail:'Expected a source commit SHA'};
   const indexed=new Map<string,SourceSnapshot>();
@@ -4669,4 +4763,17 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       unresolvedCategory:"missing_fixture",partialExperiments:out};
   }
   return {ok:true,experiments:out};
+}
+
+/** Bind exact acquired user-defined ABI types for this synchronous planning call.
+ * The saved context is restored even when malformed source fails parsing. */
+export function constructSolidityExperiments(input:ConstructionInput):ConstructionResult {
+  const previous=activeAbiTypeDefinitions;
+  try{
+    const validSources=Array.isArray(input?.sources)&&input.sources.every(source=>
+      source&&typeof source.path==="string"&&typeof source.content==="string"&&
+      /^[a-f0-9]{64}$/.test(source.sha256)&&hash(source.content)===source.sha256);
+    activeAbiTypeDefinitions=validSources?buildAbiTypeDefinitions(input.sources):new Map();
+    return constructSolidityExperimentsCore(input);
+  }finally{activeAbiTypeDefinitions=previous;}
 }
