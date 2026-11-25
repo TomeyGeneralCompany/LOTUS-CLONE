@@ -2231,19 +2231,33 @@ contract DirectState {
       {selector:'DirectState.choose',operation:'send',inputs:['address']},
       {selector:'DirectState.conditional',operation:'send',inputs:['uint256']}
     ];
-    for(const [name,getter,expected] of [
-      ['change','amount()','7'],
-      ['enable','enabled()',true],
-      ['choose','recipient()','$account2']
+    for(const [name,getter] of [
+      ['change','amount()'],
+      ['enable','enabled()'],
+      ['choose','recipient()']
     ] as const){
       const built=constructSolidityExperiments({repositoryCommit:'b'.repeat(40),
         targetPath:directStateSnap.path,targetSelector:'DirectState.'+name,
         sources:[directStateSnap],declarations:directStateMenu as any,skipLegacy:true});
       assert.equal(built.ok,true,'Direct state assignment must be source-testable: '+name);
-      if(built.ok)assert.ok(built.experiments.some(exp=>
-        exp.securityProperty.startsWith('source-defined direct state assignment')&&
-        exp.sequence.steps.some(step=>step.operation==='call'&&
-          step.function===getter&&step.expect===expected)));
+      if(built.ok){
+        const exp=built.experiments.find(candidate=>
+          candidate.securityProperty.startsWith('source-defined direct state assignment'));
+        assert.ok(exp,'Direct assignment property must be constructed: '+name);
+        if(exp){
+          const steps=exp.sequence.steps;
+          const unauthorized=steps.find(step=>step.operation==='send'&&step.sender===1);
+          const authorized=steps.find(step=>step.operation==='send'&&step.sender===0);
+          const readbacks=steps.filter(step=>step.operation==='call'&&step.function===getter);
+          assert.ok(unauthorized?.operation==='send'&&unauthorized.expectRevert,
+            'Direct assignment must test the unauthorized caller: '+name);
+          assert.ok(authorized?.operation==='send','Direct assignment must test the authorized caller: '+name);
+          assert.ok(readbacks.length>=3,'Direct assignment must include baseline, unauthorized, and authorized observations: '+name);
+          assert.deepEqual(readbacks[2]?.operation==='call'?readbacks[2].expect:null,
+            authorized?.operation==='send'?authorized.args[0]:null,
+            'Authorized readback must equal the source-backed assignment argument: '+name);
+        }
+      }
     }
     const branchState=constructSolidityExperiments({repositoryCommit:'b'.repeat(40),
       targetPath:directStateSnap.path,targetSelector:'DirectState.conditional',
