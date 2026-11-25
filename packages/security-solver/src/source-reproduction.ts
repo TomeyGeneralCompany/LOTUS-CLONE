@@ -75,7 +75,7 @@ export const sequenceObservations = z.object({contract:z.string(),accounts:z.arr
     z.object({operation:z.literal("observe"),deploymentId:z.string().optional(),function:z.string(),sender:z.number(),actual:z.unknown()}),
     z.object({operation:z.literal("send"),deploymentId:z.string().optional(),function:z.string(),sender:z.number(),valueWei:z.string(),reverted:z.boolean(),gasUsed:z.string(),passed:z.boolean(),
       receipt:evmReceiptSchema.optional(),actualEvents:z.array(z.object({name:z.string(),signature:z.string(),
-        address:z.string().nullable(),args:z.unknown()}).strict()).max(10000),
+        address:z.string().nullable(),args:z.unknown()}).strict()).max(10000).optional(),
       expectedEvents:z.array(eventCheckSchema).max(16).optional(),eventsPassed:z.boolean().optional()}),
     z.object({operation:z.literal("setup"),deploymentId:z.string().optional(),function:z.string(),sender:z.number(),gasUsed:z.string(),passed:z.literal(true),purpose:z.string(),receipt:evmReceiptSchema.optional()}),
     z.object({operation:z.literal("eth_balance"),target:z.string(),address:z.string(),balanceWei:z.string(),passed:z.boolean()}),
