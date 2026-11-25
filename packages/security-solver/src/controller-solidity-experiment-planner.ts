@@ -3631,9 +3631,11 @@ function sourceOwnerGuardedAssignmentExperiments(
   if(!owners.length)return [];
   const setup=resolveFlexibleSetup(snapshot,contract,
     resolveInheritance(snapshot,contract,sources).chain,sources,declarations,null);
-  let constructorArgs:Array<string|boolean>;
+  let constructorArgs:SoliditySequence['constructorArgs'];
+  let constructorValueWei:string|undefined;
   if(setup&&!setup.usesToken&&!setup.initSignature){
     constructorArgs=setup.constructorArgs;
+    constructorValueWei=setup.constructorValueWei;
   }else{
     // A custom public administrator (rather than a variable literally named
     // owner) is still source-verifiable when a zero-argument constructor sets
@@ -3731,7 +3733,7 @@ function sourceOwnerGuardedAssignmentExperiments(
         hypothesis:'Source-owned msg.sender equality rejects nonowner storage mutation and admits the owner exact state assignment',
         property:'source-proof generic owner guard '+contract.name+'.'+signature+':'+destination,
         sequence:{constructorArgs,
-          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+          ...(constructorValueWei?{constructorValueWei}:{}),
           steps},
         witnesses:[witness(snapshot,ctor,contract.name+'.constructor'),
           witness(snapshot,owner,contract.name+'.'+owner.name),
