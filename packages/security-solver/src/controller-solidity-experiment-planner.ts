@@ -3631,7 +3631,31 @@ function sourceOwnerGuardedAssignmentExperiments(
   if(!owners.length)return [];
   const setup=resolveFlexibleSetup(snapshot,contract,
     resolveInheritance(snapshot,contract,sources).chain,sources,declarations,null);
-  if(!setup||setup.usesToken||setup.initSignature)return [];
+  let constructorArgs:Array<string|boolean>;
+  if(setup&&!setup.usesToken&&!setup.initSignature){
+    constructorArgs=setup.constructorArgs;
+  }else{
+    // A custom public administrator (rather than a variable literally named
+    // owner) is still source-verifiable when a zero-argument constructor sets
+    // it directly from msg.sender. The generic flexible setup resolver only
+    // recognizes conventional owner names, so admit this narrower fixture
+    // after checking every constructor statement and rejecting opaque effects.
+    const ctorParams:any[]=ctor.parameters||[];
+    const ctorStatements:any[]=ctor.body.statements||[];
+    const hasInitializer=nodes.some(n=>n.type==='FunctionDefinition'&&
+      (n.modifiers||[]).some((m:any)=>m.name==='initializer'));
+    const safeConstructor=ctorParams.length===0&&!hasInitializer&&
+      (ctor.modifiers||[]).length===0&&ctorStatements.every((n:any)=>{
+        if(n.type!=='ExpressionStatement')return false;
+        const expr=n.expression;
+        if(expr?.type!=='BinaryOperation'||expr.operator!=='=')return false;
+        if(expr.left?.type!=='Identifier')return false;
+        return isMsgSender(expr.right)||
+          ['NumberLiteral','BooleanLiteral','StringLiteral','HexLiteral'].includes(expr.right?.type);
+      });
+    if(!safeConstructor)return [];
+    constructorArgs=[];
+  }
   const results:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
 
   for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
@@ -3706,7 +3730,7 @@ function sourceOwnerGuardedAssignmentExperiments(
       results.push({
         hypothesis:'Source-owned msg.sender equality rejects nonowner storage mutation and admits the owner exact state assignment',
         property:'source-proof generic owner guard '+contract.name+'.'+signature+':'+destination,
-        sequence:{constructorArgs:setup.constructorArgs,
+        sequence:{constructorArgs,
           ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
           steps},
         witnesses:[witness(snapshot,ctor,contract.name+'.constructor'),
