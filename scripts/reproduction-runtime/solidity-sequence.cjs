@@ -93,7 +93,7 @@ function validateSequence(s) {
     }
     if(step?.operation==='call')object(step,['operation','function','args','expect'],['operation','deploymentId','function','args','expect','sender','expectPath']);
     else if(step?.operation==='observe')object(step,['operation','function','args'],['operation','deploymentId','function','args','sender']);
-    else if(step?.operation==='send')object(step,['operation','function','args'],['operation','deploymentId','function','args','sender','valueWei','expectRevert','requiredSetup']);
+    else if(step?.operation==='send')object(step,['operation','function','args'],['operation','deploymentId','function','args','sender','valueWei','expectRevert','requiredSetup','expectEvents']);
     else throw new Error('Unknown sequence operation');
     if(step.deploymentId!==undefined && (typeof step.deploymentId!=='string' || !prepDeployments.has(step.deploymentId)))
       throw new Error('Unknown step deploymentId '+String(step.deploymentId));
@@ -107,7 +107,19 @@ function validateSequence(s) {
     }
     else {wei(step.valueWei);if(step.expectRevert!==undefined&&typeof step.expectRevert!=='boolean')throw new Error('Invalid revert expectation');
       if(step.requiredSetup!==undefined && (step.operation!=='send' || typeof step.requiredSetup!=='boolean' ||
-         (step.requiredSetup && step.expectRevert===true)))throw new Error('Invalid required setup flag');}
+         (step.requiredSetup && step.expectRevert===true)))throw new Error('Invalid required setup flag');
+      if(step.expectEvents!==undefined){
+        if(step.operation!=='send'||!Array.isArray(step.expectEvents)||step.expectEvents.length>16)
+          throw new Error('Invalid event expectations');
+        for(const event of step.expectEvents){
+          object(event,['signature','args']);
+          if(typeof event.signature!=='string'||event.signature.length>200||
+             !/^[A-Za-z_][A-Za-z0-9_]*\([A-Za-z0-9_,()[\]]*\)$/.test(event.signature))
+            throw new Error('Invalid event signature');
+          args(event.args);
+        }
+      }
+    }
   }
   if(!s.steps.some(step=>step.operation==='call'||step.operation==='observe'||step.operation==='eth_balance'))throw new Error('Include a read observation');
   return s;
@@ -118,6 +130,39 @@ function normalize(v) {
   if(typeof v==='string' && /^0x[0-9a-fA-F]{40}$/.test(v))return v.toLowerCase();
   if(typeof v==='string'||typeof v==='boolean')return v;
   throw new Error('Unsupported ABI result');
+}
+function receiptEvidence(receipt) {
+  return {
+    status:Number(receipt.status),
+    transactionHash:receipt.hash||receipt.transactionHash||null,
+    blockNumber:Number.isSafeInteger(receipt.blockNumber)?receipt.blockNumber:null,
+    from:typeof receipt.from==='string'?receipt.from.toLowerCase():null,
+    to:typeof receipt.to==='string'?receipt.to.toLowerCase():null,
+    contractAddress:typeof receipt.contractAddress==='string'?receipt.contractAddress.toLowerCase():null,
+    gasUsed:receipt.gasUsed?.toString?.()||null,
+    logs:Array.from(receipt.logs||[],(log,index)=>({
+      address:typeof log.address==='string'?log.address.toLowerCase():null,
+      topics:Array.from(log.topics||[]),
+      data:typeof log.data==='string'?log.data:null,
+      index:Number.isSafeInteger(log.index)?log.index:
+        Number.isSafeInteger(log.logIndex)?log.logIndex:index,
+      transactionHash:log.transactionHash||receipt.hash||null,
+      blockNumber:Number.isSafeInteger(log.blockNumber)?log.blockNumber:
+        (Number.isSafeInteger(receipt.blockNumber)?receipt.blockNumber:null)
+    }))
+  };
+}
+function receiptEvents(contractInterface,receipt) {
+  const events=[];
+  for(const log of receipt.logs||[]){
+    try{
+      const parsed=contractInterface.parseLog({topics:log.topics,data:log.data});
+      if(parsed)events.push({name:parsed.name,signature:parsed.fragment.format('sighash'),
+        address:typeof log.address==='string'?log.address.toLowerCase():null,
+        args:normalize(Array.from(parsed.args))});
+    }catch{}
+  }
+  return events;
 }
 async function runSequence(artifact, sequence, transport, preparationArtifacts={},metadata={}) {
   validateSequence(sequence);
@@ -152,7 +197,8 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       receiptStatus:typeof status==='number'?status:null,
       receiptTo:receipt?.to??null,
       transactionHash:receipt?.hash||null,
-      gasUsed:receipt?.gasUsed?.toString?.()||null
+      gasUsed:receipt?.gasUsed?.toString?.()||null,
+      receipt:receipt?receiptEvidence(receipt):undefined
     };
     return cause;
   };
@@ -189,6 +235,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
               linkedLibraries.set(key,libraryAddress);
               setupSteps.push({operation:'setup',function:'deploy-library:'+key,
                 sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),
+                receipt:receiptEvidence(receipt),
                 purpose:'link compiler-declared source library '+libraryAddress});
             } finally {linking.delete(key);}
           }
@@ -237,7 +284,8 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         const depAddress=await dep.getAddress();
         deployed.set(d.id,{contract:dep,address:depAddress,receipt});
         setupSteps.push({operation:'setup',function:'deploy:'+d.file+':'+d.contract,
-          sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),purpose:'prepare '+d.id});
+          sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),
+          receipt:receiptEvidence(receipt),purpose:'prepare '+d.id});
       }
       for(const op of preparation.operations) {
         runtimePhase='fixture_initialization';
@@ -258,7 +306,8 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         const actualReverted=receipt.status===0;
         setupSteps.push({operation:'setup',function:fragment.format('sighash'),
           sender:op.sender,gasUsed:receipt.gasUsed.toString(),
-          passed:actualReverted===!!op.expectRevert,purpose:'preparation operation '+op.id});
+          passed:actualReverted===!!op.expectRevert,receipt:receiptEvidence(receipt),
+          purpose:'preparation operation '+op.id});
         if(actualReverted!==!!op.expectRevert)
           throw new Error('Preparation transaction expectation failed: '+op.id);
       }
@@ -315,7 +364,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       const cloneDigest=createHash('sha256').update(Buffer.from(code.slice(2),'hex')).digest('hex');
       setupSteps.push({operation:'setup',function:'factoryClone:'+fn.fragment.format('sighash'),
         sender:call.sender,gasUsed:cloneReceipt.gasUsed.toString(),passed:true,
-        purpose:'acquired factory '+call.deploymentId+' created clone '+predicted.toLowerCase()+
+        receipt:receiptEvidence(cloneReceipt),purpose:'acquired factory '+call.deploymentId+' created clone '+predicted.toLowerCase()+
           ' with runtime code sha256 '+cloneDigest});
       address=predicted;
       contract=new Contract(address,linkedTarget.abi,signers[0]);
@@ -403,6 +452,13 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         } else steps.push({operation:'observe',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,actual:observed});
       } else {
         if(!['nonpayable','payable'].includes(fragment.stateMutability))throw new Error('send requires a state-changing function');
+        const expectedEvents=step.expectEvents||[];
+        const expectedEventFragments=expectedEvents.map(event=>{
+          let eventFragment;
+          try{eventFragment=targetContract.interface.getEvent(event.signature);}catch{}
+          if(!eventFragment)throw new Error('Event is not declared in the compiled acquired-source ABI: '+event.signature);
+          return eventFragment;
+        });
         if(fragment.stateMutability!=='payable' && BigInt(step.valueWei||'0')!==0n)throw new Error('Nonpayable function cannot receive value');
         let receipt;
         try {const tx=await fn.send(...args,{value:step.valueWei||'0',gasLimit:2000000});receipt=await tx.wait();}
@@ -414,18 +470,27 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         if(!receipt || ![0,1].includes(receipt.status))throw new Error('No transaction receipt');
         if(receipt.status===0 && receipt.gasUsed>=2000000n)throw new Error('Transaction exhausted its gas limit');
         const reverted=receipt.status===0;
-        // A mined revert is evidence, even when the hypothesis expected success.
-        // Record the mismatch rather than aborting and losing the receipt and
-        // subsequent read observations. A revert never proves a vulnerability.
+        const actualEvents=receiptEvents(targetContract.interface,receipt);
+        const checkedEvents=expectedEvents.map((expected,index)=>{
+          const expectedArgs=normalize(resolve(expected.args));
+          const actual=actualEvents.find(event=>event.signature===expectedEventFragments[index].format('sighash')&&
+            JSON.stringify(event.args)===JSON.stringify(expectedArgs));
+          return {signature:expectedEventFragments[index].format('sighash'),
+            expected:expectedArgs,observed:actual?.args??null,passed:!!actual};
+        });
+        const eventsPassed=checkedEvents.every(event=>event.passed);
+        // Preserve raw receipt logs for independent review; display fitting
+        // must never become the canonical evidence record.
         steps.push({operation:'send',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,
           valueWei:step.valueWei||'0',reverted,gasUsed:receipt.gasUsed.toString(),
-          passed:reverted===!!step.expectRevert});
+          receipt:receiptEvidence(receipt),actualEvents,expectedEvents:checkedEvents,
+          eventsPassed,passed:reverted===!!step.expectRevert&&eventsPassed});
         if(step.requiredSetup && reverted)
           throw new Error('PREPARATION_INITIALIZATION_FAILED: required successful setup '+fragment.format('sighash')+' reverted; security experiment not executed');
       }
     }
     const observations={contract:address.toLowerCase(),accounts:accounts.map(a=>a.toLowerCase()),
-      deploymentGasUsed:deployment.gasUsed.toString(),steps,
+      deploymentGasUsed:deployment.gasUsed.toString(),deploymentReceipt:receiptEvidence(deployment),steps,
       diagnostics:{experimentId:metadata.experimentId||null,fixtureId:metadata.fixtureId||null,
         sourceSha256:metadata.sourceSha256||null,bytecodeSha256:metadata.bytecodeSha256||null,
         compilerVersion:metadata.compilerVersion||null,evmVersion:metadata.evmVersion||null,
@@ -433,7 +498,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         constructorTypes:metadata.constructorTypes||[],
         abiSha256:metadata.abiSha256||null,
         preparationAbiSha256:metadata.preparationAbiSha256||{}}};
-    if(JSON.stringify(observations).length>64000)throw new Error('Sequence observations exceed 64KB');
+    if(JSON.stringify(observations).length>1024*1024)throw new Error('Sequence evidence exceeds 1MB; refusing to truncate verifier receipts');
     return observations;
   } catch(error) {throw diagnosticError(error);}
   finally {provider.destroy();}

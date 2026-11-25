@@ -12,7 +12,8 @@ const source=`pragma solidity ^0.8.20;
 contract Fixture {
  uint256 public value; address public owner;
  constructor(uint256 initial,address admin) payable {value=initial;owner=admin;}
- function set(uint256 x) external {require(msg.sender==owner,"owner");value=x;}
+ event ValueChanged(address indexed actor,uint256 oldValue,uint256 newValue);
+ function set(uint256 x) external {require(msg.sender==owner,"owner");uint256 old=value;value=x;emit ValueChanged(msg.sender,old,x);}
  function set(uint256 x,bool plus) external {value=plus?x+1:x;}
  function deposit() external payable {value+=msg.value;}
  function balance() external view returns(uint256) {return address(this).balance;}
@@ -27,7 +28,9 @@ const sequence={constructorArgs:['9007199254740993','$account0'],constructorValu
  {operation:'call',function:'owner()',args:[],expect:'$account0'},
  {operation:'send',function:'set(uint256)',args:['3'],sender:1,expectRevert:true},
  {operation:'call',function:'value()',args:[],expect:'9007199254740993'},
- {operation:'send',function:'set(uint256)',args:['7']},
+ {operation:'send',function:'set(uint256)',args:['7'],
+  expectEvents:[{signature:'ValueChanged(address,uint256,uint256)',
+   args:['$account0','9007199254740993','7']}]},
  {operation:'send',function:'deposit()',args:[],sender:2,valueWei:'5'},
  {operation:'call',function:'value()',args:[],expect:'12'},
  {operation:'call',function:'balance()',args:[],expect:'15'},
@@ -50,7 +53,23 @@ async function execute(s) {
    createHash('sha256').update(JSON.stringify(artifact.abi)).digest('hex'),
    'Compiled ABI provenance must survive independent EVM result capture');
  assert.equal(first.steps[2].reverted,true);
+ assert.equal(first.steps[4].eventsPassed,true,
+   'Source-declared event arguments must be checked against the mined receipt');
+ assert.equal(first.steps[4].receipt.status,1);
+ assert.ok(first.steps[4].receipt.transactionHash);
+ assert.ok(first.steps[4].receipt.logs.some(log=>log.topics.length>0&&log.data.startsWith('0x')),
+   'The complete raw receipt log must be preserved');
  assert.deepEqual(await execute(sequence),first,'Fresh deployment replay must be deterministic');
+ const wrongEvent=structuredClone(sequence);
+ wrongEvent.steps[4].expectEvents[0].args[2]='8';
+ const wrongEventResult=await execute(wrongEvent);
+ assert.equal(wrongEventResult.steps[4].eventsPassed,false);
+ assert.equal(wrongEventResult.steps[4].passed,false,
+   'An event mismatch must fail assertion without discarding receipt evidence');
+ assert.equal(wrongEventResult.steps[4].receipt.status,1);
+ const inventedEvent=structuredClone(sequence);
+ inventedEvent.steps[4].expectEvents[0].signature='Invented(address,uint256,uint256)';
+ await assert.rejects(execute(inventedEvent),/not declared in the compiled acquired-source ABI/);
  const mismatch=structuredClone(sequence);mismatch.steps.at(-1).expect=['22',true];
  assert.equal((await execute(mismatch)).steps.at(-1).passed,false);
  const unexpected=structuredClone(sequence);unexpected.steps[2].expectRevert=false;

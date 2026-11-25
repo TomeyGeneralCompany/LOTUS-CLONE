@@ -12,8 +12,11 @@ const deployment = z.object({
 }).strict();
 const signature = z.string().min(1).max(200).regex(/^[A-Za-z_][A-Za-z0-9_]*(?:\([A-Za-z0-9_,()[\]]*\))?$/);
 const prepId=z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/);
+const expectedEvent=z.object({signature:z.string().min(1).max(200)
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*\([A-Za-z0-9_,()[\]]*\)$/),args}).strict();
 const send = z.object({operation:z.literal("send"),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional(),
-  valueWei:wei.optional(),expectRevert:z.boolean().optional(),requiredSetup:z.boolean().optional()}).strict();
+  valueWei:wei.optional(),expectRevert:z.boolean().optional(),requiredSetup:z.boolean().optional(),
+  expectEvents:z.array(expectedEvent).max(16).optional()}).strict();
 const observe = z.object({operation:z.literal('observe'),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional()}).strict();
 const call = z.object({operation:z.literal("call"),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional(),expect:abiValue,expectPath:z.array(z.number().int().min(0).max(31)).min(1).max(4).optional()}).strict();
 const ethBalance = z.object({operation:z.literal("eth_balance"),
@@ -76,7 +79,7 @@ Set query to Contract.function for the primary function being tested. Sequence f
 {"constructorArgs":["5"],"steps":[{"operation":"send","function":"set(uint256)","args":["7"],"sender":0},{"operation":"call","function":"value()","args":[],"expect":"7"}]}.
 Use decimal strings for ABI integers and wei, booleans for bools, arrays for ABI arrays/tuples. $account0, $account1 and $account2 resolve to three local test accounts; $contract resolves to this deployment after construction.
 Optional constructorValueWei and send valueWei transfer only local test currency. send expectRevert=true tests a required revert. At most 16 steps; include at least one call with an expected result. A single return is a scalar; multiple returns are an array. Calls must be view/pure; sends must be nonpayable/payable. Optional expectPath is a bounded array of numeric tuple/array field positions, so a structured ABI return can be checked against a typed expected field without arbitrary evaluation. Use full ABI signatures for overloads.
-For a prerequisite initializer send, requiredSetup=true means its transaction must succeed before any hypothesis test executes. Use operation=observe with a source-declared view/pure method to record actual state without fabricating expect; pair observations before and after a send to establish baseline and transition. Observe records what happened, not proof of a violated invariant. Use operation=call with expect when a source-derived property justifies an assertion. Each sequence starts from a fresh deterministic local EVM. Output records actual receipts and read/assertion results. An assertion mismatch is only a test discrepancy, not evidence that the expected value or a vulnerability claim is correct. Compiler remains solc 0.8.30; external-chain state, proxies requiring external deployments, and linked libraries are not supplied.`;
+For a prerequisite initializer send, requiredSetup=true means its transaction must succeed before any hypothesis test executes. For a source-declared event observation, add expectEvents to a send step as [{"signature":"EventName(address,uint256)","args":["$account1","5"]}]. The executor validates the signature against the compiled acquired-source ABI, records the complete raw receipt including logs, and checks each expected event argument. An event mismatch is a failed assertion, never standalone vulnerability evidence. Use operation=observe with a source-declared view/pure method to record actual state without fabricating expect; pair observations before and after a send to establish baseline and transition. Observe records what happened, not proof of a violated invariant. Use operation=call with expect when a source-derived property justifies an assertion. Each sequence starts from a fresh deterministic local EVM. Output records actual receipts and read/assertion results. An assertion mismatch is only a test discrepancy, not evidence that the expected value or a vulnerability claim is correct. Compiler remains solc 0.8.30; external-chain state, proxies requiring external deployments, and linked libraries are not supplied.`;
 
 const scalarJson = {anyOf:[{type:"string",maxLength:2048},{type:"boolean"}]};
 const valueJson = {anyOf:[...scalarJson.anyOf,{type:"array",maxItems:32,items:{anyOf:[...scalarJson.anyOf,{type:"array",maxItems:32,items:scalarJson}]}}]};
@@ -104,7 +107,11 @@ export const soliditySequenceJsonSchema = {type:"object",additionalProperties:fa
     },required:["file","contract"]},
     steps:{type:"array",minItems:1,maxItems:16,items:{anyOf:[
       {type:"object",additionalProperties:false,properties:{operation:{const:"send"},...stepBase,
-        valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"}},
+        valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"},
+        expectEvents:{type:"array",maxItems:16,items:{type:"object",additionalProperties:false,
+          properties:{signature:{type:"string",maxLength:200,
+            pattern:"^[A-Za-z_][A-Za-z0-9_]*\\([A-Za-z0-9_,()[\\]]*\\)$"},
+            args:argsJson},required:["signature","args"]}}},
         required:["operation","function","args"]},
       {type:"object",additionalProperties:false,properties:{operation:{const:"call"},...stepBase,
         expect:valueJson,expectPath:{type:"array",minItems:1,maxItems:4,
