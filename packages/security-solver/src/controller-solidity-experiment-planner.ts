@@ -3511,10 +3511,12 @@ function sourceDirectAssignmentExperiments(
     resolveInheritance(snapshot,contract,sources).chain))return [];
   const nodes:any[]=contract.subNodes||[];
   const stateVariables=nodes.filter(n=>n.type==='StateVariableDeclaration')
-    .flatMap(n=>n.variables||[]).filter((v:any)=>
-      v.visibility==='public'&&identifier.test(v.name||'')&&
-      v.typeName?.type==='ElementaryTypeName'&&
-      /^(?:bool|address|u?int(?:[0-9]{1,3})?)$/.test(v.typeName.name||''));
+    .flatMap(n=>n.variables||[]).filter((v:any)=>{
+      const type=canonicalAbiType(v.typeName);
+      return v.visibility==='public'&&identifier.test(v.name||'')&&!!type&&
+        !type.includes('[')&&
+        (/^(?:bool|address|u?int(?:[0-9]{1,3})?)$/.test(type)||type.startsWith('('));
+    });
   if(!stateVariables.length)return [];
   const setup=resolveFlexibleSetup(snapshot,contract,
     resolveInheritance(snapshot,contract,sources).chain,
@@ -3535,11 +3537,8 @@ function sourceDirectAssignmentExperiments(
       const type=canonicalAbiType(param.typeName);
       const name=String(param.name||'');
       if(!type||!identifier.test(name)){valid=false;break;}
-      let value:SolidityArgValue|null;
-      if(type==='bool')value=true;
-      else if(type==='address')value='$account2';
-      else if(/^u?int(?:[0-9]{1,3})?$/.test(type))value='7';
-      else value=null;
+      const value=pickFlexibleArg(type,name);
+
       if(value===null){valid=false;break;}
       inputs.push(type);args.push(value);selected.set(name,value);
     }
@@ -3611,10 +3610,12 @@ function sourceOwnerGuardedAssignmentExperiments(
     resolveInheritance(snapshot,contract,sources).chain))return [];
   const nodes:any[]=contract.subNodes||[];
   const states=nodes.filter(n=>n.type==='StateVariableDeclaration')
-    .flatMap(n=>n.variables||[]).filter((v:any)=>
-      v.visibility==='public'&&identifier.test(v.name||'')&&
-      v.typeName?.type==='ElementaryTypeName'&&
-      /^(?:address|bool|u?int(?:[0-9]{1,3})?)$/.test(v.typeName.name||''));
+    .flatMap(n=>n.variables||[]).filter((v:any)=>{
+      const type=canonicalAbiType(v.typeName);
+      return v.visibility==='public'&&identifier.test(v.name||'')&&!!type&&
+        !type.includes('[')&&
+        (/^(?:address|bool|u?int(?:[0-9]{1,3})?)$/.test(type)||type.startsWith('('));
+    });
   if(states.length<2)return [];
   const ctor=nodes.find(n=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body);
   if(!ctor)return [];
@@ -3649,9 +3650,7 @@ function sourceOwnerGuardedAssignmentExperiments(
       const name=String(parameters[i].name||'');
       const type=abi[i]||'';
       if(!identifier.test(name)){supported=false;break;}
-      const value:SolidityArgValue|null=type==='address'?'$account2':
-        type==='bool'?true:
-        /^u?int(?:[0-9]{1,3})?$/.test(type)?'7':null;
+      const value=pickFlexibleArg(type,name);
       if(value===null){supported=false;break;}
       args.push(value);selected.set(name,value);
     }
