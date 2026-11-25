@@ -48,7 +48,7 @@ export const evmReceiptSchema=z.object({
     data:z.string().nullable(),index:z.number().int().nonnegative(),
     transactionHash:z.string().nullable(),blockNumber:z.number().int().nullable()}).strict()).max(10000)
 }).strict();
-const fixtureDiagnosticsSchema=z.object({
+export const fixtureDiagnosticsSchema=z.object({
   experimentId:digest.nullish(),fixtureId:digest.nullish(),sourceSha256:digest.nullish(),
   file:z.string().max(4096).nullish(),selector:z.string().max(160).nullish(),
   selectedFile:z.string().max(4096).nullish(),contractName:z.string().max(128).nullish(),
