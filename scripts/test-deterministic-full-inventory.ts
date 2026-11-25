@@ -2189,7 +2189,7 @@ contract GenericGuard {
       exp.securityProperty.startsWith('source-proof generic owner guard')&&
       exp.sequence.steps.some(x=>x.operation==='send'&&x.sender===1&&x.expectRevert)&&
       exp.sequence.steps.some(x=>x.operation==='call'&&x.function==='value()'&&x.expect==='7')),
-      'Guarded state change requires both unauthorized receipt and exact authorized readback');
+      'Guarded state change requires both unauthorized receipt and exact authorized readback: '+JSON.stringify(genericAuthorized.experiments));
     const falseGuard=constructSolidityExperiments({
       repositoryCommit:'b'.repeat(40),targetPath:guardedGeneric.path,
       targetSelector:'GenericGuard.inverted',sources:[guardedGeneric],
