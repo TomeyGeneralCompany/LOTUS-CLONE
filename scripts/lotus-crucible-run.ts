@@ -35,7 +35,12 @@ async function prepare(root:string,level:number,language:Language,seed:string,cl
  await writeFile(join(fixture,'README.md'),'Message and settlement service. Analyze source, callers, data flow, authorization boundaries, and observable security behavior.\n');
  execFileSync('git',['init','-q',fixture]);
  execFileSync('git',['-C',fixture,'add','.']);
- execFileSync('git',['-C',fixture,'-c','user.name=Gauntlet','-c','user.email=fixture@example.invalid',
+ // A 2,000+ file benchmark crosses Git's loose-object auto-GC threshold.
+ // The detached maintenance worker can create/remove .git lock files while
+ // the acquisition smoke test copies the fixture tree. This repository is
+ // disposable test input, so automatic maintenance has no useful work here.
+ execFileSync('git',['-C',fixture,'-c','gc.auto=0','-c','maintenance.auto=false',
+   '-c','user.name=Gauntlet','-c','user.email=fixture@example.invalid',
    'commit','-qm','Owned synthetic benchmark']);
  const commit=execFileSync('git',['-C',fixture,'rev-parse','HEAD'],{encoding:'utf8'}).trim();
  await writeFile(join(root,'answer-key.private.json'),JSON.stringify(answer,null,2),{mode:0o600});

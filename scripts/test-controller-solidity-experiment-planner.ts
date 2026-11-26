@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {constructSolidityExperiments,pickFlexibleArg} from '../packages/security-solver/src/controller-solidity-experiment-planner';
+import {constructSolidityExperiments,pickFlexibleArg,sourcePreparationGraph} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 import {verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 const content=`pragma solidity ^0.8.20;
 contract Vault {
@@ -21,6 +21,38 @@ const input={
  {selector:'Vault.reserve',operation:'call' as const,inputs:[]},
  {selector:'Vault.owner',operation:'call' as const,inputs:[]}
  ]};
+
+// Preparation calls must bind the exact acquired ABI overload. A matching
+// name alone is insufficient for initializer transactions and state readbacks.
+const overloadFixture=`pragma solidity ^0.8.20;
+contract SetupToken {
+  uint8 public version;
+  function initialize(uint8 value) external { version = value; }
+  function initialize(uint256) external { version = 0; }
+}`;
+const overloadFixtureSnapshot={path:'contracts/SetupToken.sol',content:overloadFixture,
+  sha256:createHash('sha256').update(overloadFixture).digest('hex')};
+const preparationSequence={constructorArgs:[],preparation:{
+  deployments:[{id:'token',file:overloadFixtureSnapshot.path,contract:'SetupToken',constructorArgs:[]}],
+  operations:[{id:'setup',deploymentId:'token',function:'initialize(uint8)',args:['7'],sender:0 as const}],
+  checks:[{id:'version',deploymentId:'token',function:'version()',args:[],sender:0 as const,expect:'7'}]
+},steps:[{operation:'call' as const,deploymentId:'token',function:'version()',args:[],expect:'7'}]};
+const exactPreparation=sourcePreparationGraph(preparationSequence,
+  new Map([[overloadFixtureSnapshot.path,overloadFixtureSnapshot]]));
+assert.equal(exactPreparation.ok,true,
+  'An acquired exact overload and generated public getter must resolve through the preparation ABI');
+const wrongOverloadPreparation=sourcePreparationGraph({...preparationSequence,preparation:{
+  ...preparationSequence.preparation,
+  operations:[{...preparationSequence.preparation.operations[0],function:'initialize(address)'}]
+}},new Map([[overloadFixtureSnapshot.path,overloadFixtureSnapshot]]));
+assert.equal(wrongOverloadPreparation.ok,false,
+  'A same-name but source-undeclared initializer overload must be rejected before execution');
+const wrongConstructorPreparation=sourcePreparationGraph({...preparationSequence,preparation:{
+  ...preparationSequence.preparation,
+  deployments:[{...preparationSequence.preparation.deployments[0],constructorArgs:['1']}]
+}},new Map([[overloadFixtureSnapshot.path,overloadFixtureSnapshot]]));
+assert.equal(wrongConstructorPreparation.ok,false,
+  'A fixture with constructor arguments inconsistent with acquired source must be rejected before execution');
 
 // A receiver's ABI can be declared by an acquired inherited base rather than
 // directly in the concrete contract. Keep that source chain as the ABI witness.
