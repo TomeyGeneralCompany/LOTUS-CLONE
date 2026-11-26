@@ -6,7 +6,8 @@ import {buildControllerSourceIndex,controllerEvidencePacket} from './controller-
 import {indexedEntryRoutes} from './controller-indexed-route';
 import {privilegedRoleMutationCandidate} from './solidity-security-candidates';
 import {controllerIndexedAuditPrompt} from './controller-index-prompt';
-import {roleConsumerImpactSequence,roleConsumerImpactObserved} from './controller-solidity-consumer-impact';
+import {roleConsumerImpactSequence,roleConsumerImpactObserved,
+  inheritedRoleConsumerImpactSequence,inheritedRoleConsumerImpactObserved} from './controller-solidity-consumer-impact';
 import {sourceCandidateEvidence,verifiedProbeSummary} from './source-candidate-evidence';
 import {rankTracedSourceCandidates} from './controller-source-candidates';
 import {traceSourceCalls,solidityDependentSources,controllerCallerChain} from './source-flow-facts';
@@ -420,6 +421,15 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
     // inspection determines the role, setter and protected consumer; actual
     // EVM receipt and before/after state determine behavior_observed.
     if(fullSourceIndex && !focus) {
+      // The role mutator and its protected consumer can live in different
+      // acquired files. Keep this source set read-only; the exact sequence
+      // constructor must prove imports, inheritance, guards and accounting.
+      const solidityPeers:Array<{path:string;source:string}>=[];
+      for(const peerPath of eligiblePaths.filter(p=>p.endsWith('.sol'))){
+        try{solidityPeers.push({path:peerPath,
+          source:await readFile(join(root,peerPath),'utf8')});}catch{}
+      }
+      const authorizedPeerSources=solidityPeers.map(peer=>peer.source);
       for(const path of eligiblePaths.filter(p=>p.endsWith('.sol'))) {
         signal.throwIfAborted();
         if(indexedVerifiedCandidates.length>=8)break;
@@ -428,17 +438,38 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
         if(!repo || missingDependencies.has(repo.url))continue;
         try {
           const code=await readFile(join(root,path),'utf8');
-          const role=privilegedRoleMutationCandidate(path,code,[code]);
+          const role=privilegedRoleMutationCandidate(path,code,authorizedPeerSources);
           if(!role)continue;
           if(!new RegExp('\\bfunction\\s+'+role.method+
              '\\s*\\(\\s*address\\s+[A-Za-z_]\\w*\\s*\\)').test(code))continue;
           // The role setter alone is not impact. Require a source-declared
           // protected consumer and execute a negative control before the
           // mutation, then the same consumer after the role transition.
-          const sequence=roleConsumerImpactSequence(code,role.role,role.method);
+          // Try the narrow same-contract case first. For inherited
+          // consumers, prove the acquired peer's import, inheritance, guard
+          // and observable accounting before constructing the attack.
+          let sequence=roleConsumerImpactSequence(code,role.role,role.method);
+          let impactObserved=(observations:unknown)=>
+            roleConsumerImpactObserved(observations,role.role,role.method);
+          if(!sequence){
+            for(const peer of solidityPeers){
+              if(peer.path===path)continue;
+              for(const match of peer.source.matchAll(
+                /\\bcontract\\s+([A-Za-z_]\\w*)\\s+is\\s+[A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)*\\s*\\{/g)){
+                const inherited=inheritedRoleConsumerImpactSequence(
+                  code,peer.source,role.role,role.method,path,peer.path,match[1]);
+                if(!inherited)continue;
+                sequence=inherited;
+                impactObserved=(observations:unknown)=>
+                  inheritedRoleConsumerImpactObserved(observations,role.role,role.method);
+                break;
+              }
+              if(sequence)break;
+            }
+          }
           if(!sequence){
             await appendFile(logFile,'[CONTROLLER_SOLIDITY_IMPACT_UNSUPPORTED] '+
-              JSON.stringify({path,role:role.role,reason:'No supported protected consumer sequence'})+'\n');
+              JSON.stringify({path,role:role.role,reason:'No supported protected consumer sequence'})+'\\n');
             continue;
           }
           const observation=JSON.parse(await session.probe(
@@ -450,7 +481,7 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
           if(observation.status!=='behavior_observed'||
              typeof observation.caseId!=='string'||
              !session.cases.has(observation.caseId) ||
-             !roleConsumerImpactObserved(observation.observations,role.role,role.method)){
+             !impactObserved(observation.observations)){
             await appendFile(logFile,'[CONTROLLER_SOLIDITY_IMPACT_NOT_PROVEN] '+
               JSON.stringify({path,status:observation.status,caseId:observation.caseId||null})+'\n');
             continue;
