@@ -173,11 +173,23 @@ export function controllerGroundedSolidityOptions(
   const legacy=sourceGroundedSolidityProbes(source,menu,{path,peers});
   if(!repositoryCommit)return legacy;
   const eligible=new Map(legacy.map(item=>[item.selector,item]));
+  const roleCandidate=privilegedRoleMutationCandidate(
+    path,source,snapshots.map(snapshot=>snapshot.content));
   const seen=new Set<string>();
   for(const entry of menu) {
     if(entry.operation!=='send'||seen.has(entry.selector))continue;
     seen.add(entry.selector);
-    if(eligible.has(entry.selector))continue;
+    const separator=entry.selector.lastIndexOf('.');
+    const entryContract=separator>0?entry.selector.slice(0,separator):'';
+    const entryMethod=separator>0?
+      entry.selector.slice(separator+1).split('(')[0]:'';
+    const isSourceProvenRoleMutation=Boolean(roleCandidate&&
+      roleCandidate.selector.slice(0,roleCandidate.selector.lastIndexOf('.'))===entryContract&&
+      roleCandidate.method===entryMethod);
+    // A legacy probe may observe only the role getter. Prefer the exact
+    // source-derived consumer-impact plan so the scheduled plan is the same
+    // property that ANALYZE records in its obligations ledger.
+    if(eligible.has(entry.selector)&&!isSourceProvenRoleMutation)continue;
     const candidate=constructSolidityExperiments({
       repositoryCommit,targetPath:path,targetSelector:entry.selector,
       sources:snapshots,declarations:menu,skipLegacy:true,
