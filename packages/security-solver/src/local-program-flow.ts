@@ -474,7 +474,7 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
           }
           await appendFile(logFile,'[CONTROLLER_SOURCE_PROBE_SELECTED] '+JSON.stringify({
             path,selector:role.selector,kind:'solidity_sequence',
-            origin:'controller-indexed-solidity-role'})+'\\n');
+            origin:'controller-indexed-solidity-role'})+'\n');
           const observation=JSON.parse(await session.probe(
             path,role.selector,'solidity_sequence',sequence));
           await appendFile(logFile,'[PROBE_RESULT] '+JSON.stringify({
