@@ -9,6 +9,7 @@ import {posix} from 'node:path';
 import type {SolidityProbeDeclaration} from './solidity-probe-inputs';
 import type {SoliditySequence} from './solidity-sequence';
 import {sourceGroundedSolidityProbes} from './controller-solidity-security-probes';
+import {inheritedRoleConsumerImpactSequence} from './controller-solidity-consumer-impact';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
 import {extractAccountingObservations} from './deterministic/accounting-observations';
 import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependenciesDetailed, verifyAcquiredReceiverMethods, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
@@ -3608,72 +3609,16 @@ function sourceDirectAssignmentExperiments(
           }
         }return null;})();
         if(constructor&&consumer){
-          const consumerNodes:any[]=consumer.contract.subNodes||[];
-          const publicMapping=consumerNodes.filter(n=>n.type==='StateVariableDeclaration')
-            .flatMap(n=>n.variables||[]).find((v:any)=>v.visibility==='public'&&
-              v.typeName?.type==='Mapping'&&
-              canonicalAbiType(v.typeName.keyType)==='address'&&
-              /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(v.typeName.valueType)||''));
-          const totalCredit=consumerNodes.filter(n=>n.type==='StateVariableDeclaration')
-            .flatMap(n=>n.variables||[]).find((v:any)=>v.name==='totalCredit'&&v.visibility==='public'&&
-              /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(v.typeName)||''));
-          const consumerParameters=(consumer.node.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
-          const consumerBody=body(consumer.source.content,consumer.node);
-          const consumerWritesCredit=publicMapping&&new RegExp('\\b'+publicMapping.name+
-            '\\s*\\[\\s*'+String((consumer.node.parameters||[])[0]?.name||'')+
-            '\\s*\\]\\s*\\+=').test(consumerBody);
-          const consumerDebitsTotal=totalCredit&&new RegExp('\\b'+totalCredit.name+
-            '\\s*-=').test(consumerBody);
-          const baseNames=(consumer.contract.baseContracts||[]).map((b:any)=>
-            String(b.baseName?.namePath||''));
-          const inheritsTarget=baseNames.includes(contract.name);
-          const fundFn=consumerNodes.find(n=>n.type==='FunctionDefinition'&&n.body&&
-            ['public','external'].includes(n.visibility)&&n.name&&
-            (n.parameters||[]).length===2&&
-            canonicalAbiType(n.parameters[0].typeName)==='address'&&
-            /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(n.parameters[1].typeName)||'')&&
-            new RegExp('\\b'+(totalCredit?.name||'totalCredit')+'\\s*\\+=')
-              .test(body(consumer.source.content,n)));
-          const fundTypes=fundFn?(fundFn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName)):[];
-          const settleTypes=consumerParameters;
-          const boundedAmount=(type:string,value:string):string|null=>{
-            const match=/^uint([0-9]{0,3})$/.exec(type);
-            if(!match)return null;
-            const bits=match[1]?Number(match[1]):256;
-            return bits>=8&&bits<=256&&bits%8===0&&BigInt(value)<(1n<<BigInt(bits))
-              ?String(value):null;
-          };
-          const seedAmount=fundTypes.length===2?boundedAmount(fundTypes[1],'1000'):null;
-          const payoutAmount=settleTypes.length===2?boundedAmount(settleTypes[1],'400'):null;
-          const impactSupported=publicMapping&&totalCredit&&consumerWritesCredit&&consumerDebitsTotal&&
-            inheritsTarget&&fundFn&&seedAmount&&payoutAmount&&
-            settleTypes[0]==='address'&&
-            new RegExp('require\\s*\\([^;]*msg\\s*\\.\\s*sender\\s*==\\s*operator\\b').test(consumerBody)&&
-            new RegExp('require\\s*\\([^;]*amount\\s*>\\s*0[^;]*amount\\s*<=\\s*totalCredit').test(consumerBody);
-          const outsiderSteps:SoliditySequence['steps']=impactSupported&&fundFn?[
-            {operation:'call',deploymentId:'roleVault',function:lhs+'()',args:[],expect:'$account0'},
-            {operation:'send',deploymentId:'roleVault',function:canonicalFunctionIdentity(fundFn),
-              args:['$account0',seedAmount!],sender:0},
-            {operation:'call',deploymentId:'roleVault',function:totalCredit.name+'()',args:[],expect:seedAmount!},
-            {operation:'send',deploymentId:'roleVault',function:signature,args,sender:2},
-            {operation:'call',deploymentId:'roleVault',function:lhs+'()',args:[],expect:'$account2'},
-            {operation:'send',deploymentId:'roleVault',function:canonicalFunctionIdentity(consumer.node),
-              args:['$account1',payoutAmount!],sender:2},
-            {operation:'call',deploymentId:'roleVault',function:publicMapping.name+'(address)',
-              args:['$account1'],expect:payoutAmount!},
-            {operation:'call',deploymentId:'roleVault',function:totalCredit.name+'()',args:[],
-              expect:String(Number(seedAmount)-Number(payoutAmount))},
-          ]:[
+          const impactSequence=inheritedRoleConsumerImpactSequence(
+            snapshot.content,consumer.source.content,lhs,method,
+            snapshot.path,consumer.source.path,consumer.contract.name);
+          const impactSupported=impactSequence!==null;
+          const outsiderSteps:SoliditySequence['steps']=impactSequence?.steps||[
             {operation:'observe',function:getter,args:[]},
             {operation:'send',function:signature,args,sender:2},
             {operation:'call',function:getter,args:[],expect:'$account2'},
           ];
-          const impactWitnesses:SourceWitness[]=impactSupported&&fundFn?[
-            witness(consumer.source,fundFn,consumer.contract.name+'.'+canonicalFunctionIdentity(fundFn)+'.funding'),
-            witness(consumer.source,consumer.node,consumer.contract.name+'.'+canonicalFunctionIdentity(consumer.node)+'.role-guard-and-accounting'),
-            witness(consumer.source,publicMapping,consumer.contract.name+'.'+publicMapping.name),
-            witness(consumer.source,totalCredit,consumer.contract.name+'.'+totalCredit.name),
-          ]:[];
+          const impactWitnesses:SourceWitness[]=[];
           out.unshift({
             hypothesis:impactSupported?
               'A non-administrator can rotate the inherited operator role to itself and execute the acquired operator-only settlement, moving funded credit while reducing totalCredit':
@@ -3685,12 +3630,14 @@ function sourceDirectAssignmentExperiments(
                 contract.name+'.'+signature+':'+lhs:
               'unauthorized source-proven privileged role mutation '+
                 contract.name+'.'+signature+':'+lhs,
-            sequence:{constructorArgs:setup.constructorArgs,
+            sequence:impactSequence?{
+              ...impactSequence,constructorArgs:setup.constructorArgs,
+              ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{})
+            }:{
+              constructorArgs:setup.constructorArgs,
               ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
-              ...(impactSupported?{preparation:{deployments:[{id:'roleVault',
-                file:consumer.source.path,contract:consumer.contract.name,constructorArgs:[]}],
-                operations:[],checks:[]}}:{}),
-              steps:outsiderSteps},
+              steps:outsiderSteps
+            },
             witnesses:[
               witness(snapshot,constructor,contract.name+'.constructor.'+lhs),
               witness(snapshot,fn,contract.name+'.'+signature),
@@ -4589,16 +4536,34 @@ export function sourcePreparationGraph(
     for(const ref of dependencies(check.expect))
       if(!availableIds.has(ref))
         return reject('Preparation readback expects an unacquired deployment: '+ref);
+  let executionTargetSource=target;
+  let executionTargetContract=contract;
+  if(sequence.deployment){
+    const acquired=sources.get(sequence.deployment.file);
+    if(!acquired)return reject('Execution target source not acquired: '+sequence.deployment.file);
+    let parsed:any;
+    try{parsed=parseAstCached(acquired);}
+    catch{return reject('Unparseable execution target source: '+sequence.deployment.file);}
+    const declared=(parsed.children||[]).find((n:any)=>
+      n.type==='ContractDefinition'&&n.name===sequence.deployment!.contract&&
+      n.kind!=='interface'&&n.kind!=='library');
+    if(!declared)return reject('Execution target contract not declared in acquired source: '+
+      sequence.deployment.file+':'+sequence.deployment.contract);
+    executionTargetSource=acquired;
+    executionTargetContract=declared;
+  }
   const appendTarget=():void=>{
-    if(!target||!contract)return;
+    if(!executionTargetSource||!executionTargetContract)return;
     // The target cannot exist before every declared prerequisite deployment,
     // initialization and state readback has completed in the isolated EVM.
-    // Unlike orderPreparation([]), this records the real target construction.
+    // A source-declared derived execution target is recorded at its actual file.
     nodes.push({id:'target:deploy',kind:'deploy',
       dependsOn:[...new Set([...nodes.map(step=>step.id),
         ...sequence.constructorArgs.flatMap(dependencies).map(id=>'deploy:'+id)])],
-      sourceEvidence:[witness(target,contract,contract.name+'.constructor')],
-      parameters:{file:target.path,contract:contract.name,
+      sourceEvidence:[witness(executionTargetSource,executionTargetContract,
+        executionTargetContract.name+'.constructor')],
+      parameters:{file:sequence.deployment?.file||executionTargetSource.path,
+        contract:sequence.deployment?.contract||executionTargetContract.name,
         constructorArgs:sequence.constructorArgs}});
   };
   if(!preparation){appendTarget();return {ok:true,nodes};}
