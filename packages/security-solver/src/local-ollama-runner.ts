@@ -1630,6 +1630,12 @@ export async function runLocalAudit(
         const propertyFamilies=new Map<string,Set<string>>();
         const constructedLeadIds=new Set<string>();
         const propertyConstructionFailures:Record<string,number>={};
+        const propertyConstructionStartedAt=Date.now();
+        let propertyConstructionCompleted=0;
+        await appendFile(logFile,"[ANALYSIS_SOURCE_PROPERTY_PASS_STARTED] "+JSON.stringify({
+          total:candidateQueue.inventory.length,
+          sourceFiles:deterministicSourceSnapshots.length,
+        })+"\n");
         for(const lead of candidateQueue.inventory){
           const menu=deterministicDeclarationsCache.get(lead.path)||[];
           try{
@@ -1658,6 +1664,23 @@ export async function runLocalAudit(
             await appendFile(logFile,"[SOURCE_PROPERTY_FAMILY_ERROR] "+
               JSON.stringify({leadId:lead.id,selector:lead.selector,
                 sourceSha256:lead.sourceSha256,error:String(error).slice(0,240)})+"\n");
+          }
+          propertyConstructionCompleted++;
+          // The controller performs this deterministic CPU pass before opening
+          // the ANALYZE model window. Emit bounded progress so the supervisor
+          // can distinguish productive source construction from a real stall.
+          if(propertyConstructionCompleted===1 ||
+             propertyConstructionCompleted%4===0 ||
+             propertyConstructionCompleted===candidateQueue.inventory.length){
+            await appendFile(logFile,"[ANALYSIS_SOURCE_PROPERTY_PROGRESS] "+JSON.stringify({
+              completed:propertyConstructionCompleted,
+              total:candidateQueue.inventory.length,
+              sourceConstructed:constructedLeadIds.size,
+              unresolvedConstruction:propertyConstructionFailures,
+              elapsedMs:Date.now()-propertyConstructionStartedAt,
+              currentLeadId:lead.id,
+              currentSelector:lead.selector,
+            })+"\n");
           }
         }
         const familyCoverage={

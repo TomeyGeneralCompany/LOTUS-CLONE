@@ -1638,8 +1638,22 @@ contract MixedProtocolVault {
       const covLogText = await readFile(covLog, "utf8");
       const capsIdx = covLogText.indexOf("[DETERMINISTIC_HOST_CAPABILITIES]");
       const winIdx = covLogText.indexOf("[ANALYSIS_MODEL_WINDOW_STARTED]");
+      const propertyPass = covLogText.match(/\[ANALYSIS_SOURCE_PROPERTY_PASS_STARTED\]\s+(\{[^\n]+\})/);
+      const propertyProgress = covLogText.split("\n")
+        .filter(line=>line.startsWith("[ANALYSIS_SOURCE_PROPERTY_PROGRESS] "))
+        .map(line=>JSON.parse(line.slice("[ANALYSIS_SOURCE_PROPERTY_PROGRESS] ".length)) as {
+          completed:number;total:number;elapsedMs:number;
+        });
       assert.ok(capsIdx >= 0, "Audit log must emit [DETERMINISTIC_HOST_CAPABILITIES] upfront");
       assert.ok(winIdx < 0 || capsIdx < winIdx, "[DETERMINISTIC_HOST_CAPABILITIES] must precede ANALYZE window");
+      assert.ok(propertyPass, "Source-property construction pass must announce its bounded inventory");
+      const propertyTotal=JSON.parse(propertyPass![1]).total as number;
+      assert.ok(propertyTotal>0, "Source-property construction must have leads to resolve");
+      assert.ok(propertyProgress.length>0, "Source-property construction must emit progress during the pass");
+      assert.equal(propertyProgress.at(-1)!.completed,propertyTotal,
+        "Final source-property progress event must account for every lead");
+      assert.ok(propertyProgress.every(progress=>progress.elapsedMs>=0&&progress.completed<=progress.total),
+        "Progress events must report bounded, valid construction counts");
       const completeMatch = covLogText.match(/\[ANALYSIS_COMPLETE\]\s+(\{[^\n]+\})/);
       assert.ok(completeMatch, "Audit log must record [ANALYSIS_COMPLETE]");
       const completePayload = JSON.parse(completeMatch![1]);
