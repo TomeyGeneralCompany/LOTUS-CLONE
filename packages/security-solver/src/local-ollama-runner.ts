@@ -102,6 +102,22 @@ export interface LocalAuditLimits {
   verifyPython?: (path:string,functionName:string,kind:string,sequence?:SoliditySequence | JavaSequence | PolyglotSequence) => Promise<string>;
 }
 
+/** Progress made while the source-grounded lead inventory is being assessed.
+ * The no-progress guard must include this state: valid assess/defer actions are
+ * deliberately refunded from the bounded retry budget and do not change the
+ * generic probe counters below. */
+export function analysisProgressFingerprint(state:{
+  selected:number;assessed:number;deferred:number;blocked:number;
+  pendingIds:readonly string[];inventoryResolved:number;inventoryRemaining:number;
+  candidateAssessed:number;candidateRemaining:number;processedBatches:number;
+}):string {
+  return JSON.stringify([
+    state.selected,state.assessed,state.deferred,state.blocked,[...state.pendingIds].sort(),
+    state.inventoryResolved,state.inventoryRemaining,state.candidateAssessed,
+    state.candidateRemaining,state.processedBatches,
+  ]);
+}
+
 /**
  * Canonical Solidity experiment admission for controller selection AND
  * model-proposed action validation. No model-provided assertions are used.
@@ -1388,6 +1404,14 @@ export async function runLocalAudit(
         controllerLoopProgressCount,
         stagedPlans.length,
         analyzeTurnsRemaining,
+        stageLock?.currentStage==='ANALYZE' ? analysisProgressFingerprint({
+          ...stageLock.analysisProgress,
+          inventoryResolved:stageLock.analysisInventoryProgress.resolved,
+          inventoryRemaining:stageLock.analysisInventoryProgress.remaining,
+          candidateAssessed:analysisProgressStore?.assessed ?? 0,
+          candidateRemaining:analysisProgressStore?.remaining ?? 0,
+          processedBatches:analysisProgressStore?.processedBatches ?? 0,
+        }) : '',
       ]);
       if(turn>0 && currentFingerprint===prevTurnFingerprint) {
         consecutiveNoProgressTurns++;
