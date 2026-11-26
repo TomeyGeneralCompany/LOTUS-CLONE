@@ -3611,8 +3611,8 @@ function sourceDirectAssignmentExperiments(
         if(constructor&&consumer){
           const impactSequence=inheritedRoleConsumerImpactSequence(
             snapshot.content,consumer.source.content,lhs,method,
-            snapshot.path.replace(/^source-[0-9]+\\//,''),
-            consumer.source.path.replace(/^source-[0-9]+\\//,''),
+            snapshot.path.replace(/^source-[0-9]+\//,''),
+            consumer.source.path.replace(/^source-[0-9]+\//,''),
             consumer.contract.name);
           const impactSupported=impactSequence!==null;
           const outsiderSteps:SoliditySequence['steps']=impactSequence?.steps||[
@@ -4541,7 +4541,7 @@ export function sourcePreparationGraph(
   let executionTargetSource=target;
   let executionTargetContract=contract;
   if(sequence.deployment){
-    const requestedPath=sequence.deployment.file.replace(/\\\\/g,'/');
+    const requestedPath=sequence.deployment.file;
     const exact=sources.get(requestedPath);
     const suffixMatches=exact?[]:[...sources.values()].filter(source=>
       source.path.endsWith('/'+requestedPath));
