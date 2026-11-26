@@ -3650,6 +3650,9 @@ function sourceDirectAssignmentExperiments(
               ...impactWitnesses
             ]
           });
+          // Do not enqueue the weaker getter-only mutation after constructing
+          // the complete inherited-consumer impact experiment for this setter.
+          if(impactSupported)continue;
         }
       }
       out.push({
