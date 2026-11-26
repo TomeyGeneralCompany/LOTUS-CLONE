@@ -1113,10 +1113,15 @@ export async function runLocalAudit(
           });
           if(built.ok&&built.experiments.length){
             const experiment=built.experiments[0];
-            if(!grounded.some(item=>item.selector===target.selector)){
-              grounded.push({selector:target.selector,probe:{hypothesis:experiment.hypothesis,
-                sequence:experiment.sequence,guardedConsumer:''}});
-            }
+            const selectedIndex=grounded.findIndex(item=>item.selector===target.selector);
+            const sourceImpactPlan={selector:target.selector,probe:{
+              hypothesis:experiment.hypothesis,sequence:experiment.sequence,
+              guardedConsumer:''}};
+            // This controller-owned source property is authoritative for the
+            // detected setter. Replace a legacy getter-only plan for the same
+            // selector so ANALYZE and EXPERIMENT share the exact impact test.
+            if(selectedIndex>=0)grounded.splice(selectedIndex,1,sourceImpactPlan);
+            else grounded.push(sourceImpactPlan);
             outcome={status:'planned',experiments:built.experiments.length};
           }else outcome={status:built.ok?'no_constructed_experiments':built.code,
             detail:built.ok?'':built.detail};
