@@ -398,7 +398,12 @@ contract MarketWithContractGuards is OwnableUpgradeable {
 // Approved financial-property regression: the construction gate must build
 // source-grounded share and vesting tests without admitting guessed properties.
 {
-  const tokenSource='pragma solidity 0.8.4; contract ERC20Mock { mapping(address=>uint256) public balanceOf; function mint(address to,uint256 amount) public {balanceOf[to]+=amount;} function approve(address,uint256) external returns(bool) { return true; } }';
+  const tokenSource=`pragma solidity 0.8.4;
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+contract ERC20Mock is ERC20 {
+ constructor() ERC20("", "") {}
+ function mint(address to,uint256 amount) public {_mint(to,amount);}
+}`;
   const tokenPath='source-1/contracts/mocks/ERC20Mock.sol';
   const shareSource=`pragma solidity 0.8.4;
 contract xMPH is ERC20Upgradeable, AccessControlUpgradeable {
@@ -444,6 +449,19 @@ contract xMPH is ERC20Upgradeable, AccessControlUpgradeable {
     assert.ok(plan.sequence.preparation?.operations.some(x=>x.id==='mintSeedAndDeposit'));
     assert.ok(plan.sequence.steps.some(x=>x.operation==='call'&&x.function==='totalSupply()'));
   }
+  const nonCanonicalToken=tokenSource.replace(
+    '@openzeppelin/contracts/token/ERC20/ERC20.sol','../unverified/ERC20.sol');
+  const unverifiedToken=constructSolidityExperiments({
+    repositoryCommit:'a'.repeat(40),targetPath:sharePath,targetSelector:'xMPH.withdraw',
+    sources:[{path:sharePath,content:shareSource,sha256:sha(shareSource)},
+      {path:tokenPath,content:nonCanonicalToken,sha256:sha(nonCanonicalToken)}],
+    declarations:[{selector:'xMPH.withdraw',operation:'send',inputs:['uint256']},
+      {selector:'xMPH.deposit',operation:'send',inputs:['uint256']},
+      {selector:'xMPH.initialize',operation:'send',inputs:['address','uint256','address']}],
+    skipFinancialInvariants:true,
+  });
+  assert.equal(unverifiedToken.ok,false,
+    'An inherited getter from an unacquired noncanonical dependency must not satisfy the preparation ABI');
   const unprovedSource=shareSource.replace('_burn(msg.sender,_shareAmount);','');
   const unproved=constructSolidityExperiments({
     repositoryCommit:'a'.repeat(40),targetPath:sharePath,targetSelector:'xMPH.withdraw',

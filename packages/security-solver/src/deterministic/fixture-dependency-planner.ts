@@ -1193,6 +1193,28 @@ export function verifyAcquiredReceiverMethods(
   return result;
 }
 
+/** Verify one exact ABI entry inherited from a directly imported canonical
+ * OpenZeppelin base. The installed dependency is still compiler- and
+ * execution-checked; this only lets source preparation recognize its
+ * compiler-defined inherited callable. */
+export function verifyCanonicalInheritedPackageMethod(
+  source:SourceSnapshot,contractName:string,signature:string,
+  sources:readonly SourceSnapshot[],
+):boolean {
+  const match=/^([A-Za-z_][A-Za-z0-9_]*)\((.*)\)$/.exec(signature);
+  if(!match)return false;
+  const contract=(astOf(source)?.children||[]).find((node:any)=>
+    node.type==="ContractDefinition"&&node.name===contractName);
+  if(!contract||!isConcrete(contract))return false;
+  const entry={source,node:contract};
+  const packageBases:string[]=[...new Set<string>((contract.baseContracts||[])
+    .map((base:any)=>String(base.baseName?.namePath||"").split(".").pop())
+    .filter((name:string)=>Boolean(name&&hasCanonicalPackageBase(entry,name)&&
+      standardInheritedAbi[name]?.[signature])))];
+  return packageBases.some(base=>verifyAcquiredReceiverMethods(
+    base,[match[1]],source.path,contractName,sources).ok);
+}
+
 export function resolveSourceFixtureDependencies(
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
   limits:Readonly<{maxDepth?:number;maxNodes?:number;choiceByType?:Readonly<Record<string,string>>}>={},

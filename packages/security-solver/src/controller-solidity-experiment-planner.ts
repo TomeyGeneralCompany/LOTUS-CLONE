@@ -12,7 +12,7 @@ import {sourceGroundedSolidityProbes} from './controller-solidity-security-probe
 import {inheritedRoleConsumerImpactSequence} from './controller-solidity-consumer-impact';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
 import {extractAccountingObservations} from './deterministic/accounting-observations';
-import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependenciesDetailed, verifyAcquiredReceiverMethods, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependenciesDetailed, verifyAcquiredReceiverMethods, verifyCanonicalInheritedPackageMethod, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
 
 export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
@@ -4543,7 +4543,19 @@ export function sourcePreparationGraph(
     }
     const exact=hasSignature?candidates.filter(item=>item.identity===requested):
       candidates.filter(item=>item.identity.startsWith(name+'('));
-    return exact.length===1?exact[0]:null;
+    if(exact.length===1)return exact[0];
+    if(exact.length!==0||!hasSignature)return null;
+    // Canonical imported package methods such as ERC20.balanceOf are part of
+    // the compiler ABI even when the dependency source is not in the acquired
+    // source census. Accept only a directly imported known base and require
+    // the concrete acquired deployment to pass the shared ABI verifier; the
+    // isolated compiler and EVM still validate implementation bytecode.
+    for(const owner of chain){
+      if(verifyCanonicalInheritedPackageMethod(owner.snapshot,
+        owner.contract.name,requested,[...sources.values()]))
+        return {source:owner.snapshot,node:owner.contract,identity:requested};
+    }
+    return null;
   };
   // The schema validates receiver IDs, but arguments and expected readbacks
   // may also carry deployment references. Reject dangling references before
