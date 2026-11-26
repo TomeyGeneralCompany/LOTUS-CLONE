@@ -398,7 +398,7 @@ contract MarketWithContractGuards is OwnableUpgradeable {
 // Approved financial-property regression: the construction gate must build
 // source-grounded share and vesting tests without admitting guessed properties.
 {
-  const tokenSource='pragma solidity 0.8.4; contract ERC20Mock is ERC20 { function mint(address to,uint256 amount) public {_mint(to,amount);} }';
+  const tokenSource='pragma solidity 0.8.4; contract ERC20Mock { mapping(address=>uint256) public balanceOf; function mint(address to,uint256 amount) public {balanceOf[to]+=amount;} function approve(address,uint256) external returns(bool) { return true; } }';
   const tokenPath='source-1/contracts/mocks/ERC20Mock.sol';
   const shareSource=`pragma solidity 0.8.4;
 contract xMPH is ERC20Upgradeable, AccessControlUpgradeable {
