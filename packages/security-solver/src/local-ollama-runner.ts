@@ -4174,7 +4174,7 @@ export async function runLocalAudit(
               const parsed=JSON.parse(fullVerifierOutput) as {caseId?:string|null;detail?:string;reason?:string};
               caseId=typeof parsed.caseId==='string'?parsed.caseId:'';
               detail=String(parsed.detail||parsed.reason||'');
-            }catch{detail='unparseable_verifier_evidence';}
+            }catch{detail='unparseable_verifier_evidence:'+fullVerifierOutput.slice(0,400).replace(/[\\r\\n]+/g,' ');}
             const evidenceId=createHash('sha256').update(JSON.stringify([
               activeStageCandidate,caseId,verifierDigest])).digest('hex');
             if(outcome==='observed'||outcome==='not_observed'){
