@@ -3611,7 +3611,9 @@ function sourceDirectAssignmentExperiments(
         if(constructor&&consumer){
           const impactSequence=inheritedRoleConsumerImpactSequence(
             snapshot.content,consumer.source.content,lhs,method,
-            snapshot.path,consumer.source.path,consumer.contract.name);
+            snapshot.path.replace(/^source-[0-9]+\\//,''),
+            consumer.source.path.replace(/^source-[0-9]+\\//,''),
+            consumer.contract.name);
           const impactSupported=impactSequence!==null;
           const outsiderSteps:SoliditySequence['steps']=impactSequence?.steps||[
             {operation:'observe',function:getter,args:[]},
@@ -4539,8 +4541,14 @@ export function sourcePreparationGraph(
   let executionTargetSource=target;
   let executionTargetContract=contract;
   if(sequence.deployment){
-    const acquired=sources.get(sequence.deployment.file);
-    if(!acquired)return reject('Execution target source not acquired: '+sequence.deployment.file);
+    const requestedPath=sequence.deployment.file.replace(/\\\\/g,'/');
+    const exact=sources.get(requestedPath);
+    const suffixMatches=exact?[]:[...sources.values()].filter(source=>
+      source.path.endsWith('/'+requestedPath));
+    const acquired=exact||(suffixMatches.length===1?suffixMatches[0]:undefined);
+    if(!acquired)return reject((suffixMatches.length>1?
+      'Execution target source path is ambiguous: ':
+      'Execution target source not acquired: ')+sequence.deployment.file);
     let parsed:any;
     try{parsed=parseAstCached(acquired);}
     catch{return reject('Unparseable execution target source: '+sequence.deployment.file);}
@@ -4562,7 +4570,7 @@ export function sourcePreparationGraph(
         ...sequence.constructorArgs.flatMap(dependencies).map(id=>'deploy:'+id)])],
       sourceEvidence:[witness(executionTargetSource,executionTargetContract,
         executionTargetContract.name+'.constructor')],
-      parameters:{file:sequence.deployment?.file||executionTargetSource.path,
+      parameters:{file:executionTargetSource.path,
         contract:sequence.deployment?.contract||executionTargetContract.name,
         constructorArgs:sequence.constructorArgs}});
   };
