@@ -455,7 +455,7 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
             for(const peer of solidityPeers){
               if(peer.path===path)continue;
               for(const match of peer.source.matchAll(
-                /\\bcontract\\s+([A-Za-z_]\\w*)\\s+is\\s+[A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)*\\s*\\{/g)){
+                /\bcontract\s+([A-Za-z_]\w*)\s+is\s+[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*\{/g)){
                 const inherited=inheritedRoleConsumerImpactSequence(
                   code,peer.source,role.role,role.method,path,peer.path,match[1]);
                 if(!inherited)continue;
@@ -469,7 +469,7 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
           }
           if(!sequence){
             await appendFile(logFile,'[CONTROLLER_SOLIDITY_IMPACT_UNSUPPORTED] '+
-              JSON.stringify({path,role:role.role,reason:'No supported protected consumer sequence'})+'\\n');
+              JSON.stringify({path,role:role.role,reason:'No supported protected consumer sequence'})+'\n');
             continue;
           }
           const observation=JSON.parse(await session.probe(
