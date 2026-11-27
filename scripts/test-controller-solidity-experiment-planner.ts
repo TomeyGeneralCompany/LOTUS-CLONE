@@ -156,7 +156,8 @@ contract ConstructorAdapter is IConstructorAdapter {
 }
 contract ConstructorConsumer {
   IConstructorAdapter public adapter;
-  constructor(IConstructorAdapter adapterAddress) { adapter=adapterAddress; }
+  constructor(address adapterAddress) { _wireAdapter(adapterAddress); }
+  function _wireAdapter(address candidate) internal { adapter=IConstructorAdapter(candidate); }
   function run() external view returns(uint256) { return adapter.execute(); }
 }`;
 const transitiveConstructorSnapshot={path:'contracts/ConstructorConsumer.sol',
@@ -168,6 +169,7 @@ assert.equal(transitiveConstructorPlan.status,'resolved',
   'Address-to-interface constructor injection through an internal helper must resolve transitively: '+
   JSON.stringify(transitiveConstructorPlan));
 if(transitiveConstructorPlan.status==='resolved'){
+  assert.equal(transitiveConstructorPlan.substitutions.adapterAddress,'$deployment:dependency2');
   assert.deepEqual(transitiveConstructorPlan.deployments.map(d=>d.contract),
     ['ConstructorLeaf','ConstructorAdapter'],JSON.stringify(transitiveConstructorPlan));
   const adapter=transitiveConstructorPlan.deployments.find(d=>d.contract==='ConstructorAdapter');
@@ -1157,7 +1159,8 @@ const benqiRes = constructSolidityExperiments({
 assert.equal(benqiRes.ok, false, 'External Benqi market adapter with ICERC20/IComptroller must refuse');
 if (!benqiRes.ok) {
   assert.equal(benqiRes.code, 'UNKNOWN_ASSERTION');
-  assert.equal(benqiRes.unresolvedCategory, 'unresolved_dependency');
+  assert.ok(['unresolved_dependency','missing_fixture'].includes(benqiRes.unresolvedCategory||''),
+    'Benqi must remain blocked with its concrete dependency or deployment-fixture reason');
 }
 
 // 8. Abstract contract with acquired concrete subclass reports subclass hint cleanly

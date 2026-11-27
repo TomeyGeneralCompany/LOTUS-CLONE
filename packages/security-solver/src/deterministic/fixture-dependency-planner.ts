@@ -1421,8 +1421,21 @@ export function resolveSourceFixtureDependencies(
   const substitutions:Record<string,string>={};
   const visited=new Map<string,string>(),stack=new Set<string>();
   let nextDeploymentId=1;
+  const targetConstructorParams=ctorOf(targetNode)?.parameters||[];
   const targetBindings=initializerStateBindings(targetNode,target,sources)
-    .filter(binding=>binding.kind==="initializer");
+    .filter(binding=>{
+      if(binding.kind==="initializer")return true;
+      const parameter=targetConstructorParams.find((p:any)=>
+        String(p.name||"")===binding.parameter);
+      const raw=parameter?.typeName?.type==="ElementaryTypeName"?
+        String(parameter.typeName.name||""):"";
+      // Address-to-interface casts in the target constructor are dependency
+      // edges. Keep the existing dedicated ERC20 token fixture route intact;
+      // generic token deployment remains owned by that source-proven path.
+      return /^(?:address|address payable)$/.test(raw)&&
+        !/^(?:I?ERC20(?:Upgradeable|Detailed|Burnable|Mintable)?|ICERC20|ICrERC20|ICToken)$/i
+          .test(binding.typeName);
+    });
   // Source-referenced constructor-injected dependencies must also contribute
   // receiver ABI requirements to implementation disambiguation.
   const constructorDemands=new Map<string,string[]>();
