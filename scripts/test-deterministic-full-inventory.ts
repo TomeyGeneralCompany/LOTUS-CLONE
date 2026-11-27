@@ -990,6 +990,31 @@ contract PrimitiveInit {
       assert.deepEqual(primitiveInitResolved.bindings,[],
         'Primitive state bindings must never create contract bindings');
     }
+    const invalidWidthInterface='pragma solidity ^0.8.20; interface IInvalidWidth { function ping() external; }';
+    const invalidWidthDependency=`pragma solidity ^0.8.20; import "./IInvalidWidth.sol";
+contract InvalidWidthDependency is IInvalidWidth {
+  constructor(uint7 amount) {}
+  function ping() external override {}
+}`;
+    const invalidWidthConsumer=`pragma solidity ^0.8.20; import "./IInvalidWidth.sol";
+contract InvalidWidthConsumer {
+  IInvalidWidth public dependency;
+  function initialize(address chosen) external { dependency=IInvalidWidth(chosen); }
+  function callDependency() external { dependency.ping(); }
+}`;
+    const invalidWidthSources=[
+      {path:'source-1/contracts/IInvalidWidth.sol',content:invalidWidthInterface,sha256:hash(invalidWidthInterface)},
+      {path:'source-1/contracts/InvalidWidthDependency.sol',content:invalidWidthDependency,sha256:hash(invalidWidthDependency)},
+      {path:'source-1/contracts/InvalidWidthConsumer.sol',content:invalidWidthConsumer,sha256:hash(invalidWidthConsumer)}
+    ];
+    const invalidWidthFixture=resolveSourceFixtureDependencies(invalidWidthSources[2],
+      'InvalidWidthConsumer',invalidWidthSources);
+    assert.equal(invalidWidthFixture.status,'unresolved',
+      'Fixture construction must not fabricate a value for an integer width Solidity does not define');
+    if(invalidWidthFixture.status==='unresolved')
+      assert.ok(invalidWidthFixture.missingDependencies.some(reason=>
+        reason.includes('unsupported_constructor_type')),
+        'Invalid ABI widths need a concrete fixture blocker');
     // Use explicit source-grounded require() constraints rather than a generic
     // zero constructor value for acquired transitive dependencies.
     const boundedInterface='pragma solidity ^0.8.0; interface IBounded { function ping() external; }';
