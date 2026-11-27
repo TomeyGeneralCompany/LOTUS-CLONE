@@ -2715,24 +2715,32 @@ export function extractSourceInvariantDescriptor(
     ...effects.get(counterpart.fn)!.plus,...effects.get(counterpart.fn)!.minus,
   ]);
   const accountingStateVars=stateDecls.filter((v:any)=>pairedStates.has(String(v.name)));
+  const amountParameters=(fn:any)=>(fn.parameters||[]).filter((param:any)=>
+    /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(param.typeName)||''));
   const amountParameter=(fn:any)=>{
-    const params=(fn.parameters||[]).filter((param:any)=>
-      /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(param.typeName)||''));
+    const params=amountParameters(fn);
     const named=params.filter((param:any)=>
       /^(?:amount|amt|value|wad|qty|quantity|principal|shares|tokens?)$/i.test(String(param.name||'')));
     return String((named.length===1?named[0]:params[params.length-1])?.name||'');
   };
-  const inflowAmountParameter=amountParameter(inflowFn);
+  const matchingAmountParameters=(fn:any,state:string,text:string,direction:"increase"|"decrease")=>
+    amountParameters(fn).filter((param:any)=>sourceExactAccountingDelta(text,state,
+      String(param.name||''),direction));
+  // Select a scalar only when source ties exactly one integer parameter to
+  // its inflow delta. A conventional name or ABI position alone cannot
+  // distinguish principal from fees, IDs, timestamps, or limits.
   const publicTotalCandidateNames=[...new Set(accountingStateVars.filter((v:any)=>v.visibility==="public"&&
     v.typeName?.type==="ElementaryTypeName"&&
     /^uint(?:[0-9]+)?$/.test(String(canonicalAbiType(v.typeName)||""))&&
-    ((!!inflowAmountParameter&&sourceExactAccountingDelta(inflowEffects,
-      String(v.name),inflowAmountParameter,'increase'))||
+    (matchingAmountParameters(inflowFn,String(v.name),inflowEffects,'increase').length===1||
       (inflowFn.stateMutability==='payable'&&inflowFn.parameters.length===0&&
        sourceExactAccountingDelta(inflowEffects,String(v.name),'msg.value','increase'))))
     .map((v:any)=>String(v.name)))];
   const publicTotal=publicTotalCandidateNames.length===1?
     accountingStateVars.find((v:any)=>v.name===publicTotalCandidateNames[0]):undefined;
+  const inflowAmountParameter=publicTotal?
+    String(matchingAmountParameters(inflowFn,String(publicTotal.name),inflowEffects,'increase')[0]?.name||''):
+    amountParameter(inflowFn);
   const publicBalance=accountingStateVars.find((v:any)=>{
     if(v.visibility!=="public"||v.typeName?.type!=="Mapping"||
       !/^uint(?:[0-9]{1,3})?$/.test(String(canonicalAbiType(v.typeName.valueType)||"")))return false;
@@ -2869,25 +2877,27 @@ export function extractSourceInvariantDescriptor(
   // to the amount. Admit only the unambiguous ABI shape of one unsigned amount
   // plus at most one address; the source delta check below independently
   // proves that this exact amount parameter mutates the observed ledger.
-  const scalarAmountParameter=(fn:any):any|null=>{
-    const params=fn.parameters||[];
-    const amounts=params.filter((param:any)=>
-      /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(param.typeName)||''));
-    const actors=params.filter((param:any)=>canonicalAbiType(param.typeName)==='address');
-    return amounts.length===1&&actors.length<=1&&amounts.length+actors.length===params.length
-      ?amounts[0]:null;
+  const scalarAmountParameter=(fn:any,state:string,text:string,direction:"increase"|"decrease"):any|null=>{
+    const matches=matchingAmountParameters(fn,state,text,direction);
+    return matches.length===1?matches[0]:null;
   };
-  const scalarAccountingArgs=(fn:any,decl:any,amount:string):string[]|null=>{
-    const amountParam=scalarAmountParameter(fn);
-    if(!amountParam||decl.inputs.length!==(fn.parameters||[]).length)return null;
-    return (fn.parameters||[]).map((param:any)=>{
-      const type=canonicalAbiType(param.typeName);
+  const scalarAccountingArgs=(fn:any,decl:any,amount:string,state:string,
+    text:string,direction:"increase"|"decrease"):string[]|null=>{
+    const amountParam=scalarAmountParameter(fn,state,text,direction);
+    const addressParameters=(fn.parameters||[]).filter((param:any)=>
+      canonicalAbiType(param.typeName)==='address');
+    if(!amountParam||addressParameters.length>1||
+      decl.inputs.length!==(fn.parameters||[]).length)return null;
+    const values=(fn.parameters||[]).map((param:any,index:number)=>{
       if(param===amountParam)return amount;
-      if(type==='address')return '$account0';
-      return null;
-    }).every((value:string|null)=>value!==null)
-      ?(fn.parameters||[]).map((param:any)=>param===amountParam?amount:'$account0')
-      :null;
+      const abi=decl.inputs[index];
+      if(!abi||canonicalAbiType(param.typeName)!==abi)return null;
+      if(abi==='address')return '$account0';
+      if(/(?:deposit|funding|position|record|token|share|fund)?(?:id|index)$/i.test(String(param.name||'')))
+        return /^uint/.test(abi)?'1':null;
+      return pickFlexibleArg(abi,String(param.name||''),{ownerAccount:'$account0',amount:'1000'});
+    });
+    return values.every((value:any)=>value!==null)?values as string[]:null;
   };
 
   let mode: SourceInvariantTransitionPlan['mode'] | null = null;
@@ -2979,13 +2989,9 @@ export function extractSourceInvariantDescriptor(
   // (uint) or (address,uint) ABIs, while refusing ambiguous or unsupported
   // parameter shapes and requiring an exact amount-to-state source delta.
   else if(totalReferenced&&!balanceReferenced&&!usesErc20Transfer){
-    const inArgs=scalarAccountingArgs(inflowFn,inflowDecl,inflowAmount);
-    const outArgs=scalarAccountingArgs(outflowFn,outflowDecl,outflowAmount);
-    const inAmount=scalarAmountParameter(inflowFn);
-    const outAmount=scalarAmountParameter(outflowFn);
-    if(inArgs&&outArgs&&inAmount&&outAmount&&
-      sourceExactAccountingDelta(inflowEffects,totalVarName,String(inAmount.name),'increase')&&
-      sourceExactAccountingDelta(outflowEffects,totalVarName,String(outAmount.name),'decrease')){
+    const inArgs=scalarAccountingArgs(inflowFn,inflowDecl,inflowAmount,totalVarName,inflowEffects,'increase');
+    const outArgs=scalarAccountingArgs(outflowFn,outflowDecl,outflowAmount,totalVarName,outflowEffects,'decrease');
+    if(inArgs&&outArgs){
       mode='internal_deposit_withdraw';inflowArgs=inArgs;outflowArgs=outArgs;
     }
   }
@@ -3020,7 +3026,10 @@ export function extractSourceInvariantDescriptor(
   // Contracts with dynamic economics require a separate measured property.
   const accountingTarget=totalReferenced?totalVarName:balanceReferenced?balanceVarName:'';
   const inflowParameter=inflowAmountParameter;
-  const outflowParameter=amountParameter(outflowFn);
+  const sourceOutflowAmounts=totalReferenced?
+    matchingAmountParameters(outflowFn,totalVarName,outflowEffects,'decrease'):[];
+  const outflowParameter=sourceOutflowAmounts.length===1?
+    String(sourceOutflowAmounts[0]?.name||''):amountParameter(outflowFn);
   const directlyProven=accountingTarget&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(accountingTarget)&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(inflowParameter)&&

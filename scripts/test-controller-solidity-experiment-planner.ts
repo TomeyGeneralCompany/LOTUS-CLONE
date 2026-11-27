@@ -675,6 +675,45 @@ if (feeAwareLedgerRes.ok) {
     'Principal experiment must not assert an unmodeled fee ledger');
 }
 
+// ABI order is not a reliable proxy for the accounting amount. Source deltas
+// identify wad even though it is not the last uint; the remaining timestamp,
+// position ID and bool arguments are filled from their typed names.
+const typedLedgerSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract TypedLedger {
+    uint256 public totalDeposits;
+    function deposit(uint64 maturityTimestamp, uint256 wad) external {
+        require(maturityTimestamp > block.timestamp);
+        totalDeposits += wad;
+    }
+    function withdraw(uint64 depositId, uint256 shares, bool early) external {
+        require(depositId == 1);
+        early;
+        totalDeposits -= shares;
+    }
+}`;
+const typedLedgerRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: 'contracts/TypedLedger.sol',
+  targetSelector: 'TypedLedger.withdraw',
+  sources: [{path: 'contracts/TypedLedger.sol', sha256: createHash('sha256').update(typedLedgerSrc).digest('hex'), content: typedLedgerSrc}],
+  declarations: [
+    {selector: 'TypedLedger.deposit', operation: 'send', inputs: ['uint64', 'uint256']},
+    {selector: 'TypedLedger.withdraw', operation: 'send', inputs: ['uint64', 'uint256', 'bool']},
+    {selector: 'TypedLedger.totalDeposits', operation: 'call', inputs: []},
+  ],
+});
+assert.equal(typedLedgerRes.ok, true, 'Source-proven accounting must support extra typed ABI inputs');
+if (typedLedgerRes.ok) {
+  const plan = typedLedgerRes.experiments.find((e) => e.securityProperty === 'financial conservation invariant (deposit->withdraw)');
+  assert.ok(plan, 'Typed deposit and withdrawal must yield financial conservation');
+  const steps = plan!.sequence.steps;
+  const deposit = steps.find((s) => s.operation === 'send' && s.function === 'deposit(uint64,uint256)');
+  const withdraw = steps.find((s) => s.operation === 'send' && s.function === 'withdraw(uint64,uint256,bool)');
+  assert.deepEqual(deposit && 'args' in deposit ? deposit.args : null, ['86400', '1000']);
+  assert.deepEqual(withdraw && 'args' in withdraw ? withdraw.args : null, ['1', '400', false]);
+}
+
 // Internal collection helpers need to feed both source-backed pair discovery
 // and the observable length getter. The asserted transition must be 0 -> 1 -> 0.
 {
