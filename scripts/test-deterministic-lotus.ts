@@ -687,6 +687,25 @@ contract MultiVault${idx} {
       "An exact canonical ABI signature must select an overloaded declaration");
     assert.equal(exactOverloadQueue.inventory[0].lineStart,3,
       "The exact uint256 overload must map to its own source span");
+    const importedTypeSource=`pragma solidity ^0.8.20;
+type AccountId is uint128;`;
+    const importedTypeContract=`pragma solidity ^0.8.20;
+import "../types/AccountId.sol";
+contract ImportedOverload {
+  function set(AccountId id) external {}
+  function set(uint256 id) external {}
+}`;
+    const importedTypeQueue=buildAnalysisCandidateQueue({items:[
+      {path:"source-0/contracts/ImportedOverload.sol",sourceCommit:commitSha,
+        sourceContent:importedTypeContract,
+        unqueuedSelectors:["ImportedOverload.set(uint128)"]},
+      {path:"source-0/types/AccountId.sol",sourceCommit:commitSha,
+        sourceContent:importedTypeSource,unqueuedSelectors:[]}
+    ]});
+    assert.equal(importedTypeQueue.inventory.length,1,
+      "An exact overload with a UDVT declared in another acquired source must resolve");
+    assert.equal(importedTypeQueue.inventory[0].lineStart,4,
+      "Imported UDVT signatures must retain the exact matching source span");
   }
 
   // Shared Toy Accounting-Defect Contracts (Buggy vs Corrected) for Tests 9-13

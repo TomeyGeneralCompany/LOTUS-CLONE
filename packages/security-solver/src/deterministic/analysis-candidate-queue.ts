@@ -133,7 +133,7 @@ type LocatedFunctionSpan = {
   span: { start:number; end:number; lineStart:number; lineEnd:number; excerpt:string; truncated:boolean };
 } | { reason:string };
 
-function canonicalAbiType(type:any,sourceAst:any,depth=0):string|null {
+function canonicalAbiType(type:any,sourceAst:any,depth=0,acquiredAsts:any[]=[sourceAst]):string|null {
   if(!type||depth>16)return null;
   if(type.type==="ElementaryTypeName"){
     const name=String(type.name||"");
@@ -143,7 +143,7 @@ function canonicalAbiType(type:any,sourceAst:any,depth=0):string|null {
       name:null;
   }
   if(type.type==="ArrayTypeName"){
-    const base=canonicalAbiType(type.baseTypeName,sourceAst,depth+1);
+    const base=canonicalAbiType(type.baseTypeName,sourceAst,depth+1,acquiredAsts);
     if(!base)return null;
     const length=type.length?.value===undefined?"":String(type.length.value);
     if(length&&!/^\d+$/.test(length))return null;
@@ -152,34 +152,46 @@ function canonicalAbiType(type:any,sourceAst:any,depth=0):string|null {
   if(type.type!=="UserDefinedTypeName")return null;
   const fullName=String(type.namePath||"");
   const name=fullName.split(".").pop()||"";
-  const definitions:any[]=[];
-  for(const top of sourceAst?.children||[]){
-    if(top.type==="ContractDefinition"){
-      for(const child of top.subNodes||[]){
-        if(child.name===name&&["StructDefinition","EnumDefinition"].includes(child.type))
-          definitions.push(child);
+  const collect=(asts:any[])=>{
+    const found:any[]=[];
+    for(const ast of asts){
+      for(const top of ast?.children||[]){
+        if(top.type==="ContractDefinition"){
+          for(const child of top.subNodes||[]){
+            if(child.name===name&&["StructDefinition","EnumDefinition"].includes(child.type))
+              found.push(child);
+          }
+          if(top.name===name)found.push(top);
+        }else if(top.name===name&&[
+          "TypeDefinition","UserDefinedValueTypeDefinition","EnumDefinition","StructDefinition"
+        ].includes(top.type)){
+          found.push(top.definition||top.underlyingType||top.underlyingTypeName);
+        }
       }
-    }else if(top.type==="TypeDefinition"&&top.name===name){
-      definitions.push(top.definition);
-    }else if(top.type==="ContractDefinition"&&top.name===name){
-      definitions.push(top);
     }
-  }
+    return [...new Set(found.filter(Boolean))];
+  };
+  // Prefer the declaration in the implementation file. Imported types may be
+  // resolved only when exactly one matching acquired declaration exists;
+  // ambiguous same-name declarations stay blocked rather than receiving a
+  // guessed ABI selector.
+  const localDefinitions=collect([sourceAst]);
+  const definitions=localDefinitions.length?localDefinitions:collect(acquiredAsts);
   if(definitions.length!==1)return null;
   const definition=definitions[0];
   if(definition.type==="EnumDefinition")return "uint8";
   if(definition.type==="ContractDefinition")return "address";
   if(definition.type==="StructDefinition"){
     const members=(definition.members||[]).map((member:any)=>
-      canonicalAbiType(member.typeName,sourceAst,depth+1));
+      canonicalAbiType(member.typeName,sourceAst,depth+1,acquiredAsts));
     return members.length&&members.every(Boolean)?"("+members.join(",")+")":null;
   }
-  return canonicalAbiType(definition,sourceAst,depth+1);
+  return canonicalAbiType(definition,sourceAst,depth+1,acquiredAsts);
 }
 
-function canonicalFunctionSignature(fn:any,sourceAst:any):string|null {
+function canonicalFunctionSignature(fn:any,sourceAst:any,acquiredAsts:any[]=[sourceAst]):string|null {
   const inputs=(fn.parameters||[]).map((parameter:any)=>
-    canonicalAbiType(parameter.typeName,sourceAst));
+    canonicalAbiType(parameter.typeName,sourceAst,0,acquiredAsts));
   return fn.name&&inputs.every(Boolean)?
     String(fn.name)+"("+inputs.join(",")+")":null;
 }
@@ -189,7 +201,7 @@ function canonicalFunctionSignature(fn:any,sourceAst:any):string|null {
  * inside comments or strings, and choosing the first same-name declaration is
  * unsafe for overloaded functions.
  */
-function locateFunctionSpan(content:string,selector:string,sourceAst:any):LocatedFunctionSpan {
+function locateFunctionSpan(content:string,selector:string,sourceAst:any,acquiredAsts:any[]=[sourceAst]):LocatedFunctionSpan {
   const separator=selector.lastIndexOf(".");
   const contractName=separator>0?selector.slice(0,separator):"";
   const selectorMethod=selector.slice(separator+1);
@@ -205,11 +217,11 @@ function locateFunctionSpan(content:string,selector:string,sourceAst:any):Locate
     !node.isFallback&&!node.isReceiveEther);
   if(declarations.length===0)return {reason:"function_declaration_not_located"};
   const selected=exactSignature?
-    declarations.filter((node:any)=>canonicalFunctionSignature(node,sourceAst)===selectorMethod):
+    declarations.filter((node:any)=>canonicalFunctionSignature(node,sourceAst,acquiredAsts)===selectorMethod):
     declarations;
   if(exactSignature&&selected.length===0)
     return {reason:"exact_function_abi_signature_not_resolved"};
-  if(selected.length>1||(!exactSignature&&selected.length>1))
+  if(selected.length>1)
     return {reason:"overloaded_function_requires_exact_abi_signature"};
   const declaration=selected[0],range=declaration.range,location=declaration.loc;
   if(!Array.isArray(range)||range.length!==2||!location?.start||!location?.end||
@@ -263,6 +275,14 @@ export function buildAnalysisCandidateQueue(
   const blocked: Array<{ path: string; selector: string; reason: string }> = [];
   const rawCandidates: AnalysisCandidate[] = [];
   const seenIds = new Set<string>();
+  const sourceAstByItem=new Map<AnalysisCandidateSourceItem,any>();
+  const acquiredSourceAsts:any[]=[];
+  for(const item of options.items){
+    try{
+      const ast=parseSolidity(item.sourceContent,{range:true,loc:true});
+      sourceAstByItem.set(item,ast);acquiredSourceAsts.push(ast);
+    }catch{sourceAstByItem.set(item,null);}
+  }
 
   // Pre-index graph coupling, unresolved external call dominance, and core protocol centrality
   const varWriters = new Map<string, Set<string>>();
@@ -328,9 +348,9 @@ export function buildAnalysisCandidateQueue(
 
     const sourceSha256 = createHash("sha256").update(item.sourceContent).digest("hex");
     const fileLeads = staticLeads.filter((l) => l.path === item.path);
-    let sourceAst:any=null;
-    try { sourceAst=parseSolidity(item.sourceContent,{range:true,loc:true}); }
-    catch { /* Each selector is retained as an explicit parser blocker below. */ }
+    const sourceAst=sourceAstByItem.get(item)||null;
+    // Each selector from an unparseable implementation is retained as an
+    // explicit parser blocker below.
     const isExternalAdapter = isExternalAdapterOrMarketPath(item.path);
     const isCoreProtocolName = CORE_PROTOCOL_NAME_RE.test(item.path) && !isExternalAdapter;
     const inboundRefCount = fileInboundReferrers.get(item.path)?.size || 0;
@@ -349,7 +369,7 @@ export function buildAnalysisCandidateQueue(
       }
 
       const located = sourceAst
-        ? locateFunctionSpan(item.sourceContent, selector, sourceAst)
+        ? locateFunctionSpan(item.sourceContent, selector, sourceAst,acquiredSourceAsts)
         : {reason:"solidity_source_parse_failed"};
       if ("reason" in located) {
         blocked.push({path:item.path,selector,reason:located.reason});
