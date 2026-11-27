@@ -5,6 +5,7 @@
  */
 import {createHash} from 'node:crypto';
 import {parse} from '@solidity-parser/parser';
+import {canonicalElementaryAbiType} from './solidity-abi-types';
 import {posix} from 'node:path';
 import type {SolidityProbeDeclaration} from './solidity-probe-inputs';
 import type {SoliditySequence} from './solidity-sequence';
@@ -217,10 +218,11 @@ function directOwnerExperiment(snapshot:SourceSnapshot,contract:any,menu:readonl
   if(!setter)return null;
   const parameter=setter.parameters[0];
   if(!identifier.test(parameter?.name||''))return null;
-  const type=parameter.typeName?.name;
-  if(!type || !/^uint(?:[0-9]{1,3})?$/.test(type))return null;
+  const type=canonicalElementaryAbiType(String(parameter.typeName?.name||''));
+  if(!type||!/^uint/.test(type))return null;
   const state=members.filter(n=>n.type==='StateVariableDeclaration').flatMap(n=>n.variables||[])
-    .find((v:any)=>v.visibility==='public'&&v.typeName?.name===type && v.name!==parameter.name);
+    .find((v:any)=>v.visibility==='public'&&
+      canonicalElementaryAbiType(String(v.typeName?.name||''))===type&&v.name!==parameter.name);
   if(!state || !identifier.test(state.name))return null;
   const fnBody=body(source,setter);
   if(!/\brequire\s*\(\s*msg\s*\.\s*sender\s*==\s*owner\b/.test(fnBody))return null;
@@ -396,19 +398,7 @@ function canonicalAbiType(typeName:any,seen=new Set<any>()):string|null {
     return base+'['+count+']';
   }
   if(typeName.type==='ElementaryTypeName'){
-    const name=String(typeName.name||'');
-    if(name==='address')return 'address';
-    if(name==='uint')return 'uint256';
-    if(name==='int')return 'int256';
-    const integer=/^(u?int)([0-9]+)$/.exec(name);
-    if(integer){
-      const width=Number(integer[2]);
-      return width>=8&&width<=256&&width%8===0?name:null;
-    }
-    if(/^(?:bool|string|bytes)$/.test(name))return name;
-    const fixedBytes=/^bytes([0-9]+)$/.exec(name);
-    if(fixedBytes){const width=Number(fixedBytes[1]);return width>=1&&width<=32?name:null;}
-    return null;
+    return canonicalElementaryAbiType(String(typeName.name||''));
   }
   if(typeName.type==='UserDefinedTypeName')return resolveUserAbiType(typeName,seen);
   return null;
@@ -1266,12 +1256,13 @@ function defaultArgsForTypes(abiTypes:string[]):SolidityArgValue[]|null {
       values.push(Array.from({length:count},()=>elem));continue;
     }
     if(/\[\]$/.test(t)){values.push([]);continue;}
-    if(/^u?int(?:[0-9]{1,3})?$/.test(t)){values.push('7');continue;}
+    const elementary=canonicalElementaryAbiType(t);
+    if(elementary&&/^u?int/.test(elementary)){values.push('7');continue;}
     if(t==='bool'){values.push(true);continue;}
     if(t==='address'||t==='address payable'){values.push('$account2');continue;}
     if(t==='string'){values.push('LOTUS-Test');continue;}
     if(t==='bytes'){values.push('0x4142');continue;}
-    const sized=t.match(/^bytes([1-9]|[12][0-9]|3[012])$/);
+    const sized=elementary?.match(/^bytes([1-9]|[12][0-9]|3[012])$/);
     if(sized){values.push('0x'+'41'.repeat(Number(sized[1])));continue;}
     return null;
   }
