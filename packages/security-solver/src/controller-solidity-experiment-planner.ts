@@ -3608,17 +3608,25 @@ function sourceInternalScalarSetterExperiments(
 ):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>{
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
-  const states=nodes.filter(n=>n.type==='StateVariableDeclaration')
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=[{contract,snapshot},...inheritance.chain];
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(owner:any,node:any):boolean=>
+    (owner.contract.subNodes||[]).includes(node)||
+    (owner.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const states=allNodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>
       identifier.test(v.name||'')&&v.typeName?.type==='ElementaryTypeName'&&
       /^(?:address|bool|uint(?:[0-9]{1,3})?)$/.test(v.typeName.name||''));
   if(!states.length)return [];
   const views=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
   const setup=resolveFlexibleSetup(snapshot,contract,
-    resolveInheritance(snapshot,contract,sources).chain,sources,declarations,null);
+    inheritance.chain,sources,declarations,null);
   if(!setup||setup.usesToken)return [];
-  const functions=nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name);
+  const functions=allNodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name);
   const results:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
 
   for(const entry of functions.filter(n=>n.name===method&&
@@ -3632,6 +3640,7 @@ function sourceInternalScalarSetterExperiments(
     if(!declarations.some(d=>d.selector===contract.name+'.'+method&&
       d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify([type])))
       continue;
+    const entrySource=sourceForNode(entry);
     const statements:any[]=entry.body.statements||[];
     const callStmt=statements[0];
     if(statements.length<1||statements.length>2||
@@ -3651,6 +3660,7 @@ function sourceInternalScalarSetterExperiments(
       canonicalAbiType(n.parameters[0].typeName)===type);
     if(helpers.length!==1)continue;
     const helper=helpers[0],hp=helper.parameters[0];
+    const helperSource=sourceForNode(helper);
     if(!identifier.test(hp.name||''))continue;
     const writes:any[]=helper.body.statements||[];
     if(writes.length!==1||writes[0]?.type!=='ExpressionStatement'||
@@ -3662,10 +3672,12 @@ function sourceInternalScalarSetterExperiments(
     const state=states.find((v:any)=>v.name===writes[0].expression.left.name&&
       canonicalAbiType(v.typeName)===type);
     if(!state)continue;
+    const stateSource=sourceForNode(state);
     const readback=state.visibility==='public'?state.name+'()':
       views.find(o=>o.kind==='scalar'&&o.stateVariable===state.name)?.getter;
     if(!readback)continue;
-    const readFn=functions.find(n=>n.name===readback.split('(')[0]&&n.body);
+    const readFn=functions.find(n=>n.name===readback.split('(')[0]&&n.body&&
+      canonicalFunctionIdentity(n)===readback);
     const value:SolidityArgValue=type==='bool'?true:
       type==='address'?'$account2':'7';
     const steps:SoliditySequence['steps']=[];
@@ -3685,11 +3697,11 @@ function sourceInternalScalarSetterExperiments(
         ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
         steps},
       witnesses:[
-        witness(snapshot,entry,contract.name+'.'+canonicalFunctionIdentity(entry)),
-        witness(snapshot,helper,contract.name+'.'+helperName),
-        witness(snapshot,writes[0],contract.name+'.'+helperName+'.assignment'),
-        witness(snapshot,state,contract.name+'.'+state.name),
-        ...(readFn?[witness(snapshot,readFn,contract.name+'.'+readback)]:[])
+        witness(entrySource,entry,contract.name+'.'+canonicalFunctionIdentity(entry)),
+        witness(helperSource,helper,contract.name+'.'+helperName),
+        witness(helperSource,writes[0],contract.name+'.'+helperName+'.assignment'),
+        witness(stateSource,state,contract.name+'.'+state.name),
+        ...(readFn?[witness(sourceForNode(readFn),readFn,contract.name+'.'+readback)]:[])
       ]
     });
   }
