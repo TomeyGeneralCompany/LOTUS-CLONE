@@ -982,6 +982,27 @@ function splitCanonicalTupleFields(tuple:string):string[]|null {
   fields.push(last);
   return fields;
 }
+/** Solidity omits mapping and array members from the ABI of a public getter
+ * for a struct. Keep every other field only when its acquired source type can
+ * be resolved exactly. This is intentionally limited to direct struct fields;
+ * nested structs that themselves contain omitted members remain blocked until
+ * compiler ABI evidence is available for that nested shape.
+ */
+function publicGetterStructFields(type:any,owner:ContractEntry,
+  entries:readonly ContractEntry[]):string[]|null {
+  const declaration=acquiredValueDeclaration(type,owner.node,owner.source,
+    entries.map(entry=>entry.source));
+  if(declaration?.node.type!=="StructDefinition")return null;
+  const outputs:string[]=[];
+  for(const member of declaration.node.members||[]){
+    const memberType=member.typeName;
+    if(memberType?.type==="Mapping"||memberType?.type==="ArrayTypeName")continue;
+    const canonical=callableType(memberType,owner,entries);
+    if(!canonical)return null;
+    outputs.push(canonical);
+  }
+  return outputs.length?outputs:null;
+}
 function publicGetter(variable:any,owner:ContractEntry,
   entries:readonly ContractEntry[]):{identity:string;returns:string[]}|null {
   if(variable.visibility!=="public"||!variable.name)return null;
@@ -998,13 +1019,15 @@ function publicGetter(variable:any,owner:ContractEntry,
       type=type.baseTypeName;
     }
   }
-  const output=callableType(type,owner,entries);
+  let output=callableType(type,owner,entries);
+  if(!output&&type?.type==="UserDefinedTypeName"){
+    const fields=publicGetterStructFields(type,owner,entries);
+    if(fields)output="("+fields.join(",")+")";
+  }
   if(!output)return null;
-  // Solidity public STRUCT getters return an ABI list of elementary fields,
-  // not a single tuple output. Flatten only the known all-scalar shape;
-  // nested mappings/tuples remain unresolved pending compiler ABI evidence.
-  if(type?.type==="UserDefinedTypeName"&&
-    output.startsWith("(")&&output.endsWith(")")){
+  // Solidity public STRUCT getters return an ABI list of exposed fields,
+  // excluding mapping and array members. Keep nested tuple boundaries.
+  if(type?.type==="UserDefinedTypeName"&&output.startsWith("(")&&output.endsWith(")")){
     const fields=splitCanonicalTupleFields(output);
     if(!fields?.length)return null;
     return {identity:variable.name+"("+inputs.join(",")+")",returns:fields};
