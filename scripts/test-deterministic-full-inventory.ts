@@ -2278,6 +2278,29 @@ contract PairChild is PairBase {}`;
       experiment.securityProperty.startsWith('source-paired scalar conservation')&&
       experiment.witnesses.some(w=>w.sourceSha256===inheritedPairBase.sha256)),
       'An inherited conservation pair must retain the state and transition base hash');
+    const inheritedPureBaseText=`pragma solidity ^0.8.20;
+contract PureBase { function quote(uint16 amount) external pure returns(uint16) { return amount * 2; } }`;
+    const inheritedPureChildText=`pragma solidity ^0.8.20;
+import "./PureBase.sol";
+contract PureChild is PureBase {}`;
+    const inheritedPureBase={path:'source-1/contracts/PureBase.sol',
+      content:inheritedPureBaseText,sha256:hash(inheritedPureBaseText)};
+    const inheritedPureChild={path:'source-1/contracts/PureChild.sol',
+      content:inheritedPureChildText,sha256:hash(inheritedPureChildText)};
+    const inheritedPurePlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:inheritedPureChild.path,
+      targetSelector:'PureChild.quote',
+      sources:[inheritedPureBase,inheritedPureChild],
+      declarations:([{selector:'PureChild.quote',operation:'call',inputs:['uint16']}] as any),
+      skipLegacy:true});
+    assert.equal(inheritedPurePlan.ok,true,
+      'Inherited pure source expressions must produce executable value checks');
+    if(inheritedPurePlan.ok)assert.ok(inheritedPurePlan.experiments.some(experiment=>
+      experiment.securityProperty.startsWith('source-exact pure return')&&
+      experiment.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='quote(uint16)'&&step.expect==='14')&&
+      experiment.witnesses.some(w=>w.sourceSha256===inheritedPureBase.sha256)),
+      'Inherited pure expression experiments must retain their function source hash');
     const inheritedOwnerBaseText=`pragma solidity ^0.8.20;
 contract OwnerBase {
   address public administrator;

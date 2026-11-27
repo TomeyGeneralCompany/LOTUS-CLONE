@@ -4332,7 +4332,12 @@ function sourcePureExpressionExperiment(
 ):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=inheritance.chain;
+  const nodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(entry:any,node:any):boolean=>(entry.contract.subNodes||[]).includes(node);
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
   const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
 
   for(const fn of nodes.filter((n:any)=>n.type==='FunctionDefinition'&&n.body&&
@@ -4427,7 +4432,7 @@ function sourcePureExpressionExperiment(
       if(answer<lower||answer>upper)continue;
     }
     const setup=resolveFlexibleSetup(snapshot,contract,
-      resolveInheritance(snapshot,contract,sources).chain,
+      inheritance.chain,
       sources,declarations,null);
     if(!setup||setup.usesToken)continue;
     const signature=canonicalFunctionIdentity(fn);
@@ -4444,8 +4449,8 @@ function sourcePureExpressionExperiment(
       sequence:{constructorArgs:setup.constructorArgs,
         ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
         steps},
-      witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
-        witness(snapshot,statements[0],contract.name+'.'+signature+'.return')],
+      witnesses:[witness(sourceForNode(fn),fn,contract.name+'.'+signature),
+        witness(sourceForNode(fn),statements[0],contract.name+'.'+signature+'.return')],
     });
   }
   return out;
