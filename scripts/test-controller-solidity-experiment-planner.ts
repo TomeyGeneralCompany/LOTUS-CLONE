@@ -1537,8 +1537,9 @@ contract DynamicVault {
     _deposit(depositAmount,maturationTimestamp);
   }
   function _deposit(uint256 depositAmount,uint64 maturationTimestamp) internal {
+    uint256 interestAmount=depositAmount; uint256 feeAmount=depositAmount;
     deposits.push(Deposit(depositAmount,0)); totalDeposit += depositAmount;
-    totalInterestOwed += depositAmount; totalFeeOwed += depositAmount;
+    totalInterestOwed += interestAmount; totalFeeOwed += feeAmount;
   }
   function withdraw(uint64 depositID,uint256 virtualTokenAmount,bool early) external {
     _withdraw(depositID,virtualTokenAmount,early);
@@ -1549,8 +1550,9 @@ contract DynamicVault {
     if(virtualTokenAmount>virtualTokenTotalSupply){virtualTokenAmount=virtualTokenTotalSupply;}
     uint256 interestRate=depositEntry.interestRate;
     uint256 depositAmount=virtualTokenAmount.div(interestRate+PRECISION);
+    uint256 interestAmount=depositAmount; uint256 feeAmount=depositAmount;
     totalDeposit-=depositAmount;
-    totalInterestOwed-=depositAmount; totalFeeOwed-=depositAmount;
+    totalInterestOwed-=interestAmount; totalFeeOwed-=feeAmount;
     depositEntry.virtualTokenTotalSupply-=virtualTokenAmount;
   }
   function getDeposit(uint64 depositID) external view returns(Deposit memory){return deposits[depositID-1];}
