@@ -410,8 +410,13 @@ export async function runLocalAudit(
       }
     }
     let repairAdded=0,repairBlocked=0;
-    for(const lead of sourceRepairBatch){
+    for(const [repairIndex,lead] of sourceRepairBatch.entries()){
       const record=analysisProgressStore.records.get(lead.id)!;
+      const leadRepairStartedAt=Date.now();
+      await appendFile(logFile,"[EXPERIMENT_REPAIR_LEAD_STARTED] "+JSON.stringify({
+        phase,index:repairIndex+1,total:sourceRepairBatch.length,
+        leadId:lead.id,path:lead.path,selector:lead.selector,
+        sourceSha256:lead.sourceSha256})+"\n");
       // Re-enter repair when independently observed EVM evidence, an actual
       // inconclusive attempt or a newly identified source obligation changes
       // the state. A repeated no-op with identical source/obligations remains
@@ -430,6 +435,10 @@ export async function runLocalAudit(
       if(!declarations.length){
         const reason="missing_source_declarations";
         analysisProgressStore.noteRepairAttempt(lead.id,strategy,reason);
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_LEAD_DONE] "+JSON.stringify({
+          phase,index:repairIndex+1,total:sourceRepairBatch.length,
+          leadId:lead.id,status:"blocked",reason,
+          elapsedMs:Date.now()-leadRepairStartedAt})+"\n");
         await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
           leadId:lead.id,path:lead.path,selector:lead.selector,reason,
           sourceSha256:lead.sourceSha256})+"\n");
@@ -441,6 +450,13 @@ export async function runLocalAudit(
         targetSelector:lead.selector,sources:deterministicSourceSnapshots,
         declarations,staticLeads:limits.staticLeads||[],
       });
+      await appendFile(logFile,"[EXPERIMENT_REPAIR_LEAD_DONE] "+JSON.stringify({
+        phase,index:repairIndex+1,total:sourceRepairBatch.length,
+        leadId:lead.id,status:constructed.ok?"constructed":"blocked",
+        code:constructed.ok?undefined:constructed.code,
+        experiments:constructed.ok?constructed.experiments.length:
+          constructed.partialExperiments?.length||0,
+        elapsedMs:Date.now()-leadRepairStartedAt})+"\n");
       const partialIds=new Set<string>();
       const successful=constructed.ok?[constructed]:[];
       if(!constructed.ok&&constructed.partialExperiments?.length){
