@@ -809,6 +809,33 @@ contract CallResolutionDemo is BaseA, BaseB {
       allHyps.some((h) => h.category === "accounting_invariant" && h.relational?.id === vaultRel!.id),
       "generateHypotheses must integrate RelationalHypothesis into prioritized output",
     );
+
+    const uintKeyVault=`// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract UintKeyVault {
+    mapping(uint256 => uint256) public balances;
+    uint256 public totalDeposits;
+    function deposit(uint256 account) external payable {
+        balances[account] += msg.value;
+        totalDeposits += msg.value;
+    }
+    function withdraw(uint256 account, uint256 amount) external {
+        balances[account] -= amount;
+        totalDeposits -= amount;
+    }
+}
+`;
+    const uintKeyGraph=buildProgramFactsGraph({sources:[{
+      path:"source-0/contracts/UintKeyVault.sol",
+      content:uintKeyVault,
+      sha256:sha(uintKeyVault),
+    }]});
+    const uintKeyHypothesis=generateRelationalHypotheses(uintKeyGraph).find(r=>
+      r.entrypoints.includes("UintKeyVault.deposit")&&
+      r.entrypoints.includes("UintKeyVault.withdraw"));
+    assert.ok(uintKeyHypothesis,"uint-key mapping accounting must produce a relational property");
+    assert.ok(uintKeyHypothesis.requiredObservations.includes("balances(uint256)"),
+      "Public mapping observations must use the acquired source's exact key type");
   }
 
   // 10. Regression Case 3: Insufficient evidence -> UNKNOWN_ASSERTION, zero fabricated experiments

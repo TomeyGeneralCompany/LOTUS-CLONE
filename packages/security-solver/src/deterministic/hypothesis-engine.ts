@@ -449,8 +449,11 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
     for (const sv of stateDeps) {
       const svSym = stateVarSymbols.get(sv);
       if (svSym?.visibility === "public") {
-        const getterSig = svSym.returnType === "mapping" ? `${svSym.name}(address)` : `${svSym.name}()`;
-        requiredObservations.push(getterSig);
+        if(svSym.returnType==="mapping"||svSym.returnType?.endsWith("[]")){
+          const inputs=svSym.publicGetterInputs;
+          if(inputs?.length)requiredObservations.push(`${svSym.name}(${inputs.join(",")})`);
+          else propertyRequiredPrerequisites.push(`unsupported_public_getter_inputs:${sv}`);
+        }else requiredObservations.push(`${svSym.name}()`);
       } else {
         propertyRequiredPrerequisites.push(`missing_public_getter:${sv}`);
       }
