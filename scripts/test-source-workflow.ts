@@ -113,7 +113,7 @@ const {SoliditySourceIndex}=await import("../packages/security-solver/src/solidi
 const solidityProbeDir=await mkdtemp(join(tmpdir(),"autohack-solidity-intent-"));
 try {
   const contract=join(solidityProbeDir,"State.sol");
-  await writeFile(contract,"pragma solidity ^0.8.20; contract State { enum Phase { Open, Closed } uint256 private counter; mapping(uint7 => uint256) public malformed; mapping(uint8 => uint256) public valid; mapping(Phase => uint256) public phaseBalances; function increment(uint256 value) public { counter += value; } function get() public view returns (uint256) { return counter; } }");
+  await writeFile(contract,"pragma solidity ^0.8.20; type AccountId is uint64; contract State { enum Phase { Open, Closed } uint256 private counter; mapping(uint7 => uint256) public malformed; mapping(uint8 => uint256) public valid; mapping(Phase => uint256) public phaseBalances; mapping(AccountId => uint256) public accountBalances; function increment(uint256 value) public { counter += value; } function get() public view returns (uint256) { return counter; } }");
   const index=new SoliditySourceIndex(solidityProbeDir);
   const menu=await index.probeMenu(contract);
   assert.ok(menu.some(item=>item.selector==="State.increment" && item.operation==="send" && item.inputs[0]==="uint256"));
@@ -121,6 +121,8 @@ try {
   assert.ok(menu.some(item=>item.selector==="State.valid"&&item.inputs[0]==="uint8"));
   assert.ok(menu.some(item=>item.selector==="State.phaseBalances"&&item.inputs[0]==="uint8"),
     "enum mapping getters must be indexed with the compiler ABI uint8 key type");
+  assert.ok(menu.some(item=>item.selector==="State.accountBalances"&&item.inputs[0]==="uint64"),
+    "user-defined value type mapping getters must resolve to their acquired underlying ABI type");
   assert.ok(!menu.some(item=>item.selector==="State.malformed"),
     "source indexing must not invent a compiler ABI getter for an invalid key width");
 } finally { await rm(solidityProbeDir,{recursive:true,force:true}); }
