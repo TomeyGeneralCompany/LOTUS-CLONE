@@ -2606,6 +2606,19 @@ export function extractSourceInvariantDescriptor(
     witness(sourceOfFunction(outflowFn), outflowFn, `${contract.name}.${outflowFn.name}`),
   ];
 
+  // Keep the measured values inside the narrowest amount ABI used by this
+  // transition. For example, 1000 is not a valid uint8 argument even though
+  // it fits the planner's JavaScript number representation.
+  const transitionUintWidths=[inflowFn,outflowFn].flatMap((fn:any)=>(fn.parameters||[])
+    .map((parameter:any)=>canonicalAbiType(parameter.typeName)||'')
+    .map((type:string)=>/^uint([0-9]+)?$/.exec(type))
+    .filter((match):match is RegExpExecArray=>match!==null)
+    .map((match:RegExpExecArray)=>match[1]?Number(match[1]):256));
+  const narrowTransitionAmounts=transitionUintWidths.some(width=>width<10);
+  const inflowAmount=narrowTransitionAmounts?'100':'1000';
+  const outflowAmount=narrowTransitionAmounts?'40':'400';
+  const expectedRemainder=narrowTransitionAmounts?'60':'600';
+
   // Classify external contract/interface/token calls inside the inflow/outflow pair.
   // Acquired-source ERC20 token fixtures can be deployed locally; all other external
   // protocol interfaces (IComptroller, ILendingPool, IExternalBook, etc.) must refuse
@@ -2724,7 +2737,7 @@ export function extractSourceInvariantDescriptor(
          push.test(inflowBody) &&
          fieldDecrement.test(outflowBody)){
         return {getter:observation.getter,args:['0'],expectPath:[observation.fieldIndex],
-          baseline:'0',afterInflow:'1000',afterOutflow:'600'};
+          baseline:'0',afterInflow:inflowAmount,afterOutflow:expectedRemainder};
       }
     }
     return undefined;
@@ -2821,9 +2834,31 @@ export function extractSourceInvariantDescriptor(
   }
 
   const isUintType = (t: string) => /^uint(?:[0-9]{1,3})?$/.test(t);
-  const inflowAmount = '1000';
-  const outflowAmount = '400';
-  const expectedRemainder = '600';
+  // A source-proven scalar ledger may use protocol-specific entrypoint names
+  // (issue/redeem, create/destroy, etc.) and an actor parameter in addition
+  // to the amount. Admit only the unambiguous ABI shape of one unsigned amount
+  // plus at most one address; the source delta check below independently
+  // proves that this exact amount parameter mutates the observed ledger.
+  const scalarAmountParameter=(fn:any):any|null=>{
+    const params=fn.parameters||[];
+    const amounts=params.filter((param:any)=>
+      /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(param.typeName)||''));
+    const actors=params.filter((param:any)=>canonicalAbiType(param.typeName)==='address');
+    return amounts.length===1&&actors.length<=1&&amounts.length+actors.length===params.length
+      ?amounts[0]:null;
+  };
+  const scalarAccountingArgs=(fn:any,decl:any,amount:string):string[]|null=>{
+    const amountParam=scalarAmountParameter(fn);
+    if(!amountParam||decl.inputs.length!==(fn.parameters||[]).length)return null;
+    return (fn.parameters||[]).map((param:any,index:number)=>{
+      const type=canonicalAbiType(param.typeName);
+      if(param===amountParam)return amount;
+      if(type==='address')return '$account0';
+      return null;
+    }).every((value:string|null)=>value!==null)
+      ?(fn.parameters||[]).map((param:any)=>param===amountParam?amount:'$account0')
+      :null;
+  };
 
   let mode: SourceInvariantTransitionPlan['mode'] | null = null;
   let inflowArgs: string[] = [];
@@ -2908,6 +2943,21 @@ export function extractSourceInvariantDescriptor(
         witnesses:pairWitnesses};
     }
     mode='internal_deposit_withdraw';inflowArgs=inArgs;outflowArgs=outArgs;
+  }
+  // Source-proven scalar ledgers do not require conventional method names.
+  // This covers issuance/redemption and other paired transitions with either
+  // (uint) or (address,uint) ABIs, while refusing ambiguous or unsupported
+  // parameter shapes and requiring an exact amount-to-state source delta.
+  else if(totalReferenced&&!balanceReferenced&&!usesErc20Transfer){
+    const inArgs=scalarAccountingArgs(inflowFn,inflowDecl,inflowAmount);
+    const outArgs=scalarAccountingArgs(outflowFn,outflowDecl,outflowAmount);
+    const inAmount=scalarAmountParameter(inflowFn);
+    const outAmount=scalarAmountParameter(outflowFn);
+    if(inArgs&&outArgs&&inAmount&&outAmount&&
+      sourceExactAccountingDelta(inflowEffects,totalVarName,String(inAmount.name),'increase')&&
+      sourceExactAccountingDelta(outflowEffects,totalVarName,String(outAmount.name),'decrease')){
+      mode='internal_deposit_withdraw';inflowArgs=inArgs;outflowArgs=outArgs;
+    }
   }
   // Mode C/D: Internal or acquired-ERC20 deposit(uint256)/stake(uint256) + withdraw(uint256)/unstake(uint256)
   else if (
