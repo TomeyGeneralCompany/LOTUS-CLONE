@@ -3439,7 +3439,9 @@ export function admitSourceInvariantDescriptor(
     JSON.stringify(tp.dynamicPositionObservation.args)!=='["1"]'||
     JSON.stringify(tp.dynamicPositionObservation.argumentPath)!=='[0]'||
     JSON.stringify(tp.outflowArgs)!=='["1","$lastObservation:0",true]'||
-    (tp.dynamicPositionCompanionGetters||[]).some(g=>!/^[_A-Za-z][_A-Za-z0-9]*\(\)$/.test(g))||
+    (tp.dynamicPositionCompanionGetters||[]).some(g=>!/^[_A-Za-z][_A-Za-z0-9]*\(\)$/.test(g)||
+      !invariant.witnesses?.some(w=>w.symbol.endsWith('.'+g.slice(0,-2))&&
+        w.sourceSha256===invariant.sourceSha256))||
     new Set(tp.dynamicPositionCompanionGetters||[]).size!==(tp.dynamicPositionCompanionGetters||[]).length||
     !invariant.witnesses?.some(w=>w.symbol.endsWith('.getDeposit(uint64)')&&
       w.sourceSha256===invariant.sourceSha256)||
