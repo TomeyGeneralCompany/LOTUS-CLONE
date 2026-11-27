@@ -43,6 +43,10 @@ export interface AnalysisCandidateQueueOptions {
   maxPerFile?: number;
   /** Explicitly opt into admitting test/mock/echidna harness contracts (default: false). */
   includeTestContracts?: boolean;
+  /** Synchronous bounded heartbeat for long CPU-only queue builds. */
+  onProgress?: (progress:Readonly<{
+    completedItems:number;totalItems:number;candidates:number;blocked:number;currentPath:string;
+  }>)=>void;
 }
 
 export interface AnalysisCandidateQueueResult {
@@ -251,6 +255,13 @@ export function buildAnalysisCandidateQueue(
     }
   }
 
+  let completedItems=0;
+  const reportItemProgress=(path:string)=>{
+    completedItems++;
+    if(completedItems%4===0||completedItems===options.items.length)
+      options.onProgress?.({completedItems,totalItems:options.items.length,
+        candidates:rawCandidates.length,blocked:blocked.length,currentPath:path});
+  };
   for (const item of options.items) {
     const isTestOrMock = isTestOrMockContractPath(item.path);
     if (isTestOrMock && !includeTestContracts) {
@@ -261,6 +272,7 @@ export function buildAnalysisCandidateQueue(
           reason: "test_or_mock_contract",
         });
       }
+      reportItemProgress(item.path);
       continue;
     }
 
@@ -424,6 +436,7 @@ export function buildAnalysisCandidateQueue(
         lineEnd: span.lineEnd,
       });
     }
+    reportItemProgress(item.path);
   }
 
   // Deterministic ordering: highest priority first, then path, then selector, then id

@@ -23,6 +23,7 @@ import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequen
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { buildAnalysisCandidateQueue, reconcileStagedLeadSelectors, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
+import { appendFileSync } from "node:fs";
 import { appendFile, mkdtemp, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { resolve, relative, sep, join, dirname, posix } from "node:path";
 import { createHash } from "node:crypto";
@@ -1616,13 +1617,26 @@ export async function runLocalAudit(
             unqueuedSelectors,
           });
         }
+        const candidateQueueStartedAt=Date.now();
+        await appendFile(logFile,'[ANALYSIS_CANDIDATE_QUEUE_STARTED] '+JSON.stringify({
+          sourceItems:candidateSourceItems.length,
+          sourceSelectors:candidateSourceItems.reduce((sum,item)=>sum+item.unqueuedSelectors.length,0),
+          graphEdges:deterministicProgramGraph?.edges.length||0,
+        })+'\n');
         const candidateQueue=buildAnalysisCandidateQueue({
           items:candidateSourceItems,
           staticLeads:solLeads,
           graph:deterministicProgramGraph||undefined,
           maxAdmitted:analysisBatchSize,
           maxPerFile:analysisPerFileCap,
+          onProgress:progress=>appendFileSync(logFile,
+            '[ANALYSIS_CANDIDATE_QUEUE_PROGRESS] '+JSON.stringify(progress)+'\n'),
         });
+        await appendFile(logFile,'[ANALYSIS_CANDIDATE_QUEUE_COMPLETE] '+JSON.stringify({
+          total:candidateQueue.inventory.length,blocked:candidateQueue.blocked.length,
+          admitted:candidateQueue.admitted.length,queued:candidateQueue.queued.length,
+          elapsedMs:Date.now()-candidateQueueStartedAt,
+        })+'\n');
         // Diagnose actual source-family applicability over the ORIGINAL
         // immutable lead inventory, not over whichever 78 names happen to
         // look easy. These are only CONSTRUCTED hypotheses, not EVM results.

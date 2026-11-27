@@ -591,6 +591,15 @@ contract MultiVault${idx} {
       maxAdmitted: 6,
       maxPerFile: 2,
     });
+    const queueProgress:Array<{completedItems:number;totalItems:number;candidates:number;blocked:number}>=[];
+    buildAnalysisCandidateQueue({
+      items, maxAdmitted:6, maxPerFile:2,
+      onProgress:progress=>queueProgress.push(progress),
+    });
+    assert.deepEqual(queueProgress.map(progress=>progress.completedItems),[4],
+      'Large candidate-queue work must emit a bounded heartbeat and a final inventory count');
+    assert.equal(queueProgress[0].totalItems,items.length);
+    assert.equal(queueProgress[0].candidates,12);
     assert.equal(q1.inventory.length, 12, "All 12 candidates across 4 files must be preserved");
     assert.equal(q1.admitted.length, 6, "Bounded admission must select exactly 6 candidates");
     assert.equal(q1.queued.length, 6, "Remaining 6 candidates must stay queued rather than discarded");
