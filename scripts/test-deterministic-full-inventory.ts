@@ -17,6 +17,7 @@ import {unfittedVerifierTranscript} from '../packages/security-solver/src/determ
 import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from '../packages/security-solver/src/deterministic/source-unavailability-verifier';
 import {reconcileStagedLeadSelectors} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {resolveSourceFixtureDependencies,enumerateSourceFixtureDependencies,enumerateSourceFixtureDependenciesDetailed,resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,verifyAcquiredReceiverMethods,enumerateAcquiredInheritedAbi} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {extractAccountingObservations} from '../packages/security-solver/src/deterministic/accounting-observations';
 import type {AnalysisCandidate} from '../packages/security-solver/src/deterministic/analysis-candidate-queue';
 import {constructSolidityExperiments,sourcePreparationGraph,pickFlexibleArg} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 import {buildProgramFactsGraph} from '../packages/security-solver/src/deterministic/program-facts';
@@ -1015,6 +1016,21 @@ contract InvalidWidthConsumer {
       assert.ok(invalidWidthFixture.missingDependencies.some(reason=>
         reason.includes('unsupported_constructor_type')),
         'Invalid ABI widths need a concrete fixture blocker');
+    const enumObservationSource=`pragma solidity ^0.8.20;
+contract EnumObservation {
+  enum Phase { Open, Closed }
+  mapping(Phase => uint256) private balances;
+  function balanceOf(Phase phase) external view returns (uint256) {
+    return balances[phase];
+  }
+}`;
+    const enumObservationSnapshot={path:'source-1/contracts/EnumObservation.sol',
+      content:enumObservationSource,sha256:hash(enumObservationSource)};
+    const enumObservations=extractAccountingObservations(enumObservationSnapshot,
+      'EnumObservation',[{selector:'EnumObservation.balanceOf',operation:'call',inputs:['uint8']}] as any);
+    assert.ok(enumObservations.some(o=>o.kind==='mapping'&&o.getter==='balanceOf(uint8)'&&
+      o.keyType==='uint8'&&o.stateVariable==='balances'),
+      'Accounting observations must resolve enum mapping keys to compiler ABI uint8');
     // Use explicit source-grounded require() constraints rather than a generic
     // zero constructor value for acquired transitive dependencies.
     const boundedInterface='pragma solidity ^0.8.0; interface IBounded { function ping() external; }';

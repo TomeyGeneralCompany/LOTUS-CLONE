@@ -30,6 +30,8 @@ export function extractAccountingObservations(
   const contract=(ast.children||[]).find((node:any)=>node.type==="ContractDefinition"&&node.name===contractName);
   if(!contract)return [];
   const nodes=contract.subNodes||[];
+  const topTypes=(ast.children||[]).filter((node:any)=>
+    ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(node.type));
   const states=new Map<string,any>();
   const structs=new Map<string,any[]>();
   for(const node of nodes){
@@ -38,6 +40,30 @@ export function extractAccountingObservations(
     }
     if(node.type==="StructDefinition")structs.set(node.name,node.members||[]);
   }
+  const sourceAbiType=(node:any,seen=new Set<any>()):string|null=>{
+    if(!node||seen.has(node))return null;
+    seen.add(node);
+    if(node.type==="ElementaryTypeName")return canonicalElementaryAbiType(String(node.name||''));
+    if(node.type==="ArrayTypeName"){
+      const base=sourceAbiType(node.baseTypeName,seen);if(!base)return null;
+      const length=node.length?.value===undefined?'':String(node.length.value);
+      return length&&/^\d+$/.test(length)?base+'['+length+']':length?null:base+'[]';
+    }
+    if(node.type!=="UserDefinedTypeName")return null;
+    const name=String(node.namePath||'').split('.').pop()||'';
+    const declarations=[...nodes,...topTypes].filter((item:any)=>item.name===name&&
+      ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(item.type));
+    if(declarations.length===1){
+      const definition=declarations[0];
+      if(definition.type==="EnumDefinition")return (definition.members||[]).length<=256?'uint8':null;
+      if(["UserDefinedValueTypeDefinition","TypeDefinition"].includes(definition.type))
+        return sourceAbiType(definition.underlyingType||definition.typeName,seen);
+      const fields=(definition.members||[]).map((field:any)=>sourceAbiType(field.typeName,new Set(seen)));
+      return fields.length&&fields.every(Boolean)?'('+fields.join(',')+')':null;
+    }
+    const contracts=nodes.filter((item:any)=>item.type==="ContractDefinition"&&item.name===name);
+    return contracts.length===1?'address':null;
+  };
   const out:AccountingObservation[]=[];
   const seen=new Set<string>();
   const add=(o:AccountingObservation)=>{
@@ -53,7 +79,7 @@ export function extractAccountingObservations(
     const body=fnLines.slice(line-1,last).join("\n");
     const witness=snapshot.path+":"+line+"-"+last+":"+snapshot.sha256;
     const returns=fn.returnParameters||[];
-    const resultType=returns.length===1?typeName(returns[0]?.typeName):"";
+    const resultType=returns.length===1?sourceAbiType(returns[0]?.typeName)||typeName(returns[0]?.typeName):"";
     for(const [name,state] of states){
       if(!new RegExp("\\b"+regexEscape(name)+"\\b").test(body))continue;
       const stateType=state.typeName;
@@ -73,8 +99,7 @@ export function extractAccountingObservations(
         add({kind:"external_balance",getter,keyType:"address",stateVariable:name,sourceWitness:witness});
       }
       if(stateType?.type==="Mapping"&&declaration.inputs.length===1){
-        const rawKeyType=typeName(stateType.keyType);
-        const keyType=canonicalElementaryAbiType(rawKeyType)||rawKeyType;
+        const keyType=sourceAbiType(stateType.keyType)||typeName(stateType.keyType);
         if(declaration.inputs[0]===keyType && simple(resultType))
           add({kind:"mapping",getter,keyType,stateVariable:name,sourceWitness:witness});
       }
