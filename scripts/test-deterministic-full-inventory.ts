@@ -1100,6 +1100,24 @@ contract ImportedStructObservation {
     assert.ok(importedStructObservations.some(o=>o.kind==='struct_field'&&o.fieldName==='amount'&&
       o.fieldType==='uint256'&&o.getter==='position(uint256)'),
       'Accounting observations must resolve fields of imported aliased structs from acquired source');
+    const renamedTokenInterface=`pragma solidity ^0.8.20;
+interface ITokenBalance { function balanceOf(address account) external view returns (uint256); }`;
+    const renamedTokenConsumer=`pragma solidity ^0.8.20;
+import {ITokenBalance as AcquiredToken} from "./ITokenBalance.sol";
+contract TokenBalanceObservation {
+  AcquiredToken public token;
+  function tokenBalance(address account) external view returns (uint256) { return token.balanceOf(account); }
+}`;
+    const renamedTokenInterfaceSnapshot={path:'source-1/contracts/ITokenBalance.sol',
+      content:renamedTokenInterface,sha256:hash(renamedTokenInterface)};
+    const renamedTokenConsumerSnapshot={path:'source-1/contracts/TokenBalanceObservation.sol',
+      content:renamedTokenConsumer,sha256:hash(renamedTokenConsumer)};
+    const renamedTokenObservations=extractAccountingObservations(renamedTokenConsumerSnapshot,
+      'TokenBalanceObservation',[{selector:'TokenBalanceObservation.tokenBalance',operation:'call',inputs:['address']}] as any,
+      [renamedTokenInterfaceSnapshot,renamedTokenConsumerSnapshot]);
+    assert.ok(renamedTokenObservations.some(o=>o.kind==='external_balance'&&
+      o.getter==='tokenBalance(address)'&&o.stateVariable==='token'),
+      'An aliased acquired ERC20 interface is a valid external balance readback only when its source declares balanceOf(address) view returning uint');
     const structObservationSource=`pragma solidity ^0.8.20;
 contract StructObservation {
   struct Position { uint256 amount; bool active; }

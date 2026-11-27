@@ -187,8 +187,20 @@ export function extractAccountingObservations(
       // equivalent public readback. A fee, share-price or event-only wrapper
       // cannot be interpreted as a token balance.
       const tokenType=typeName(stateType);
+      const resolvedTokenType=stateType?.type==="UserDefinedTypeName"?
+        resolveType(String(stateType.namePath||""),stateOwner.path,stateOwner.contract):null;
+      const acquiredBalanceOf=(resolvedTokenType?.node.subNodes||[]).some((candidate:any)=>
+        candidate.type==="FunctionDefinition"&&candidate.name==="balanceOf"&&
+        ["public","external"].includes(candidate.visibility)&&
+        ["view","pure"].includes(candidate.stateMutability||"")&&
+        (candidate.parameters||[]).length===1&&
+        canonicalElementaryAbiType(typeName(candidate.parameters[0]?.typeName))==="address"&&
+        (candidate.returnParameters?.length||0)===1&&
+        /^uint(?:[0-9]{1,3})?$/.test(String(canonicalElementaryAbiType(
+          typeName(candidate.returnParameters[0]?.typeName))||"")));
       const parameter=String(fn.parameters?.[0]?.name||"");
-      if(/^(?:I?ERC20|IERC20Upgradeable|ERC20Upgradeable|MockERC20|ERC20Mock)$/.test(tokenType)&&
+      if((/^(?:I?ERC20|IERC20Upgradeable|ERC20Upgradeable|MockERC20|ERC20Mock)$/.test(tokenType)||
+          acquiredBalanceOf)&&
         declaration.inputs.length===1&&declaration.inputs[0]==="address"&&
         /^[A-Za-z_][A-Za-z0-9_]*$/.test(parameter)&&
         new RegExp("\\breturn\\s+"+regexEscape(name)+
