@@ -3719,8 +3719,16 @@ function sourceDirectAssignmentExperiments(
 ):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
-  const stateVariables=nodes.filter(n=>n.type==='StateVariableDeclaration')
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=[{contract,snapshot},...inheritance.chain];
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(owner:any,node:any):boolean=>
+    (owner.contract.subNodes||[]).includes(node)||
+    (owner.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const stateVariables=allNodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>{
       const type=canonicalAbiType(v.typeName);
       return v.visibility==='public'&&identifier.test(v.name||'')&&!!type&&
@@ -3729,11 +3737,11 @@ function sourceDirectAssignmentExperiments(
     });
   if(!stateVariables.length)return [];
   const setup=resolveFlexibleSetup(snapshot,contract,
-    resolveInheritance(snapshot,contract,sources).chain,
+    inheritance.chain,
     sources,declarations,null);
   if(!setup||setup.usesToken)return [];
   const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
-  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+  for(const fn of allNodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
     ['public','external'].includes(n.visibility)&&
     !['view','pure'].includes(n.stateMutability||''))){
     if((fn.modifiers||[]).length)continue;
@@ -3756,7 +3764,8 @@ function sourceDirectAssignmentExperiments(
       d.selector.startsWith(contract.name+'.')&&
       d.selector.slice(contract.name.length+1).split('(')[0]===method&&
       d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
-    const fnText=body(snapshot.content,fn);
+    const fnSource=sourceForNode(fn);
+    const fnText=body(fnSource.content,fn);
     if(hasAnySourceAuthGuard(fn,fnText))continue;
     const statements:any[]=fn.body.statements||[];
     // Only a top-level direct assignment is considered unconditional. A
@@ -3780,7 +3789,7 @@ function sourceDirectAssignmentExperiments(
         n.type==='ExpressionStatement'&&n.expression?.type==='BinaryOperation'&&
         n.expression.left?.type==='Identifier'&&n.expression.left.name===lhs);
       if(overwritten)continue;
-      const text=body(snapshot.content,fn);
+      const text=body(fnSource.content,fn);
       if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(text))continue;
       const signature=canonicalFunctionIdentity(fn);
       const getter=lhs+'()';
@@ -3797,13 +3806,13 @@ function sourceDirectAssignmentExperiments(
       // both deployer initialization and a privileged consumer. Exercise the
       // setter from a distinct account and require the role getter to expose
       // that outsider, rather than treating any state assignment as a flaw.
-      if(stateType==='address'&&canonicalAbiType(param.typeName)==='address'&&
+      if(fnSource.path===snapshot.path&&stateType==='address'&&canonicalAbiType(param.typeName)==='address'&&
         expected==='$account2'&&!hasAnySourceAuthGuard(fn,body(snapshot.content,fn))&&
         declarations.some(d=>d.operation==='call'&&d.selector.startsWith(contract.name+'.')&&
           d.selector.slice(contract.name.length+1).split('(')[0]===lhs&&d.inputs.length===0)){
-        const constructor=nodes.find((n:any)=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body&&
+        const constructor=allNodes.find((n:any)=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body&&
           new RegExp('\\b'+lhs+'\\s*=\\s*msg\\s*\\.\\s*sender\\b')
-            .test(body(snapshot.content,n)));
+            .test(body(sourceForNode(n).content,n)));
         const consumer=(()=>{for(const peer of sources.values()){
           if(peer.path===snapshot.path)continue;
           let peerAst:any;try{peerAst=parseAstCached(peer);}catch{continue;}
@@ -3850,10 +3859,10 @@ function sourceDirectAssignmentExperiments(
               steps:outsiderSteps
             },
             witnesses:[
-              witness(snapshot,constructor,contract.name+'.constructor.'+lhs),
-              witness(snapshot,fn,contract.name+'.'+signature),
-              witness(snapshot,stmt,contract.name+'.'+signature+'.assignment'),
-              witness(snapshot,state,contract.name+'.'+lhs),
+              witness(sourceForNode(constructor),constructor,contract.name+'.constructor.'+lhs),
+              witness(fnSource,fn,contract.name+'.'+signature),
+              witness(fnSource,stmt,contract.name+'.'+signature+'.assignment'),
+              witness(sourceForNode(state),state,contract.name+'.'+lhs),
               witness(consumer.source,consumer.node,
                 consumer.contract.name+'.'+canonicalFunctionIdentity(consumer.node)+'.role-guard'),
               ...impactWitnesses
@@ -3872,9 +3881,9 @@ function sourceDirectAssignmentExperiments(
         sequence:{constructorArgs:setup.constructorArgs,
           ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
           steps},
-        witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
-          witness(snapshot,stmt,contract.name+'.'+signature+'.assignment'),
-          witness(snapshot,state,contract.name+'.'+lhs)],
+        witnesses:[witness(fnSource,fn,contract.name+'.'+signature),
+          witness(fnSource,stmt,contract.name+'.'+signature+'.assignment'),
+          witness(sourceForNode(state),state,contract.name+'.'+lhs)],
       });
     }
   }
