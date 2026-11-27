@@ -706,6 +706,19 @@ contract ImportedOverload {
       "An exact overload with a UDVT declared in another acquired source must resolve");
     assert.equal(importedTypeQueue.inventory[0].lineStart,4,
       "Imported UDVT signatures must retain the exact matching source span");
+    const invalidWidthSource=`pragma solidity ^0.8.20;
+contract InvalidIntegerWidth {
+  function set(uint7 value) external {}
+}`;
+    const invalidWidthQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/InvalidIntegerWidth.sol",sourceCommit:commitSha,
+      sourceContent:invalidWidthSource,
+      unqueuedSelectors:["InvalidIntegerWidth.set(uint7)"]
+    }]});
+    assert.equal(invalidWidthQueue.inventory.length,0,
+      "Canonical ABI resolution must reject integer widths Solidity does not define");
+    assert.equal(invalidWidthQueue.blocked[0]?.reason,
+      "exact_function_abi_signature_not_resolved");
   }
 
   // Shared Toy Accounting-Defect Contracts (Buggy vs Corrected) for Tests 9-13

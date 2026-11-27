@@ -143,8 +143,15 @@ function canonicalAbiType(type:any,sourceAst:any,depth=0,
     const name=String(type.name||"");
     if(name==="uint")return "uint256";
     if(name==="int")return "int256";
-    return /^(?:address|bool|string|bytes(?:[1-9]|[12][0-9]|3[012])?|u?int(?:[0-9]{1,3})?)$/.test(name)?
-      name:null;
+    const integer=/^(u?int)([0-9]+)$/.exec(name);
+    if(integer){
+      const width=Number(integer[2]);
+      return width>=8&&width<=256&&width%8===0?name:null;
+    }
+    if(/^(?:address|bool|string|bytes)$/.test(name))return name;
+    const fixedBytes=/^bytes([0-9]+)$/.exec(name);
+    if(fixedBytes){const width=Number(fixedBytes[1]);return width>=1&&width<=32?name:null;}
+    return null;
   }
   if(type.type==="ArrayTypeName"){
     const base=canonicalAbiType(type.baseTypeName,sourceAst,depth+1,acquiredAsts,sourcePath);

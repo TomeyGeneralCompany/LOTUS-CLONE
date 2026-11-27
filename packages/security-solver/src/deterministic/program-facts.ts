@@ -17,6 +17,7 @@ import { javaParserFactsAdapter, isJavaParserAvailable } from "./adapters/javapa
 import { isMythrilAvailable } from "./adapters/mythril-adapter";
 import { isJoernAvailable } from "./adapters/joern-adapter";
 import type { SourceSnapshot, StaticLeadHint } from "../controller-solidity-experiment-planner";
+import {canonicalElementaryAbiType} from "../solidity-abi-types";
 
 export type FactLanguage = "solidity" | "javascript" | "python" | "java" | "unknown";
 
@@ -281,7 +282,7 @@ export const solidityAstFactsAdapter: ProgramFactsAdapter = {
         let name=String(typeNode.name||"");
         if(name==="uint")name="uint256";
         else if(name==="int")name="int256";
-        if(/^(?:address|bool|bytes(?:[1-9]|[12][0-9]|3[012])?|u?int(?:[0-9]{1,3})?)$/.test(name))
+        if(canonicalElementaryAbiType(name)!==null)
           return name;
         return null;
       }

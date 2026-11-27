@@ -2,6 +2,7 @@
 import {parse} from "@solidity-parser/parser";
 import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
 import type {SolidityProbeDeclaration} from "../solidity-probe-inputs";
+import {canonicalElementaryAbiType} from "../solidity-abi-types";
 
 export type AccountingObservation =
   | {kind:"scalar";getter:string;sourceWitness:string;stateVariable:string}
@@ -18,7 +19,7 @@ const typeName=(node:any):string=>{
   if(node.type==="Mapping")return "mapping";
   return "";
 };
-const simple=(type:string)=>/^(?:u?int(?:[0-9]+)?|bool|address|bytes(?:[0-9]+)?)$/.test(type);
+const simple=(type:string)=>canonicalElementaryAbiType(type)!==null;
 const regexEscape=(v:string)=>v.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
 
 export function extractAccountingObservations(
@@ -72,7 +73,8 @@ export function extractAccountingObservations(
         add({kind:"external_balance",getter,keyType:"address",stateVariable:name,sourceWitness:witness});
       }
       if(stateType?.type==="Mapping"&&declaration.inputs.length===1){
-        const keyType=typeName(stateType.keyType);
+        const rawKeyType=typeName(stateType.keyType);
+        const keyType=canonicalElementaryAbiType(rawKeyType)||rawKeyType;
         if(declaration.inputs[0]===keyType && simple(resultType))
           add({kind:"mapping",getter,keyType,stateVariable:name,sourceWitness:witness});
       }
@@ -80,7 +82,8 @@ export function extractAccountingObservations(
          new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*;").test(body)){
         add({kind:"scalar",getter,stateVariable:name,sourceWitness:witness});
       }
-      if(stateType?.type==="ArrayTypeName"&&declaration.inputs.length===1&&/^u?int/.test(declaration.inputs[0])){
+      if(stateType?.type==="ArrayTypeName"&&declaration.inputs.length===1&&
+        /^u?int/.test(canonicalElementaryAbiType(declaration.inputs[0])||'')){
         const structName=typeName(stateType.baseTypeName);
         const fields=structs.get(structName)||[];
         if(resultType===structName&&fields.length){

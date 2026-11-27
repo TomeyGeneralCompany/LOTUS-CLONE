@@ -89,6 +89,9 @@ const {fixtureArguments}=await import("../packages/security-solver/src/solidity-
 assert.deepEqual(fixtureArguments(["uint256","address","bool","string","bytes4"]),["7","$account1",true,"TOMEY_LOCAL_PROBE","0x41414141"]);
 assert.deepEqual(fixtureArguments(["uint256[2]"]),[["7","7"]]);
 assert.equal(fixtureArguments(["CustomContract"]),null);
+assert.equal(fixtureArguments(["uint7"]),null,"invalid integer widths cannot receive executable fixtures");
+assert.equal(fixtureArguments(["int264"]),null,"out-of-range signed widths cannot receive executable fixtures");
+assert.equal(fixtureArguments(["bytes33"]),null,"fixed bytes widths above 32 cannot receive executable fixtures");
 const {buildBaselineSequence}=await import("../packages/security-solver/src/solidity-probe-inputs");
 const baselinePlan=buildBaselineSequence([
   {selector:"State.increment",operation:"send",inputs:["uint256"]},
@@ -110,11 +113,13 @@ const {SoliditySourceIndex}=await import("../packages/security-solver/src/solidi
 const solidityProbeDir=await mkdtemp(join(tmpdir(),"autohack-solidity-intent-"));
 try {
   const contract=join(solidityProbeDir,"State.sol");
-  await writeFile(contract,"pragma solidity ^0.8.20; contract State { uint256 private counter; function increment(uint256 value) public { counter += value; } function get() public view returns (uint256) { return counter; } }");
+  await writeFile(contract,"pragma solidity ^0.8.20; contract State { uint256 private counter; mapping(uint7 => uint256) public malformed; function increment(uint256 value) public { counter += value; } function get() public view returns (uint256) { return counter; } }");
   const index=new SoliditySourceIndex(solidityProbeDir);
   const menu=await index.probeMenu(contract);
   assert.ok(menu.some(item=>item.selector==="State.increment" && item.operation==="send" && item.inputs[0]==="uint256"));
   assert.ok(menu.some(item=>item.selector==="State.get" && item.operation==="call" && item.inputs.length===0));
+  assert.ok(!menu.some(item=>item.selector==="State.malformed"),
+    "source indexing must not invent a compiler ABI getter for an invalid key width");
 } finally { await rm(solidityProbeDir,{recursive:true,force:true}); }
 
 // Shared controller choice menu must cover Python, JS, and Java source.

@@ -8,6 +8,7 @@
  */
 import { createHash } from "node:crypto";
 import {summarizeEntrypointEffects} from "./entrypoint-effects";
+import {canonicalElementaryAbiType} from "../solidity-abi-types";
 import type {
   FactLanguage,
   ProgramFact,
@@ -152,7 +153,7 @@ function isNonNumericAddressOrConfigType(
   if (!rt) return false;
   // Only integer counters and mappings can represent numeric financial accounting state.
   // An `address public rewards` or contract reference is configuration/recipient state.
-  return !/^(?:u?int(?:[0-9]{1,3})?|mapping)$/i.test(rt);
+  return canonicalElementaryAbiType(rt)===null&&rt!=='mapping';
 }
 
 function isAccountingStateVar(
@@ -408,7 +409,7 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
     const sourceArithmeticDeps=rawStateDeps.filter(v=>{
       const symbol=stateVarSymbols.get(v);
       const type=symbol?.returnType?.trim()||"";
-      if(!/^(?:u?int(?:[0-9]{1,3})?|mapping)$/i.test(type))return false;
+      if(canonicalElementaryAbiType(type)===null&&type!=='mapping')return false;
       return (stateWriters.get(v)||[]).some(write=>
         (write.fn===pair.a||write.fn===pair.b)&&
         ["+=","-=","++","--"].includes(write.operator||""));

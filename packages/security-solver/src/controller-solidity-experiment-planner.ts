@@ -400,7 +400,14 @@ function canonicalAbiType(typeName:any,seen=new Set<any>()):string|null {
     if(name==='address')return 'address';
     if(name==='uint')return 'uint256';
     if(name==='int')return 'int256';
-    if(/^(?:u?int[0-9]{0,3}|bool|string|bytes(?:[0-9]{1,2})?)$/.test(name))return name;
+    const integer=/^(u?int)([0-9]+)$/.exec(name);
+    if(integer){
+      const width=Number(integer[2]);
+      return width>=8&&width<=256&&width%8===0?name:null;
+    }
+    if(/^(?:bool|string|bytes)$/.test(name))return name;
+    const fixedBytes=/^bytes([0-9]+)$/.exec(name);
+    if(fixedBytes){const width=Number(fixedBytes[1]);return width>=1&&width<=32?name:null;}
     return null;
   }
   if(typeName.type==='UserDefinedTypeName')return resolveUserAbiType(typeName,seen);

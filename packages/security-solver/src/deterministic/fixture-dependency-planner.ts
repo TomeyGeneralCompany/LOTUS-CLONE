@@ -3,6 +3,7 @@ import {parse} from "@solidity-parser/parser";
 import {createHash} from "node:crypto";
 import {posix} from "node:path";
 import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
+import {canonicalElementaryAbiType} from "../solidity-abi-types";
 type PreparedArg=string|boolean|string[]|Array<string|boolean|string[]>;
 export interface PreparedDeployment {id:string;file:string;contract:string;constructorArgs:PreparedArg[];}
 export interface FixtureSourceWitness {file:string;line:number;contract:string;sourceSha256?:string;parameter?:string;stateVariable?:string;}
@@ -157,7 +158,7 @@ function primitiveFixtureArg(type:any,nonzero=false,contract?:any,source?:Source
   if(k==="bytes")return "0x";
   const bytes=k.match(/^bytes([1-9]|[12][0-9]|3[012])$/);
   if(bytes)return "0x"+"00".repeat(Number(bytes[1]));
-  if(/^(?:u?int)(?:[0-9]{1,3})?$/.test(k))return nonzero?"1":"0";
+  if(/^u?int/.test(canonicalElementaryAbiType(k)||''))return nonzero?"1":"0";
   return null;
 }
 /** Derive a scalar fixture value from literal require() bounds in the exact
@@ -295,10 +296,7 @@ function fixtureAbiType(type:any,contract:any,depth=0,source?:SourceSnapshot,
   }
   if(type?.type!=="ElementaryTypeName")return null;
   const raw=String(type.name||"");
-  const standard=raw==="uint"?"uint256":raw==="int"?"int256":
-    raw==="address payable"?"address":raw;
-  return /^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(standard)?
-    standard:null;
+  return canonicalElementaryAbiType(raw);
 }
 function initializerStateBindings(
   node:any,source:SourceSnapshot,sources:readonly SourceSnapshot[]
@@ -946,10 +944,7 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
   }
   if(type?.type!=="ElementaryTypeName")return null;
   const t=String(type.name||"");
-  const canonical=t==="uint"?"uint256":t==="int"?"int256":
-    t==="address payable"?"address":t;
-  return /^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(canonical)?
-    canonical:null;
+  return canonicalElementaryAbiType(t);
 }
 function callableTypes(parameters:readonly any[],owner:ContractEntry,
   entries:readonly ContractEntry[]):string[]|null {

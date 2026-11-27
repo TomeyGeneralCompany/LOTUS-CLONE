@@ -5,6 +5,7 @@ import { dirname, relative, resolve, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { canonicalElementaryAbiType } from './solidity-abi-types';
 const exec = promisify(execFile);
 type Parsed = { text:string; ast:ReturnType<typeof parse> };
 type Unit = Parsed & { path:string; imports:Map<ImportDirective,Unit>; unresolved:string[] };
@@ -127,9 +128,7 @@ export class SoliditySourceIndex {
             const canonical=(t:any):string|null=>{
               if(t?.type!=='ElementaryTypeName')return null;
               const name=String(t.name||'');
-              const abi=name==='uint'?'uint256':name==='int'?'int256':
-                name==='address payable'?'address':name;
-              return /^(?:address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[012])|u?int(?:[0-9]{1,3})?)$/.test(abi)?abi:null;
+              return canonicalElementaryAbiType(name);
             };
             const keyTypes:string[]=[];
             let valueType:any=variable.typeName;
