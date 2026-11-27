@@ -126,15 +126,15 @@ try {
   assert.ok(!menu.some(item=>item.selector==="State.malformed"),
     "source indexing must not invent a compiler ABI getter for an invalid key width");
   const types=join(solidityProbeDir,"Types.sol");
-  await writeFile(types,"pragma solidity ^0.8.20; type AccountKey is uint48;");
+  await writeFile(types,"pragma solidity ^0.8.20; type AccountKey is uint48; interface IAsset {}");
   const imported=join(solidityProbeDir,"ImportedState.sol");
-  await writeFile(imported,"pragma solidity ^0.8.20; import {AccountKey as UserKey} from './Types.sol'; contract ImportedState { enum Phase { Open, Closed } struct Config { uint16 amount; bool active; } mapping(UserKey => uint256) public balances; function typed(UserKey key, Phase phase, uint256[] calldata ids, Config calldata config) external {} }");
+  await writeFile(imported,"pragma solidity ^0.8.20; import {AccountKey as UserKey, IAsset} from './Types.sol'; contract ImportedState { enum Phase { Open, Closed } struct Config { uint16 amount; bool active; } mapping(UserKey => uint256) public balances; function typed(UserKey key, Phase phase, uint256[] calldata ids, Config calldata config, IAsset asset) external {} }");
   const importedMenu=await index.probeMenu(imported);
   assert.ok(importedMenu.some(item=>item.selector==="ImportedState.balances"&&item.inputs[0]==="uint48"),
     "aliased imported value type mapping getters must use the acquired underlying ABI type");
   assert.deepEqual(importedMenu.find(item=>item.selector==="ImportedState.typed")?.inputs,
-    ["uint48","uint8","uint256[]","(uint16,bool)"],
-    "function probe inputs must be canonical ABI types for imported values, enums, arrays, and structs");
+    ["uint48","uint8","uint256[]","(uint16,bool)","address"],
+    "function probe inputs must be canonical ABI types for imported values, contracts, enums, arrays, and structs");
 } finally { await rm(solidityProbeDir,{recursive:true,force:true}); }
 
 // Shared controller choice menu must cover Python, JS, and Java source.
