@@ -636,6 +636,45 @@ for (const [name, code] of [['BuggyAccountingVault', buggyVaultSrc], ['FixedAcco
   }
 }
 
+// A source-proven principal ledger remains testable when a separate fee
+// accumulator changes during deposit. The experiment must target principal
+// conservation without silently treating fees as principal.
+const feeAwareLedgerSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract FeeAwareLedger {
+    uint256 public totalDeposits;
+    uint256 public accruedFees;
+    function deposit(uint256 amount) external {
+        uint256 fee = amount / 10;
+        accruedFees += fee;
+        totalDeposits += amount;
+    }
+    function withdraw(uint256 amount) external {
+        totalDeposits -= amount;
+    }
+}`;
+const feeAwareLedgerRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: 'contracts/FeeAwareLedger.sol',
+  targetSelector: 'FeeAwareLedger.withdraw',
+  sources: [{path: 'contracts/FeeAwareLedger.sol', sha256: createHash('sha256').update(feeAwareLedgerSrc).digest('hex'), content: feeAwareLedgerSrc}],
+  declarations: [
+    {selector: 'FeeAwareLedger.deposit', operation: 'send', inputs: ['uint256']},
+    {selector: 'FeeAwareLedger.withdraw', operation: 'send', inputs: ['uint256']},
+    {selector: 'FeeAwareLedger.totalDeposits', operation: 'call', inputs: []},
+    {selector: 'FeeAwareLedger.accruedFees', operation: 'call', inputs: []},
+  ],
+});
+assert.equal(feeAwareLedgerRes.ok, true, 'A fee accumulator must not block principal-ledger conservation');
+if (feeAwareLedgerRes.ok) {
+  const principalExperiment = feeAwareLedgerRes.experiments.find((e) => e.securityProperty === 'financial conservation invariant (deposit->withdraw)');
+  assert.ok(principalExperiment, 'Fee-bearing deposit must retain a principal conservation experiment');
+  assert.ok(principalExperiment!.sequence.steps.some((s) => s.operation === 'call' && s.function === 'totalDeposits()' && s.expect === '600'),
+    'Principal conservation must assert totalDeposits() == 600');
+  assert.ok(!principalExperiment!.sequence.steps.some((s) => s.operation === 'call' && s.function === 'accruedFees()'),
+    'Principal experiment must not assert an unmodeled fee ledger');
+}
+
 // Internal collection helpers need to feed both source-backed pair discovery
 // and the observable length getter. The asserted transition must be 0 -> 1 -> 0.
 {

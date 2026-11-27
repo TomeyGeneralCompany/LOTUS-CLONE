@@ -2481,6 +2481,16 @@ function sourceExactAccountingDelta(
       "\\b|\\.\\s*"+method+"\\s*\\(\\s*"+value+"\\s*\\))").test(text);
 }
 
+/** Number of writes to one source state symbol in a reachable method closure.
+ * Used to reject an exact-looking delta when the same operation also mutates
+ * that ledger through a second, unmodeled path. */
+function sourceAccountingWriteCount(text:string,state:string):number {
+  if(!identifier.test(state))return 0;
+  const escape=state.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const write=new RegExp('\\b'+escape+'(?:\\s*\\[[^\\]\\n]{1,128}\\]){0,2}\\s*(?:\\+=|-=|=(?!=))','g');
+  return [...text.matchAll(write)].length;
+}
+
 export function extractSourceInvariantDescriptor(
   snapshot: SourceSnapshot,
   contract: any,
@@ -2705,9 +2715,24 @@ export function extractSourceInvariantDescriptor(
     ...effects.get(counterpart.fn)!.plus,...effects.get(counterpart.fn)!.minus,
   ]);
   const accountingStateVars=stateDecls.filter((v:any)=>pairedStates.has(String(v.name)));
-  const publicTotal=accountingStateVars.find((v:any)=>v.visibility==="public"&&
+  const amountParameter=(fn:any)=>{
+    const params=(fn.parameters||[]).filter((param:any)=>
+      /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(param.typeName)||''));
+    const named=params.filter((param:any)=>
+      /^(?:amount|amt|value|wad|qty|quantity|principal|shares|tokens?)$/i.test(String(param.name||'')));
+    return String((named.length===1?named[0]:params[params.length-1])?.name||'');
+  };
+  const inflowAmountParameter=amountParameter(inflowFn);
+  const publicTotalCandidateNames=[...new Set(accountingStateVars.filter((v:any)=>v.visibility==="public"&&
     v.typeName?.type==="ElementaryTypeName"&&
-    /^uint(?:[0-9]+)?$/.test(String(v.typeName.name||"")));
+    /^uint(?:[0-9]+)?$/.test(String(canonicalAbiType(v.typeName)||""))&&
+    ((!!inflowAmountParameter&&sourceExactAccountingDelta(inflowEffects,
+      String(v.name),inflowAmountParameter,'increase'))||
+      (inflowFn.stateMutability==='payable'&&inflowFn.parameters.length===0&&
+       sourceExactAccountingDelta(inflowEffects,String(v.name),'msg.value','increase'))))
+    .map((v:any)=>String(v.name)))];
+  const publicTotal=publicTotalCandidateNames.length===1?
+    accountingStateVars.find((v:any)=>v.name===publicTotalCandidateNames[0]):undefined;
   const publicBalance=accountingStateVars.find((v:any)=>{
     if(v.visibility!=="public"||v.typeName?.type!=="Mapping"||
       !/^uint(?:[0-9]{1,3})?$/.test(String(canonicalAbiType(v.typeName.valueType)||"")))return false;
@@ -2994,22 +3019,17 @@ export function extractSourceInvariantDescriptor(
   // proves direct matching updates without fees, exchange rates or accrual.
   // Contracts with dynamic economics require a separate measured property.
   const accountingTarget=totalReferenced?totalVarName:balanceReferenced?balanceVarName:'';
-  const amountParameter=(fn:any)=>{
-    const params=(fn.parameters||[]).filter((param:any)=>
-      /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(param.typeName)||''));
-    const named=params.filter((param:any)=>
-      /^(?:amount|amt|value|wad|qty|quantity|principal|shares|tokens?)$/i.test(String(param.name||'')));
-    return String((named.length===1?named[0]:params[params.length-1])?.name||'');
-  };
-  const inflowParameter=amountParameter(inflowFn);
+  const inflowParameter=inflowAmountParameter;
   const outflowParameter=amountParameter(outflowFn);
   const directlyProven=accountingTarget&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(accountingTarget)&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(inflowParameter)&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(outflowParameter)&&
+    sourceAccountingWriteCount(inflowEffects,accountingTarget)===1&&
+    sourceAccountingWriteCount(outflowEffects,accountingTarget)===1&&
     sourceExactAccountingDelta(inflowEffects,accountingTarget,inflowParameter,"increase")&&
     sourceExactAccountingDelta(outflowEffects,accountingTarget,outflowParameter,"decrease")&&
-    !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
+    totalReferenced;
   // A payable deposit and ETH withdrawal can independently establish
   // conservation from the caller balance and the actual transferred value.
   // This detects a missing aggregate-ledger decrement (the BuggyVault case)
