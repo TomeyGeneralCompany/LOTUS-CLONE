@@ -3340,7 +3340,11 @@ function sourceMappingDeltaExperiments(
   const maps=nodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>
       v.visibility==='public'&&identifier.test(v.name||'')&&
-      v.typeName?.type==='Mapping'&&v.typeName.keyType?.name==='address'&&
+      v.typeName?.type==='Mapping'&&
+      ['address',...(canonicalAbiType(v.typeName.keyType)&&
+        /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(v.typeName.keyType)!)?
+          [canonicalAbiType(v.typeName.keyType)!]:[])].includes(
+            canonicalAbiType(v.typeName.keyType)||'')&&
       v.typeName.valueType?.type==='ElementaryTypeName'&&
       /^uint(?:[0-9]{1,3})?$/.test(String(v.typeName.valueType.name||'')));
   if(!maps.length)return [];
@@ -3367,8 +3371,15 @@ function sourceMappingDeltaExperiments(
       identifier.test(p.name||'')&&/^uint(?:[0-9]{1,3})?$/.test(types[i]||''));
     const accountKeys=params.filter((p,i)=>
       identifier.test(p.name||'')&&types[i]==='address').map(p=>p.name);
-    for(const variable of maps)for(const key of ['msg.sender',...accountKeys]){
+    for(const variable of maps){
+      const mappingKeyType=canonicalAbiType(variable.typeName.keyType);
+      if(!mappingKeyType)continue;
+      const candidateKeys=mappingKeyType==='address'?['msg.sender',...accountKeys]:
+        params.filter((p:any,i:number)=>types[i]===mappingKeyType&&
+          identifier.test(p.name||'')).map((p:any)=>String(p.name));
+      for(const key of candidateKeys){
       for(const amountParam of numeric){
+        if(key===amountParam.name)continue;
         if(!sourceExactAccountingDelta(methodSource,variable.name,
           amountParam.name,'increase',key))continue;
         const args:SolidityArgValue[]=[];
@@ -3376,14 +3387,17 @@ function sourceMappingDeltaExperiments(
         for(let i=0;i<params.length;i++){
           const p=params[i];
           const value:SolidityArgValue|null=
-            p.name===amountParam.name?'1':p.name===key?'$account2':
+            p.name===amountParam.name?'1':p.name===key?
+              (mappingKeyType==='address'?'$account2':'1'):
               pickFlexibleArg(types[i]||'',p.name||'',
                 {ownerAccount:'$account0',amount:'1'});
           if(value===null){supported=false;break;}
           args.push(value);
         }
         if(!supported)continue;
-        const targetKey=key==='msg.sender'?'$account0':'$account2';
+        const targetKey=key==='msg.sender'?'$account0':
+          args[params.findIndex((p:any)=>p.name===key)];
+        if(targetKey===undefined)continue;
         const signature=canonicalFunctionIdentity(fn);
         // A checked increase with an acquired supply precondition must be
         // funded before testing. Executing it against zero supply yields a
@@ -3404,6 +3418,10 @@ function sourceMappingDeltaExperiments(
             sourceExactAccountingDelta(methodSource,total.name,amountParam.name,'decrease');
         });
         if(constrained){
+          // The paired funding constructor below is source-proven only for
+          // address-keyed liabilities; numeric-key ledgers use the direct
+          // exact-key path unless a separate funding strategy is constructed.
+          if(mappingKeyType!=='address')continue;
           const candidate=nodes.filter(n=>n.type==='FunctionDefinition'&&
             n.name!==method&&n.body&&['external','public'].includes(n.visibility)&&
             !(n.modifiers||[]).length&&(n.parameters||[]).length===2);
@@ -3469,10 +3487,11 @@ function sourceMappingDeltaExperiments(
         if(setup.initSignature)steps.push({
           operation:'send',function:setup.initSignature,args:setup.initArgs,
           sender:0,requiredSetup:true});
-        steps.push({operation:'call',function:variable.name+'(address)',
+        const getter=variable.name+'('+mappingKeyType+')';
+        steps.push({operation:'call',function:getter,
           args:[targetKey],expect:'0'});
         steps.push({operation:'send',function:signature,args,sender:0});
-        steps.push({operation:'call',function:variable.name+'(address)',
+        steps.push({operation:'call',function:getter,
           args:[targetKey],expect:'1'});
         out.push({
           hypothesis:'Source-declared update must add 1 to the exact '+
@@ -3488,6 +3507,7 @@ function sourceMappingDeltaExperiments(
             witness(snapshot,variable,contract.name+'.'+variable.name)],
         });
       }
+    }
     }
   }
   return out;

@@ -2496,6 +2496,28 @@ contract DirectMap {
       e.securityProperty.includes('mapping conservation')&&
       e.securityProperty.endsWith(':recipient')),
       'Crediting msg.sender must not prove a credit to recipient');
+    const indexedMapText=`pragma solidity ^0.8.20;
+contract IndexedMap {
+  mapping(uint64 => uint256) public credits;
+  function credit(uint64 index,uint256 amount) external { credits[index] += amount; }
+}`;
+    const indexedMap={path:'source-1/contracts/IndexedMap.sol',content:indexedMapText,
+      sha256:hash(indexedMapText)};
+    const indexedMapPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:indexedMap.path,
+      targetSelector:'IndexedMap.credit',sources:[indexedMap],
+      declarations:[
+        {selector:'IndexedMap.credit',operation:'send' as const,inputs:['uint64','uint256']}
+      ] as any,skipLegacy:true});
+    assert.equal(indexedMapPlan.ok,true,
+      'Exact numeric mapping keys must receive source-backed accounting experiments');
+    if(indexedMapPlan.ok)assert.ok(indexedMapPlan.experiments.some(e=>
+      e.securityProperty.includes('mapping conservation')&&
+      e.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='credits(uint64)'&&JSON.stringify(step.args)===JSON.stringify(['1']))&&
+      e.sequence.steps.some(step=>step.operation==='send'&&step.function==='credit(uint64,uint256)'&&
+        JSON.stringify(step.args)===JSON.stringify(['1','1']))),
+      'Experiment must use the same source-declared uint64 key in the call and compiler-generated getter');
 
     // An owner authorization conclusion must follow the actual source
     // require(msg.sender == acquired owner storage) and the exact state write.
