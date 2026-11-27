@@ -2518,6 +2518,28 @@ contract IndexedMap {
       e.sequence.steps.some(step=>step.operation==='send'&&step.function==='credit(uint64,uint256)'&&
         JSON.stringify(step.args)===JSON.stringify(['1','1']))),
       'Experiment must use the same source-declared uint64 key in the call and compiler-generated getter');
+    const enumMapText=`pragma solidity ^0.8.20;
+contract EnumMap {
+  enum Phase { Open }
+  mapping(Phase => uint256) public credits;
+  function credit(Phase phase,uint256 amount) external { credits[phase] += amount; }
+}`;
+    const enumMap={path:'source-1/contracts/EnumMap.sol',content:enumMapText,
+      sha256:hash(enumMapText)};
+    const enumMapPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:enumMap.path,
+      targetSelector:'EnumMap.credit',sources:[enumMap],
+      declarations:[{selector:'EnumMap.credit',operation:'send' as const,
+        inputs:['uint8','uint256']}] as any,skipLegacy:true});
+    assert.equal(enumMapPlan.ok,true,
+      'Enum-keyed mapping increments must use a valid compiler ABI key');
+    if(enumMapPlan.ok)assert.ok(enumMapPlan.experiments.some(e=>
+      e.securityProperty.includes('mapping conservation')&&
+      e.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='credits(uint8)'&&JSON.stringify(step.args)===JSON.stringify(['0']))&&
+      e.sequence.steps.some(step=>step.operation==='send'&&step.function==='credit(uint8,uint256)'&&
+        JSON.stringify(step.args)===JSON.stringify(['0','1']))),
+      'A single-member enum key must be zero, not an invalid synthetic one');
 
     // An owner authorization conclusion must follow the actual source
     // require(msg.sender == acquired owner storage) and the exact state write.

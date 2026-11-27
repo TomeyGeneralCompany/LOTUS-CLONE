@@ -3380,6 +3380,15 @@ function sourceMappingDeltaExperiments(
       for(const key of candidateKeys){
       for(const amountParam of numeric){
         if(key===amountParam.name)continue;
+        const keyParameter=key==='msg.sender'?null:
+          params.find((p:any)=>p.name===key);
+        const enumCardinality=keyParameter?enumAbiCardinality(keyParameter.typeName):null;
+        const keyConstraints=keyParameter?
+          collectParamConstraints(fn.body,new Set([key])).get(key)||new Set():new Set();
+        if(enumCardinality!==null&&(enumCardinality<1||
+          (enumCardinality===1&&(keyConstraints.has('gt_zero')||keyConstraints.has('nonzero')))))continue;
+        const numericKeyValue=enumCardinality!==null?
+          String(Math.min(1,enumCardinality-1)):'1';
         if(!sourceExactAccountingDelta(methodSource,variable.name,
           amountParam.name,'increase',key))continue;
         const args:SolidityArgValue[]=[];
@@ -3388,7 +3397,7 @@ function sourceMappingDeltaExperiments(
           const p=params[i];
           const value:SolidityArgValue|null=
             p.name===amountParam.name?'1':p.name===key?
-              (mappingKeyType==='address'?'$account2':'1'):
+              (mappingKeyType==='address'?'$account2':numericKeyValue):
               pickFlexibleArg(types[i]||'',p.name||'',
                 {ownerAccount:'$account0',amount:'1'});
           if(value===null){supported=false;break;}
