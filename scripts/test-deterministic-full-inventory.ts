@@ -2249,6 +2249,35 @@ contract HelperChild is HelperBase {}`;
       experiment.witnesses.some(w=>w.sourceSha256===inheritedHelperBase.sha256&&
         w.symbol.includes('_set'))),
       'Inherited helper and state witnesses must use the base source hash');
+    const inheritedPairBaseText=`pragma solidity ^0.8.20;
+contract PairBase {
+  uint256 private held;
+  function remaining() external view returns(uint256) { return held; }
+  function increase(uint256 amount) external { held += amount; }
+  function decrease(uint256 amount) external { held -= amount; }
+}`;
+    const inheritedPairChildText=`pragma solidity ^0.8.20;
+import "./PairBase.sol";
+contract PairChild is PairBase {}`;
+    const inheritedPairBase={path:'source-1/contracts/PairBase.sol',
+      content:inheritedPairBaseText,sha256:hash(inheritedPairBaseText)};
+    const inheritedPairChild={path:'source-1/contracts/PairChild.sol',
+      content:inheritedPairChildText,sha256:hash(inheritedPairChildText)};
+    const inheritedPairPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:inheritedPairChild.path,
+      targetSelector:'PairChild.increase',
+      sources:[inheritedPairBase,inheritedPairChild],
+      declarations:[
+        {selector:'PairChild.remaining',operation:'call',inputs:[]},
+        {selector:'PairChild.increase',operation:'send',inputs:['uint256']},
+        {selector:'PairChild.decrease',operation:'send',inputs:['uint256']}
+      ] as any,skipLegacy:true});
+    assert.equal(inheritedPairPlan.ok,true,
+      'Inherited private scalar transitions must preserve their exact source readback');
+    if(inheritedPairPlan.ok)assert.ok(inheritedPairPlan.experiments.some(experiment=>
+      experiment.securityProperty.startsWith('source-paired scalar conservation')&&
+      experiment.witnesses.some(w=>w.sourceSha256===inheritedPairBase.sha256)),
+      'An inherited conservation pair must retain the state and transition base hash');
     const inheritedOwnerBaseText=`pragma solidity ^0.8.20;
 contract OwnerBase {
   address public administrator;

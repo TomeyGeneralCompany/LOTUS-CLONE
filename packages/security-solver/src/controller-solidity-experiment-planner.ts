@@ -4462,7 +4462,15 @@ function sourcePairedScalarConservationExperiments(
 ):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=inheritance.chain;
+  const nodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(entry:any,node:any):boolean=>
+    (entry.contract.subNodes||[]).includes(node)||
+    (entry.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
   const stateVars=nodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>
       identifier.test(v.name||'')&&!v.expression&&
@@ -4471,10 +4479,10 @@ function sourcePairedScalarConservationExperiments(
   if(!stateVars.length)return [];
   const observations=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
   const setup=resolveFlexibleSetup(snapshot,contract,
-    resolveInheritance(snapshot,contract,sources).chain,
+    inheritance.chain,
     sources,declarations,null);
   if(!setup||setup.usesToken)return [];
-  const ctor=nodes.find(n=>n.type==='FunctionDefinition'&&n.isConstructor);
+  const ctors=nodes.filter(n=>n.type==='FunctionDefinition'&&n.isConstructor);
   const init=nodes.find(n=>n.type==='FunctionDefinition'&&
     /^(?:initialize|init)$/.test(n.name||'')&&n.body);
   const entries=nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&
@@ -4488,7 +4496,7 @@ function sourcePairedScalarConservationExperiments(
       d.operation==='send'&&
       JSON.stringify(d.inputs)===JSON.stringify([canonicalAbiType(n.parameters[0].typeName)])))
     .filter(n=>{
-      const text=body(snapshot.content,n);
+      const text=body(sourceForNode(n).content,n);
       return !hasAnySourceAuthGuard(n,text)&&
         !/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(text)&&
         !/\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(text);
@@ -4501,19 +4509,19 @@ function sourcePairedScalarConservationExperiments(
       observations.find(o=>o.kind==='scalar'&&o.stateVariable===state.name)?.getter;
     if(!getter)continue;
     const mutation=new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)');
-    if((ctor&&mutation.test(body(snapshot.content,ctor)))||
-      (init&&mutation.test(body(snapshot.content,init))))continue;
+    if(ctors.some(ctor=>mutation.test(body(sourceForNode(ctor).content,ctor)))||
+      (init&&mutation.test(body(sourceForNode(init).content,init))))continue;
     const readback=nodes.find(n=>n.type==='FunctionDefinition'&&
-      n.name===getter.split('(')[0]&&n.body);
+      n.name===getter.split('(')[0]&&n.body&&canonicalFunctionIdentity(n)===getter);
     for(const increase of entries){
       const inParam=increase.parameters[0].name;
-      if(!sourceExactAccountingDelta(body(snapshot.content,increase),
+      if(!sourceExactAccountingDelta(body(sourceForNode(increase).content,increase),
         state.name,inParam,'increase'))continue;
       for(const decrease of entries){
         if(increase===decrease||!
           [increase.name,decrease.name].includes(method))continue;
         const outParam=decrease.parameters[0].name;
-        if(!sourceExactAccountingDelta(body(snapshot.content,decrease),
+        if(!sourceExactAccountingDelta(body(sourceForNode(decrease).content,decrease),
           state.name,outParam,'decrease'))continue;
         const inSig=canonicalFunctionIdentity(increase),
           outSig=canonicalFunctionIdentity(decrease);
@@ -4534,10 +4542,11 @@ function sourcePairedScalarConservationExperiments(
           sequence:{constructorArgs:setup.constructorArgs,
             ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
             steps},
-          witnesses:[witness(snapshot,increase,contract.name+'.'+inSig),
-            witness(snapshot,decrease,contract.name+'.'+outSig),
-            witness(snapshot,state,contract.name+'.'+state.name),
-            ...(readback?[witness(snapshot,readback,contract.name+'.'+getter)]:[])],
+          witnesses:[witness(sourceForNode(increase),increase,contract.name+'.'+inSig),
+            witness(sourceForNode(decrease),decrease,contract.name+'.'+outSig),
+            witness(sourceForNode(state),state,contract.name+'.'+state.name),
+            ...(readback?[witness(sourceForNode(readback),readback,
+              contract.name+'.'+getter)]:[])],
         });
       }
     }
