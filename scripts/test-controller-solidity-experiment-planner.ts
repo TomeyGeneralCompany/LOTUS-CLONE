@@ -158,6 +158,10 @@ assert.equal(pickFlexibleArg('uint8','amount'),'255',
   'uint8 probe values must fit the exact ABI width');
 assert.equal(pickFlexibleArg('uint8','status'),'0',
   'Enum parameters use a valid zero-based ordinal rather than an out-of-range int width');
+assert.equal(pickFlexibleArg('uint8','maturityTimestamp'),null,
+  'An ABI that cannot represent a future timestamp must remain an explicit fixture failure');
+assert.equal(pickFlexibleArg('uint32','maturityTimestamp'),'2000000000',
+  'An absolute timestamp fixture must be future-dated relative to the deterministic EVM clock');
 
 const a=constructSolidityExperiments(input);
 assert.equal(a.ok,true,JSON.stringify(a));
