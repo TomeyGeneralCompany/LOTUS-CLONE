@@ -2850,7 +2850,7 @@ export function extractSourceInvariantDescriptor(
   const scalarAccountingArgs=(fn:any,decl:any,amount:string):string[]|null=>{
     const amountParam=scalarAmountParameter(fn);
     if(!amountParam||decl.inputs.length!==(fn.parameters||[]).length)return null;
-    return (fn.parameters||[]).map((param:any,index:number)=>{
+    return (fn.parameters||[]).map((param:any)=>{
       const type=canonicalAbiType(param.typeName);
       if(param===amountParam)return amount;
       if(type==='address')return '$account0';
@@ -3399,8 +3399,16 @@ function sourceMappingDeltaExperiments(
 ):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
-  const maps=nodes.filter(n=>n.type==='StateVariableDeclaration')
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=[{contract,snapshot},...inheritance.chain];
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(owner:any,node:any):boolean=>
+    (owner.contract.subNodes||[]).includes(node)||
+    (owner.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const maps=allNodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>
       v.visibility==='public'&&identifier.test(v.name||'')&&
       v.typeName?.type==='Mapping'&&
@@ -3412,10 +3420,10 @@ function sourceMappingDeltaExperiments(
       /^uint(?:[0-9]{1,3})?$/.test(String(v.typeName.valueType.name||'')));
   if(!maps.length)return [];
   const setup=resolveFlexibleSetup(snapshot,contract,
-    resolveInheritance(snapshot,contract,sources).chain,sources,declarations,null);
+    inheritance.chain,sources,declarations,null);
   if(!setup||setup.usesToken)return [];
   const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
-  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&
+  for(const fn of allNodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&
     n.name===method&&['public','external'].includes(n.visibility)&&
     !['view','pure'].includes(n.stateMutability||''))){
     if((fn.modifiers||[]).length)continue;
@@ -3425,7 +3433,8 @@ function sourceMappingDeltaExperiments(
     if(types.some(x=>!x)||!declarations.some(d=>
       d.selector===contract.name+'.'+fn.name&&d.operation==='send'&&
       JSON.stringify(d.inputs)===JSON.stringify(types)))continue;
-    const methodSource=body(snapshot.content,fn);
+    const fnSource=sourceForNode(fn);
+    const methodSource=body(fnSource.content,fn);
     // Calls into an external protocol need a separately proven receiver and
     // preparation. Pure SafeMath operations on the same lvalue are allowed.
     if(/\b(?!msg\b|block\b|abi\b|SafeMath\b)[A-Za-z_]\w*\s*\.\s*(?!add\b|sub\b)[A-Za-z_]\w*\s*\(/.test(methodSource)||
@@ -3476,7 +3485,7 @@ function sourceMappingDeltaExperiments(
         // revert observation, not an experiment on its source-defined branch.
         // Admit a funding pathway only when both independent storage writes
         // and the guard are visible in the same acquired contract.
-        const totals=nodes.filter(n=>n.type==='StateVariableDeclaration')
+        const totals=allNodes.filter(n=>n.type==='StateVariableDeclaration')
           .flatMap(n=>n.variables||[]).filter((v:any)=>
             v.visibility==='public'&&identifier.test(v.name||'')&&
             v.typeName?.type==='ElementaryTypeName'&&
@@ -3494,7 +3503,7 @@ function sourceMappingDeltaExperiments(
           // address-keyed liabilities; numeric-key ledgers use the direct
           // exact-key path unless a separate funding strategy is constructed.
           if(mappingKeyType!=='address')continue;
-          const candidate=nodes.filter(n=>n.type==='FunctionDefinition'&&
+          const candidate=allNodes.filter(n=>n.type==='FunctionDefinition'&&
             n.name!==method&&n.body&&['external','public'].includes(n.visibility)&&
             !(n.modifiers||[]).length&&(n.parameters||[]).length===2);
           const acquiredFunding=candidate.flatMap((fund:any)=>{
@@ -3508,7 +3517,8 @@ function sourceMappingDeltaExperiments(
               d.operation==='send'&&JSON.stringify(d.inputs)===
                 JSON.stringify([canonicalAbiType(p[0].typeName),canonicalAbiType(p[1].typeName)])))
               return [];
-            const text=body(snapshot.content,fund);
+            const fundSource=sourceForNode(fund);
+            const text=body(fundSource.content,fund);
             const bound=text.match(new RegExp(
               String.raw`\buint(?:256)?\s+([A-Za-z_]\w*)\s*=\s*`+
               p[1].name+String.raw`\s*\.\s*bounded\s*\(`));
@@ -3548,10 +3558,11 @@ function sourceMappingDeltaExperiments(
             sequence:{constructorArgs:setup.constructorArgs,
               ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
               steps:prepared},
-            witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
-              witness(snapshot,variable,contract.name+'.'+variable.name),
-              witness(snapshot,constrained,contract.name+'.'+constrained.name),
-              witness(snapshot,evidence.fund,contract.name+'.'+evidence.signature)],
+            witnesses:[witness(fnSource,fn,contract.name+'.'+signature),
+              witness(sourceForNode(variable),variable,contract.name+'.'+variable.name),
+              witness(sourceForNode(constrained),constrained,contract.name+'.'+constrained.name),
+              witness(sourceForNode(evidence.fund),evidence.fund,
+                contract.name+'.'+evidence.signature)],
           });
           continue;
         }
@@ -3575,8 +3586,8 @@ function sourceMappingDeltaExperiments(
             ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
             steps},
           witnesses:[
-            witness(snapshot,fn,contract.name+'.'+signature),
-            witness(snapshot,variable,contract.name+'.'+variable.name)],
+            witness(fnSource,fn,contract.name+'.'+signature),
+            witness(sourceForNode(variable),variable,contract.name+'.'+variable.name)],
         });
       }
     }
