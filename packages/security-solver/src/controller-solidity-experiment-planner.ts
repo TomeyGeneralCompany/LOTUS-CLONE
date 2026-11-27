@@ -5286,4 +5286,9 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   const previous=activeAbiTypeDefinitions;
   try{
     const validSources=Array.isArray(input?.sources)&&input.sources.every(source=>
-      source&&typeof source.path==="string"&&typeof sou
+      source&&typeof source.path==="string"&&typeof source.content==="string"&&
+      /^[a-f0-9]{64}$/.test(source.sha256)&&hash(source.content)===source.sha256);
+    activeAbiTypeDefinitions=validSources?buildAbiTypeDefinitions(input.sources):new Map();
+    return constructSolidityExperimentsCore(input);
+  }finally{activeAbiTypeDefinitions=previous;}
+}
