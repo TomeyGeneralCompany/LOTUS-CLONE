@@ -133,6 +133,57 @@ type LocatedFunctionSpan = {
   span: { start:number; end:number; lineStart:number; lineEnd:number; excerpt:string; truncated:boolean };
 } | { reason:string };
 
+function canonicalAbiType(type:any,sourceAst:any,depth=0):string|null {
+  if(!type||depth>16)return null;
+  if(type.type==="ElementaryTypeName"){
+    const name=String(type.name||"");
+    if(name==="uint")return "uint256";
+    if(name==="int")return "int256";
+    return /^(?:address|bool|string|bytes(?:[1-9]|[12][0-9]|3[012])?|u?int(?:[0-9]{1,3})?)$/.test(name)?
+      name:null;
+  }
+  if(type.type==="ArrayTypeName"){
+    const base=canonicalAbiType(type.baseTypeName,sourceAst,depth+1);
+    if(!base)return null;
+    const length=type.length?.value===undefined?"":String(type.length.value);
+    if(length&&!/^\d+$/.test(length))return null;
+    return base+"["+length+"]";
+  }
+  if(type.type!=="UserDefinedTypeName")return null;
+  const fullName=String(type.namePath||"");
+  const name=fullName.split(".").pop()||"";
+  const definitions:any[]=[];
+  for(const top of sourceAst?.children||[]){
+    if(top.type==="ContractDefinition"){
+      for(const child of top.subNodes||[]){
+        if(child.name===name&&["StructDefinition","EnumDefinition"].includes(child.type))
+          definitions.push(child);
+      }
+    }else if(top.type==="TypeDefinition"&&top.name===name){
+      definitions.push(top.definition);
+    }else if(top.type==="ContractDefinition"&&top.name===name){
+      definitions.push(top);
+    }
+  }
+  if(definitions.length!==1)return null;
+  const definition=definitions[0];
+  if(definition.type==="EnumDefinition")return "uint8";
+  if(definition.type==="ContractDefinition")return "address";
+  if(definition.type==="StructDefinition"){
+    const members=(definition.members||[]).map((member:any)=>
+      canonicalAbiType(member.typeName,sourceAst,depth+1));
+    return members.length&&members.every(Boolean)?"("+members.join(",")+")":null;
+  }
+  return canonicalAbiType(definition,sourceAst,depth+1);
+}
+
+function canonicalFunctionSignature(fn:any,sourceAst:any):string|null {
+  const inputs=(fn.parameters||[]).map((parameter:any)=>
+    canonicalAbiType(parameter.typeName,sourceAst));
+  return fn.name&&inputs.every(Boolean)?
+    String(fn.name)+"("+inputs.join(",")+")":null;
+}
+
 /**
  * Locate source declarations through the Solidity AST. Brace scanning can stop
  * inside comments or strings, and choosing the first same-name declaration is
@@ -141,8 +192,10 @@ type LocatedFunctionSpan = {
 function locateFunctionSpan(content:string,selector:string,sourceAst:any):LocatedFunctionSpan {
   const separator=selector.lastIndexOf(".");
   const contractName=separator>0?selector.slice(0,separator):"";
-  const method=selector.slice(separator+1);
-  if(!/^[A-Za-z_]\w*$/.test(contractName)||!/^[A-Za-z_]\w*$/.test(method))
+  const selectorMethod=selector.slice(separator+1);
+  const exactSignature=/^([A-Za-z_]\w*\(.*\))$/.test(selectorMethod);
+  const method=exactSignature?selectorMethod.slice(0,selectorMethod.indexOf("(")):selectorMethod;
+  if(!/^[A-Za-z_]\w*$/.test(contractName)||!(/^[A-Za-z_]\w*$/.test(method)||exactSignature))
     return {reason:"function_selector_not_canonical"};
   const contracts=(sourceAst?.children||[]).filter((node:any)=>
     node.type==="ContractDefinition"&&node.name===contractName);
@@ -151,8 +204,14 @@ function locateFunctionSpan(content:string,selector:string,sourceAst:any):Locate
     node.type==="FunctionDefinition"&&node.name===method&&!node.isConstructor&&
     !node.isFallback&&!node.isReceiveEther);
   if(declarations.length===0)return {reason:"function_declaration_not_located"};
-  if(declarations.length>1)return {reason:"overloaded_function_requires_exact_abi_signature"};
-  const declaration=declarations[0],range=declaration.range,location=declaration.loc;
+  const selected=exactSignature?
+    declarations.filter((node:any)=>canonicalFunctionSignature(node,sourceAst)===selectorMethod):
+    declarations;
+  if(exactSignature&&selected.length===0)
+    return {reason:"exact_function_abi_signature_not_resolved"};
+  if(selected.length>1||(!exactSignature&&selected.length>1))
+    return {reason:"overloaded_function_requires_exact_abi_signature"};
+  const declaration=selected[0],range=declaration.range,location=declaration.loc;
   if(!Array.isArray(range)||range.length!==2||!location?.start||!location?.end||
     !Number.isInteger(range[0])||!Number.isInteger(range[1]))
     return {reason:"function_source_range_missing"};
@@ -304,7 +363,9 @@ export function buildAnalysisCandidateQueue(
       if (seenIds.has(id)) continue;
       seenIds.add(id);
 
-      const method = selector.split(".").pop() || "";
+      const selectorMethod=selector.split(".").pop()||"";
+      const method=selectorMethod.slice(0,selectorMethod.indexOf("(")<0?
+        selectorMethod.length:selectorMethod.indexOf("("));
       let priority = 10;
       const selectionReasons: string[] = [];
       const staticLeadIds: string[] = [];

@@ -678,6 +678,15 @@ contract MultiVault${idx} {
       "Name-only overloads must never be assigned to an arbitrary declaration");
     assert.equal(overloadQueue.blocked[0]?.reason,
       "overloaded_function_requires_exact_abi_signature");
+    const exactOverloadQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/OverloadedFixture.sol",sourceCommit:commitSha,
+      sourceContent:overloadedSource,
+      unqueuedSelectors:["OverloadedFixture.set(uint256)"],
+    }]});
+    assert.equal(exactOverloadQueue.inventory.length,1,
+      "An exact canonical ABI signature must select an overloaded declaration");
+    assert.equal(exactOverloadQueue.inventory[0].lineStart,3,
+      "The exact uint256 overload must map to its own source span");
   }
 
   // Shared Toy Accounting-Defect Contracts (Buggy vs Corrected) for Tests 9-13
