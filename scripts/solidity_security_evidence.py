@@ -27,11 +27,12 @@ def _strip_comments(text: str) -> str:
     return re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", text)
 
 
-def _extract_fn_body(source: str, fn_name: str) -> Tuple[str, str]:
+def _extract_fn_bodies(source: str, fn_name: str) -> list[Tuple[str, str]]:
     cleaned = _strip_comments(source)
     pattern = re.compile(
         r"\bfunction\s+" + re.escape(fn_name) + r"\s*\([^)]*\)\s*(?:external|public)\b[^;{]*\{"
     )
+    out=[]
     for m in pattern.finditer(cleaned):
         depth = 1
         pos = m.end()
@@ -42,7 +43,14 @@ def _extract_fn_body(source: str, fn_name: str) -> Tuple[str, str]:
                 depth -= 1
             pos += 1
         if depth == 0:
-            return m.group(0), cleaned[m.end():pos - 1]
+            out.append((m.group(0),cleaned[m.end():pos - 1]))
+    return out
+
+
+def _extract_fn_body(source: str, fn_name: str) -> Tuple[str, str]:
+    bodies=_extract_fn_bodies(source,fn_name)
+    if bodies:
+        return bodies[0]
     return "", ""
 
 
@@ -487,27 +495,28 @@ def _asserted_source_scalar_delta(
         return None
     source=_strip_comments(text)
     public_state=bool(re.search(r"\buint(?:[0-9]{1,3})?\s+public\s+"+re.escape(state)+r"\s*;",source))
-    header,fn_body=_extract_fn_body(source,method_name)
-    if not header or not fn_body:
+    def parse_parameters(header_text):
+        signature_match=re.search(r"\bfunction\s+"+re.escape(method_name)+r"\s*\(([^)]*)\)",header_text)
+        if not signature_match:return None
+        declarations=[part.strip() for part in signature_match.group(1).split(",")]
+        if len(declarations)!=len(declared_types):return None
+        parsed=[]
+        for declaration in declarations:
+            item=re.fullmatch(
+                r"(uint(?:[0-9]{1,3})?|int(?:[0-9]{1,3})?|address(?:\s+payable)?|bool|string|bytes(?:[1-9]|[12][0-9]|3[012])?)"
+                r"\s+(?:(?:memory|calldata|storage)\s+)?([A-Za-z_]\w*)",declaration)
+            if not item:return None
+            abi_type=re.sub(r"\s+payable$","",item.group(1))
+            if abi_type=="uint":abi_type="uint256"
+            if abi_type=="int":abi_type="int256"
+            parsed.append((abi_type,item.group(2)))
+        return parsed if [item[0] for item in parsed]==declared_types else None
+    selected=next(((candidate_header,candidate_body,parsed)
+        for candidate_header,candidate_body in _extract_fn_bodies(source,method_name)
+        if (parsed:=parse_parameters(candidate_header)) is not None),None)
+    if not selected:
         return None
-    signature_match=re.search(r"\bfunction\s+"+re.escape(method_name)+r"\s*\(([^)]*)\)",header)
-    if not signature_match:
-        return None
-    declarations=[part.strip() for part in signature_match.group(1).split(",")]
-    if len(declarations)!=len(declared_types):
-        return None
-    source_parameters=[]
-    for declaration in declarations:
-        item=re.fullmatch(
-            r"(uint(?:[0-9]{1,3})?|int(?:[0-9]{1,3})?|address(?:\s+payable)?|bool|string|bytes(?:[1-9]|[12][0-9]|3[012])?)"
-            r"\s+(?:(?:memory|calldata|storage)\s+)?([A-Za-z_]\w*)",declaration)
-        if not item:return None
-        abi_type=re.sub(r"\s+payable$","",item.group(1))
-        if abi_type=="uint":abi_type="uint256"
-        if abi_type=="int":abi_type="int256"
-        source_parameters.append((abi_type,item.group(2)))
-    if [item[0] for item in source_parameters]!=declared_types:
-        return None
+    header,fn_body,source_parameters=selected
     amount_indexes=[i for i,(abi_type,param_name) in enumerate(source_parameters)
                     if param_name==parameter and abi_type.startswith("uint")]
     if len(amount_indexes)!=1:

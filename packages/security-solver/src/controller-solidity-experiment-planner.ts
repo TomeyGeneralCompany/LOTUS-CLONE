@@ -1719,12 +1719,10 @@ export function pickFlexibleArg(abiType:string,paramName:string,options:{
     // experiment. Choose a bounded nonzero input, NEVER a passing receipt.
     const maximum=intType[1]==='uint'?(1n<<BigInt(bits))-1n:
       (1n<<BigInt(bits-1))-1n;
-    const absoluteTimestamp=/(?:timestamp|maturation|deadline|expiry|expiration|unlocktime)/i.test(name);
-    if(absoluteTimestamp&&maximum<2000000000n)return null;
     const preferred=options.tupleComponent&&bits===8?'0':
       /^(?:status|state|mode|kind|role|action|phase|stage|reason|category|strategy|operation)$/i.test(name)?'0':
       /(?:decimal|precision|scale)/i.test(name)?'18':
-      absoluteTimestamp?'2000000000':
+      /(?:timestamp|maturation|deadline|expiry|expiration|unlocktime)/i.test(name)?'2000000000':
       /(?:period|duration|epoch|lock|interval|delay|window|time)/i.test(name)?'86400':
       /(?:fee|bps|rate|ratio|percent)/i.test(name)?'100':options.amount??'1000';
     if(!/^[0-9]+$/.test(preferred))return null;

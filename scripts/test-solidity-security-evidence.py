@@ -438,6 +438,7 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
             source.write_text("""pragma solidity ^0.8.20;
 contract TypedLedger {
 uint256 public totalDeposits;
+function deposit(uint256 amount) external { totalDeposits+=amount; }
 function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {
 require(maturityTimestamp>block.timestamp);
 enabled;

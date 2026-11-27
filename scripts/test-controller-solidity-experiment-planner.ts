@@ -1202,6 +1202,7 @@ if(ledgerProof.ok){
 const typedScalarSource=`pragma solidity ^0.8.20;
 contract TypedScalar {
   uint256 public totalDeposits;
+  function deposit(uint256 amount) external { totalDeposits += amount; }
   function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {
     require(maturityTimestamp>block.timestamp);
     enabled;
@@ -1220,7 +1221,9 @@ const typedScalarPlan=constructSolidityExperiments({
 });
 assert.equal(typedScalarPlan.ok,true,'Single-operation scalar deltas should support typed non-amount inputs');
 if(typedScalarPlan.ok){
-  const experiment=typedScalarPlan.experiments.find(x=>x.sequence.sourceProperty?.kind==='scalar_delta');
+  const experiment=typedScalarPlan.experiments.find(x=>
+    x.sequence.sourceProperty?.kind==='scalar_delta'&&
+    x.sequence.sourceProperty.method==='deposit(uint64,uint256,bool)');
   assert.ok(experiment,'The source-exact amount parameter must produce a scalar delta experiment');
   const send=experiment!.sequence.steps.find(step=>step.operation==='send');
   assert.deepEqual(send&&'args'in send?send.args:null,['2000000000','1000',false]);

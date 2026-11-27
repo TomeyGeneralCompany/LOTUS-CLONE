@@ -176,6 +176,7 @@ const typedScalarSource=[
   'pragma solidity ^0.8.20;',
   'contract TypedScalar {',
   ' uint256 public totalDeposits;',
+  ' function deposit(uint256 amount) external { totalDeposits+=amount; }',
   ' function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {',
   '   require(maturityTimestamp>block.timestamp);',
   '   enabled;',
@@ -197,7 +198,8 @@ const typedScalar=constructSolidityExperiments({
 assert.equal(typedScalar.ok,true,JSON.stringify(typedScalar));
 if(!typedScalar.ok)throw new Error('Typed scalar delta property missing');
 const typedScalarProperty=typedScalar.experiments.find(e=>
-  e.sequence.sourceProperty?.kind==='scalar_delta');
+  e.sequence.sourceProperty?.kind==='scalar_delta'&&
+  e.sequence.sourceProperty.method==='deposit(uint64,uint256,bool)');
 assert.ok(typedScalarProperty,'Source should bind the non-final uint amount parameter');
 assert.deepEqual(typedScalarProperty.sequence.steps.find((step:any)=>
   step.operation==='send')&&
