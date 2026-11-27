@@ -621,6 +621,44 @@ contract MultiVault${idx} {
       q2.inventory.map((c) => ({ id: c.id, selector: c.selector, priority: c.priority, status: c.status })),
       "Candidate inventory IDs, scores, and ordering must be 100% deterministic across repeated runs",
     );
+    // AST spans must ignore braces inside comments and strings. The prior
+    // brace scanner could stop inside a comment and capture only part of a body.
+    const spanSource=[
+      'pragma solidity ^0.8.20;',
+      'contract SpanFixture {',
+      '  uint256 private stored;',
+      '  function settle(uint256 amount) external {',
+      '    /* comment braces: } { */',
+      '    string memory marker = "}";',
+      '    stored += amount;',
+      '  }',
+      '  function next() external { stored = 0; }',
+      '}',
+    ].join("\n");
+    const spanQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/SpanFixture.sol",sourceCommit:commitSha,
+      sourceContent:spanSource,unqueuedSelectors:["SpanFixture.settle"],
+    }]});
+    assert.equal(spanQueue.inventory.length,1);
+    assert.equal(spanQueue.inventory[0].lineStart,4);
+    assert.equal(spanQueue.inventory[0].lineEnd,8,
+      "AST evidence span must include the whole body despite comment/string braces");
+
+    const overloadedSource=[
+      'pragma solidity ^0.8.20;',
+      'contract OverloadedFixture {',
+      '  function set(uint256 value) external {}',
+      '  function set(address value) external {}',
+      '}',
+    ].join("\n");
+    const overloadQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/OverloadedFixture.sol",sourceCommit:commitSha,
+      sourceContent:overloadedSource,unqueuedSelectors:["OverloadedFixture.set"],
+    }]});
+    assert.equal(overloadQueue.inventory.length,0,
+      "Name-only overloads must never be assigned to an arbitrary declaration");
+    assert.equal(overloadQueue.blocked[0]?.reason,
+      "overloaded_function_requires_exact_abi_signature");
   }
 
   // Shared Toy Accounting-Defect Contracts (Buggy vs Corrected) for Tests 9-13

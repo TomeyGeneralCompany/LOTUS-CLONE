@@ -7,6 +7,7 @@
  * retaining all remaining candidates in the persisted queue).
  */
 import { createHash } from "node:crypto";
+import { parse as parseSolidity } from "@solidity-parser/parser";
 import type { StaticLeadHint } from "../controller-solidity-experiment-planner";
 import type { ProgramFactsGraph } from "./program-facts";
 
@@ -128,50 +129,38 @@ function stableStaticLeadId(lead: StaticLeadHint): string {
  * Locate the target function span inside Solidity source without losing
  * multi-function files to first-selector-only truncation.
  */
-function locateFunctionSpan(
-  content: string,
-  selector: string,
-): { start: number; end: number; lineStart: number; lineEnd: number; excerpt: string; truncated: boolean } | null {
-  const method = selector.split(".").pop() || "";
-  const safeMethod = method.replace(/[^A-Za-z0-9_]/g, "");
-  if (!safeMethod) return null;
-  const re = new RegExp(`\\bfunction\\s+${safeMethod}\\s*\\(`);
-  const match = re.exec(content);
-  if (!match) return null;
+type LocatedFunctionSpan = {
+  span: { start:number; end:number; lineStart:number; lineEnd:number; excerpt:string; truncated:boolean };
+} | { reason:string };
 
-  const start = Math.max(0, match.index - 160);
-  const end = Math.min(content.length, match.index + 1100);
-  const lineStart = computeLineNumber(content, match.index);
-  // Locate the exact closing brace (or semicolon for interface decl) of this function
-  // so static leads localize strictly to this function rather than neighboring functions.
-  let fnEndIdx = Math.min(content.length, match.index + 1100);
-  let braceDepth = 0;
-  let seenBrace = false;
-  for (let i = match.index; i < content.length; i++) {
-    const ch = content[i];
-    if (ch === "{") {
-      braceDepth++;
-      seenBrace = true;
-    } else if (ch === "}") {
-      braceDepth--;
-      if (seenBrace && braceDepth === 0) {
-        fnEndIdx = i;
-        break;
-      }
-    } else if (ch === ";" && !seenBrace) {
-      fnEndIdx = i;
-      break;
-    }
-  }
-  const lineEnd = computeLineNumber(content, fnEndIdx);
-  return {
-    start,
-    end,
-    lineStart,
-    lineEnd,
-    excerpt: content.slice(start, end),
-    truncated: end < content.length,
-  };
+/**
+ * Locate source declarations through the Solidity AST. Brace scanning can stop
+ * inside comments or strings, and choosing the first same-name declaration is
+ * unsafe for overloaded functions.
+ */
+function locateFunctionSpan(content:string,selector:string,sourceAst:any):LocatedFunctionSpan {
+  const separator=selector.lastIndexOf(".");
+  const contractName=separator>0?selector.slice(0,separator):"";
+  const method=selector.slice(separator+1);
+  if(!/^[A-Za-z_]\w*$/.test(contractName)||!/^[A-Za-z_]\w*$/.test(method))
+    return {reason:"function_selector_not_canonical"};
+  const contracts=(sourceAst?.children||[]).filter((node:any)=>
+    node.type==="ContractDefinition"&&node.name===contractName);
+  if(contracts.length!==1)return {reason:"function_contract_not_unique"};
+  const declarations=(contracts[0].subNodes||[]).filter((node:any)=>
+    node.type==="FunctionDefinition"&&node.name===method&&!node.isConstructor&&
+    !node.isFallback&&!node.isReceiveEther);
+  if(declarations.length===0)return {reason:"function_declaration_not_located"};
+  if(declarations.length>1)return {reason:"overloaded_function_requires_exact_abi_signature"};
+  const declaration=declarations[0],range=declaration.range,location=declaration.loc;
+  if(!Array.isArray(range)||range.length!==2||!location?.start||!location?.end||
+    !Number.isInteger(range[0])||!Number.isInteger(range[1]))
+    return {reason:"function_source_range_missing"};
+  const start=range[0],excerptStart=Math.max(0,start-160);
+  const excerptEnd=Math.min(content.length,start+1100);
+  return {span:{start:excerptStart,end:excerptEnd,
+    lineStart:location.start.line,lineEnd:location.end.line,
+    excerpt:content.slice(excerptStart,excerptEnd),truncated:excerptEnd<content.length}};
 }
 
 /**
@@ -278,6 +267,9 @@ export function buildAnalysisCandidateQueue(
 
     const sourceSha256 = createHash("sha256").update(item.sourceContent).digest("hex");
     const fileLeads = staticLeads.filter((l) => l.path === item.path);
+    let sourceAst:any=null;
+    try { sourceAst=parseSolidity(item.sourceContent,{range:true,loc:true}); }
+    catch { /* Each selector is retained as an explicit parser blocker below. */ }
     const isExternalAdapter = isExternalAdapterOrMarketPath(item.path);
     const isCoreProtocolName = CORE_PROTOCOL_NAME_RE.test(item.path) && !isExternalAdapter;
     const inboundRefCount = fileInboundReferrers.get(item.path)?.size || 0;
@@ -295,15 +287,14 @@ export function buildAnalysisCandidateQueue(
         continue;
       }
 
-      const span = locateFunctionSpan(item.sourceContent, selector);
-      if (!span) {
-        blocked.push({
-          path: item.path,
-          selector,
-          reason: "function_declaration_not_located",
-        });
+      const located = sourceAst
+        ? locateFunctionSpan(item.sourceContent, selector, sourceAst)
+        : {reason:"solidity_source_parse_failed"};
+      if ("reason" in located) {
+        blocked.push({path:item.path,selector,reason:located.reason});
         continue;
       }
+      const span=located.span;
 
       const id = createHash("sha256")
         .update(JSON.stringify([item.sourceCommit, sourceSha256, item.path, selector]))
