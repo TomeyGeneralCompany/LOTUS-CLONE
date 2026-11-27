@@ -108,7 +108,22 @@ export class SoliditySourceIndex {
   /** Source-derived Solidity probe menu, including state-changing entry points.
    * Never synthesizes expected values or asserts that a contract is deployable. */
   async probeMenu(path:string,limit=24) {
-    const unit=await this.graph(path);
+    const scope=new SoliditySourceIndex(this.root,this.signal);
+    const unit=await scope.load(path);
+    // Resolve only direct source imports needed for ABI aliases/types. Walking
+    // every transitive dependency here can consume the bounded 32-file index
+    // on unrelated imports before a bounded probe menu is available.
+    for(const directive of (unit.ast.children as any[]).filter((node:any)=>node.type==='ImportDirective')){
+      if(!directive.path?.startsWith('.'))continue;
+      try{
+        const imported=await scope.load(resolve(this.root,dirname(unit.path),directive.path));
+        unit.imports.set(directive as ImportDirective,imported);
+      }catch(error){
+        this.signal?.throwIfAborted();
+        const message=`${unit.path}: import ${directive.path}: ${String(error).slice(0,160)}`;
+        if(!unit.unresolved.includes(message))unit.unresolved.push(message);
+      }
+    }
     const entries:Array<{selector:string;signature:string;operation:'send'|'call'|'constructor';visibility:string;inputs:string[]}>=[];
     const resolveTypedDefinition=(name:string,ownerNode:any,ownerUnit:Unit,
       visited=new Set<string>()):{definition:any;unit:Unit}|null=>{
