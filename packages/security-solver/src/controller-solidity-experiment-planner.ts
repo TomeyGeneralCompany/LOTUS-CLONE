@@ -56,6 +56,7 @@ export interface SourceInvariantTransitionPlan {
   totalScalarGetter?: string;
   typedObservation?: {getter:string;args:string[];expectPath?:number[];baseline:string;afterInflow:string;afterOutflow:string};
   dynamicPositionObservation?:{getter:string;args:string[];argumentPath:number[]};
+  dynamicPositionCompanionGetters?:string[];
   dependencyDeployments?:PreparedDeployment[];
   dependencyInitializerOperations?:PreparedInitializerOperation[];
   dependencyBindings?:Record<string,string>;
@@ -2570,9 +2571,9 @@ function sourceAccountingWriteCount(text:string,state:string):number {
  * same amount. */
 function sourceDynamicFullPositionWithdrawal(
   snapshot:SourceSnapshot,contract:any,declarations:readonly SolidityProbeDeclaration[],
-  outflowFn:any,outflowEffects:string,
+  outflowFn:any,inflowEffects:string,outflowEffects:string,
   ledger:string,
-):{getter:string;args:string[];argumentPath:number[];depositIdIndex:number;amountIndex:number;earlyIndex:number;witnesses:SourceWitness[]}|null {
+):{getter:string;args:string[];argumentPath:number[];depositIdIndex:number;amountIndex:number;earlyIndex:number;companionGetters:string[];witnesses:SourceWitness[]}|null {
   const fail=(_reason:string):null=>null;
   const clean=(value:string)=>value.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
   const bodyText=clean(outflowEffects);
@@ -2620,11 +2621,34 @@ function sourceDynamicFullPositionWithdrawal(
   const struct=(contract.subNodes||[]).find((n:any)=>n.type==='StructDefinition'&&n.name==='Deposit');
   const first=(struct?.members||[])[0];
   if(!first||first.name!=='virtualTokenTotalSupply'||canonicalAbiType(first.typeName)!=='uint256')return fail('position getter field layout');
+  // Also retain directly observable interest/fee/reward ledgers that this
+  // exact inflow increases and this exact full-position outflow decreases.
+  // Each must have one source write in each transition and a generated public
+  // zero-argument getter; no unrelated or merely named state is asserted.
+  const companionGetters:string[]=[];
+  const companionWitnesses:SourceWitness[]=[];
+  for(const declaration of (contract.subNodes||[]).filter((node:any)=>
+    node.type==='StateVariableDeclaration')){
+    for(const variable of declaration.variables||[]){
+      const name=String(variable.name||'');
+      if(variable.visibility!=='public'||!/(?:interest|fee|reward)/i.test(name)||
+        canonicalAbiType(variable.typeName)!=='uint256'||name===ledger||
+        sourceAccountingWriteCount(inflowEffects,name)!==1||
+        sourceAccountingWriteCount(bodyText,name)!==1)continue;
+      const incoming=accountingDirections(inflowEffects,name);
+      const outgoing=accountingDirections(bodyText,name);
+      if(!incoming.increase||incoming.decrease||outgoing.increase||!outgoing.decrease||
+        !declarations.some(d=>d.operation==='call'&&d.selector===contract.name+'.'+name&&
+          Array.isArray(d.inputs)&&d.inputs.length===0))continue;
+      companionGetters.push(name+'()');
+      companionWitnesses.push(witness(snapshot,variable,contract.name+'.'+name));
+    }
+  }
   // The getter body and first struct field prove the observation path.
   return {getter:'getDeposit(uint64)',args:['1'],argumentPath:[0],
-    depositIdIndex:idIndex,amountIndex,earlyIndex,
+    depositIdIndex:idIndex,amountIndex,earlyIndex,companionGetters,
     witnesses:[witness(snapshot,getter,contract.name+'.getDeposit(uint64)'),
-      witness(snapshot,struct,contract.name+'.Deposit.virtualTokenTotalSupply')]};
+      witness(snapshot,struct,contract.name+'.Deposit.virtualTokenTotalSupply'),...companionWitnesses]};
 }
 
 export function extractSourceInvariantDescriptor(
@@ -3085,6 +3109,7 @@ export function extractSourceInvariantDescriptor(
   let inflowValueWei: string | undefined;
   let outflowArgs: Array<string|boolean> = [];
   let dynamicPositionObservation:SourceInvariantTransitionPlan['dynamicPositionObservation'];
+  let dynamicPositionCompanionGetters:string[]=[];
   let dynamicPositionWitnesses:SourceWitness[]=[];
   const mappedArgs=(fn:any,key:{sourceKey:string;parameterName?:string}|null,
     amount:string,keyValue:string|undefined):string[]|null=>{
@@ -3172,7 +3197,7 @@ export function extractSourceInvariantDescriptor(
   // withdrawal ABI argument in the local-EVM sequence.
   else if(totalReferenced&&!balanceReferenced&&(!usesErc20Transfer||!!mockToken)){
     const dynamic=sourceDynamicFullPositionWithdrawal(snapshot,contract,declarations,
-      outflowFn,outflowEffects,totalVarName);
+      outflowFn,inflowEffects,outflowEffects,totalVarName);
     if(dynamic){
       const dynamicInflowAmount=scalarAmountParameter(inflowFn,totalVarName,
         inflowEffects,'increase');
@@ -3195,6 +3220,7 @@ export function extractSourceInvariantDescriptor(
           outflowAmount='1';expectedRemainder='0';
           dynamicPositionObservation={getter:dynamic.getter,args:dynamic.args,
             argumentPath:dynamic.argumentPath};
+          dynamicPositionCompanionGetters=dynamic.companionGetters;
           dynamicPositionWitnesses=dynamic.witnesses;
       }
     }
@@ -3321,9 +3347,14 @@ export function extractSourceInvariantDescriptor(
 
   const inflowSig = `${inflowFn.name}(${inflowDecl.inputs.join(',')})`;
   const outflowSig = `${outflowFn.name}(${outflowDecl.inputs.join(',')})`;
-  const obsList = [totalGetterSig, balanceGetterSig, typedObservation?.getter].filter(Boolean).join(' and ');
+  const obsList = [totalGetterSig,balanceGetterSig,typedObservation?.getter,
+    ...dynamicPositionCompanionGetters].filter(Boolean).join(' and ');
   const dynamicPositionReadback=dynamicPositionObservation?
     dynamicPositionObservation.getter+"(1).virtualTokenTotalSupply":undefined;
+  for(const getter of dynamicPositionCompanionGetters){
+    preState.push({expression:`${contract.name}.${getter} == 0`,readback:getter});
+    postState.push({expression:`${contract.name}.${getter} == 0`,readback:getter});
+  }
   const observedExpected=collectionLifecycleProven?typedObservation!.afterOutflow:expectedRemainder;
   if(typedObservation){
     preState.push({expression:`${contract.name}.${typedObservation.getter} == ${typedObservation.baseline}`,readback:typedObservation.getter});
@@ -3367,6 +3398,7 @@ export function extractSourceInvariantDescriptor(
         totalScalarGetter: totalGetterSig,
         typedObservation,
         dynamicPositionObservation,
+        ...(dynamicPositionCompanionGetters.length?{dynamicPositionCompanionGetters}:{}),
         ...(dependencyPlan.status==='resolved'&&dependencyPlan.deployments.length?{
           dependencyDeployments:dependencyPlan.deployments,
           dependencyInitializerOperations:dependencyPlan.initializerOperations,
@@ -3407,6 +3439,8 @@ export function admitSourceInvariantDescriptor(
     JSON.stringify(tp.dynamicPositionObservation.args)!=='["1"]'||
     JSON.stringify(tp.dynamicPositionObservation.argumentPath)!=='[0]'||
     JSON.stringify(tp.outflowArgs)!=='["1","$lastObservation:0",true]'||
+    (tp.dynamicPositionCompanionGetters||[]).some(g=>!/^[_A-Za-z][_A-Za-z0-9]*\(\)$/.test(g))||
+    new Set(tp.dynamicPositionCompanionGetters||[]).size!==(tp.dynamicPositionCompanionGetters||[]).length||
     !invariant.witnesses?.some(w=>w.symbol.endsWith('.getDeposit(uint64)')&&
       w.sourceSha256===invariant.sourceSha256)||
     !invariant.witnesses?.some(w=>w.symbol.endsWith('.Deposit.virtualTokenTotalSupply')&&
@@ -3560,6 +3594,8 @@ export function constructCoreInvariantExperiment(
   // 1. Pre-state baseline readbacks
   const preTyped=typedReadback(tp.typedObservation?.baseline||'');
   if(preTyped)steps.push(preTyped);
+  for(const getter of tp.dynamicPositionCompanionGetters||[])
+    steps.push({operation:'call',function:getter,args:[],expect:'0'});
   if (tp.totalScalarGetter) {
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: '0' });
   }
@@ -3601,6 +3637,8 @@ export function constructCoreInvariantExperiment(
   }
   const postTyped=typedReadback(tp.typedObservation?.afterOutflow||'');
   if(postTyped)steps.push(postTyped);
+  for(const getter of tp.dynamicPositionCompanionGetters||[])
+    steps.push({operation:'call',function:getter,args:[],expect:'0'});
   // 5. Post-state conservation / supply-accounting assertions (== expectedRemainder)
   if (tp.totalScalarGetter) {
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: tp.expectedRemainder });
