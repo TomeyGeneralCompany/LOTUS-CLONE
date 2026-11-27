@@ -16,13 +16,23 @@ function validateSequence(s) {
   object(s,['constructorArgs','steps'],['constructorArgs','constructorValueWei','steps','deployment','preparation','factoryClone','sourceProperty']);
   if(s.sourceProperty!==undefined){
     const p=s.sourceProperty;
-    object(p,['kind','state','method','parameter','amount','direction','sourceSha256']);
+    object(p,['kind','state','method','parameter','amount','direction','sourceSha256'],
+      ['kind','state','method','parameter','amount','formula','expectedDelta','direction','sourceSha256']);
     if(p.kind!=='scalar_delta'||p.direction!=='increase'||
       !/^[A-Za-z_]\w*$/.test(p.state)||!/^[A-Za-z_]\w*$/.test(p.parameter)||
       !/^[A-Za-z_]\w*\([A-Za-z0-9_,()[\]]*\)$/.test(p.method)||
       !/^(0|[1-9][0-9]{0,29})$/.test(p.amount)||
       !/^[a-f0-9]{64}$/.test(p.sourceSha256))
       throw new Error('Invalid source-identified scalar obligation');
+    if(p.formula!==undefined){
+      object(p.formula,['multiplier','divisor']);
+      if(!/^[1-9][0-9]{0,9}$/.test(p.formula.multiplier)||
+         !/^[1-9][0-9]{0,9}$/.test(p.formula.divisor)||
+         typeof p.expectedDelta!=='string'||
+         !/^(0|[1-9][0-9]{0,29})$/.test(p.expectedDelta))
+        throw new Error('Invalid bounded scalar formula obligation');
+    }else if(p.expectedDelta!==undefined)
+      throw new Error('Scalar expectedDelta requires a source formula');
   }
   if(s.deployment!==undefined) {
     object(s.deployment,['file','contract']);

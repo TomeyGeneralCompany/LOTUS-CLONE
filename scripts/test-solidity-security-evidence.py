@@ -509,6 +509,48 @@ function accrue(uint256 value) external { held+=value; }
             self.assertEqual(result[0],"behavior_not_observed")
             self.assertEqual(result[1],"source_scalar_delta_negative")
 
+    def test_source_scalar_delta_verifies_literal_fee_formula(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            source=root/"FeeLedger.sol"
+            source.write_text("""pragma solidity ^0.8.20;
+contract FeeLedger {
+uint256 public fees;
+function deposit(uint256 amount) external { fees += amount * 100 / 10000; }
+}
+""",encoding="utf8")
+            sha=hashlib.sha256(source.read_bytes()).hexdigest()
+            requested=[
+                {"operation":"call","function":"fees()","args":[],"expect":"0"},
+                {"operation":"send","function":"deposit(uint256)",
+                 "args":["10000"],"sender":0},
+                {"operation":"call","function":"fees()","args":[],"expect":"100"},
+            ]
+            actual=[
+                {"operation":"call","actual":"0","passed":True},
+                {"operation":"send","reverted":False,"passed":True},
+                {"operation":"call","actual":"100","passed":True},
+            ]
+            prop={"kind":"scalar_delta","state":"fees",
+                  "method":"deposit(uint256)","parameter":"amount",
+                  "amount":"10000","formula":{"multiplier":"100",
+                  "divisor":"10000"},"expectedDelta":"100",
+                  "direction":"increase","sourceSha256":sha}
+            spec={"sequence":{"constructorArgs":[],"steps":requested,
+                              "sourceProperty":prop}}
+            result=security_experiment_disposition(root,source,"FeeLedger.deposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual},spec)
+            self.assertEqual(result[0],"behavior_not_observed")
+            self.assertEqual(result[1],"source_scalar_delta_negative")
+            wrong_formula={**prop,"expectedDelta":"101"}
+            wrong_spec={"sequence":{"constructorArgs":[],"steps":requested,
+                                    "sourceProperty":wrong_formula}}
+            self.assertEqual(security_experiment_disposition(
+                root,source,"FeeLedger.deposit",{"accounts":ACCOUNTS,
+                "contract":CONTRACT_ADDR,"steps":actual},wrong_spec)[0],
+                "observation_only")
+
     def test_bounded_funding_source_and_state_negative(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

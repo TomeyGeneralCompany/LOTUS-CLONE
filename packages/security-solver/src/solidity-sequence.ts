@@ -64,6 +64,9 @@ const scalarDeltaProperty=z.object({kind:z.literal("scalar_delta"),
   state:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),method:signature,
   parameter:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
   amount:z.string().regex(/^(0|[1-9][0-9]{0,29})$/),
+  formula:z.object({multiplier:z.string().regex(/^[1-9][0-9]{0,9}$/),
+    divisor:z.string().regex(/^[1-9][0-9]{0,9}$/)}).strict().optional(),
+  expectedDelta:z.string().regex(/^(0|[1-9][0-9]{0,29})$/).optional(),
   direction:z.literal("increase"),sourceSha256:z.string().regex(/^[a-f0-9]{64}$/)
 }).strict();
 const factoryCloneSchema=z.object({deploymentId:prepId,function:signature,args,sender}).strict();
@@ -111,6 +114,11 @@ export const soliditySequenceJsonSchema = {type:"object",additionalProperties:fa
       method:{type:"string",maxLength:200},
       parameter:{type:"string",pattern:"^[A-Za-z_][A-Za-z0-9_]*$"},
       amount:weiJson,direction:{const:"increase"},
+      formula:{type:"object",additionalProperties:false,properties:{
+        multiplier:{type:"string",pattern:"^[1-9][0-9]{0,9}$"},
+        divisor:{type:"string",pattern:"^[1-9][0-9]{0,9}$"}},
+        required:["multiplier","divisor"]},
+      expectedDelta:weiJson,
       sourceSha256:{type:"string",pattern:"^[a-f0-9]{64}$"}
     },required:["kind","state","method","parameter","amount","direction","sourceSha256"]},
     factoryClone:{type:"object",additionalProperties:false,properties:{

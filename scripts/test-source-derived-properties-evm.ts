@@ -212,6 +212,41 @@ assert.ok(typedScalarEvm.steps.every((step:any)=>step.passed!==false),
   'Source-derived future timestamp and typed arguments must execute: '+JSON.stringify(typedScalarEvm));
 assert.ok(typedScalarEvm.steps.some((step:any)=>step.operation==='call'&&
   step.function==='totalDeposits()'&&step.actual==='1000'));
+const feeFormulaSource=[
+  'pragma solidity ^0.8.20;',
+  'contract FeeLedger {',
+  ' uint256 public principal;',
+  ' uint256 public fees;',
+  ' function deposit(uint256 amount) external {',
+  '   principal += amount;',
+  '   fees += amount * 100 / 10000;',
+  ' }',
+  '}',
+].join('\n');
+const feeFormulaFile='source-1/contracts/FeeLedger.sol';
+const feeFormulaPlan=constructSolidityExperiments({
+  repositoryCommit:'d'.repeat(40),targetPath:feeFormulaFile,
+  targetSelector:'FeeLedger.deposit',
+  sources:[{path:feeFormulaFile,content:feeFormulaSource,
+    sha256:sha(feeFormulaSource)}],
+  declarations:[
+    {selector:'FeeLedger.deposit',operation:'send',inputs:['uint256']},
+    {selector:'FeeLedger.principal',operation:'call',inputs:[]},
+    {selector:'FeeLedger.fees',operation:'call',inputs:[]},
+  ],skipLegacy:true,
+});
+assert.equal(feeFormulaPlan.ok,true,JSON.stringify(feeFormulaPlan));
+if(!feeFormulaPlan.ok)throw new Error('Formula-backed fee transition missing');
+const feeFormulaProperty=feeFormulaPlan.experiments.find(e=>
+  e.sequence.sourceProperty?.kind==='scalar_delta'&&
+  e.sequence.sourceProperty.state==='fees');
+assert.ok(feeFormulaProperty,'Fee ledger formula must be independently executable');
+const feeFormulaEvm=await execute(
+  compile(feeFormulaFile,feeFormulaSource,'FeeLedger'),feeFormulaProperty.sequence);
+assert.ok(feeFormulaEvm.steps.every((step:any)=>step.passed!==false),
+  'Source-derived fee formula must match the mined EVM transition: '+JSON.stringify(feeFormulaEvm));
+assert.ok(feeFormulaEvm.steps.some((step:any)=>step.operation==='call'&&
+  step.function==='fees()'&&step.actual==='100'));
 const privateScalarSource=[
   'pragma solidity ^0.8.20;',
   'contract PrivateScalar {',

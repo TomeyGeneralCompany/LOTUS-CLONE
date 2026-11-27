@@ -481,6 +481,8 @@ def _asserted_source_scalar_delta(
     parameter=property_spec.get("parameter")
     method=property_spec.get("method")
     amount=property_spec.get("amount")
+    formula=property_spec.get("formula")
+    expected_delta=property_spec.get("expectedDelta")
     if not all(isinstance(v,str) and re.fullmatch(r"[A-Za-z_]\w*",v)
                for v in (state,parameter)):
         return None
@@ -521,9 +523,34 @@ def _asserted_source_scalar_delta(
                     if param_name==parameter and abi_type.startswith("uint")]
     if len(amount_indexes)!=1:
         return None
-    if not re.search(r"\b"+re.escape(state)+r"\s*\+=\s*"+
-                     re.escape(parameter)+r"\s*;",fn_body):
-        return None
+    if formula is None:
+        if expected_delta is not None or not re.search(
+            r"\b"+re.escape(state)+r"\s*\+=\s*"+
+            re.escape(parameter)+r"\s*;",fn_body):
+            return None
+        expected_state_delta=amount
+    else:
+        if (not isinstance(formula,dict) or
+                set(formula)!={"multiplier","divisor"} or
+                any(not isinstance(formula.get(k),str) or
+                    not re.fullmatch(r"[1-9][0-9]{0,9}",formula[k])
+                    for k in ("multiplier","divisor")) or
+                not isinstance(expected_delta,str) or
+                not re.fullmatch(r"(?:0|[1-9][0-9]{0,29})",expected_delta)):
+            return None
+        formula_match=re.search(
+            r"\b"+re.escape(state)+r"\s*\+=\s*"+re.escape(parameter)+
+            r"\s*(?:\*\s*([1-9][0-9]{0,9}))?\s*/\s*([1-9][0-9]{0,9})\s*;",
+            fn_body)
+        if (not formula_match or
+                (formula_match.group(1) or "1")!=formula["multiplier"] or
+                formula_match.group(2)!=formula["divisor"]):
+            return None
+        expected_state_delta=str(
+            int(amount)*int(formula["multiplier"])//int(formula["divisor"])
+        )
+        if expected_state_delta!=expected_delta or expected_state_delta=="0":
+            return None
     if len(actual_steps)!=len(requested_steps):
         return None
     getter=state+"()" if public_state else None
@@ -558,15 +585,17 @@ def _asserted_source_scalar_delta(
     if pre.get("operation")!="call" or post.get("operation")!="call" or \
        transaction.get("operation")!="send":
         return None
-    if str(pre.get("actual"))!="0" or str(post.get("actual"))!=amount:
+    if str(pre.get("actual"))!="0" or str(post.get("actual"))!=expected_state_delta:
         return None
     if requested_steps[calls[0]].get("expect")!="0" or \
-       requested_steps[calls[1]].get("expect")!=amount:
+       requested_steps[calls[1]].get("expect")!=expected_state_delta:
         return None
     return ("source_scalar_delta_negative",
             "Source-identified scalar increment executed in the isolated EVM; "
             "the prestate, successful transaction and poststate agree with the "
-            "source-derived bounded state-transition equation. This proves only "
+            "source-derived bounded state-transition equation"+
+            (" including the exact integer multiplier/divisor formula" if formula else "")+
+            ". This proves only "
             "the tested input and fixture state.")
 
 def _source_witnessed_direct_assignment_negative(
