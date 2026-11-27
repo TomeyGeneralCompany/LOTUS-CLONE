@@ -1062,6 +1062,44 @@ contract QualifiedObservation {
     assert.ok(qualifiedObservations.some(o=>o.kind==='mapping'&&o.getter==='balanceOf(uint48)'&&
       o.keyType==='uint48'&&o.stateVariable==='balances'),
       'Accounting readbacks must resolve namespace-qualified imported value types');
+    const inheritedObservationBase=`pragma solidity ^0.8.20;
+import {AccountKey as LocalKey} from "./AccountKey.sol";
+contract ObservationBase {
+  mapping(LocalKey => uint256) private balances;
+  function balanceOf(LocalKey key) external view returns (uint256) { return balances[key]; }
+}`;
+    const inheritedObservationChild=`pragma solidity ^0.8.20;
+import {ObservationBase as LedgerBase} from "./ObservationBase.sol";
+contract InheritedObservation is LedgerBase {}`;
+    const inheritedBaseSnapshot={path:'source-1/contracts/ObservationBase.sol',
+      content:inheritedObservationBase,sha256:hash(inheritedObservationBase)};
+    const inheritedChildSnapshot={path:'source-1/contracts/InheritedObservation.sol',
+      content:inheritedObservationChild,sha256:hash(inheritedObservationChild)};
+    const inheritedObservations=extractAccountingObservations(inheritedChildSnapshot,
+      'InheritedObservation',[{selector:'InheritedObservation.balanceOf',operation:'call',inputs:['uint48']}] as any,
+      [importedTypeSnapshot,inheritedBaseSnapshot,inheritedChildSnapshot]);
+    assert.ok(inheritedObservations.some(o=>o.kind==='mapping'&&o.getter==='balanceOf(uint48)'&&
+      o.keyType==='uint48'&&o.stateVariable==='balances'&&
+      o.sourceWitness.includes('ObservationBase.sol')&&o.sourceWitness.includes(hash(inheritedObservationBase))),
+      'Accounting observations must follow acquired aliased inheritance and retain the base function and state source identities');
+    const importedStructSource=`pragma solidity ^0.8.20;
+struct Position { uint256 amount; bool active; }`;
+    const importedStructOwner=`pragma solidity ^0.8.20;
+import {Position as AcquiredPosition} from "./Position.sol";
+contract ImportedStructObservation {
+  AcquiredPosition[] private positions;
+  function position(uint256 index) external view returns (AcquiredPosition memory) { return positions[index]; }
+}`;
+    const importedStructSnapshot={path:'source-1/contracts/Position.sol',
+      content:importedStructSource,sha256:hash(importedStructSource)};
+    const importedStructOwnerSnapshot={path:'source-1/contracts/ImportedStructObservation.sol',
+      content:importedStructOwner,sha256:hash(importedStructOwner)};
+    const importedStructObservations=extractAccountingObservations(importedStructOwnerSnapshot,
+      'ImportedStructObservation',[{selector:'ImportedStructObservation.position',operation:'call',inputs:['uint256']}] as any,
+      [importedStructSnapshot,importedStructOwnerSnapshot]);
+    assert.ok(importedStructObservations.some(o=>o.kind==='struct_field'&&o.fieldName==='amount'&&
+      o.fieldType==='uint256'&&o.getter==='position(uint256)'),
+      'Accounting observations must resolve fields of imported aliased structs from acquired source');
     const structObservationSource=`pragma solidity ^0.8.20;
 contract StructObservation {
   struct Position { uint256 amount; bool active; }
