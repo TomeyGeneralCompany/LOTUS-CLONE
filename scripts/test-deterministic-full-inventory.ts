@@ -1031,6 +1031,14 @@ contract EnumObservation {
     assert.ok(enumObservations.some(o=>o.kind==='mapping'&&o.getter==='balanceOf(uint8)'&&
       o.keyType==='uint8'&&o.stateVariable==='balances'),
       'Accounting observations must resolve enum mapping keys to compiler ABI uint8');
+    const fabricatedEnumReadSource=enumObservationSource.replace(
+      'return balances[phase];','return 0; // balances[phase]');
+    const fabricatedEnumReadSnapshot={path:'source-1/contracts/EnumObservation.sol',
+      content:fabricatedEnumReadSource,sha256:hash(fabricatedEnumReadSource)};
+    assert.equal(extractAccountingObservations(fabricatedEnumReadSnapshot,'EnumObservation',
+      [{selector:'EnumObservation.balanceOf',operation:'call',inputs:['uint8']}] as any)
+      .some(o=>o.kind==='mapping'),false,
+      'A matching state name in comments or an unrelated return value is not a mapping observation');
     const importedAccountType=`pragma solidity ^0.8.20; type AccountKey is uint48;`;
     const importedObservationSource=`pragma solidity ^0.8.20;
 import {AccountKey as UserKey} from "./AccountKey.sol";

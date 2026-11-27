@@ -162,7 +162,11 @@ export function extractAccountingObservations(
   };
   for(const {node:fn,owner:fnOwner} of nodes){
     if(fn.type!=="FunctionDefinition"||!fn.name||!fn.body||!["view","pure"].includes(fn.stateMutability))continue;
-    const declaration=declarations.find(d=>d.selector===contractName+"."+fn.name&&d.operation==="call");
+    const inputs=(fn.parameters||[]).map((parameter:any)=>
+      sourceAbiType(parameter.typeName,fnOwner.path,fnOwner.contract));
+    if(inputs.some((input:string|null)=>input===null))continue;
+    const declaration=declarations.find(d=>d.selector===contractName+"."+fn.name&&
+      d.operation==="call"&&JSON.stringify(d.inputs)===JSON.stringify(inputs));
     if(!declaration)continue;
     const getter=fn.name+"("+declaration.inputs.join(",")+")";
     const fnSource=sourceByPath.get(fnOwner.path)||snapshot;
@@ -170,17 +174,24 @@ export function extractAccountingObservations(
     const line=Math.max(1,fn.loc?.start?.line||1),last=Math.max(line,fn.loc?.end?.line||line);
     const body=fnLines.slice(line-1,last).join("\n");
     const functionWitness=fnSource.path+":"+line+"-"+last+":"+fnSource.sha256;
+    const cleanBody=body.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
     const returns=fn.returnParameters||[];
     const resultSourceType=returns.length===1?typeName(returns[0]?.typeName):"";
     const resultType=returns.length===1?
       sourceAbiType(returns[0]?.typeName,fnOwner.path,fnOwner.contract)||resultSourceType:"";
     for(const {name,declaration:state,owner:stateOwner} of states){
       if(!new RegExp("\\b"+regexEscape(name)+"\\b").test(body))continue;
+      const sameName=states.filter(item=>item.name===name);
+      const localState=sameName.filter(item=>item.owner.path===fnOwner.path);
+      if(localState.length===1&&localState[0]!==states.find(item=>
+        item.name===name&&item.owner.path===stateOwner.path&&item.declaration===state))continue;
+      if(localState.length===0&&sameName.length!==1)continue;
       const stateLine=Math.max(1,state.loc?.start?.line||1);
       const witness=functionWitness+";state="+stateOwner.path+":"+stateLine+":"+
         (sourceByPath.get(stateOwner.path)||snapshot).sha256;
       const stateType=state.typeName;
-      if(new RegExp("\\b"+regexEscape(name)+"\\s*\\.\\s*length\\b").test(body)&&declaration.inputs.length===0&&simple(resultType)){
+      if(new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\.\\s*length\\s*;",'s').test(cleanBody)&&
+        declaration.inputs.length===0&&simple(resultType)){
         add({kind:"collection_length",getter,stateVariable:name,sourceWitness:witness});
       }
       // Only an exact source-level return of token.balanceOf(caller) is an
@@ -202,23 +213,34 @@ export function extractAccountingObservations(
       if((/^(?:I?ERC20|IERC20Upgradeable|ERC20Upgradeable|MockERC20|ERC20Mock)$/.test(tokenType)||
           acquiredBalanceOf)&&
         declaration.inputs.length===1&&declaration.inputs[0]==="address"&&
+        canonicalElementaryAbiType(typeName(fn.parameters?.[0]?.typeName))==="address"&&
         /^[A-Za-z_][A-Za-z0-9_]*$/.test(parameter)&&
         new RegExp("\\breturn\\s+"+regexEscape(name)+
-          "\\s*\\.\\s*balanceOf\\s*\\(\\s*"+parameter+"\\s*\\)\\s*;").test(body)){
+          "\\s*\\.\\s*balanceOf\\s*\\(\\s*"+parameter+"\\s*\\)\\s*;",'s').test(cleanBody)){
         add({kind:"external_balance",getter,keyType:"address",stateVariable:name,sourceWitness:witness});
       }
       if(stateType?.type==="Mapping"&&declaration.inputs.length===1){
         const keyType=sourceAbiType(stateType.keyType,stateOwner.path,stateOwner.contract)||typeName(stateType.keyType);
-        if(declaration.inputs[0]===keyType && simple(resultType))
+        const matchingKey=(fn.parameters||[]).filter((parameter:any)=>
+          sourceAbiType(parameter.typeName,fnOwner.path,fnOwner.contract)===keyType);
+        const exactMappingRead=matchingKey.some((parameter:any)=>/^[A-Za-z_]\w*$/.test(String(parameter.name||''))&&
+          new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\[\\s*"+
+            regexEscape(String(parameter.name))+"\\s*\\]\\s*;",'s').test(cleanBody));
+        if(declaration.inputs[0]===keyType&&simple(resultType)&&exactMappingRead)
           add({kind:"mapping",getter,keyType,stateVariable:name,sourceWitness:witness});
       }
       if(declaration.inputs.length===0&&simple(resultType)&&stateType?.type==="ElementaryTypeName"&&
-         new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*;").test(body)){
+         new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*;",'s').test(cleanBody)){
         add({kind:"scalar",getter,stateVariable:name,sourceWitness:witness});
       }
       if(stateType?.type==="ArrayTypeName"&&declaration.inputs.length===1&&
         /^u?int/.test(canonicalElementaryAbiType(declaration.inputs[0])||'')){
         const structName=typeName(stateType.baseTypeName);
+        const indexParameter=(fn.parameters||[]).find((parameter:any)=>
+          sourceAbiType(parameter.typeName,fnOwner.path,fnOwner.contract)===declaration.inputs[0]&&
+          /^[A-Za-z_]\w*$/.test(String(parameter.name||''))&&new RegExp("\\breturn\\s+"+
+            regexEscape(name)+"\\s*\\[\\s*"+regexEscape(String(parameter.name))+
+            "\\s*\\]\\s*;",'s').test(cleanBody));
         const structMatches=structs.get(structName)||[];
         const matchingStructs=structMatches.filter(item=>
           item.owner.path===stateOwner.path||item.owner.contract===stateOwner.contract);
@@ -230,7 +252,7 @@ export function extractAccountingObservations(
             {path:importedStruct.path,ast:astByPath.get(importedStruct.path),contract:importedStruct.node}:null;
         const structFields=selectedStructs.length===1?selectedStructs[0].members:
           importedStruct?.node.type==="StructDefinition"?(importedStruct.node.members||[]):[];
-        if(resultSourceType===structName&&structOwner&&structFields.length){
+        if(resultSourceType===structName&&structOwner&&structFields.length&&indexParameter){
           structFields.forEach((field:any,index:number)=>{
             const ft=sourceAbiType(field.typeName,structOwner.path,
               structOwner.contract)||typeName(field.typeName);
