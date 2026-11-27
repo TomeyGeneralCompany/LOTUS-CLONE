@@ -1520,4 +1520,60 @@ if(clonedProperty.ok){
     step.function==='initialize(address)'),false,'Factory already initialized the clone');
 }
 
+// A source-proven position getter may supply a withdrawal amount dynamically.
+// The planner must observe the exact stored field, use it as the withdrawal
+// argument, and retain getter/field witnesses instead of guessing a constant.
+const dynamicPositionSource=`pragma solidity ^0.8.20;
+library SafeMath { function div(uint256 a,uint256 b) internal pure returns(uint256){return a/b;} }
+contract DynamicVault {
+  using SafeMath for uint256;
+  uint256 public totalDeposit;
+  uint256 constant PRECISION=1e18;
+  struct Deposit { uint256 virtualTokenTotalSupply; uint256 interestRate; }
+  Deposit[] internal deposits;
+  function deposit(uint256 depositAmount,uint64 maturationTimestamp) external {
+    _deposit(depositAmount,maturationTimestamp);
+  }
+  function _deposit(uint256 depositAmount,uint64 maturationTimestamp) internal {
+    deposits.push(Deposit(depositAmount,0)); totalDeposit += depositAmount;
+  }
+  function withdraw(uint64 depositID,uint256 virtualTokenAmount,bool early) external {
+    _withdraw(depositID,virtualTokenAmount,early);
+  }
+  function _withdraw(uint64 depositID,uint256 virtualTokenAmount,bool early) internal {
+    Deposit storage depositEntry=deposits[depositID-1];
+    uint256 virtualTokenTotalSupply=depositEntry.virtualTokenTotalSupply;
+    if(virtualTokenAmount>virtualTokenTotalSupply){virtualTokenAmount=virtualTokenTotalSupply;}
+    uint256 interestRate=depositEntry.interestRate;
+    uint256 depositAmount=virtualTokenAmount.div(interestRate+PRECISION);
+    totalDeposit-=depositAmount;
+    depositEntry.virtualTokenTotalSupply-=virtualTokenAmount;
+  }
+  function getDeposit(uint64 depositID) external view returns(Deposit memory){return deposits[depositID-1];}
+}`;
+const dynamicPositionSnapshot={path:'contracts/DynamicVault.sol',content:dynamicPositionSource,
+  sha256:createHash('sha256').update(dynamicPositionSource).digest('hex')};
+const dynamicPositionPlan=constructSolidityExperiments({repositoryCommit:'f'.repeat(40),
+  targetPath:dynamicPositionSnapshot.path,targetSelector:'DynamicVault.deposit',
+  sources:[dynamicPositionSnapshot],skipLegacy:true,declarations:[
+    {selector:'DynamicVault.deposit',operation:'send',inputs:['uint256','uint64']},
+    {selector:'DynamicVault.withdraw',operation:'send',inputs:['uint64','uint256','bool']},
+    {selector:'DynamicVault.totalDeposit',operation:'call',inputs:[]},
+    {selector:'DynamicVault.getDeposit',operation:'call',inputs:['uint64']},
+  ]});
+assert.equal(dynamicPositionPlan.ok,true,JSON.stringify(dynamicPositionPlan));
+if(dynamicPositionPlan.ok){
+  const dynamicExperiment=dynamicPositionPlan.experiments.find(e=>
+    e.sequence.steps.some(step=>step.operation==='observe'&&step.function==='getDeposit(uint64)'));
+  assert.ok(dynamicExperiment,'A full-position readback must appear before withdrawal');
+  const observedAt=dynamicExperiment!.sequence.steps.findIndex(step=>
+    step.operation==='observe'&&step.function==='getDeposit(uint64)');
+  const withdrawal=dynamicExperiment!.sequence.steps[observedAt+1];
+  assert.equal(withdrawal.operation,'send');
+  assert.equal(withdrawal.function,'withdraw(uint64,uint256,bool)');
+  assert.deepEqual(withdrawal.args,['1','$lastObservation:0',true]);
+  assert.ok(dynamicExperiment!.witnesses.some(w=>w.symbol==='DynamicVault.getDeposit(uint64)'));
+  assert.ok(dynamicExperiment!.witnesses.some(w=>w.symbol==='DynamicVault.Deposit.virtualTokenTotalSupply'));
+}
+
 console.log('Standalone experiment construction passed');

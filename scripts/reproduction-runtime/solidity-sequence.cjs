@@ -270,8 +270,24 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       return {...compiledArtifact,evm:{...compiledArtifact.evm,
         bytecode:{...compiledArtifact.evm.bytecode,object:linkedBytecode}}};
     };
+    let lastObservation = null;
     const resolve = v => {
       if(Array.isArray(v))return v.map(resolve);
+      if(typeof v==='string'){
+        const observedReference=/^\$lastObservation:([0-9]+(?:\.[0-9]+)*)$/.exec(v);
+        if(observedReference){
+          if(lastObservation===null)throw new Error('Dynamic observation reference has no preceding observe step');
+          let value=lastObservation;
+          for(const segment of observedReference[1].split('.')){
+            const index=Number(segment);
+            if(!Array.isArray(value)||index>=value.length)
+              throw new Error('Dynamic observation reference path is outside the observed value');
+            value=value[index];
+          }
+          if(value===null||value===undefined)throw new Error('Dynamic observation reference resolved to no value');
+          return value;
+        }
+      }
       if(typeof v==='string' && /^\$account[012]$/.test(v))return accounts[Number(v.at(-1))];
       if(typeof v==='string'&&/^\$deployment:[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(v)){
         const item=deployed.get(v.slice('$deployment:'.length));
@@ -472,7 +488,11 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
           const expected=normalize(resolve(step.expect));
           steps.push({operation:'call',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,
             actual,expected,...(step.expectPath?{expectPath:step.expectPath}:{}),passed:JSON.stringify(actual)===JSON.stringify(expected)});
-        } else steps.push({operation:'observe',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,actual:observed});
+        } else {
+          lastObservation=observed;
+          steps.push({operation:'observe',...depMeta,function:fragment.format('sighash'),
+            sender:step.sender??0,args:normalize(args),actual:observed});
+        }
       } else {
         if(!['nonpayable','payable'].includes(fragment.stateMutability))throw new Error('send requires a state-changing function');
         const expectedEvents=step.expectEvents||[];
@@ -506,6 +526,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         // Preserve raw receipt logs for independent review; display fitting
         // must never become the canonical evidence record.
         steps.push({operation:'send',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,
+          args:normalize(args),
           valueWei:step.valueWei||'0',reverted,gasUsed:receipt.gasUsed.toString(),
           receipt:receiptEvidence(receipt),actualEvents,expectedEvents:checkedEvents,
           eventsPassed,passed:reverted===!!step.expectRevert&&eventsPassed});

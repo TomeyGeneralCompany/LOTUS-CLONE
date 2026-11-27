@@ -10,7 +10,8 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from solidity_security_evidence import security_behavior_observed, security_experiment_disposition  # noqa: E402
+from solidity_security_evidence import (security_behavior_observed, security_experiment_disposition,
+    _dynamic_observation_arguments_match, _asserted_dynamic_position_withdrawal_negative)  # noqa: E402
 
 repro_spec = importlib.util.spec_from_file_location('source_repro', SCRIPTS_DIR / 'source-reproduction.py')
 repro_mod = importlib.util.module_from_spec(repro_spec)
@@ -30,6 +31,65 @@ CONTRACT_ADDR = "0x" + "44" * 20
 
 
 class SoliditySecurityEvidenceTests(unittest.TestCase):
+    def test_dynamic_withdrawal_argument_must_match_prior_struct_observation(self):
+        requested=[
+            {"operation":"observe","function":"getDeposit(uint64)","args":["1"]},
+            {"operation":"send","function":"withdraw(uint64,uint256,bool)",
+             "args":["1","$lastObservation:0",True]},
+        ]
+        actual=[
+            {"operation":"observe","function":"getDeposit(uint64)","args":["1"],
+             "actual":["1087","87000000000000000"]},
+            {"operation":"send","function":"withdraw(uint64,uint256,bool)",
+             "args":["1","1087",True]},
+        ]
+        self.assertTrue(_dynamic_observation_arguments_match(requested,actual))
+        tampered=[dict(actual[0]),dict(actual[1],args=["1","1088",True])]
+        self.assertFalse(_dynamic_observation_arguments_match(requested,tampered))
+        missing=[dict(actual[0]),{"operation":"send","args":["1",True]}]
+        self.assertFalse(_dynamic_observation_arguments_match(requested,missing))
+        out_of_range=[dict(requested[0]),dict(requested[1],args=["1","$lastObservation:8",True])]
+        self.assertFalse(_dynamic_observation_arguments_match(out_of_range,actual))
+
+    def test_dynamic_position_lifecycle_requires_source_and_two_final_readbacks(self):
+        source=("contract Vault { struct Deposit { uint256 virtualTokenTotalSupply; } "
+                "function getDeposit(uint64 depositID) external view returns(Deposit memory) "
+                "{ return deposits[depositID - 1]; } "
+                "function deposit(uint256 depositAmount,uint64) external "
+                "{ totalDeposit += depositAmount; } "
+                "function withdraw(uint64 depositID,uint256 virtualTokenAmount,bool) external "
+                "{ if(virtualTokenAmount > virtualTokenTotalSupply) "
+                "{ virtualTokenAmount = virtualTokenTotalSupply; } "
+                "totalDeposit -= depositAmount; "
+                "_getDeposit(depositID).virtualTokenTotalSupply -= virtualTokenAmount; } }")
+        requested=[
+            {"operation":"call","function":"totalDeposit()","expect":"0"},
+            {"operation":"send","function":"deposit(uint256,uint64)"},
+            {"operation":"call","function":"totalDeposit()","expect":"1000"},
+            {"operation":"observe","function":"getDeposit(uint64)","args":["1"]},
+            {"operation":"send","function":"withdraw(uint64,uint256,bool)",
+             "args":["1","$lastObservation:0",True]},
+            {"operation":"call","function":"getDeposit(uint64)","expectPath":[0]},
+            {"operation":"call","function":"totalDeposit()","expect":"0"},
+        ]
+        actual=[
+            {"operation":"call","actual":"0","passed":True},
+            {"operation":"send","args":["1000","2000000000"],"passed":True},
+            {"operation":"call","actual":"1000","passed":True},
+            {"operation":"observe","args":["1"],"actual":["1000"]},
+            {"operation":"send","args":["1","1000",True],"passed":True},
+            {"operation":"call","actual":"0","passed":True},
+            {"operation":"call","actual":"0","passed":True},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path=Path(tmp)/"Vault.sol"
+            source_path.write_text(source,encoding="utf8")
+            result=_asserted_dynamic_position_withdrawal_negative(source_path,requested,actual)
+            self.assertIsNotNone(result)
+            bad=actual[:-1]+[dict(actual[-1],actual="1",passed=False)]
+            self.assertIsNone(_asserted_dynamic_position_withdrawal_negative(
+                source_path,requested,bad))
+
     def test_imported_inherited_method_requires_acquired_executable_body(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

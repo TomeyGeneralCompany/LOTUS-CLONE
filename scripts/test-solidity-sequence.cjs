@@ -50,6 +50,14 @@ async function execute(s) {
    preparationAbiSha256:{}
  });} finally {await transport.disconnect();}
 }
+async function executePosition(positionArtifact,s) {
+ const transport=ganache.provider({logging:{quiet:true},wallet:{deterministic:true,totalAccounts:3},
+  chain:{hardfork:'shanghai',chainId:1337,time:new Date('2020-01-01T00:00:00Z')},miner:{blockGasLimit:12000000,timestampIncrement:1}});
+ try {return await runSequence(positionArtifact,s,transport,{}, {
+   abiSha256:createHash('sha256').update(JSON.stringify(positionArtifact.abi)).digest('hex'),
+   preparationAbiSha256:{}});
+ } finally {await transport.disconnect();}
+}
 (async()=>{
  validateSequence(sequence);
  const first=await execute(sequence);
@@ -65,6 +73,50 @@ async function execute(s) {
  assert.ok(first.steps[4].receipt.logs.some(log=>log.topics.length>0&&log.data.startsWith('0x')),
    'The complete raw receipt log must be preserved');
  assert.deepEqual(await execute(sequence),first,'Fresh deployment replay must be deterministic');
+ const dynamicSequence={...structuredClone(sequence),steps:[...structuredClone(sequence.steps),
+  {operation:'observe',function:'pair()',args:[]},
+  {operation:'send',function:'set(uint256,bool)',args:['$lastObservation:0',true]},
+  {operation:'call',function:'value()',args:[],expect:'22'}]};
+ const dynamicResult=await execute(dynamicSequence);
+ assert.ok(dynamicResult.steps.filter(x=>x.operation!=='observe').every(x=>x.passed),JSON.stringify(dynamicResult));
+ assert.deepEqual(dynamicResult.steps.at(-3).actual,['21',true]);
+ assert.deepEqual(dynamicResult.steps.at(-2).args,['21',true],
+  'A dynamic transaction argument must be recorded as the observed value that was encoded');
+ const positionSource=`pragma solidity ^0.8.20;
+ contract PositionFixture {
+   struct Deposit { uint256 virtualTokenTotalSupply; }
+   Deposit[] private deposits; uint256 public totalDeposit;
+   function deposit(uint256 amount) external {
+     deposits.push(Deposit(amount)); totalDeposit += amount;
+   }
+   function withdraw(uint64 id,uint256 amount,bool) external {
+     Deposit storage item=deposits[id-1];
+     if(amount>item.virtualTokenTotalSupply)amount=item.virtualTokenTotalSupply;
+     totalDeposit-=amount; item.virtualTokenTotalSupply-=amount;
+   }
+   function getDeposit(uint64 id) external view returns(Deposit memory){return deposits[id-1];}
+ }`;
+ const positionCompiled=JSON.parse(solc.compile(JSON.stringify({language:'Solidity',
+  sources:{'Position.sol':{content:positionSource}},
+  settings:{evmVersion:'shanghai',outputSelection:{'*':{'*':['abi','evm.bytecode.object']}}}})));
+ assert.equal((positionCompiled.errors||[]).filter(e=>e.severity==='error').length,0,
+  JSON.stringify(positionCompiled.errors));
+ const positionArtifact=positionCompiled.contracts['Position.sol'].PositionFixture;
+ const positionSequence={constructorArgs:[],steps:[
+  {operation:'call',function:'totalDeposit()',args:[],expect:'0'},
+  {operation:'send',function:'deposit(uint256)',args:['1000']},
+  {operation:'call',function:'totalDeposit()',args:[],expect:'1000'},
+  {operation:'observe',function:'getDeposit(uint64)',args:['1']},
+  {operation:'send',function:'withdraw(uint64,uint256,bool)',args:['1','$lastObservation:0',true]},
+  {operation:'call',function:'getDeposit(uint64)',args:['1'],expect:'0',expectPath:[0]},
+  {operation:'call',function:'totalDeposit()',args:[],expect:'0'},
+ ]};
+ validateSequence(positionSequence);
+ const positionResult=await executePosition(positionArtifact,positionSequence);
+ assert.ok(positionResult.steps.filter(s=>s.operation!=='observe').every(s=>s.passed),
+  JSON.stringify(positionResult));
+ assert.equal(positionResult.steps[3].actual[0],'1000');
+ assert.deepEqual(positionResult.steps[4].args,['1','1000',true]);
  const wrongEvent=structuredClone(sequence);
  wrongEvent.steps[4].expectEvents[0].args[2]='8';
  const wrongEventResult=await execute(wrongEvent);

@@ -826,16 +826,19 @@ def security_experiment_disposition(
     successful sequence assertions, and matching before/after state evidence.
     Mere absence of a recognized positive result is always inconclusive.
     """
+    requested = (specification or {}).get("sequence") or {}
+    requested_steps = requested.get("steps") or []
+    actual_steps = [step for step in (data.get("steps") or [])
+                    if step.get("operation") != "setup"]
+    if not _dynamic_observation_arguments_match(requested_steps, actual_steps):
+        return "observation_only", None, "A dynamic argument was not independently matched to its preceding recorded observation."
+
     positive, classification, explanation = security_behavior_observed(
         repository, file, selector, data, specification
     )
     if positive:
         return "behavior_observed", classification, explanation
 
-    requested = (specification or {}).get("sequence") or {}
-    requested_steps = requested.get("steps") or []
-    actual_steps = [step for step in (data.get("steps") or [])
-                    if step.get("operation") != "setup"]
     if len(requested_steps) != len(actual_steps) or not requested_steps:
         return "observation_only", None, explanation
     if any(step.get("passed") is not True for step in actual_steps
@@ -859,6 +862,12 @@ def security_experiment_disposition(
     )
     if scalar is not None:
         return "behavior_not_observed", scalar[0], scalar[1]
+
+    dynamic_position = _asserted_dynamic_position_withdrawal_negative(
+        file, requested_steps, actual_steps
+    )
+    if dynamic_position is not None:
+        return "behavior_not_observed", dynamic_position[0], dynamic_position[1]
 
     bounded = _asserted_financial_or_vesting_negative(
         file, selector, requested_steps, actual_steps,
@@ -901,6 +910,146 @@ def security_experiment_disposition(
                     return ("behavior_not_observed", "guarded_negative",
                             "Unauthorized selected transaction reverted and an identical source-declared state readback remained unchanged; all recorded assertions passed.")
     return "observation_only", None, explanation
+
+
+def _dynamic_observation_arguments_match(requested_steps: list, actual_steps: list) -> bool:
+    """Check runtime-substituted arguments against actual prior readbacks."""
+    def contains_reference(value):
+        if isinstance(value, list):
+            return any(contains_reference(item) for item in value)
+        return isinstance(value, str) and value.startswith("$lastObservation:")
+
+    has_dynamic_reference = any(contains_reference(step.get("args", []))
+                                 for step in requested_steps)
+    if len(requested_steps) != len(actual_steps):
+        return not has_dynamic_reference
+    last_observation = None
+
+    def resolve(value):
+        if isinstance(value, list):
+            return [resolve(item) for item in value]
+        if not isinstance(value, str):
+            return value
+        import re
+        match = re.fullmatch(r"\$lastObservation:([0-9]+(?:\.[0-9]+)*)", value)
+        if not match:
+            return value
+        if last_observation is None:
+            raise ValueError("dynamic reference precedes observation")
+        resolved = last_observation
+        for raw_index in match.group(1).split("."):
+            index = int(raw_index)
+            if not isinstance(resolved, list) or index >= len(resolved):
+                raise ValueError("dynamic reference path outside observation")
+            resolved = resolved[index]
+        if resolved is None:
+            raise ValueError("dynamic reference resolved to null")
+        return resolved
+
+    try:
+        for requested, actual in zip(requested_steps, actual_steps):
+            operation = requested.get("operation")
+            observed_after_step = None
+            if operation == "observe":
+                if actual.get("operation") != "observe":
+                    return False
+                if requested.get("args") != actual.get("args"):
+                    return False
+                observed_after_step = actual.get("actual")
+            refs = []
+
+            def collect(value, path=()):
+                if isinstance(value, list):
+                    for index, item in enumerate(value):
+                        collect(item, path + (index,))
+                elif isinstance(value, str) and value.startswith("$lastObservation:"):
+                    refs.append((path, resolve(value)))
+
+            collect(requested.get("args", []))
+            if refs:
+                actual_args = actual.get("args")
+                if not isinstance(actual_args, list):
+                    return False
+                for path, expected in refs:
+                    value = actual_args
+                    for index in path:
+                        if not isinstance(value, list) or index >= len(value):
+                            return False
+                        value = value[index]
+                    if value != expected:
+                        return False
+            if operation == "observe":
+                last_observation = observed_after_step
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def _asserted_dynamic_position_withdrawal_negative(
+    file: Path, requested_steps: list, actual_steps: list,
+) -> Tuple[str, str] | None:
+    """Recognize the source-checked full-position withdrawal lifecycle probe."""
+    import re
+
+    try:
+        source = file.read_text(encoding="utf8")
+    except (OSError, UnicodeError):
+        return None
+    clean = re.sub(r"/\*[\s\S]*?\*/|//[^\n]*", "", source)
+    if not (re.search(r"struct\s+Deposit\s*\{\s*uint256\s+virtualTokenTotalSupply\s*;", clean) and
+            re.search(r"function\s+getDeposit\s*\(\s*uint64\s+depositID\s*\)[\s\S]{0,500}?return\s+deposits\s*\[\s*depositID\s*-\s*1\s*\]", clean) and
+            re.search(r"totalDeposit\s*\+=\s*depositAmount\s*;", clean) and
+            re.search(r"totalDeposit\s*-=?\s*depositAmount\s*;", clean) and
+            re.search(r"if\s*\(\s*virtualTokenAmount\s*>\s*virtualTokenTotalSupply\s*\)[\s\S]{0,240}?virtualTokenAmount\s*=\s*virtualTokenTotalSupply\s*;", clean) and
+            re.search(r"_getDeposit\s*\(\s*depositID\s*\)\.virtualTokenTotalSupply\s*-=?\s*virtualTokenAmount\s*;", clean)):
+        return None
+    if len(requested_steps) != len(actual_steps):
+        return None
+    observations = [(index, step, actual_steps[index]) for index, step in enumerate(requested_steps)
+                    if step.get("operation") == "observe" and
+                    step.get("function") == "getDeposit(uint64)"]
+    withdrawals = [(index, step, actual_steps[index]) for index, step in enumerate(requested_steps)
+                   if step.get("operation") == "send" and
+                   step.get("function") == "withdraw(uint64,uint256,bool)"]
+    if len(observations) != 1 or len(withdrawals) != 1 or observations[0][0] >= withdrawals[0][0]:
+        return None
+    observer = observations[0][2]
+    withdrawal = withdrawals[0][2]
+    if (not isinstance(observer.get("actual"), list) or not observer["actual"] or
+            observations[0][1].get("args") != ["1"] or
+            not isinstance(withdrawal.get("args"), list) or len(withdrawal["args"]) != 3 or
+            withdrawal.get("passed") is not True or withdrawal["args"][0] != "1" or
+            withdrawal["args"][2] is not True):
+        return None
+    position_readbacks = [(index, actual) for index, (requested, actual) in
+                          enumerate(zip(requested_steps, actual_steps))
+                          if requested.get("operation") == "call" and
+                          requested.get("function") == "getDeposit(uint64)" and
+                          requested.get("expectPath") == [0]]
+    if not any(index > withdrawals[0][0] and actual.get("actual") == "0" and
+               actual.get("passed") is True for index, actual in position_readbacks):
+        return None
+    deposit_sends = [(requested, actual) for requested, actual in zip(requested_steps, actual_steps)
+                     if requested.get("operation") == "send" and
+                     requested.get("function") == "deposit(uint256,uint64)"]
+    ledger_reads = [(requested, actual) for requested, actual in zip(requested_steps, actual_steps)
+                    if requested.get("operation") == "call" and
+                    requested.get("function") == "totalDeposit()"]
+    if (len(deposit_sends) != 1 or len(deposit_sends[0][1].get("args", [])) != 2 or
+            deposit_sends[0][1].get("passed") is not True):
+        return None
+    deposit_amount = deposit_sends[0][1]["args"][0]
+    if (len(ledger_reads) < 3 or ledger_reads[0][0].get("expect") != "0" or
+            ledger_reads[0][1].get("actual") != "0" or ledger_reads[0][1].get("passed") is not True or
+            ledger_reads[1][0].get("expect") != deposit_amount or
+            ledger_reads[1][1].get("actual") != deposit_amount or
+            ledger_reads[1][1].get("passed") is not True or
+            ledger_reads[-1][0].get("expect") != "0" or
+            ledger_reads[-1][1].get("actual") != "0" or
+            ledger_reads[-1][1].get("passed") is not True):
+        return None
+    return ("dynamic_full_position_conservation",
+            "The acquired source records a bounded position, exposes its virtual-token supply, caps withdrawal to that supply, burns the same amount, and debits the principal ledger. The local EVM used the observed supply as the withdrawal argument and verified totalDeposit returned to zero; this bounded property was observed without a violation.")
 
 
 def security_behavior_observed(

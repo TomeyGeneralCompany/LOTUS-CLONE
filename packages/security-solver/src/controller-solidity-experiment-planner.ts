@@ -36,7 +36,7 @@ export type InvariantUnresolvedCategory =
   | 'no_supported_property';
 
 export interface SourceInvariantTransitionPlan {
-  mode: 'eth_deposit_withdraw' | 'internal_deposit_withdraw' | 'erc20_deposit_withdraw' | 'mint_burn_supply';
+  mode: 'eth_deposit_withdraw' | 'internal_deposit_withdraw' | 'erc20_deposit_withdraw' | 'mint_burn_supply' | 'dynamic_full_position_withdraw';
   usesMockToken?: boolean;
   /** ID of an acquired ERC20 fixture already injected through a transitive
    * constructor/initializer edge. */
@@ -47,7 +47,7 @@ export interface SourceInvariantTransitionPlan {
   inflowValueWei?: string;
   outflowMethod: string;
   outflowSig: string;
-  outflowArgs: string[];
+  outflowArgs: Array<string|boolean>;
   inflowAmount: string;
   outflowAmount: string;
   expectedRemainder: string;
@@ -55,6 +55,7 @@ export interface SourceInvariantTransitionPlan {
   balanceMappingGetterArgs?: string[];
   totalScalarGetter?: string;
   typedObservation?: {getter:string;args:string[];expectPath?:number[];baseline:string;afterInflow:string;afterOutflow:string};
+  dynamicPositionObservation?:{getter:string;args:string[];argumentPath:number[]};
   dependencyDeployments?:PreparedDeployment[];
   dependencyInitializerOperations?:PreparedInitializerOperation[];
   dependencyBindings?:Record<string,string>;
@@ -2562,6 +2563,70 @@ function sourceAccountingWriteCount(text:string,state:string):number {
   return [...text.matchAll(write)].length;
 }
 
+/** Prove a full-position withdrawal can be measured through an acquired
+ * source getter and fed back into the withdrawal amount. This is deliberately
+ * narrow: the amount must be capped by and burned from one stored position,
+ * and the principal ledger must be debited by a formula derived from that
+ * same amount. */
+function sourceDynamicFullPositionWithdrawal(
+  snapshot:SourceSnapshot,contract:any,declarations:readonly SolidityProbeDeclaration[],
+  outflowFn:any,outflowEffects:string,
+  ledger:string,
+):{getter:string;args:string[];argumentPath:number[];depositIdIndex:number;amountIndex:number;earlyIndex:number;witnesses:SourceWitness[]}|null {
+  const fail=(_reason:string):null=>null;
+  const clean=(value:string)=>value.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
+  const bodyText=clean(outflowEffects);
+  const params=outflowFn.parameters||[];
+  const idIndex=params.findIndex((p:any)=>/^(?:depositID|positionID|recordID|id)$/i.test(String(p.name||''))&&
+    /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p.typeName)||''));
+  const amountIndex=params.findIndex((p:any)=>/^(?:virtualTokenAmount|positionAmount|withdrawAmount|amount)$/i.test(String(p.name||''))&&
+    /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p.typeName)||''));
+  const earlyIndex=params.findIndex((p:any)=>canonicalAbiType(p.typeName)==='bool'&&
+    /^(?:early|earlyWithdraw)$/i.test(String(p.name||'')));
+  if(idIndex<0||amountIndex<0||earlyIndex<0||params.length!==3||
+    sourceAccountingWriteCount(bodyText,ledger)!==1)return fail('ABI or ledger write shape');
+  const idName=String(params[idIndex].name||'');
+  const storageMatch=bodyText.match(new RegExp(String.raw`\b[A-Za-z_]\w*\s+storage\s+([A-Za-z_]\w*)\s*=\s*deposits\s*\[\s*${idName}\s*-\s*1\s*\]`))||
+    bodyText.match(new RegExp(String.raw`\b[A-Za-z_]\w*\s+storage\s+([A-Za-z_]\w*)\s*=\s*_getDeposit\s*\(\s*${idName}\s*\)`));
+  if(!storageMatch)return fail('withdrawal ID does not select the observed stored position');
+  const entry=storageMatch[1];
+  if(storageMatch[0].includes('_getDeposit')){
+    const getterHelper=(contract.subNodes||[]).filter((node:any)=>node.type==='FunctionDefinition'&&
+      node.name==='_getDeposit'&&(node.parameters||[]).length===1&&
+      canonicalAbiType(node.parameters[0].typeName)==='uint64'&&
+      /\breturn\s+deposits\s*\[\s*depositID\s*-\s*1\s*\]\s*;/.test(clean(body(snapshot.content,node))));
+    if(getterHelper.length!==1||!bodyText.includes('return deposits['))
+      return fail('acquired _getDeposit helper does not map ID to observed array position');
+  }
+  const amountName=String(params[amountIndex].name||'');
+  const localNames=[...bodyText.matchAll(new RegExp(String.raw`\b([A-Za-z_]\w*)\s*=\s*${amountName}\s*\.\s*div\s*\(\s*([A-Za-z_]\w*)\s*\+\s*([A-Za-z_]\w*)\s*\)\s*;`,'g'))];
+  if(localNames.length!==1)return fail('principal formula count '+localNames.length);
+  const principal=localNames[0][1];
+  if(!sourceExactAccountingDelta(bodyText,ledger,principal,'decrease')||
+    !(new RegExp(String.raw`\b${entry}\.virtualTokenTotalSupply\s*-=\s*${amountName}\b`).test(bodyText)||
+      new RegExp(String.raw`_getDeposit\s*\(\s*${idName}\s*\)\.virtualTokenTotalSupply\s*-=\s*${amountName}\b`).test(bodyText)))return fail('ledger debit or position burn');
+  // The same requested amount is capped at the recorded supply before it is
+  // used for the accounting debit and the stored-token burn.
+  const capMatch=bodyText.match(new RegExp(String.raw`if\s*\(\s*${amountName}\s*>\s*([A-Za-z_]\w*)\s*\)\s*\{[\s\S]{0,240}?${amountName}\s*=\s*([A-Za-z_]\w*)\s*;`));
+  if(!capMatch||capMatch[1]!==capMatch[2]||
+    !new RegExp(String.raw`\b${capMatch[1]}\s*=\s*${entry}\.virtualTokenTotalSupply\s*;`).test(bodyText))
+    return fail('cap requested amount at stored supply');
+  const getter=(contract.subNodes||[]).find((n:any)=>n.type==='FunctionDefinition'&&n.name==='getDeposit'&&
+    ['public','external'].includes(n.visibility)&&n.stateMutability==='view'&&
+    (n.parameters||[]).length===1&&canonicalAbiType(n.parameters[0].typeName)==='uint64'&&
+    /\breturn\s+deposits\s*\[\s*depositID\s*-\s*1\s*\]\s*;/.test(clean(body(snapshot.content,n))));
+  if(!getter||!declarations.some(d=>d.operation==='call'&&d.selector===contract.name+'.getDeposit'&&
+    JSON.stringify(d.inputs)===JSON.stringify(['uint64'])))return fail('exact acquired getter unavailable');
+  const struct=(contract.subNodes||[]).find((n:any)=>n.type==='StructDefinition'&&n.name==='Deposit');
+  const first=(struct?.members||[])[0];
+  if(!first||first.name!=='virtualTokenTotalSupply'||canonicalAbiType(first.typeName)!=='uint256')return fail('position getter field layout');
+  // The getter body and first struct field prove the observation path.
+  return {getter:'getDeposit(uint64)',args:['1'],argumentPath:[0],
+    depositIdIndex:idIndex,amountIndex,earlyIndex,
+    witnesses:[witness(snapshot,getter,contract.name+'.getDeposit(uint64)'),
+      witness(snapshot,struct,contract.name+'.Deposit.virtualTokenTotalSupply')]};
+}
+
 export function extractSourceInvariantDescriptor(
   snapshot: SourceSnapshot,
   contract: any,
@@ -2575,6 +2640,12 @@ export function extractSourceInvariantDescriptor(
   if(isTestOrMockPath(snapshot.path))
     return {ok:false,category:'no_supported_property',
       reason:'Mock source is not an eligible financial property'};
+  // Keep every AST node in a source identity on the same cached parse tree.
+  // This also makes direct descriptor callers safe when they parsed the same
+  // acquired bytes independently before passing the contract node here.
+  const canonicalContract=(parseAstCached(snapshot).children||[]).find((node:any)=>
+    node.type==='ContractDefinition'&&node.name===contract.name);
+  if(canonicalContract)contract=canonicalContract;
   const { chain } = resolveInheritance(snapshot, contract, sources);
   if (isAbstractContractNode(contract, chain)) {
     const concreteSubclasses: string[] = [];
@@ -2698,8 +2769,8 @@ export function extractSourceInvariantDescriptor(
     .map((match:RegExpExecArray)=>match[1]?Number(match[1]):256));
   const narrowTransitionAmounts=transitionUintWidths.some(width=>width<10);
   const inflowAmount=narrowTransitionAmounts?'100':'1000';
-  const outflowAmount=narrowTransitionAmounts?'40':'400';
-  const expectedRemainder=narrowTransitionAmounts?'60':'600';
+  let outflowAmount:string=narrowTransitionAmounts?'40':'400';
+  let expectedRemainder:string=narrowTransitionAmounts?'60':'600';
 
   // Classify external contract/interface/token calls inside the inflow/outflow pair.
   // Acquired-source ERC20 token fixtures can be deployed locally; all other external
@@ -3012,7 +3083,9 @@ export function extractSourceInvariantDescriptor(
   let mode: SourceInvariantTransitionPlan['mode'] | null = null;
   let inflowArgs: string[] = [];
   let inflowValueWei: string | undefined;
-  let outflowArgs: string[] = [];
+  let outflowArgs: Array<string|boolean> = [];
+  let dynamicPositionObservation:SourceInvariantTransitionPlan['dynamicPositionObservation'];
+  let dynamicPositionWitnesses:SourceWitness[]=[];
   const mappedArgs=(fn:any,key:{sourceKey:string;parameterName?:string}|null,
     amount:string,keyValue:string|undefined):string[]|null=>{
     if(!key||!keyValue)return null;
@@ -3093,15 +3166,44 @@ export function extractSourceInvariantDescriptor(
     }
     mode='internal_deposit_withdraw';inflowArgs=inArgs;outflowArgs=outArgs;
   }
-  // Source-proven scalar ledgers do not require conventional method names.
-  // This covers issuance/redemption and other paired transitions with either
-  // (uint) or (address,uint) ABIs, while refusing ambiguous or unsupported
-  // parameter shapes and requiring an exact amount-to-state source delta.
-  else if(totalReferenced&&!balanceReferenced&&!usesErc20Transfer){
-    const inArgs=scalarAccountingArgs(inflowFn,inflowDecl,inflowAmount,totalVarName,inflowEffects,'increase');
-    const outArgs=scalarAccountingArgs(outflowFn,outflowDecl,outflowAmount,totalVarName,outflowEffects,'decrease');
-    if(inArgs&&outArgs){
-      mode='internal_deposit_withdraw';inflowArgs=inArgs;outflowArgs=outArgs;
+  // Dynamic full-position withdrawal is admitted only when the acquired
+  // getter, position field, capped amount, ledger debit and token burn all
+  // have direct source witnesses. The observed position amount becomes the
+  // withdrawal ABI argument in the local-EVM sequence.
+  else if(totalReferenced&&!balanceReferenced&&(!usesErc20Transfer||!!mockToken)){
+    const dynamic=sourceDynamicFullPositionWithdrawal(snapshot,contract,declarations,
+      outflowFn,outflowEffects,totalVarName);
+    if(dynamic){
+      const dynamicInflowAmount=scalarAmountParameter(inflowFn,totalVarName,
+        inflowEffects,'increase');
+      const inArgs=dynamicInflowAmount?(inflowFn.parameters||[]).map((param:any)=>{
+        if(param===dynamicInflowAmount)return inflowAmount;
+        if(/^(?:maturationTimestamp|maturityTimestamp)$/i.test(String(param.name||''))&&
+          canonicalAbiType(param.typeName)==='uint64')return '2000000000';
+        return null;
+      }):null;
+      const dynamicValues=(outflowFn.parameters||[]).map((param:any,index:number)=>{
+        if(index===dynamic.depositIdIndex)return '1';
+        if(index===dynamic.amountIndex)return '$lastObservation:0';
+        if(index===dynamic.earlyIndex)return true;
+        return null;
+      });
+      if(inArgs&&inArgs.length===2&&inArgs.every((value:any)=>value!==null)&&
+        dynamicValues.every((value:any)=>value!==null)){
+          mode='dynamic_full_position_withdraw';inflowArgs=inArgs;
+          outflowArgs=dynamicValues as Array<string|boolean>;
+          outflowAmount='1';expectedRemainder='0';
+          dynamicPositionObservation={getter:dynamic.getter,args:dynamic.args,
+            argumentPath:dynamic.argumentPath};
+          dynamicPositionWitnesses=dynamic.witnesses;
+      }
+    }
+    if(!mode){
+      const inArgs=scalarAccountingArgs(inflowFn,inflowDecl,inflowAmount,totalVarName,inflowEffects,'increase');
+      const outArgs=scalarAccountingArgs(outflowFn,outflowDecl,outflowAmount,totalVarName,outflowEffects,'decrease');
+      if(inArgs&&outArgs){
+        mode='internal_deposit_withdraw';inflowArgs=inArgs;outflowArgs=outArgs;
+      }
     }
   }
   // Mode C/D: Internal or acquired-ERC20 deposit(uint256)/stake(uint256) + withdraw(uint256)/unstake(uint256)
@@ -3148,6 +3250,9 @@ export function extractSourceInvariantDescriptor(
     sourceExactAccountingDelta(inflowEffects,accountingTarget,inflowParameter,"increase")&&
     sourceExactAccountingDelta(outflowEffects,accountingTarget,outflowParameter,"decrease")&&
     totalReferenced;
+  const dynamicFullPositionProven=mode==='dynamic_full_position_withdraw'&&
+    !!dynamicPositionObservation&&totalReferenced&&expectedRemainder==='0'&&
+    outflowArgs.includes('$lastObservation:0');
   // A payable deposit and ETH withdrawal can independently establish
   // conservation from the caller balance and the actual transferred value.
   // This detects a missing aggregate-ledger decrement (the BuggyVault case)
@@ -3185,7 +3290,7 @@ export function extractSourceInvariantDescriptor(
     sourceExactAccountingDelta(inflowEffects,balanceVarName,inflowParameter,"increase","msg.sender")&&
     sourceExactAccountingDelta(outflowEffects,balanceVarName,outflowParameter,"decrease","msg.sender")&&
     !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
-  if(!directlyProven&&!coupledPayableConservation&&!matchedTokenPrincipal&&
+  if(!directlyProven&&!dynamicFullPositionProven&&!coupledPayableConservation&&!matchedTokenPrincipal&&
     !matchedInternalPrincipal&&!collectionLifecycleProven){
     return {ok:false,category:'no_supported_property',
       reason:'Fixed-value conservation was not source-proven for '+contract.name+'.'+
@@ -3217,11 +3322,15 @@ export function extractSourceInvariantDescriptor(
   const inflowSig = `${inflowFn.name}(${inflowDecl.inputs.join(',')})`;
   const outflowSig = `${outflowFn.name}(${outflowDecl.inputs.join(',')})`;
   const obsList = [totalGetterSig, balanceGetterSig, typedObservation?.getter].filter(Boolean).join(' and ');
+  const dynamicPositionReadback=dynamicPositionObservation?
+    dynamicPositionObservation.getter+"(1).virtualTokenTotalSupply":undefined;
   const observedExpected=collectionLifecycleProven?typedObservation!.afterOutflow:expectedRemainder;
   if(typedObservation){
     preState.push({expression:`${contract.name}.${typedObservation.getter} == ${typedObservation.baseline}`,readback:typedObservation.getter});
     postState.push({expression:`${contract.name}.${typedObservation.getter} == ${typedObservation.afterOutflow}`,readback:typedObservation.getter});
   }
+  if(dynamicPositionReadback)
+    postState.push({expression:dynamicPositionReadback+' == 0',readback:dynamicPositionObservation!.getter});
 
   return {
     ok: true,
@@ -3230,11 +3339,15 @@ export function extractSourceInvariantDescriptor(
       target: `${contract.name}.${method}`,
       companionTarget: `${contract.name}.${method === inflowFn.name ? outflowFn.name : inflowFn.name}`,
       propertyKind,
-      predictedRelation: `After ${inflowSig} (${inflowAmount}) followed by ${outflowSig} (${outflowAmount}) by $account0, ${obsList} must equal ${observedExpected}.`,
-      falsifier: `Execute ${inflowSig} (+${inflowAmount}) then ${outflowSig} (-${outflowAmount}) on a fresh local EVM; violation observed if ${obsList} diverges from ${observedExpected}.`,
+      predictedRelation: mode==='dynamic_full_position_withdraw'?
+        `After ${inflowSig} (${inflowAmount}) creates deposit 1, observe ${dynamicPositionObservation!.getter} field 0 and withdraw exactly that recorded virtual-token supply using ${outflowSig}; ${obsList} must return to ${observedExpected} and the position supply must be zero.`:
+        `After ${inflowSig} (${inflowAmount}) followed by ${outflowSig} (${outflowAmount}) by $account0, ${obsList} must equal ${observedExpected}.`,
+      falsifier: mode==='dynamic_full_position_withdraw'?
+        `Execute ${inflowSig}, read the acquired deposit position getter, feed its field 0 into ${outflowSig}, then read ${obsList} and the position supply; a nonzero ledger or remaining position supply falsifies the source-derived relation.`:
+        `Execute ${inflowSig} (+${inflowAmount}) then ${outflowSig} (-${outflowAmount}) on a fresh local EVM; violation observed if ${obsList} diverges from ${observedExpected}.`,
       preState,
       postState,
-      witnesses: pairWitnesses,
+      witnesses: [...pairWitnesses,...dynamicPositionWitnesses],
       transitionPlan: {
         mode,
         ...(usesErc20Transfer&&mockToken?{usesMockToken:true}:{}),
@@ -3253,6 +3366,7 @@ export function extractSourceInvariantDescriptor(
         ...(balanceMappingGetterArgs?{balanceMappingGetterArgs}:{}),
         totalScalarGetter: totalGetterSig,
         typedObservation,
+        dynamicPositionObservation,
         ...(dependencyPlan.status==='resolved'&&dependencyPlan.deployments.length?{
           dependencyDeployments:dependencyPlan.deployments,
           dependencyInitializerOperations:dependencyPlan.initializerOperations,
@@ -3284,13 +3398,24 @@ export function admitSourceInvariantDescriptor(
     return null;
   }
   const tp = invariant.transitionPlan;
-  if (!tp.totalScalarGetter && !tp.balanceMappingGetter && !tp.typedObservation) return null;
+  if (!tp.totalScalarGetter && !tp.balanceMappingGetter && !tp.typedObservation&&
+    !tp.dynamicPositionObservation) return null;
   if(tp.typedObservation && (!tp.typedObservation.getter||
     ![tp.typedObservation.baseline,tp.typedObservation.afterInflow,tp.typedObservation.afterOutflow].every(v=>/^(?:0|[1-9][0-9]*)$/.test(v))))return null;
+  if(tp.mode==='dynamic_full_position_withdraw'&&(!tp.dynamicPositionObservation?.getter||
+    tp.dynamicPositionObservation.getter!=='getDeposit(uint64)'||
+    JSON.stringify(tp.dynamicPositionObservation.args)!=='["1"]'||
+    JSON.stringify(tp.dynamicPositionObservation.argumentPath)!=='[0]'||
+    JSON.stringify(tp.outflowArgs)!=='["1","$lastObservation:0",true]'||
+    !invariant.witnesses?.some(w=>w.symbol.endsWith('.getDeposit(uint64)')&&
+      w.sourceSha256===invariant.sourceSha256)||
+    !invariant.witnesses?.some(w=>w.symbol.endsWith('.Deposit.virtualTokenTotalSupply')&&
+      w.sourceSha256===invariant.sourceSha256)||tp.expectedRemainder!=='0'))return null;
   if (!/^[1-9][0-9]*$/.test(tp.inflowAmount) || !/^[1-9][0-9]*$/.test(tp.outflowAmount) || !/^(?:0|[1-9][0-9]*)$/.test(tp.expectedRemainder)) {
     return null;
   }
-  if (BigInt(tp.inflowAmount) - BigInt(tp.outflowAmount) !== BigInt(tp.expectedRemainder)) {
+  if (tp.mode!=='dynamic_full_position_withdraw'&&
+    BigInt(tp.inflowAmount) - BigInt(tp.outflowAmount) !== BigInt(tp.expectedRemainder)) {
     return null;
   }
   return invariant;
@@ -3309,6 +3434,9 @@ export function constructCoreInvariantExperiment(
 ): { hypothesis: string; property: string; sequence: SoliditySequence; witnesses: SourceWitness[] } | null {
   const admitted = admitSourceInvariantDescriptor(invariant);
   if (!admitted || admitted.sourceSha256 !== snapshot.sha256) return null;
+  const canonicalContract=(parseAstCached(snapshot).children||[]).find((node:any)=>
+    node.type==='ContractDefinition'&&node.name===contract.name);
+  if(canonicalContract)contract=canonicalContract;
   const tp = admitted.transitionPlan!;
   const { chain } = resolveInheritance(snapshot, contract, sources);
   const mockToken = tp.usesMockToken || tp.mode === 'erc20_deposit_withdraw' ? findRepositoryMockToken(sources) : null;
@@ -3455,6 +3583,10 @@ export function constructCoreInvariantExperiment(
   }
   const midTyped=typedReadback(tp.typedObservation?.afterInflow||'');
   if(midTyped)steps.push(midTyped);
+  if(tp.dynamicPositionObservation){
+    steps.push({operation:'observe',function:tp.dynamicPositionObservation.getter,
+      args:tp.dynamicPositionObservation.args});
+  }
   // 4. Outflow operation (-outflowAmount)
   steps.push({
     operation: 'send',
@@ -3462,6 +3594,11 @@ export function constructCoreInvariantExperiment(
     args: tp.outflowArgs,
     sender: 0,
   });
+  if(tp.dynamicPositionObservation){
+    steps.push({operation:'call',function:tp.dynamicPositionObservation.getter,
+      args:tp.dynamicPositionObservation.args,expect:'0',
+      expectPath:tp.dynamicPositionObservation.argumentPath});
+  }
   const postTyped=typedReadback(tp.typedObservation?.afterOutflow||'');
   if(postTyped)steps.push(postTyped);
   // 5. Post-state conservation / supply-accounting assertions (== expectedRemainder)
