@@ -2446,15 +2446,17 @@ function accountingDirections(text:string,state:string):{increase:boolean;decrea
   const indexed="(?:\\s*\\[[^\\]\\n]{1,128}\\]){0,2}";
   const lvalue="\\b"+state+"("+indexed+")\\s*";
   const simple="\\b"+state+"\\s*"+indexed+"\\s*";
+  const collectionPush=new RegExp("\\b"+state+"\\s*\\.\\s*push\\s*\\(");
+  const collectionPop=new RegExp("\\b"+state+"\\s*\\.\\s*pop\\s*\\(");
   const assigned=(operation:"add"|"sub")=>{
     const arithmetic=operation==="add"?"\\+":"-";
     return new RegExp(lvalue+"=\\s*"+state+"\\1\\s*(?:"+arithmetic+
       "|\\.\\s*"+operation+"\\s*\\()");
   };
   return {
-    increase:new RegExp(simple+"\\+=").test(text)||
+    increase:collectionPush.test(text)||new RegExp(simple+"\\+=").test(text)||
       assigned("add").test(text),
-    decrease:new RegExp(simple+"-=").test(text)||
+    decrease:collectionPop.test(text)||new RegExp(simple+"-=").test(text)||
       assigned("sub").test(text),
   };
 }
@@ -2742,6 +2744,10 @@ export function extractSourceInvariantDescriptor(
     return undefined;
   };
   const typedObservation=(!totalGetterDecl&&!balanceGetterDecl)?findTypedObservation():undefined;
+  const collectionLifecycleProven=!!typedObservation&&sourceObservations.some(observation=>
+    observation.kind==='collection_length'&&observation.getter===typedObservation.getter)&&
+    typedObservation.baseline==='0'&&typedObservation.afterInflow==='1'&&
+    typedObservation.afterOutflow==='0';
   if (!totalGetterDecl && !balanceGetterDecl && !typedObservation) {
     return {
       ok: false,
@@ -3041,7 +3047,8 @@ export function extractSourceInvariantDescriptor(
     sourceExactAccountingDelta(inflowEffects,balanceVarName,inflowParameter,"increase","msg.sender")&&
     sourceExactAccountingDelta(outflowEffects,balanceVarName,outflowParameter,"decrease","msg.sender")&&
     !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
-  if(!directlyProven&&!coupledPayableConservation&&!matchedTokenPrincipal&&!matchedInternalPrincipal){
+  if(!directlyProven&&!coupledPayableConservation&&!matchedTokenPrincipal&&
+    !matchedInternalPrincipal&&!collectionLifecycleProven){
     return {ok:false,category:'no_supported_property',
       reason:'Fixed-value conservation was not source-proven for '+contract.name+'.'+
         inflowFn.name+'/'+outflowFn.name+'; requires a property-specific measured scenario.',
@@ -3050,7 +3057,7 @@ export function extractSourceInvariantDescriptor(
 
   const totalGetterSig = totalReferenced ? `${totalVarName}()` : undefined;
   const balanceGetterSig = balanceReferenced ? balanceVarName+'('+(publicBalanceKeyAbi||'address')+')' : undefined;
-  const propertyKind: InvariantPropertyKind =
+  const propertyKind: InvariantPropertyKind = collectionLifecycleProven?'other':
     mode === 'mint_burn_supply' || /supply/i.test(totalVarName)
       ? 'supply-accounting'
       : /share/i.test(totalVarName) || /share/i.test(balanceVarName)
@@ -3072,6 +3079,7 @@ export function extractSourceInvariantDescriptor(
   const inflowSig = `${inflowFn.name}(${inflowDecl.inputs.join(',')})`;
   const outflowSig = `${outflowFn.name}(${outflowDecl.inputs.join(',')})`;
   const obsList = [totalGetterSig, balanceGetterSig, typedObservation?.getter].filter(Boolean).join(' and ');
+  const observedExpected=collectionLifecycleProven?typedObservation!.afterOutflow:expectedRemainder;
   if(typedObservation){
     preState.push({expression:`${contract.name}.${typedObservation.getter} == ${typedObservation.baseline}`,readback:typedObservation.getter});
     postState.push({expression:`${contract.name}.${typedObservation.getter} == ${typedObservation.afterOutflow}`,readback:typedObservation.getter});
@@ -3084,8 +3092,8 @@ export function extractSourceInvariantDescriptor(
       target: `${contract.name}.${method}`,
       companionTarget: `${contract.name}.${method === inflowFn.name ? outflowFn.name : inflowFn.name}`,
       propertyKind,
-      predictedRelation: `After ${inflowSig} (${inflowAmount}) followed by ${outflowSig} (${outflowAmount}) by $account0, ${obsList} must equal ${expectedRemainder}.`,
-      falsifier: `Execute ${inflowSig} (+${inflowAmount}) then ${outflowSig} (-${outflowAmount}) on a fresh local EVM; violation observed if ${obsList} diverges from ${expectedRemainder}.`,
+      predictedRelation: `After ${inflowSig} (${inflowAmount}) followed by ${outflowSig} (${outflowAmount}) by $account0, ${obsList} must equal ${observedExpected}.`,
+      falsifier: `Execute ${inflowSig} (+${inflowAmount}) then ${outflowSig} (-${outflowAmount}) on a fresh local EVM; violation observed if ${obsList} diverges from ${observedExpected}.`,
       preState,
       postState,
       witnesses: pairWitnesses,

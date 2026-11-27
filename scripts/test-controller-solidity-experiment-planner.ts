@@ -636,6 +636,46 @@ for (const [name, code] of [['BuggyAccountingVault', buggyVaultSrc], ['FixedAcco
   }
 }
 
+// Internal collection helpers need to feed both source-backed pair discovery
+// and the observable length getter. The asserted transition must be 0 -> 1 -> 0.
+{
+  const code=`pragma solidity ^0.8.20;
+contract PositionBook {
+  struct Position { uint256 amount; }
+  Position[] private positions;
+  function deposit(uint256 amount) external { _append(amount); }
+  function withdraw(uint256 amount) external { _remove(amount); }
+  function _append(uint256 amount) internal {
+    positions.push(Position({amount:amount}));
+  }
+  function _remove(uint256 amount) internal {
+    require(positions[positions.length-1].amount>=amount);
+    positions.pop();
+  }
+  function positionsLength() external view returns(uint256) { return positions.length; }
+}`;
+  const path='contracts/PositionBook.sol';
+  const result=constructSolidityExperiments({
+    repositoryCommit:'e'.repeat(40),targetPath:path,targetSelector:'PositionBook.withdraw',
+    sources:[{path,sha256:createHash('sha256').update(code).digest('hex'),content:code}],
+    declarations:[
+      {selector:'PositionBook.deposit',operation:'send' as const,inputs:['uint256']},
+      {selector:'PositionBook.withdraw',operation:'send' as const,inputs:['uint256']},
+      {selector:'PositionBook.positionsLength',operation:'call' as const,inputs:[]},
+    ],
+  });
+  assert.equal(result.ok,true,'Internal push/pop accounting must construct');
+  if(result.ok){
+    const experiment=result.experiments.find(e=>e.securityProperty==='financial other invariant (deposit->withdraw)');
+    assert.ok(experiment,'Collection lifecycle must be classified as an independent source property');
+    const steps=experiment!.sequence.steps;
+    assert.ok(steps.some(s=>s.operation==='call'&&s.function==='positionsLength()'&&s.expect==='0'));
+    assert.ok(steps.some(s=>s.operation==='call'&&s.function==='positionsLength()'&&s.expect==='1'));
+    assert.equal(steps.filter(s=>s.operation==='send'&&
+      ['deposit(uint256)','withdraw(uint256)'].includes(s.function)).length,2);
+  }
+}
+
 // Verified module operator rotation and bounded funding construction, source-only.
 {
   const operatorSrc=`pragma solidity ^0.8.20;
