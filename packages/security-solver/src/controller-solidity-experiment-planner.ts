@@ -2509,7 +2509,7 @@ function sourceBooleanGateForScalarWrite(
     sourceExactScalarFormula(source,state,amount)!==null;
   const gates:Array<{parameter:string;value:boolean}>=[];
   const unsupported:{value:boolean}={value:false};
-  const ifStart=/\bif\s*\(\s*(!?\s*[A-Za-z_]\w*)\s*\)\s*\{/g;
+  const ifStart=/\bif\s*\(([^()]*)\)\s*\{/g;
   for(let match;(match=ifStart.exec(text));){
     let depth=1,pos=ifStart.lastIndex;
     for(;pos<text.length&&depth>0;pos++){
@@ -2520,9 +2520,13 @@ function sourceBooleanGateForScalarWrite(
     const branch=text.slice(ifStart.lastIndex,pos-1);
     if(!writes(branch))continue;
     const condition=match[1].replace(/\s+/g,'');
+    const gatedParameters=boolParameters.filter(parameter=>
+      new RegExp('(?:^|[^A-Za-z0-9_$])'+parameter+'(?:$|[^A-Za-z0-9_$])').test(condition));
+    if(!gatedParameters.length)continue;
+    if(gatedParameters.length!==1){unsupported.value=true;continue;}
+    const parameter=gatedParameters[0];
+    if(condition!==parameter&&condition!=='!'+parameter){unsupported.value=true;continue;}
     const negated=condition.startsWith('!');
-    const parameter=negated?condition.slice(1):condition;
-    if(!boolParameters.includes(parameter)){unsupported.value=true;continue;}
     gates.push({parameter,value:!negated});
   }
   if(unsupported.value)return null;
@@ -3444,8 +3448,8 @@ function sourceScalarDeltaExperiments(
       // remain ambiguous and are refused.
       const matchedAmounts=amountParameters.map((candidate:any)=>{
         if(!identifier.test(candidate.name||''))return null;
+        if(sourceAccountingWriteCount(fnText,state.name)!==1)return null;
         const formula=sourceExactScalarFormula(fnText,state.name,candidate.name);
-        if(formula&&sourceAccountingWriteCount(fnText,state.name)!==1)return null;
         const direct=!formula&&sourceExactAccountingDelta(fnText,state.name,candidate.name,'increase');
         return direct!==Boolean(formula)?{param:candidate,formula}:null;
       }).filter((value:any)=>value!==null);

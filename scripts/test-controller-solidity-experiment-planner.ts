@@ -1262,6 +1262,27 @@ if(typedScalarPlan.ok){
   const send=experiment!.sequence.steps.find(step=>step.operation==='send');
   assert.deepEqual(send&&'args'in send?send.args:null,['2000000000','1000',true]);
 }
+const ambiguousBooleanSource=typedScalarSource.replace(
+  'if (enabled) { totalDeposits+=wad; }',
+  'if (enabled && wad > 0) { totalDeposits+=wad; }');
+const ambiguousBooleanSnapshot={path:'contracts/TypedScalar.sol',
+  content:ambiguousBooleanSource,
+  sha256:createHash('sha256').update(ambiguousBooleanSource).digest('hex')};
+const ambiguousBooleanPlan=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:ambiguousBooleanSnapshot.path,
+  targetSelector:'TypedScalar.deposit',sources:[ambiguousBooleanSnapshot],
+  declarations:[
+    {selector:'TypedScalar.deposit',operation:'send',inputs:['uint256']},
+    {selector:'TypedScalar.deposit',operation:'send',inputs:['uint64','uint256','bool']},
+    {selector:'TypedScalar.totalDeposits',operation:'call',inputs:[]},
+  ],skipLegacy:true,
+});
+assert.equal(ambiguousBooleanPlan.ok,true,JSON.stringify(ambiguousBooleanPlan));
+if(ambiguousBooleanPlan.ok)
+  assert.equal(ambiguousBooleanPlan.experiments.some(e=>
+    e.sequence.sourceProperty?.kind==='scalar_delta'&&
+    e.sequence.sourceProperty.method==='deposit(uint64,uint256,bool)'),false,
+    'A compound bool guard must not receive an unproven false fixture');
 // An external dependency is not converted into a certified local scalar proof.
 const externalLedgerSource=ledgerSource.replace('reserve += amount;',
   'IProtocol(protocol).deposit(amount); reserve += amount;');
