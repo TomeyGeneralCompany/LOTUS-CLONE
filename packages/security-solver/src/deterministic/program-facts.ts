@@ -267,20 +267,60 @@ export const solidityAstFactsAdapter: ProgramFactsAdapter = {
       return "";
     };
 
+    const sourceTypeNodes:any[]=[];
+    for(const src of input.sources){
+      if(detectLanguage(src.path)!=="solidity")continue;
+      try{
+        const parsed:any=parseSolidity(src.content,{loc:true,range:true,tolerant:true});
+        sourceTypeNodes.push(...(parsed.children||[]));
+      }catch{/* An unrelated unparseable source cannot supply a type witness. */}
+    }
+    const getterKeyType=(typeNode:any,depth=0):string|null=>{
+      if(depth>8||!typeNode)return null;
+      if(typeNode.type==="ElementaryTypeName"){
+        let name=String(typeNode.name||"");
+        if(name==="uint")name="uint256";
+        else if(name==="int")name="int256";
+        if(/^(?:address|bool|bytes(?:[1-9]|[12][0-9]|3[012])?|u?int(?:[0-9]{1,3})?)$/.test(name))
+          return name;
+        return null;
+      }
+      if(typeNode.type!=="UserDefinedTypeName")return null;
+      const fullName=String(typeNode.namePath||"");
+      const shortName=fullName.split(".").pop()||"";
+      const definitions:any[]=[];
+      for(const top of sourceTypeNodes){
+        for(const child of top.subNodes||[]){
+          if((child.type==="EnumDefinition"||child.type==="UserDefinedValueTypeDefinition"||
+              child.type==="ContractDefinition")&&child.name===shortName)
+            definitions.push({node:child,owner:top.name});
+        }
+        if(top.type==="TypeDefinition"&&top.name===shortName)
+          definitions.push({node:top.definition,owner:""});
+        else if((top.type==="EnumDefinition"||top.type==="ContractDefinition")&&
+            top.name===shortName)
+          definitions.push({node:top,owner:""});
+      }
+      const qualifiedOwner=fullName.includes(".")?fullName.slice(0,fullName.lastIndexOf(".")):null;
+      const candidates=qualifiedOwner?
+        definitions.filter(item=>item.owner===qualifiedOwner):
+        definitions;
+      if(candidates.length!==1)return null;
+      const definition=candidates[0].node;
+      if(definition.type==="EnumDefinition")return "uint8";
+      if(definition.type==="ContractDefinition")return "address";
+      if(definition.type==="ElementaryTypeName")
+        return getterKeyType(definition,depth+1);
+      return null;
+    };
     const publicGetterInputTypes = (typeNode:any):string[]|null => {
       const inputs:string[]=[];
       let current=typeNode;
       while(current?.type==="Mapping"||current?.type==="ArrayTypeName"){
         if(current.type==="Mapping"){
-          const key=current.keyType;
-          if(key?.type!=="ElementaryTypeName")return null;
-          let name=String(key.name||"");
-          if(name==="uint")name="uint256";
-          else if(name==="int")name="int256";
-          else if(name==="address payable")name="address";
-          if(!/^(?:address|bool|bytes(?:[1-9]|[12][0-9]|3[012])?|u?int(?:[0-9]{1,3})?)$/.test(name))
-            return null;
-          inputs.push(name);
+          const keyType=getterKeyType(current.keyType);
+          if(!keyType)return null;
+          inputs.push(keyType);
           current=current.valueType;
         }else{
           inputs.push("uint256");

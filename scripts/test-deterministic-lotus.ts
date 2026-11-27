@@ -836,6 +836,40 @@ contract UintKeyVault {
     assert.ok(uintKeyHypothesis,"uint-key mapping accounting must produce a relational property");
     assert.ok(uintKeyHypothesis.requiredObservations.includes("balances(uint256)"),
       "Public mapping observations must use the acquired source's exact key type");
+
+    const typedKeyVault=`// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+type AccountId is uint64;
+contract TypedKeyVault {
+    enum Phase { Open, Closed }
+    mapping(Phase => uint256) public balances;
+    mapping(AccountId => uint256) public shares;
+    uint256 public totalDeposits;
+    function deposit(Phase phase, AccountId account) external payable {
+        balances[phase] += msg.value;
+        shares[account] += msg.value;
+        totalDeposits += msg.value;
+    }
+    function withdraw(Phase phase, AccountId account, uint256 amount) external {
+        balances[phase] -= amount;
+        shares[account] -= amount;
+        totalDeposits -= amount;
+    }
+}
+`;
+    const typedKeyGraph=buildProgramFactsGraph({sources:[{
+      path:"source-0/contracts/TypedKeyVault.sol",
+      content:typedKeyVault,
+      sha256:sha(typedKeyVault),
+    }]});
+    const typedKeyHypothesis=generateRelationalHypotheses(typedKeyGraph).find(r=>
+      r.entrypoints.includes("TypedKeyVault.deposit")&&
+      r.entrypoints.includes("TypedKeyVault.withdraw"));
+    assert.ok(typedKeyHypothesis,"enum/UDVT mapping accounting must produce a relational property");
+    assert.ok(typedKeyHypothesis.requiredObservations.includes("balances(uint8)"),
+      "Enum mapping getter inputs must use Solidity's ABI uint8 representation");
+    assert.ok(typedKeyHypothesis.requiredObservations.includes("shares(uint64)"),
+      "UDVT mapping getter inputs must resolve through the declared underlying ABI type");
   }
 
   // 10. Regression Case 3: Insufficient evidence -> UNKNOWN_ASSERTION, zero fabricated experiments
