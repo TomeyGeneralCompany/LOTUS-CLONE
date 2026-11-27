@@ -2664,7 +2664,9 @@ contract OverrideRates is Ownable {
     // ERC1155 contract is required for the approval's local state assertion.
     const nestedAllowance=`pragma solidity ^0.8.0;
 contract PrivateAllowance {
+ uint8 public decimals;
  mapping(address=>mapping(address=>uint256)) private _allowances;
+ function initialize(uint8 decimals_) external { decimals=decimals_; }
  function allowance(address owner,address spender) external view returns(uint256) {
    return _allowances[owner][spender];
  }
@@ -2685,6 +2687,8 @@ contract PrivateAllowance {
     const nestedAllowanceSnap={path:'source-1/contracts/PrivateAllowance.sol',
       content:nestedAllowance,sha256:hash(nestedAllowance)};
     const nestedAllowanceMenu=[
+      {selector:'PrivateAllowance.initialize',operation:'send',inputs:['uint8']},
+      {selector:'PrivateAllowance.decimals',operation:'call',inputs:[]},
       {selector:'PrivateAllowance.approve',operation:'send',inputs:['address','uint256']},
       {selector:'PrivateAllowance.increaseAllowance',operation:'send',inputs:['address','uint256']},
       {selector:'PrivateAllowance.allowance',operation:'call',inputs:['address','address']}
@@ -2697,6 +2701,8 @@ contract PrivateAllowance {
       'Exact private mapping helper and public getter must produce an executable property');
     if(allowancePlan.ok)assert.ok(allowancePlan.experiments.some(exp=>
       exp.securityProperty.includes('internal setter and public mapping getter')&&
+      exp.sequence.steps.some(step=>step.operation==='send'&&
+        step.function==='initialize(uint8)'&&step.args[0]==='18')&&
       exp.sequence.steps.some(step=>step.operation==='call'&&
         step.function==='allowance(address,address)'&&step.expect==='7')),
       'Private mapping mutation must be falsified by an actual getter result');
