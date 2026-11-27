@@ -1062,6 +1062,19 @@ contract QualifiedObservation {
     assert.ok(qualifiedObservations.some(o=>o.kind==='mapping'&&o.getter==='balanceOf(uint48)'&&
       o.keyType==='uint48'&&o.stateVariable==='balances'),
       'Accounting readbacks must resolve namespace-qualified imported value types');
+    const structObservationSource=`pragma solidity ^0.8.20;
+contract StructObservation {
+  struct Position { uint256 amount; bool active; }
+  Position[] private positions;
+  function position(uint256 index) external view returns (Position memory) { return positions[index]; }
+}`;
+    const structObservationSnapshot={path:'source-1/contracts/StructObservation.sol',
+      content:structObservationSource,sha256:hash(structObservationSource)};
+    const structObservations=extractAccountingObservations(structObservationSnapshot,
+      'StructObservation',[{selector:'StructObservation.position',operation:'call',inputs:['uint256']}] as any);
+    assert.ok(structObservations.some(o=>o.kind==='struct_field'&&o.getter==='position(uint256)'&&
+      o.fieldName==='amount'&&o.fieldType==='uint256'),
+      'Struct tuple ABI resolution must preserve source struct field observations');
     // Use explicit source-grounded require() constraints rather than a generic
     // zero constructor value for acquired transitive dependencies.
     const boundedInterface='pragma solidity ^0.8.0; interface IBounded { function ping() external; }';

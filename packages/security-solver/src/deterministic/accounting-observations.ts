@@ -118,7 +118,8 @@ export function extractAccountingObservations(
     const body=fnLines.slice(line-1,last).join("\n");
     const witness=snapshot.path+":"+line+"-"+last+":"+snapshot.sha256;
     const returns=fn.returnParameters||[];
-    const resultType=returns.length===1?sourceAbiType(returns[0]?.typeName)||typeName(returns[0]?.typeName):"";
+    const resultSourceType=returns.length===1?typeName(returns[0]?.typeName):"";
+    const resultType=returns.length===1?sourceAbiType(returns[0]?.typeName)||resultSourceType:"";
     for(const [name,state] of states){
       if(!new RegExp("\\b"+regexEscape(name)+"\\b").test(body))continue;
       const stateType=state.typeName;
@@ -150,7 +151,7 @@ export function extractAccountingObservations(
         /^u?int/.test(canonicalElementaryAbiType(declaration.inputs[0])||'')){
         const structName=typeName(stateType.baseTypeName);
         const fields=structs.get(structName)||[];
-        if(resultType===structName&&fields.length){
+        if(resultSourceType===structName&&fields.length){
           fields.forEach((field:any,index:number)=>{
             const ft=typeName(field.typeName);
             if(simple(ft))add({kind:"struct_field",getter,keyType:declaration.inputs[0],fieldName:field.name,
