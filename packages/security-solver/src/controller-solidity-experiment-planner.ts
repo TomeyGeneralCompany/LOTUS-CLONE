@@ -407,6 +407,18 @@ function canonicalAbiType(typeName:any,seen=new Set<any>()):string|null {
   return null;
 }
 
+function enumAbiCardinality(typeName:any):number|null {
+  if(typeName?.type!=='UserDefinedTypeName')return null;
+  const name=String(typeName.namePath||'');
+  if(!identifier.test(name)&&!/^([A-Za-z_]\w*\.)+[A-Za-z_]\w*$/.test(name))return null;
+  const owner=abiNodeOwner.get(typeName);
+  const choices=activeAbiTypeDefinitions.get(owner&&!name.includes('.')?owner+'.'+name:name)||
+    activeAbiTypeDefinitions.get(name)||[];
+  if(!choices.length||choices.some(choice=>choice.kind!=='enum'))return null;
+  const cardinalities=[...new Set(choices.map(choice=>(choice.node.members||[]).length))];
+  return cardinalities.length===1?cardinalities[0]:null;
+}
+
 function classifyScalarType(abiType:string|null):AbiScalarType|null {
   if(!abiType)return null;
   if(abiType==='address')return 'address';
@@ -2686,8 +2698,7 @@ export function extractSourceInvariantDescriptor(
     /^uint(?:[0-9]+)?$/.test(String(v.typeName.name||"")));
   const publicBalance=accountingStateVars.find((v:any)=>{
     if(v.visibility!=="public"||v.typeName?.type!=="Mapping"||
-      !/^uint(?:[0-9]+)?$/.test(String(v.typeName.valueType?.name||"")))return false;
-    if(v.typeName.keyType?.type!=="ElementaryTypeName")return false;
+      !/^uint(?:[0-9]{1,3})?$/.test(String(canonicalAbiType(v.typeName.valueType)||"")))return false;
     const keyType=canonicalAbiType(v.typeName.keyType);
     return keyType==="address"||/^uint(?:[0-9]{1,3})?$/.test(String(keyType||""));
   });
@@ -2749,15 +2760,23 @@ export function extractSourceInvariantDescriptor(
     const parameter=(fn.parameters||[]).find((item:any)=>item.name===sourceKey);
     if(!parameter||canonicalAbiType(parameter.typeName)!==publicBalanceKeyAbi)return null;
     const constraints=collectParamConstraints(fn.body,new Set([sourceKey]));
+    const enumCardinality=enumAbiCardinality(parameter.typeName);
+    const requiresPositive=constraints.get(sourceKey)?.has("gt_zero")||
+      constraints.get(sourceKey)?.has("nonzero");
+    if(enumCardinality!==null&&enumCardinality===0)return null;
+    if(enumCardinality===1&&requiresPositive)return null;
     const keyValue=publicBalanceKeyAbi==="address"?"$account0":
-      constraints.get(sourceKey)?.has("gt_zero")?"1":"7";
+      enumCardinality!==null?String(Math.min(1,enumCardinality-1)):
+      requiresPositive?"1":"7";
     return {sourceKey,parameterName:sourceKey,getterArg:keyValue};
   };
   const inflowMappingKey=balanceReferenced?mappingKeyFor(inflowFn):null;
   const outflowMappingKey=balanceReferenced?mappingKeyFor(outflowFn):null;
   const commonMappingKeyArg=inflowMappingKey&&outflowMappingKey?
     (publicBalanceKeyAbi==="address"?"$account0":
-      inflowMappingKey.getterArg==="1"||outflowMappingKey.getterArg==="1"?"1":"7"):undefined;
+      inflowMappingKey.getterArg==="1"||outflowMappingKey.getterArg==="1"?"1":
+      inflowMappingKey.getterArg===outflowMappingKey.getterArg?
+        inflowMappingKey.getterArg:undefined):undefined;
   const balanceMappingGetterArgs=commonMappingKeyArg?[commonMappingKeyArg]:undefined;
   if (!totalReferenced && !balanceReferenced && !typedObservation) {
     return {

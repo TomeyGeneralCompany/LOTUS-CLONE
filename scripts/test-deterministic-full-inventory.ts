@@ -2203,6 +2203,72 @@ contract FundedMapping {
         JSON.stringify(step.args)===JSON.stringify(['1','400'])),
         'Withdrawal must use the same source-proven mapping key and amount');
     }
+    const enumLedgerText=`pragma solidity ^0.8.20;
+contract EnumLedger {
+  enum AccountId { Unknown, Treasury }
+  mapping(AccountId => uint256) public balances;
+  uint256 public total;
+  function deposit(AccountId accountId,uint256 amount) external {
+    require(accountId != AccountId.Unknown);
+    balances[accountId] += amount; total += amount;
+  }
+  function withdraw(AccountId accountId,uint256 amount) external {
+    require(accountId != AccountId.Unknown);
+    balances[accountId] -= amount; total -= amount;
+  }
+}`;
+    const enumLedger={path:'source-1/contracts/EnumLedger.sol',
+      content:enumLedgerText,sha256:hash(enumLedgerText)};
+    const enumLedgerPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:enumLedger.path,
+      targetSelector:'EnumLedger.withdraw',sources:[enumLedger],
+      declarations:[
+        {selector:'EnumLedger.deposit',operation:'send',inputs:['uint8','uint256']},
+        {selector:'EnumLedger.withdraw',operation:'send',inputs:['uint8','uint256']},
+        {selector:'EnumLedger.total',operation:'call',inputs:[]}
+      ] as any,skipLegacy:true});
+    assert.equal(enumLedgerPlan.ok,true,
+      'Enum-key public mapping accounting must resolve to its canonical uint8 getter ABI');
+    if(enumLedgerPlan.ok){
+      const enumExperiment=enumLedgerPlan.experiments.find(e=>
+        e.securityProperty.startsWith('financial conservation invariant'));
+      assert.ok(enumExperiment,'Enum-key ledger should produce a financial experiment');
+      assert.ok(enumExperiment!.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='balances(uint8)'&&JSON.stringify(step.args)===JSON.stringify(['1'])),
+        'Enum fixture key must remain within the acquired enum ordinal range');
+    }
+    const valueTypeLedgerText=`pragma solidity ^0.8.20;
+type AccountId is uint16;
+contract ValueTypeLedger {
+  mapping(AccountId => uint256) public balances;
+  uint256 public total;
+  function deposit(AccountId accountId,uint256 amount) external {
+    balances[accountId] += amount; total += amount;
+  }
+  function withdraw(AccountId accountId,uint256 amount) external {
+    balances[accountId] -= amount; total -= amount;
+  }
+}`;
+    const valueTypeLedger={path:'source-1/contracts/ValueTypeLedger.sol',
+      content:valueTypeLedgerText,sha256:hash(valueTypeLedgerText)};
+    const valueTypePlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:valueTypeLedger.path,
+      targetSelector:'ValueTypeLedger.withdraw',sources:[valueTypeLedger],
+      declarations:[
+        {selector:'ValueTypeLedger.deposit',operation:'send',inputs:['uint16','uint256']},
+        {selector:'ValueTypeLedger.withdraw',operation:'send',inputs:['uint16','uint256']},
+        {selector:'ValueTypeLedger.total',operation:'call',inputs:[]}
+      ] as any,skipLegacy:true});
+    assert.equal(valueTypePlan.ok,true,
+      'UDVT-key public mapping accounting must resolve using the acquired underlying integer width');
+    if(valueTypePlan.ok){
+      const valueTypeExperiment=valueTypePlan.experiments.find(e=>
+        e.securityProperty.startsWith('financial conservation invariant'));
+      assert.ok(valueTypeExperiment,'UDVT-key ledger should produce a financial experiment');
+      assert.ok(valueTypeExperiment!.sequence.steps.some(step=>step.operation==='call'&&
+        step.function==='balances(uint16)'&&JSON.stringify(step.args)===JSON.stringify(['7'])),
+        'UDVT fixture key must match the canonical underlying ABI type');
+    }
     const mixedCallerLedgerText=`pragma solidity ^0.8.20;
 contract MixedCallerLedger {
   mapping(address => uint256) public balances;
