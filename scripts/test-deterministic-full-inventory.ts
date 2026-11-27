@@ -1031,6 +1031,23 @@ contract EnumObservation {
     assert.ok(enumObservations.some(o=>o.kind==='mapping'&&o.getter==='balanceOf(uint8)'&&
       o.keyType==='uint8'&&o.stateVariable==='balances'),
       'Accounting observations must resolve enum mapping keys to compiler ABI uint8');
+    const importedAccountType=`pragma solidity ^0.8.20; type AccountKey is uint48;`;
+    const importedObservationSource=`pragma solidity ^0.8.20;
+import {AccountKey as UserKey} from "./AccountKey.sol";
+contract ImportedObservation {
+  mapping(UserKey => uint256) private balances;
+  function balanceOf(UserKey key) external view returns (uint256) { return balances[key]; }
+}`;
+    const importedTypeSnapshot={path:'source-1/contracts/AccountKey.sol',
+      content:importedAccountType,sha256:hash(importedAccountType)};
+    const importedObservationSnapshot={path:'source-1/contracts/ImportedObservation.sol',
+      content:importedObservationSource,sha256:hash(importedObservationSource)};
+    const importedObservations=extractAccountingObservations(importedObservationSnapshot,
+      'ImportedObservation',[{selector:'ImportedObservation.balanceOf',operation:'call',inputs:['uint48']}] as any,
+      [importedTypeSnapshot,importedObservationSnapshot]);
+    assert.ok(importedObservations.some(o=>o.kind==='mapping'&&o.getter==='balanceOf(uint48)'&&
+      o.keyType==='uint48'&&o.stateVariable==='balances'),
+      'Accounting readbacks must resolve imported aliased UDVT mapping keys from acquired source');
     // Use explicit source-grounded require() constraints rather than a generic
     // zero constructor value for acquired transitive dependencies.
     const boundedInterface='pragma solidity ^0.8.0; interface IBounded { function ping() external; }';

@@ -2712,7 +2712,7 @@ export function extractSourceInvariantDescriptor(
 
   // Source-backed collection and struct-return observations are distinct from
   // scalar balance getters. Admit only a directly witnessed transition.
-  const sourceObservations=extractAccountingObservations(snapshot,contract.name,declarations);
+  const sourceObservations=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
   const findTypedObservation=():SourceInvariantTransitionPlan['typedObservation']|undefined=>{
     for(const observation of sourceObservations){
       const {push,pop,fieldDecrement}=accountingTransitionPatterns(observation.stateVariable,observation.kind==='struct_field'?observation.fieldName:'');
@@ -3114,7 +3114,7 @@ export function constructCoreInvariantExperiment(
   const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0',tp.dependencyBindings||{});
   if (!setup) return null;
   if(tp.typedObservation){
-    const observed=extractAccountingObservations(snapshot,contract.name,declarations);
+    const observed=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
     const supported=observed.some(obs=>obs.getter===tp.typedObservation!.getter &&
       (tp.typedObservation!.expectPath===undefined ||
        (obs.kind==='struct_field'&&tp.typedObservation!.expectPath.length===1&&
@@ -3257,7 +3257,7 @@ function sourceScalarDeltaExperiments(
   // A private/internal scalar can be measured only when the acquired source
   // explicitly declares an independent view/pure return of that same state.
   // Arbitrary functions with related names are not accepted as readbacks.
-  const observations=extractAccountingObservations(snapshot,contract.name,declarations);
+  const observations=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
   const setup=resolveFlexibleSetup(snapshot,contract,
     resolveInheritance(snapshot,contract,sources).chain,
     sources,declarations,null);
@@ -3511,7 +3511,7 @@ function sourceInternalScalarSetterExperiments(
       identifier.test(v.name||'')&&v.typeName?.type==='ElementaryTypeName'&&
       /^(?:address|bool|uint(?:[0-9]{1,3})?)$/.test(v.typeName.name||''));
   if(!states.length)return [];
-  const views=extractAccountingObservations(snapshot,contract.name,declarations);
+  const views=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
   const setup=resolveFlexibleSetup(snapshot,contract,
     resolveInheritance(snapshot,contract,sources).chain,sources,declarations,null);
   if(!setup||setup.usesToken)return [];
@@ -4316,7 +4316,7 @@ function sourcePairedScalarConservationExperiments(
       v.typeName?.type==='ElementaryTypeName'&&
       /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||''));
   if(!stateVars.length)return [];
-  const observations=extractAccountingObservations(snapshot,contract.name,declarations);
+  const observations=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
   const setup=resolveFlexibleSetup(snapshot,contract,
     resolveInheritance(snapshot,contract,sources).chain,
     sources,declarations,null);
