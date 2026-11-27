@@ -108,7 +108,7 @@ export class SoliditySourceIndex {
   /** Source-derived Solidity probe menu, including state-changing entry points.
    * Never synthesizes expected values or asserts that a contract is deployable. */
   async probeMenu(path:string,limit=24) {
-    const unit=await new SoliditySourceIndex(this.root,this.signal).load(path);
+    const unit=await this.graph(path);
     const entries:Array<{selector:string;signature:string;operation:'send'|'call'|'constructor';visibility:string;inputs:string[]}>=[];
     for(const node of unit.ast.children) {
       if(node.type!=='ContractDefinition')continue;
@@ -125,18 +125,43 @@ export class SoliditySourceIndex {
             // contract references and structs are actual compiler ABI entrypoints.
             // Earlier scalar-only indexing hid independent readback witnesses
             // from the controller even when the deployed contract exposed them.
-            const canonical=(t:any,seen=new Set<any>()):string|null=>{
+            const resolveTypedDefinition=(name:string,ownerNode:any,ownerUnit:Unit,
+              visited=new Set<string>()):{definition:any;unit:Unit}|null=>{
+              const visitKey=ownerUnit.path+':'+ownerNode?.name+':'+name;
+              if(visited.has(visitKey))return null;
+              visited.add(visitKey);
+              const kinds=['EnumDefinition','UserDefinedValueTypeDefinition','TypeDefinition'];
+              const local=[...(ownerNode?.subNodes||[]),...(ownerUnit.ast.children||[])].filter((d:any)=>
+                d.name===name&&kinds.includes(d.type));
+              if(local.length===1)return {definition:local[0],unit:ownerUnit};
+              if(local.length>1)return null;
+              const imported:Array<{definition:any;unit:Unit}>=[];
+              for(const [directive,child] of ownerUnit.imports){
+                const aliases=Array.isArray((directive as any).symbolAliases)&&
+                  (directive as any).symbolAliases.length?
+                  (directive as any).symbolAliases.map(([original,alias]:[string,string|null])=>
+                    ({original,local:alias||original})):[{original:name,local:name}];
+                const match=aliases.find((item:any)=>item.local===name);
+                if(!match)continue;
+                const definitions=(child.ast.children||[]).filter((d:any)=>
+                  d.name===match.original&&kinds.includes(d.type));
+                for(const definition of definitions)imported.push({definition,unit:child});
+              }
+              return imported.length===1?imported[0]:null;
+            };
+            const canonical=(t:any,seen=new Set<any>(),ownerNode:any=node,ownerUnit:Unit=unit):string|null=>{
               if(!t||seen.has(t))return null;
               seen.add(t);
               if(t.type==='ElementaryTypeName')return canonicalElementaryAbiType(String(t.name||''));
               if(t.type!=='UserDefinedTypeName')return null;
               const name=String(t.namePath||'').split('.').pop()||'';
-              const definitions:any[]=[...(node.subNodes||[]),...(unit.ast.children||[])].filter((d:any)=>
-                d.name===name&&['EnumDefinition','UserDefinedValueTypeDefinition','TypeDefinition'].includes(d.type));
-              if(definitions.length!==1)return null;
-              const definition=definitions[0];
+              const found=resolveTypedDefinition(name,ownerNode,ownerUnit);
+              if(!found)return null;
+              const {definition,unit:definitionUnit}=found;
               if(definition.type==='EnumDefinition')return (definition.members||[]).length<=256?'uint8':null;
-              return canonical(definition.underlyingType||definition.typeName||definition.definition,seen);
+              const nextOwner=definition.type==='ContractDefinition'?definition:ownerNode;
+              return canonical(definition.underlyingType||definition.typeName||definition.definition,
+                seen,nextOwner,definitionUnit);
             };
             const keyTypes:string[]=[];
             let valueType:any=variable.typeName;

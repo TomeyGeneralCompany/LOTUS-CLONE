@@ -125,6 +125,13 @@ try {
     "user-defined value type mapping getters must resolve to their acquired underlying ABI type");
   assert.ok(!menu.some(item=>item.selector==="State.malformed"),
     "source indexing must not invent a compiler ABI getter for an invalid key width");
+  const types=join(solidityProbeDir,"Types.sol");
+  await writeFile(types,"pragma solidity ^0.8.20; type AccountKey is uint48;");
+  const imported=join(solidityProbeDir,"ImportedState.sol");
+  await writeFile(imported,"pragma solidity ^0.8.20; import {AccountKey as UserKey} from './Types.sol'; contract ImportedState { mapping(UserKey => uint256) public balances; }");
+  const importedMenu=await index.probeMenu(imported);
+  assert.ok(importedMenu.some(item=>item.selector==="ImportedState.balances"&&item.inputs[0]==="uint48"),
+    "aliased imported value type mapping getters must use the acquired underlying ABI type");
 } finally { await rm(solidityProbeDir,{recursive:true,force:true}); }
 
 // Shared controller choice menu must cover Python, JS, and Java source.
