@@ -3901,8 +3901,16 @@ function sourceOwnerGuardedAssignmentExperiments(
 ):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
-  const states=nodes.filter(n=>n.type==='StateVariableDeclaration')
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=[{contract,snapshot},...inheritance.chain];
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(entry:any,node:any):boolean=>
+    (entry.contract.subNodes||[]).includes(node)||
+    (entry.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const states=allNodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>{
       const type=canonicalAbiType(v.typeName);
       return v.visibility==='public'&&identifier.test(v.name||'')&&!!type&&
@@ -3910,20 +3918,23 @@ function sourceOwnerGuardedAssignmentExperiments(
         (/^(?:address|bool|u?int(?:[0-9]{1,3})?)$/.test(type)||type.startsWith('('));
     });
   if(states.length<2)return [];
-  const ctor=nodes.find(n=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body);
-  if(!ctor)return [];
+  const constructors=allNodes.filter(n=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body);
+  if(!constructors.length)return [];
   const initializedBySender=new Set<string>();
-  for(const statement of ctor.body.statements||[]){
+  const ownerInitializer=new Map<string,any>();
+  for(const ctor of constructors)for(const statement of ctor.body.statements||[]){
     const expr=statement.type==='ExpressionStatement'?statement.expression:null;
     if(expr?.type==='BinaryOperation'&&expr.operator==='='&&
-      expr.left?.type==='Identifier'&&isMsgSender(expr.right))
-      initializedBySender.add(String(expr.left.name));
+      expr.left?.type==='Identifier'&&isMsgSender(expr.right)){
+      const name=String(expr.left.name);
+      initializedBySender.add(name);ownerInitializer.set(name,ctor);
+    }
   }
-  const owners=states.filter(v=>v.typeName.name==='address'&&
+  const ownerVars=states.filter(v=>canonicalAbiType(v.typeName)==='address'&&
     initializedBySender.has(v.name)&&!v.expression);
-  if(!owners.length)return [];
+  if(!ownerVars.length)return [];
   const setup=resolveFlexibleSetup(snapshot,contract,
-    resolveInheritance(snapshot,contract,sources).chain,sources,declarations,null);
+    inheritance.chain,sources,declarations,null);
   let constructorArgs:SoliditySequence['constructorArgs'];
   let constructorValueWei:string|undefined;
   if(setup&&!setup.usesToken&&!setup.initSignature){
@@ -3935,9 +3946,12 @@ function sourceOwnerGuardedAssignmentExperiments(
     // it directly from msg.sender. The generic flexible setup resolver only
     // recognizes conventional owner names, so admit this narrower fixture
     // after checking every constructor statement and rejecting opaque effects.
+    const ctor=constructors.find(candidate=>candidate===contract.subNodes?.find((n:any)=>
+      n.type==='FunctionDefinition'&&n.isConstructor&&n.body));
+    if(!ctor)return [];
     const ctorParams:any[]=ctor.parameters||[];
     const ctorStatements:any[]=ctor.body.statements||[];
-    const hasInitializer=nodes.some(n=>n.type==='FunctionDefinition'&&
+    const hasInitializer=allNodes.some(n=>n.type==='FunctionDefinition'&&
       (n.modifiers||[]).some((m:any)=>m.name==='initializer'));
     const safeConstructor=ctorParams.length===0&&!hasInitializer&&
       (ctor.modifiers||[]).length===0&&ctorStatements.every((n:any)=>{
@@ -3953,7 +3967,7 @@ function sourceOwnerGuardedAssignmentExperiments(
   }
   const results:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
 
-  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+  for(const fn of allNodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
     ['external','public'].includes(n.visibility)&&
     !['view','pure'].includes(n.stateMutability||''))){
     if((fn.modifiers||[]).length)continue;
@@ -3984,8 +3998,11 @@ function sourceOwnerGuardedAssignmentExperiments(
     const ownerRef=isMsgSender(condition.left)?condition.right:
       isMsgSender(condition.right)?condition.left:null;
     if(ownerRef?.type!=='Identifier'||!
-      owners.some(owner=>owner.name===ownerRef.name))continue;
-    const owner=owners.find(v=>v.name===ownerRef.name)!;
+      ownerVars.some(owner=>owner.name===ownerRef.name))continue;
+    const owner=ownerVars.find(v=>v.name===ownerRef.name)!;
+    const fnSource=sourceForNode(fn);
+    const constructor=ownerInitializer.get(owner.name);
+    if(!constructor)continue;
     // A second guard or an opaque helper can invalidate the authorized path.
     // Neither source-inferred call effects nor arbitrary aliases are accepted.
     if(statements.slice(1).some((n:any)=>
@@ -4003,10 +4020,10 @@ function sourceOwnerGuardedAssignmentExperiments(
       if(!state||!parameter||!selected.has(sourceParam)||
         canonicalAbiType(state.typeName)!==canonicalAbiType(parameter.typeName))continue;
       if(writes.filter(n=>n.expression.left.name===destination).length!==1)continue;
-      const stateCtorWrites=(ctor.body.statements||[]).some((n:any)=>
+      const stateCtorWrites=constructors.some((constructor:any)=>(constructor.body.statements||[]).some((n:any)=>
         n.type==='ExpressionStatement'&&n.expression?.type==='BinaryOperation'&&
         n.expression.left?.type==='Identifier'&&
-        n.expression.left.name===destination);
+        n.expression.left.name===destination));
       if(stateCtorWrites)continue;
       const expected=selected.get(sourceParam)!;
       const baseline:SolidityArgValue=abi[parameters.indexOf(parameter)]==='bool'?false:
@@ -4028,11 +4045,11 @@ function sourceOwnerGuardedAssignmentExperiments(
         sequence:{constructorArgs,
           ...(constructorValueWei?{constructorValueWei}:{}),
           steps},
-        witnesses:[witness(snapshot,ctor,contract.name+'.constructor'),
-          witness(snapshot,owner,contract.name+'.'+owner.name),
-          witness(snapshot,fn,contract.name+'.'+signature),
-          witness(snapshot,statement,contract.name+'.'+signature+'.assignment'),
-          witness(snapshot,state,contract.name+'.'+destination)],
+        witnesses:[witness(sourceForNode(constructor),constructor,contract.name+'.constructor'),
+          witness(sourceForNode(owner),owner,contract.name+'.'+owner.name),
+          witness(fnSource,fn,contract.name+'.'+signature),
+          witness(fnSource,statement,contract.name+'.'+signature+'.assignment'),
+          witness(sourceForNode(state),state,contract.name+'.'+destination)],
       });
     }
   }
