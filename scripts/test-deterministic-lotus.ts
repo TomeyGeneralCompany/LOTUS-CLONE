@@ -652,7 +652,7 @@ contract MultiVault${idx} {
       '    return value;',
       '  }',
       '}',
-    ].join("\\n");
+    ].join("\n");
     const longFunctionQueue=buildAnalysisCandidateQueue({items:[{
       path:"source-0/contracts/LongFunctionFixture.sol",sourceCommit:commitSha,
       sourceContent:longFunctionSource,unqueuedSelectors:["LongFunctionFixture.settle"],
