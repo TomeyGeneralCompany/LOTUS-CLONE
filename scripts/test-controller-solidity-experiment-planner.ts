@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {constructSolidityExperiments,pickFlexibleArg,sourcePreparationGraph} from '../packages/security-solver/src/controller-solidity-experiment-planner';
-import {verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies,verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 const content=`pragma solidity ^0.8.20;
 contract Vault {
   address public owner;
@@ -116,6 +116,32 @@ const packageVestingAbi=verifyAcquiredReceiverMethods('VestingFixture',
 assert.equal(packageVestingAbi.ok,true,
   'Canonical inherited ERC721 safe-transfer overloads must satisfy the acquired Vesting02 receiver ABI: '+
   JSON.stringify(packageVestingAbi));
+
+// A constructor fixture dependency may be injected through a unique internal
+// initializer helper. Resolve the address parameter back to the root
+// initializer and bind it to the acquired concrete implementation.
+const injectedAssetSource=`pragma solidity ^0.8.20;
+interface IInjectedAsset { function transferFrom(address,address,uint256) external returns(bool); }
+contract InjectedVault {
+  IInjectedAsset public asset;
+  function initialize(address assetAddress) external { _wireAsset(assetAddress); }
+  function _wireAsset(address candidate) internal { asset = IInjectedAsset(candidate); }
+  function deposit(uint256 amount) external { asset.transferFrom(msg.sender,address(this),amount); }
+}
+contract LocalInjectedAsset is IInjectedAsset {
+  function transferFrom(address,address,uint256) external pure returns(bool) { return true; }
+}`;
+const injectedAssetSnapshot={path:'contracts/InjectedVault.sol',content:injectedAssetSource,
+  sha256:createHash('sha256').update(injectedAssetSource).digest('hex')};
+const injectedAssetPlan=resolveSourceFixtureDependencies(injectedAssetSnapshot,
+  'InjectedVault',[injectedAssetSnapshot]);
+assert.equal(injectedAssetPlan.status,'resolved',
+  'An internal helper cast must preserve the initializer’s source-proven dependency binding: '+
+  JSON.stringify(injectedAssetPlan));
+if(injectedAssetPlan.status==='resolved'){
+  assert.equal(injectedAssetPlan.substitutions.assetAddress,'$deployment:dependency1');
+  assert.deepEqual(injectedAssetPlan.deployments.map(d=>d.contract),['LocalInjectedAsset']);
+}
 
 const typedAbiSource=`pragma solidity ^0.8.20;
 enum Stage { Open, Closed }
@@ -869,6 +895,33 @@ const mintBurnRes = constructSolidityExperiments({
   ],
 });
 assert.equal(mintBurnRes.ok, true, 'Mint/burn conservation invariant must construct');
+
+// Equivalent source-proven financial ledgers can use commutative SafeMath
+// ordering. The deposited amount stays exact and is paired with the same
+// source-written outflow before the planner constructs a conservation probe.
+for(const [name,credit] of [
+  ['ReverseAddLedger','total = amount + total;'],
+  ['ReverseSafeMathLedger','total = amount.add(total);'],
+] as const){
+  const source=`pragma solidity ^0.8.20;
+contract ${name} {
+  uint256 public total;
+  function deposit(uint256 amount) external { ${credit} }
+  function withdraw(uint256 amount) external { total = total.sub(amount); }
+}`;
+  const path=`contracts/${name}.sol`;
+  const result=constructSolidityExperiments({repositoryCommit:'d'.repeat(40),
+    targetPath:path,targetSelector:`${name}.withdraw`,
+    sources:[{path,content:source,sha256:createHash('sha256').update(source).digest('hex')}],
+    declarations:[{selector:`${name}.deposit`,operation:'send',inputs:['uint256']},
+      {selector:`${name}.withdraw`,operation:'send',inputs:['uint256']},
+      {selector:`${name}.total`,operation:'call',inputs:[]}],
+  });
+  assert.equal(result.ok,true,`${name} must retain its source-exact amount and conservation proof: `+
+    JSON.stringify(result));
+  if(result.ok)assert.ok(result.experiments.some(item=>
+    item.securityProperty===`financial conservation invariant (deposit->withdraw)`));
+}
 
 // 4. Negative control: private state without public getters -> UNKNOWN_ASSERTION(missing_observable_state)
 const privateVaultSrc = `pragma solidity ^0.8.20;

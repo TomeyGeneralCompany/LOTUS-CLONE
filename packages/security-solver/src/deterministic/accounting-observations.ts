@@ -191,7 +191,7 @@ export function extractAccountingObservations(
         (sourceByPath.get(stateOwner.path)||snapshot).sha256;
       const stateType=state.typeName;
       if(new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\.\\s*length\\s*;",'s').test(cleanBody)&&
-        declaration.inputs.length===0&&simple(resultType)){
+        declaration.inputs.length===0&&resultType==="uint256"){
         add({kind:"collection_length",getter,stateVariable:name,sourceWitness:witness});
       }
       // Only an exact source-level return of token.balanceOf(caller) is an
@@ -221,15 +221,22 @@ export function extractAccountingObservations(
       }
       if(stateType?.type==="Mapping"&&declaration.inputs.length===1){
         const keyType=sourceAbiType(stateType.keyType,stateOwner.path,stateOwner.contract)||typeName(stateType.keyType);
+        const valueType=sourceAbiType(stateType.valueType,stateOwner.path,stateOwner.contract)||
+          canonicalElementaryAbiType(typeName(stateType.valueType))||"";
         const matchingKey=(fn.parameters||[]).filter((parameter:any)=>
           sourceAbiType(parameter.typeName,fnOwner.path,fnOwner.contract)===keyType);
         const exactMappingRead=matchingKey.some((parameter:any)=>/^[A-Za-z_]\w*$/.test(String(parameter.name||''))&&
           new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\[\\s*"+
             regexEscape(String(parameter.name))+"\\s*\\]\\s*;",'s').test(cleanBody));
-        if(declaration.inputs[0]===keyType&&simple(resultType)&&exactMappingRead)
+        // A lossy cast may return a value that looks like this ledger while
+        // hiding its real amount. Treat a getter as a state observation only
+        // when its complete ABI value type matches the mapped source value.
+        if(declaration.inputs[0]===keyType&&simple(resultType)&&resultType===valueType&&exactMappingRead)
           add({kind:"mapping",getter,keyType,stateVariable:name,sourceWitness:witness});
       }
-      if(declaration.inputs.length===0&&simple(resultType)&&stateType?.type==="ElementaryTypeName"&&
+      const exactStateAbi=sourceAbiType(stateType,stateOwner.path,stateOwner.contract);
+      if(declaration.inputs.length===0&&simple(resultType)&&resultType===exactStateAbi&&
+         stateType?.type==="ElementaryTypeName"&&
          new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*;",'s').test(cleanBody)){
         add({kind:"scalar",getter,stateVariable:name,sourceWitness:witness});
       }

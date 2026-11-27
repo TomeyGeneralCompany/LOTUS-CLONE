@@ -246,6 +246,42 @@ assert.ok(feeFormulaEvm.steps.every((step:any)=>step.passed!==false),
   'Source-derived fee formula must match the mined EVM transition: '+JSON.stringify(feeFormulaEvm));
 assert.ok(feeFormulaEvm.steps.some((step:any)=>step.operation==='call'&&
   step.function==='fees()'&&step.actual==='100'));
+const reverseSafeMathSource=`pragma solidity ^0.8.20;
+library AcquiredSafeMath {
+  function add(uint256 a,uint256 b) internal pure returns(uint256) { return a+b; }
+  function sub(uint256 a,uint256 b) internal pure returns(uint256) { return a-b; }
+}
+contract ReverseSafeMathLedger {
+  using AcquiredSafeMath for uint256;
+  uint256 public total;
+  function deposit(uint256 amount) external { total = amount.add(total); }
+  function withdraw(uint256 amount) external { total = total.sub(amount); }
+}`;
+const reverseSafeMathFile='source-1/contracts/ReverseSafeMathLedger.sol';
+const reverseSafeMathPlan=constructSolidityExperiments({
+  repositoryCommit:'d'.repeat(40),targetPath:reverseSafeMathFile,
+  targetSelector:'ReverseSafeMathLedger.withdraw',
+  sources:[{path:reverseSafeMathFile,content:reverseSafeMathSource,
+    sha256:sha(reverseSafeMathSource)}],
+  declarations:[
+    {selector:'ReverseSafeMathLedger.deposit',operation:'send',inputs:['uint256']},
+    {selector:'ReverseSafeMathLedger.withdraw',operation:'send',inputs:['uint256']},
+    {selector:'ReverseSafeMathLedger.total',operation:'call',inputs:[]},
+  ],skipLegacy:true,
+});
+assert.equal(reverseSafeMathPlan.ok,true,JSON.stringify(reverseSafeMathPlan));
+if(!reverseSafeMathPlan.ok)throw new Error('Commutative SafeMath conservation property missing');
+const reverseSafeMathProperty=reverseSafeMathPlan.experiments.find(e=>
+  e.securityProperty==='financial conservation invariant (deposit->withdraw)');
+assert.ok(reverseSafeMathProperty,'Reverse SafeMath arithmetic must produce a source-derived financial invariant');
+const reverseSafeMathEvm=await execute(
+  compile(reverseSafeMathFile,reverseSafeMathSource,'ReverseSafeMathLedger'),
+  reverseSafeMathProperty.sequence);
+assert.ok(reverseSafeMathEvm.steps.every((step:any)=>step.passed!==false),
+  'Reverse SafeMath financial sequence must match independently mined EVM state: '+
+  JSON.stringify(reverseSafeMathEvm));
+assert.ok(reverseSafeMathEvm.steps.some((step:any)=>step.operation==='call'&&
+  step.function==='total()'&&step.actual==='600'));
 const privateScalarSource=[
   'pragma solidity ^0.8.20;',
   'contract PrivateScalar {',

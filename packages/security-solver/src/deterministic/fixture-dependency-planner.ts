@@ -349,27 +349,63 @@ function initializerStateBindings(
   const out:Array<{parameter:string;receiver:string;typeName:string;line:number}>=[];
   for(const fn of (node.subNodes||[]).filter((x:any)=>x.type==="FunctionDefinition"&&x.body&&
     /^(?:initialize|init|__.*init.*)$/i.test(x.name||""))){
-    for(const n of descendants(fn.body)){
-      if(n.type!=="BinaryOperation"||n.operator!=="=")continue;
-      const receiver=String(n.left?.name||"");
-      const declared=vars.get(receiver);
-      const cast=n.right;
-      const params=new Map((fn.parameters||[]).map((p:any)=>[
-        String(p.name||""),typeOf(p.typeName)]));
-      // Both "receiver = Interface(paramAddress)" and the directly typed
-      // "receiver = interfaceParameter" are compiler-valid binding edges.
-      let parameter="";
-      if(cast?.type==="FunctionCall"&&cast.expression?.type==="Identifier"&&
-        String(cast.expression.name)===declared&&
-        Array.isArray(cast.arguments)&&cast.arguments.length===1)
-        parameter=String(cast.arguments[0]?.name||"");
-      else if(cast?.type==="Identifier"&&params.get(String(cast.name||""))===declared)
-        parameter=String(cast.name);
-      if(!declared||!parameter)continue;
-      out.push({parameter,receiver,typeName:declared,line:n.loc?.start?.line||fn.loc?.start?.line||1});
+    const functions=(node.subNodes||[]).filter((x:any)=>x.type==="FunctionDefinition"&&x.body&&x.name);
+    const rootParameters=new Map<string,string>((fn.parameters||[]).map((p:any):[string,string]=>[
+      String(p.name||""),String(p.name||"")]));
+    const pending:Array<{fn:any;originForParameter:Map<string,string>}>=
+      [{fn,originForParameter:rootParameters}];
+    const visited=new Set<any>();
+    while(pending.length&&visited.size<64){
+      const current=pending.shift()!;
+      if(visited.has(current.fn))continue;
+      visited.add(current.fn);
+      for(const n of descendants(current.fn.body)){
+        if(n.type!=="BinaryOperation"||n.operator!=="=")continue;
+        const receiver=String(n.left?.name||"");
+        const declared=vars.get(receiver);
+        const cast=n.right;
+        let parameter="";
+        if(declared&&cast?.type==="FunctionCall"&&cast.expression?.type==="Identifier"&&
+          String(cast.expression.name)===declared&&Array.isArray(cast.arguments)&&
+          cast.arguments.length===1){
+          const helperParameter=String(cast.arguments[0]?.name||"");
+          parameter=current.originForParameter.get(helperParameter)||"";
+        }else if(declared&&cast?.type==="Identifier"){
+          const helperParameter=String(cast.name||"");
+          const original=current.originForParameter.get(helperParameter)||"";
+          const declaredType=typeOf((current.fn.parameters||[]).find((p:any)=>p.name===helperParameter)?.typeName);
+          if(declaredType===declared)parameter=original;
+        }
+        if(declared&&parameter)
+          out.push({parameter,receiver,typeName:declared,
+            line:n.loc?.start?.line||current.fn.loc?.start?.line||1});
+      }
+      // Internal initializer helpers may perform the cast and state write.
+      // Trace only uniquely resolved, identifier-named local calls with an
+      // exact argument-to-parameter mapping. External calls and overloaded
+      // helpers remain unresolved instead of manufacturing a fixture edge.
+      for(const call of descendants(current.fn.body).filter((item:any)=>
+        item.type==="FunctionCall"&&item.expression?.type==="Identifier"&&
+        Array.isArray(item.arguments))){
+        const candidates=functions.filter((candidate:any)=>candidate.name===call.expression.name&&
+          candidate!==current.fn&&["internal","private","public"].includes(candidate.visibility||"internal")&&
+          (candidate.parameters||[]).length===call.arguments.length);
+        if(candidates.length!==1)continue;
+        const callee=candidates[0],mapped=new Map<string,string>();
+        let valid=true;
+        for(let index=0;index<call.arguments.length;index++){
+          const argument=call.arguments[index],parameter=callee.parameters[index];
+          if(argument?.type!=="Identifier") {valid=false;break;}
+          const original=current.originForParameter.get(String(argument.name||""));
+          if(!original){valid=false;break;}
+          mapped.set(String(parameter.name||""),original);
+        }
+        if(valid)pending.push({fn:callee,originForParameter:mapped});
+      }
     }
   }
-  return out;
+  return [...new Map(out.map(binding=>[
+    binding.parameter+":"+binding.receiver+":"+binding.typeName,binding])).values()];
 }
 /** A canonical OpenZeppelin import proves a standard package edge exists,
  * not that an unavailable source has been independently analyzed. */

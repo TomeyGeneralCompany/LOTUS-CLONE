@@ -1039,6 +1039,15 @@ contract EnumObservation {
       [{selector:'EnumObservation.balanceOf',operation:'call',inputs:['uint8']}] as any)
       .some(o=>o.kind==='mapping'),false,
       'A matching state name in comments or an unrelated return value is not a mapping observation');
+    const lossyMappingRead=enumObservationSource
+      .replace('returns (uint256) {','returns (uint8) {')
+      .replace('return balances[phase];','return uint8(balances[phase]);');
+    const lossyMappingSnapshot={path:'source-1/contracts/EnumObservation.sol',
+      content:lossyMappingRead,sha256:hash(lossyMappingRead)};
+    assert.equal(extractAccountingObservations(lossyMappingSnapshot,'EnumObservation',
+      [{selector:'EnumObservation.balanceOf',operation:'call',inputs:['uint8']}] as any)
+      .some(o=>o.kind==='mapping'),false,
+      'A narrowing getter cast must not be treated as an exact observation of the source ledger');
     const importedAccountType=`pragma solidity ^0.8.20; type AccountKey is uint48;`;
     const importedObservationSource=`pragma solidity ^0.8.20;
 import {AccountKey as UserKey} from "./AccountKey.sol";

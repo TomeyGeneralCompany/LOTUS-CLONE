@@ -2453,14 +2453,22 @@ function accountingDirections(text:string,state:string):{increase:boolean;decrea
   const collectionPop=new RegExp("\\b"+state+"\\s*\\.\\s*pop\\s*\\(");
   const assigned=(operation:"add"|"sub")=>{
     const arithmetic=operation==="add"?"\\+":"-";
-    return new RegExp(lvalue+"=\\s*"+state+"\\1\\s*(?:"+arithmetic+
+    const forward=new RegExp(lvalue+"=\\s*"+state+"\\1\\s*(?:"+arithmetic+
       "|\\.\\s*"+operation+"\\s*\\()");
+    if(operation!=="add")return (text:string)=>forward.test(text);
+    // Addition is commutative: real SafeMath code can put the new amount on
+    // the left while preserving the exact same ledger lvalue on the right.
+    const reverse=new RegExp(lvalue+"=\\s*(?:[A-Za-z_][A-Za-z0-9_]*\\s*\\+\\s*"+
+      state+"\\1|[A-Za-z_][A-Za-z0-9_]*\\s*\\.\\s*add\\s*\\(\\s*"+
+      state+"\\1\\s*\\))");
+    return (text:string)=>forward.test(text)||reverse.test(text);
   };
+  const addition=assigned("add"),subtraction=assigned("sub");
   return {
     increase:collectionPush.test(text)||new RegExp(simple+"\\+=").test(text)||
-      assigned("add").test(text),
+      addition(text),
     decrease:collectionPop.test(text)||new RegExp(simple+"-=").test(text)||
-      assigned("sub").test(text),
+      subtraction(text),
   };
 }
 
@@ -2479,9 +2487,13 @@ function sourceExactAccountingDelta(
   const value=amount==="msg.value"?"msg\\.value":amount;
   const op=direction==="increase"?"\\+":"-";
   const method=direction==="increase"?"add":"sub";
-  return new RegExp(ref+"\\s*"+op+"=\\s*"+value+"\\b").test(text)||
-    new RegExp(ref+"\\s*=\\s*"+ref+"\\s*(?:"+op+"\\s*"+value+
-      "\\b|\\.\\s*"+method+"\\s*\\(\\s*"+value+"\\s*\\))").test(text);
+  const augmented=new RegExp(ref+"\\s*"+op+"=\\s*"+value+"\\b");
+  const forward=new RegExp(ref+"\\s*=\\s*"+ref+"\\s*(?:"+op+"\\s*"+value+
+    "\\b|\\.\\s*"+method+"\\s*\\(\\s*"+value+"\\s*\\))");
+  const reverse=direction==="increase"?new RegExp(ref+"\\s*=\\s*"+value+
+    "\\s*\\+\\s*"+ref+"(?![A-Za-z0-9_$])|"+ref+"\\s*=\\s*"+value+
+    "\\s*\\.\\s*add\\s*\\(\\s*"+ref+"\\s*\\)"):null;
+  return augmented.test(text)||forward.test(text)||!!reverse?.test(text);
 }
 
 /** Accept only a direct source-written proportional increment whose complete
