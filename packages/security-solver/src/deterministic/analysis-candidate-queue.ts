@@ -157,7 +157,9 @@ function locateFunctionSpan(content:string,selector:string,sourceAst:any):Locate
     !Number.isInteger(range[0])||!Number.isInteger(range[1]))
     return {reason:"function_source_range_missing"};
   const start=range[0],excerptStart=Math.max(0,start-160);
-  const excerptEnd=Math.min(content.length,start+1100);
+  // Keep the complete declaration available to source-grounded analysis. The
+  // old fixed 1,100-character window silently cut off long accounting paths.
+  const excerptEnd=Math.min(content.length,range[1]+1);
   return {span:{start:excerptStart,end:excerptEnd,
     lineStart:location.start.line,lineEnd:location.end.line,
     excerpt:content.slice(excerptStart,excerptEnd),truncated:excerptEnd<content.length}};

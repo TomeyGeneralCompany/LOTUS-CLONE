@@ -644,6 +644,25 @@ contract MultiVault${idx} {
     assert.equal(spanQueue.inventory[0].lineEnd,8,
       "AST evidence span must include the whole body despite comment/string braces");
 
+    const longFunctionSource=[
+      'pragma solidity ^0.8.20;',
+      'contract LongFunctionFixture {',
+      '  function settle(uint256 value) external pure returns (uint256) {',
+      ...Array.from({length:80},(_,i)=>`    value += ${i+1};`),
+      '    return value;',
+      '  }',
+      '}',
+    ].join("\\n");
+    const longFunctionQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/LongFunctionFixture.sol",sourceCommit:commitSha,
+      sourceContent:longFunctionSource,unqueuedSelectors:["LongFunctionFixture.settle"],
+    }]});
+    assert.equal(longFunctionQueue.inventory.length,1);
+    assert.ok(longFunctionQueue.inventory[0].sourceExcerpt.includes("value += 80;"),
+      "Source evidence must retain the end of long functions beyond the former 1,100-character window");
+    assert.ok(longFunctionQueue.inventory[0].sourceExcerpt.includes("return value;"),
+      "Source evidence must include the complete function body");
+
     const overloadedSource=[
       'pragma solidity ^0.8.20;',
       'contract OverloadedFixture {',
