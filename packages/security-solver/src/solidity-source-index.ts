@@ -110,6 +110,57 @@ export class SoliditySourceIndex {
   async probeMenu(path:string,limit=24) {
     const unit=await this.graph(path);
     const entries:Array<{selector:string;signature:string;operation:'send'|'call'|'constructor';visibility:string;inputs:string[]}>=[];
+    const resolveTypedDefinition=(name:string,ownerNode:any,ownerUnit:Unit,
+      visited=new Set<string>()):{definition:any;unit:Unit}|null=>{
+      const visitKey=ownerUnit.path+':'+ownerNode?.name+':'+name;
+      if(visited.has(visitKey))return null;
+      visited.add(visitKey);
+      const kinds=['ContractDefinition','EnumDefinition','StructDefinition',
+        'UserDefinedValueTypeDefinition','TypeDefinition'];
+      const local=[ownerNode,...(ownerNode?.subNodes||[]),...(ownerUnit.ast.children||[])].filter((d:any)=>
+        d?.name===name&&kinds.includes(d.type));
+      if(local.length===1)return {definition:local[0],unit:ownerUnit};
+      if(local.length>1)return null;
+      const imported:Array<{definition:any;unit:Unit}>=[];
+      for(const [directive,child] of ownerUnit.imports){
+        const aliases=Array.isArray((directive as any).symbolAliases)&&
+          (directive as any).symbolAliases.length?
+          (directive as any).symbolAliases.map(([original,alias]:[string,string|null])=>
+            ({original,local:alias||original})):[{original:name,local:name}];
+        const match=aliases.find((item:any)=>item.local===name);
+        if(!match)continue;
+        const definitions=(child.ast.children||[]).filter((d:any)=>
+          d.name===match.original&&kinds.includes(d.type));
+        for(const definition of definitions)imported.push({definition,unit:child});
+      }
+      return imported.length===1?imported[0]:null;
+    };
+    const canonical=(t:any,seen=new Set<any>(),ownerNode:any,ownerUnit:Unit):string|null=>{
+      if(!t||seen.has(t))return null;
+      seen.add(t);
+      if(t.type==='ElementaryTypeName')return canonicalElementaryAbiType(String(t.name||''));
+      if(t.type==='ArrayTypeName'){
+        const base=canonical(t.baseTypeName,new Set(seen),ownerNode,ownerUnit);
+        if(!base)return null;
+        const length=t.length?.number??t.length?.value;
+        return length===undefined||length===null?base+'[]':
+          /^\d+$/.test(String(length))?base+'['+String(length)+']':null;
+      }
+      if(t.type!=='UserDefinedTypeName')return null;
+      const name=String(t.namePath||'').split('.').pop()||'';
+      const found=resolveTypedDefinition(name,ownerNode,ownerUnit);
+      if(!found)return null;
+      const {definition,unit:definitionUnit}=found;
+      if(definition.type==='ContractDefinition')return 'address';
+      if(definition.type==='EnumDefinition')return (definition.members||[]).length<=256?'uint8':null;
+      if(definition.type==='StructDefinition'){
+        const members=(definition.members||[]).map((member:any)=>
+          canonical(member.typeName,new Set(seen),definition,definitionUnit));
+        return members.length&&members.every(Boolean)?'('+members.join(',')+')':null;
+      }
+      return canonical(definition.underlyingType||definition.typeName||definition.definition,
+        seen,ownerNode,definitionUnit);
+    };
     for(const node of unit.ast.children) {
       if(node.type!=='ContractDefinition')continue;
       for(const member of node.subNodes) {
@@ -125,44 +176,6 @@ export class SoliditySourceIndex {
             // contract references and structs are actual compiler ABI entrypoints.
             // Earlier scalar-only indexing hid independent readback witnesses
             // from the controller even when the deployed contract exposed them.
-            const resolveTypedDefinition=(name:string,ownerNode:any,ownerUnit:Unit,
-              visited=new Set<string>()):{definition:any;unit:Unit}|null=>{
-              const visitKey=ownerUnit.path+':'+ownerNode?.name+':'+name;
-              if(visited.has(visitKey))return null;
-              visited.add(visitKey);
-              const kinds=['EnumDefinition','UserDefinedValueTypeDefinition','TypeDefinition'];
-              const local=[...(ownerNode?.subNodes||[]),...(ownerUnit.ast.children||[])].filter((d:any)=>
-                d.name===name&&kinds.includes(d.type));
-              if(local.length===1)return {definition:local[0],unit:ownerUnit};
-              if(local.length>1)return null;
-              const imported:Array<{definition:any;unit:Unit}>=[];
-              for(const [directive,child] of ownerUnit.imports){
-                const aliases=Array.isArray((directive as any).symbolAliases)&&
-                  (directive as any).symbolAliases.length?
-                  (directive as any).symbolAliases.map(([original,alias]:[string,string|null])=>
-                    ({original,local:alias||original})):[{original:name,local:name}];
-                const match=aliases.find((item:any)=>item.local===name);
-                if(!match)continue;
-                const definitions=(child.ast.children||[]).filter((d:any)=>
-                  d.name===match.original&&kinds.includes(d.type));
-                for(const definition of definitions)imported.push({definition,unit:child});
-              }
-              return imported.length===1?imported[0]:null;
-            };
-            const canonical=(t:any,seen=new Set<any>(),ownerNode:any=node,ownerUnit:Unit=unit):string|null=>{
-              if(!t||seen.has(t))return null;
-              seen.add(t);
-              if(t.type==='ElementaryTypeName')return canonicalElementaryAbiType(String(t.name||''));
-              if(t.type!=='UserDefinedTypeName')return null;
-              const name=String(t.namePath||'').split('.').pop()||'';
-              const found=resolveTypedDefinition(name,ownerNode,ownerUnit);
-              if(!found)return null;
-              const {definition,unit:definitionUnit}=found;
-              if(definition.type==='EnumDefinition')return (definition.members||[]).length<=256?'uint8':null;
-              const nextOwner=definition.type==='ContractDefinition'?definition:ownerNode;
-              return canonical(definition.underlyingType||definition.typeName||definition.definition,
-                seen,nextOwner,definitionUnit);
-            };
             const keyTypes:string[]=[];
             let valueType:any=variable.typeName;
             while(keyTypes.length<8&&
@@ -170,7 +183,7 @@ export class SoliditySourceIndex {
               if(valueType.type==='ArrayTypeName'){
                 keyTypes.push('uint256');valueType=valueType.baseTypeName;
               }else{
-                const key=canonical(valueType.keyType);
+                const key=canonical(valueType.keyType,new Set<any>(),node,unit);
                 if(!key){keyTypes.length=0;valueType=null;break;}
                 keyTypes.push(key);valueType=valueType.valueType;
               }
@@ -178,13 +191,13 @@ export class SoliditySourceIndex {
             if(!valueType||valueType.type==='Mapping'||valueType.type==='ArrayTypeName')continue;
             // Built-in ABI outputs, address-valued contract refs, and local
             // scalar structs all create real source-declared public getters.
-            let available=!!canonical(valueType);
+            let available=!!canonical(valueType,new Set<any>(),node,unit);
             if(valueType.type==='UserDefinedTypeName'){
               const name=String(valueType.namePath||'').split('.').pop();
               const knownStruct=(node.subNodes||[]).find((d:any)=>
                 d.type==='StructDefinition'&&d.name===name);
               if(knownStruct){
-                available=(((knownStruct as any).members)||[]).some((m:any)=>!!canonical(m.typeName));
+                available=(((knownStruct as any).members)||[]).some((m:any)=>!!canonical(m.typeName,new Set<any>(),node,unit));
               }else available=true; // compiler confirms the acquired contract/type
             }
             if(!available)continue;
@@ -201,10 +214,7 @@ export class SoliditySourceIndex {
         if(!fn.isConstructor && !['public','external'].includes(visibility))continue;
         const mutability=String((fn as any).stateMutability||
           ((fn as any).isView?'view':(fn as any).isPure?'pure':(fn as any).isPayable?'payable':'nonpayable'));
-        const inputs=(fn.parameters||[]).map((p:any)=>{
-          try{return unit.text.slice(...bounds(p.typeName)).replace(/\s+/g,' ').slice(0,120);}
-          catch{return '?';}
-        });
+        const inputs=(fn.parameters||[]).map((p:any)=>canonical(p.typeName,new Set<any>(),node,unit)||'?');
         const operation: 'send'|'call'|'constructor'=fn.isConstructor?'constructor':
           ['view','pure'].includes(mutability)?'call':'send';
         const [start]=bounds(fn);
