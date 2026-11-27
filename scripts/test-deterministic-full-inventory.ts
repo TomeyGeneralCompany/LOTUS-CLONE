@@ -1139,6 +1139,23 @@ contract StructObservation {
     assert.ok(structObservations.some(o=>o.kind==='struct_field'&&o.getter==='position(uint256)'&&
       o.fieldName==='amount'&&o.fieldType==='uint256'),
       'Struct tuple ABI resolution must preserve source struct field observations');
+    const oneBasedStructObservation=`pragma solidity ^0.8.4;
+contract OneBasedDepositView {
+  struct Deposit { uint256 principal; uint256 feeRate; }
+  Deposit[] internal deposits;
+  function getDeposit(uint64 depositID) external view returns (Deposit memory) {
+    return deposits[depositID - 1];
+  }
+}`;
+    const oneBasedStructSnapshot={path:'source-1/contracts/OneBasedDepositView.sol',
+      content:oneBasedStructObservation,sha256:hash(oneBasedStructObservation)};
+    const oneBasedObservations=extractAccountingObservations(oneBasedStructSnapshot,
+      'OneBasedDepositView',[{selector:'OneBasedDepositView.getDeposit',operation:'call',
+        inputs:['uint64']}] as any);
+    assert.ok(oneBasedObservations.some(o=>o.kind==='struct_field'&&
+      o.getter==='getDeposit(uint64)'&&o.fieldName==='principal'&&
+      JSON.stringify(o.getterArgs)==='["1"]'),
+      'One-based struct getters must expose a source-proven valid first-record readback argument');
     // Use explicit source-grounded require() constraints rather than a generic
     // zero constructor value for acquired transitive dependencies.
     const boundedInterface='pragma solidity ^0.8.0; interface IBounded { function ping() external; }';

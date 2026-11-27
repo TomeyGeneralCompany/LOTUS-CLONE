@@ -2728,14 +2728,14 @@ export function extractSourceInvariantDescriptor(
   const findTypedObservation=():SourceInvariantTransitionPlan['typedObservation']|undefined=>{
     for(const observation of sourceObservations){
       const {push,pop,fieldDecrement}=accountingTransitionPatterns(observation.stateVariable,observation.kind==='struct_field'?observation.fieldName:'');
-      if(observation.kind==='collection_length' && push.test(inflowBody) && pop.test(outflowBody))
+      if(observation.kind==='collection_length' && push.test(inflowEffects) && pop.test(outflowEffects))
         return {getter:observation.getter,args:[],baseline:'0',afterInflow:'1',afterOutflow:'0'};
       // A struct field check requires literal storage updates witnessed in both
       // operations. A shared variable name or ABI compatibility is insufficient.
       if(observation.kind==='struct_field' && observation.keyType.startsWith('uint') &&
-         push.test(inflowBody) &&
-         fieldDecrement.test(outflowBody)){
-        return {getter:observation.getter,args:['0'],expectPath:[observation.fieldIndex],
+         push.test(inflowEffects) &&
+         fieldDecrement.test(outflowEffects)){
+        return {getter:observation.getter,args:observation.getterArgs||['0'],expectPath:[observation.fieldIndex],
           baseline:'0',afterInflow:inflowAmount,afterOutflow:expectedRemainder};
       }
     }

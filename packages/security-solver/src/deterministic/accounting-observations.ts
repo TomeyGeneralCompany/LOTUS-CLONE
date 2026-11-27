@@ -8,7 +8,7 @@ import {posix} from "node:path";
 export type AccountingObservation =
   | {kind:"scalar";getter:string;sourceWitness:string;stateVariable:string}
   | {kind:"mapping";getter:string;keyType:string;stateVariable:string;sourceWitness:string}
-  | {kind:"struct_field";getter:string;keyType:string;fieldName:string;fieldType:string;fieldIndex:number;stateVariable:string;sourceWitness:string}
+  | {kind:"struct_field";getter:string;keyType:string;fieldName:string;fieldType:string;fieldIndex:number;stateVariable:string;sourceWitness:string;getterArgs?:string[]}
   | {kind:"collection_length";getter:string;stateVariable:string;sourceWitness:string}
   | {kind:"external_balance";getter:string;keyType:"address";stateVariable:string;sourceWitness:string};
 
@@ -236,11 +236,17 @@ export function extractAccountingObservations(
       if(stateType?.type==="ArrayTypeName"&&declaration.inputs.length===1&&
         /^u?int/.test(canonicalElementaryAbiType(declaration.inputs[0])||'')){
         const structName=typeName(stateType.baseTypeName);
-        const indexParameter=(fn.parameters||[]).find((parameter:any)=>
-          sourceAbiType(parameter.typeName,fnOwner.path,fnOwner.contract)===declaration.inputs[0]&&
-          /^[A-Za-z_]\w*$/.test(String(parameter.name||''))&&new RegExp("\\breturn\\s+"+
-            regexEscape(name)+"\\s*\\[\\s*"+regexEscape(String(parameter.name))+
-            "\\s*\\]\\s*;",'s').test(cleanBody));
+        const indexParameter=(fn.parameters||[]).map((parameter:any)=>{
+          if(sourceAbiType(parameter.typeName,fnOwner.path,fnOwner.contract)!==declaration.inputs[0]||
+            !/^[A-Za-z_]\w*$/.test(String(parameter.name||'')))return null;
+          const exact=new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\[\\s*"+
+            regexEscape(String(parameter.name))+"\\s*\\]\\s*;",'s');
+          const oneBased=new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\[\\s*"+
+            regexEscape(String(parameter.name))+"\\s*-\\s*1\\s*\\]\\s*;",'s');
+          if(oneBased.test(cleanBody))return {parameter,firstRecordArg:'1'};
+          if(exact.test(cleanBody))return {parameter,firstRecordArg:'0'};
+          return null;
+        }).find(Boolean);
         const structMatches=structs.get(structName)||[];
         const matchingStructs=structMatches.filter(item=>
           item.owner.path===stateOwner.path||item.owner.contract===stateOwner.contract);
@@ -257,7 +263,8 @@ export function extractAccountingObservations(
             const ft=sourceAbiType(field.typeName,structOwner.path,
               structOwner.contract)||typeName(field.typeName);
             if(simple(ft))add({kind:"struct_field",getter,keyType:declaration.inputs[0],fieldName:field.name,
-              fieldType:ft,fieldIndex:index,stateVariable:name,sourceWitness:witness});
+              fieldType:ft,fieldIndex:index,stateVariable:name,sourceWitness:witness,
+              ...(indexParameter?{getterArgs:[indexParameter.firstRecordArg]}:{})});
           });
         }
       }
