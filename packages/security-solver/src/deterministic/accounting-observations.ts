@@ -48,8 +48,9 @@ export function extractAccountingObservations(
     }
     if(node.type==="StructDefinition")structs.set(node.name,node.members||[]);
   }
-  const resolveType=(name:string,ownerPath:string,ownerContract:any,
+  const resolveType=(qualifiedName:string,ownerPath:string,ownerContract:any,
     seen=new Set<string>()):{node:any;path:string}|null=>{
+    const name=qualifiedName.split('.').pop()||'';
     const visit=ownerPath+':'+ownerContract?.name+':'+name;
     if(seen.has(visit))return null;seen.add(visit);
     const ownerAst=astByPath.get(ownerPath);
@@ -65,13 +66,12 @@ export function extractAccountingObservations(
       const importedAst=astByPath.get(importedPath);
       if(!importedAst)continue;
       const unitAlias=String(directive.unitAlias||"");
-      const qualifiedName=String(name||"");
       const aliases=Array.isArray(directive.symbolAliases)&&directive.symbolAliases.length?
         directive.symbolAliases.map(([original,alias]:[string,string|null])=>
           ({original,local:alias||original})):[{original:name,local:name}];
       const match=aliases.find((item:any)=>item.local===name)||
         (unitAlias&&qualifiedName.startsWith(unitAlias+".")?
-          {original:qualifiedName.slice(unitAlias.length+1),local:name}:null);
+          {original:name,local:name}:null);
       if(!match)continue;
       for(const item of importedAst.children||[])if(item.name===match.original&&typedKinds.includes(item.type))
         imported.push({node:item,path:importedPath});
@@ -89,8 +89,9 @@ export function extractAccountingObservations(
       return length===undefined||length===null?base+'[]':/^\d+$/.test(String(length))?base+'['+String(length)+']':null;
     }
     if(node.type!=="UserDefinedTypeName")return null;
-    const name=String(node.namePath||'').split('.').pop()||'';
-    const found=resolveType(name,ownerPath,ownerContract);
+    const fullName=String(node.namePath||'');
+    const name=fullName.split('.').pop()||'';
+    const found=resolveType(fullName,ownerPath,ownerContract);
     if(!found)return null;
     if(found.node.type==="ContractDefinition")return 'address';
     if(found.node.type==="EnumDefinition")return (found.node.members||[]).length<=256?'uint8':null;

@@ -1048,6 +1048,20 @@ contract ImportedObservation {
     assert.ok(importedObservations.some(o=>o.kind==='mapping'&&o.getter==='balanceOf(uint48)'&&
       o.keyType==='uint48'&&o.stateVariable==='balances'),
       'Accounting readbacks must resolve imported aliased UDVT mapping keys from acquired source');
+    const qualifiedObservationSource=`pragma solidity ^0.8.20;
+import "./AccountKey.sol" as Types;
+contract QualifiedObservation {
+  mapping(Types.AccountKey => uint256) private balances;
+  function balanceOf(Types.AccountKey key) external view returns (uint256) { return balances[key]; }
+}`;
+    const qualifiedObservationSnapshot={path:'source-1/contracts/QualifiedObservation.sol',
+      content:qualifiedObservationSource,sha256:hash(qualifiedObservationSource)};
+    const qualifiedObservations=extractAccountingObservations(qualifiedObservationSnapshot,
+      'QualifiedObservation',[{selector:'QualifiedObservation.balanceOf',operation:'call',inputs:['uint48']}] as any,
+      [importedTypeSnapshot,qualifiedObservationSnapshot]);
+    assert.ok(qualifiedObservations.some(o=>o.kind==='mapping'&&o.getter==='balanceOf(uint48)'&&
+      o.keyType==='uint48'&&o.stateVariable==='balances'),
+      'Accounting readbacks must resolve namespace-qualified imported value types');
     // Use explicit source-grounded require() constraints rather than a generic
     // zero constructor value for acquired transitive dependencies.
     const boundedInterface='pragma solidity ^0.8.0; interface IBounded { function ping() external; }';
