@@ -142,6 +142,37 @@ if(injectedAssetPlan.status==='resolved'){
   assert.equal(injectedAssetPlan.substitutions.assetAddress,'$deployment:dependency1');
   assert.deepEqual(injectedAssetPlan.deployments.map(d=>d.contract),['LocalInjectedAsset']);
 }
+const transitiveConstructorSource=`pragma solidity ^0.8.20;
+interface IConstructorLeaf { function ping() external view returns(uint256); }
+interface IConstructorAdapter { function execute() external view returns(uint256); }
+contract ConstructorLeaf is IConstructorLeaf {
+  function ping() external pure returns(uint256) { return 7; }
+}
+contract ConstructorAdapter is IConstructorAdapter {
+  IConstructorLeaf public leaf;
+  constructor(address leafAddress) { _wireLeaf(leafAddress); }
+  function _wireLeaf(address candidate) internal { leaf=IConstructorLeaf(candidate); }
+  function execute() external view returns(uint256) { return leaf.ping(); }
+}
+contract ConstructorConsumer {
+  IConstructorAdapter public adapter;
+  constructor(IConstructorAdapter adapterAddress) { adapter=adapterAddress; }
+  function run() external view returns(uint256) { return adapter.execute(); }
+}`;
+const transitiveConstructorSnapshot={path:'contracts/ConstructorConsumer.sol',
+  content:transitiveConstructorSource,
+  sha256:createHash('sha256').update(transitiveConstructorSource).digest('hex')};
+const transitiveConstructorPlan=resolveSourceFixtureDependencies(
+  transitiveConstructorSnapshot,'ConstructorConsumer',[transitiveConstructorSnapshot]);
+assert.equal(transitiveConstructorPlan.status,'resolved',
+  'Address-to-interface constructor injection through an internal helper must resolve transitively: '+
+  JSON.stringify(transitiveConstructorPlan));
+if(transitiveConstructorPlan.status==='resolved'){
+  assert.deepEqual(transitiveConstructorPlan.deployments.map(d=>d.contract),
+    ['ConstructorLeaf','ConstructorAdapter'],JSON.stringify(transitiveConstructorPlan));
+  const adapter=transitiveConstructorPlan.deployments.find(d=>d.contract==='ConstructorAdapter');
+  assert.equal(adapter?.constructorArgs[0],'$deployment:dependency1');
+}
 
 const typedAbiSource=`pragma solidity ^0.8.20;
 enum Stage { Open, Closed }
@@ -1062,7 +1093,7 @@ const erc20VaultRes = constructSolidityExperiments({
 assert.equal(erc20VaultRes.ok, true, 'Acquired-source ERC20 vault with MockERC20 must construct multi-contract fixture');
 if (erc20VaultRes.ok) {
   const exp = erc20VaultRes.experiments.find((e) => e.securityProperty.includes('conservation'));
-  assert.ok(exp, 'Expected conservation invariant experiment for CoreERC20Vault');
+  assert.ok(exp, 'Expected conservation invariant experiment for CoreERC20Vault: '+JSON.stringify(erc20VaultRes));
   assert.equal(exp!.sequence.preparation?.deployments?.[0]?.id, 'token');
   assert.equal(exp!.sequence.preparation?.deployments?.[0]?.file, mockErc20Snap.path);
   assert.deepEqual(exp!.sequence.constructorArgs, ['$deployment:token']);

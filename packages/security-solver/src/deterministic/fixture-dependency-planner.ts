@@ -300,7 +300,7 @@ function fixtureAbiType(type:any,contract:any,depth=0,source?:SourceSnapshot,
 }
 function initializerStateBindings(
   node:any,source:SourceSnapshot,sources:readonly SourceSnapshot[]
-):Array<{parameter:string;receiver:string;typeName:string;line:number}>{
+):Array<{parameter:string;receiver:string;typeName:string;line:number;kind:"constructor"|"initializer"}>{
   // Solidity user-defined names also denote structs, enums and value types,
   // including qualified declarations imported from other acquired files.
   // Verify the actual acyclic import namespace before constructing ANY
@@ -346,14 +346,15 @@ function initializerStateBindings(
       typeOf(v.typeName)&&(!localContracts.has(typeOf(v.typeName))?
         !nonDeployable.has(typeOf(v.typeName)):true))
       vars.set(v.name,typeOf(v.typeName));
-  const out:Array<{parameter:string;receiver:string;typeName:string;line:number}>=[];
+  const out:Array<{parameter:string;receiver:string;typeName:string;line:number;kind:"constructor"|"initializer"}>=[];
   for(const fn of (node.subNodes||[]).filter((x:any)=>x.type==="FunctionDefinition"&&x.body&&
-    /^(?:initialize|init|__.*init.*)$/i.test(x.name||""))){
+    (x.isConstructor||/^(?:initialize|init|__.*init.*)$/i.test(x.name||"")))){
     const functions=(node.subNodes||[]).filter((x:any)=>x.type==="FunctionDefinition"&&x.body&&x.name);
     const rootParameters=new Map<string,string>((fn.parameters||[]).map((p:any):[string,string]=>[
       String(p.name||""),String(p.name||"")]));
-    const pending:Array<{fn:any;originForParameter:Map<string,string>}>=
-      [{fn,originForParameter:rootParameters}];
+    const rootKind=fn.isConstructor?"constructor":"initializer";
+    const pending:Array<{fn:any;originForParameter:Map<string,string>;kind:"constructor"|"initializer"}>=
+      [{fn,originForParameter:rootParameters,kind:rootKind}];
     const visited=new Set<any>();
     while(pending.length&&visited.size<64){
       const current=pending.shift()!;
@@ -378,7 +379,8 @@ function initializerStateBindings(
         }
         if(declared&&parameter)
           out.push({parameter,receiver,typeName:declared,
-            line:n.loc?.start?.line||current.fn.loc?.start?.line||1});
+            line:n.loc?.start?.line||current.fn.loc?.start?.line||1,
+            kind:current.kind});
       }
       // Internal initializer helpers may perform the cast and state write.
       // Trace only uniquely resolved, identifier-named local calls with an
@@ -400,12 +402,12 @@ function initializerStateBindings(
           if(!original){valid=false;break;}
           mapped.set(String(parameter.name||""),original);
         }
-        if(valid)pending.push({fn:callee,originForParameter:mapped});
+        if(valid)pending.push({fn:callee,originForParameter:mapped,kind:current.kind});
       }
     }
   }
   return [...new Map(out.map(binding=>[
-    binding.parameter+":"+binding.receiver+":"+binding.typeName,binding])).values()];
+    binding.kind+":"+binding.parameter+":"+binding.receiver+":"+binding.typeName,binding])).values()];
 }
 /** A canonical OpenZeppelin import proves a standard package edge exists,
  * not that an unavailable source has been independently analyzed. */
@@ -1419,7 +1421,8 @@ export function resolveSourceFixtureDependencies(
   const substitutions:Record<string,string>={};
   const visited=new Map<string,string>(),stack=new Set<string>();
   let nextDeploymentId=1;
-  const targetBindings=initializerStateBindings(targetNode,target,sources);
+  const targetBindings=initializerStateBindings(targetNode,target,sources)
+    .filter(binding=>binding.kind==="initializer");
   // Source-referenced constructor-injected dependencies must also contribute
   // receiver ABI requirements to implementation disambiguation.
   const constructorDemands=new Map<string,string[]>();
@@ -1549,15 +1552,21 @@ export function resolveSourceFixtureDependencies(
     }
     stack.add(key);
     const args:PreparedArg[]=[];let valid=true;
+    const constructorBindings=initializerStateBindings(selected.node,selected.source,sources)
+      .filter(binding=>binding.kind==="constructor"&&
+        (ctorOf(selected.node)?.parameters||[]).some((p:any)=>
+        String(p.name||"")===binding.parameter));
     for(const p of ctorOf(selected.node)?.parameters||[]){
       const argType=typeOf(p.typeName);
+      const injected=constructorBindings.find(binding=>binding.parameter===String(p.name||""));
       const struct=p.typeName?.type==="UserDefinedTypeName"&&
         (selected.node.subNodes||[]).some((n:any)=>
           n.type==="StructDefinition"&&n.name===String(p.typeName.namePath||"").split(".").pop());
       const typeClass=p.typeName?.type==="UserDefinedTypeName"?
         classifyUserType(selected.source,selected.node,argType):"value";
-      if(p.typeName?.type==="UserDefinedTypeName"&&!struct&&typeClass==="contract"){
-        const dep=resolve(argType,depth+1,selected.source);
+      if(injected||(p.typeName?.type==="UserDefinedTypeName"&&!struct&&typeClass==="contract")){
+        const dependencyType=injected?.typeName||argType;
+        const dep=resolve(dependencyType,depth+1,selected.source);
         if(!dep){valid=false;break;}args.push("$deployment:"+dep);
       }else{
         const literal=typeClass==="unknown"?null:
@@ -1581,7 +1590,8 @@ export function resolveSourceFixtureDependencies(
     const initializer=initOf(selected.node);
     if(initializer){
       const initArgs:PreparedArg[]=[];
-      const initBindings=initializerStateBindings(selected.node,selected.source,sources);
+      const initBindings=initializerStateBindings(selected.node,selected.source,sources)
+        .filter(binding=>binding.kind==="initializer");
       for(const p of initializer.parameters||[]){
         const name=String(p.name||""),argType=typeOf(p.typeName);
         const matching=initBindings.find(x=>x.parameter===name);
