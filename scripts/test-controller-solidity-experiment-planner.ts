@@ -1228,7 +1228,7 @@ if(feeFormulaPlan.ok){
   assert.ok(feeExperiment,'A literal source-derived fee transition should be executable');
   assert.deepEqual(feeExperiment!.sequence.sourceProperty?.formula,
     {multiplier:'100',divisor:'10000'});
-  assert.equal(feeExperiment!.sequence.sourceProperty?.amount,'10000');
+  assert.equal(feeExperiment!.sequence.sourceProperty?.amount,'10001');
   assert.equal(feeExperiment!.sequence.sourceProperty?.expectedDelta,'100');
   const post=feeExperiment!.sequence.steps.at(-1);
   assert.equal(post?.operation,'call');

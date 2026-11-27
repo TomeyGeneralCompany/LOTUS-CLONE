@@ -524,7 +524,7 @@ function deposit(uint256 amount) external { fees += amount * 100 / 10000; }
             requested=[
                 {"operation":"call","function":"fees()","args":[],"expect":"0"},
                 {"operation":"send","function":"deposit(uint256)",
-                 "args":["10000"],"sender":0},
+                 "args":["10001"],"sender":0},
                 {"operation":"call","function":"fees()","args":[],"expect":"100"},
             ]
             actual=[
@@ -534,7 +534,7 @@ function deposit(uint256 amount) external { fees += amount * 100 / 10000; }
             ]
             prop={"kind":"scalar_delta","state":"fees",
                   "method":"deposit(uint256)","parameter":"amount",
-                  "amount":"10000","formula":{"multiplier":"100",
+                  "amount":"10001","formula":{"multiplier":"100",
                   "divisor":"10000"},"expectedDelta":"100",
                   "direction":"increase","sourceSha256":sha}
             spec={"sequence":{"constructorArgs":[],"steps":requested,

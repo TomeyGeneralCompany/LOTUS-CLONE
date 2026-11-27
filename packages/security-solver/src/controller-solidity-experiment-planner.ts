@@ -3464,7 +3464,11 @@ function sourceScalarDeltaExperiments(
       const stateSource=sourceForNode(state);
       const amountWidth=Number(String(canonicalAbiType(param.typeName)||'').replace(/\D/g,''))||256;
       const stateWidth=Number(String(canonicalAbiType(state.typeName)||'').replace(/\D/g,''))||256;
-      const amount=formula?formula.divisor:(amountWidth<=8?'100':'1000');
+      const amountMaximum=(1n<<BigInt(amountWidth))-1n;
+      const formulaDivisor=formula?BigInt(formula.divisor):0n;
+      const amount=formula?
+        (formulaDivisor<amountMaximum?(formulaDivisor+1n):formulaDivisor).toString():
+        (amountWidth<=8?'100':'1000');
       const expectedDelta=formula?
         (BigInt(amount)*BigInt(formula.multiplier)/BigInt(formula.divisor)).toString():amount;
       if(BigInt(amount)>(1n<<BigInt(amountWidth))-1n||
