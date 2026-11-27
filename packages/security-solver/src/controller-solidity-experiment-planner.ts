@@ -2597,10 +2597,9 @@ export function extractSourceInvariantDescriptor(
   // and external-dependency validation must inspect that SAME witnessed call
   // closure, otherwise source-visible accounting state written by a helper
   // is incorrectly dismissed as an unobservable property.
-  const combinedBody = [
-    reachableAccountingSource(snapshot,contract,inflowFn,sources),
-    reachableAccountingSource(snapshot,contract,outflowFn,sources),
-  ].join("\n");
+  const inflowEffects=reachableAccountingSource(snapshot,contract,inflowFn,sources);
+  const outflowEffects=reachableAccountingSource(snapshot,contract,outflowFn,sources);
+  const combinedBody=[inflowEffects,outflowEffects].join("\n");
   const pairWitnesses: SourceWitness[] = [
     witness(sourceOfFunction(inflowFn), inflowFn, `${contract.name}.${inflowFn.name}`),
     witness(sourceOfFunction(outflowFn), outflowFn, `${contract.name}.${outflowFn.name}`),
@@ -2612,7 +2611,7 @@ export function extractSourceInvariantDescriptor(
   const transitionUintWidths=[inflowFn,outflowFn].flatMap((fn:any)=>(fn.parameters||[])
     .map((parameter:any)=>canonicalAbiType(parameter.typeName)||'')
     .map((type:string)=>/^uint([0-9]+)?$/.exec(type))
-    .filter((match):match is RegExpExecArray=>match!==null)
+    .filter((match:RegExpExecArray|null):match is RegExpExecArray=>match!==null)
     .map((match:RegExpExecArray)=>match[1]?Number(match[1]):256));
   const narrowTransitionAmounts=transitionUintWidths.some(width=>width<10);
   const inflowAmount=narrowTransitionAmounts?'100':'1000';
@@ -2978,6 +2977,13 @@ export function extractSourceInvariantDescriptor(
     };
   }
 
+  if(mode===null){
+    return {ok:false,category:'missing_fixture',
+      reason:'No unambiguous ABI argument plan for the source-proven accounting pair '+
+        contract.name+'.'+inflowFn.name+'/'+outflowFn.name,
+      witnesses:pairWitnesses};
+  }
+
   // Numeric 1000/400/600 assertions apply only when the acquired source
   // proves direct matching updates without fees, exchange rates or accrual.
   // Contracts with dynamic economics require a separate measured property.
@@ -2991,8 +2997,6 @@ export function extractSourceInvariantDescriptor(
   };
   const inflowParameter=amountParameter(inflowFn);
   const outflowParameter=amountParameter(outflowFn);
-  const inflowEffects=reachableAccountingSource(snapshot,contract,inflowFn,sources);
-  const outflowEffects=reachableAccountingSource(snapshot,contract,outflowFn,sources);
   const directlyProven=accountingTarget&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(accountingTarget)&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(inflowParameter)&&
@@ -3298,7 +3302,7 @@ function sourceScalarDeltaExperiments(
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
   const inheritance=resolveInheritance(snapshot,contract,sources);
-  const owners=[{contract,snapshot},...inheritance.chain];
+  const owners=inheritance.chain;
   const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
   const ownsNode=(owner:any,node:any):boolean=>
     (owner.contract.subNodes||[]).includes(node)||
@@ -3400,7 +3404,7 @@ function sourceMappingDeltaExperiments(
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
   const inheritance=resolveInheritance(snapshot,contract,sources);
-  const owners=[{contract,snapshot},...inheritance.chain];
+  const owners=inheritance.chain;
   const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
   const ownsNode=(owner:any,node:any):boolean=>
     (owner.contract.subNodes||[]).includes(node)||
@@ -3609,7 +3613,7 @@ function sourceInternalScalarSetterExperiments(
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
   const inheritance=resolveInheritance(snapshot,contract,sources);
-  const owners=[{contract,snapshot},...inheritance.chain];
+  const owners=inheritance.chain;
   const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
   const ownsNode=(owner:any,node:any):boolean=>
     (owner.contract.subNodes||[]).includes(node)||
@@ -3720,7 +3724,7 @@ function sourceDirectAssignmentExperiments(
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
   const inheritance=resolveInheritance(snapshot,contract,sources);
-  const owners=[{contract,snapshot},...inheritance.chain];
+  const owners=inheritance.chain;
   const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
   const ownsNode=(owner:any,node:any):boolean=>
     (owner.contract.subNodes||[]).includes(node)||
@@ -3902,7 +3906,7 @@ function sourceOwnerGuardedAssignmentExperiments(
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
   const inheritance=resolveInheritance(snapshot,contract,sources);
-  const owners=[{contract,snapshot},...inheritance.chain];
+  const owners=inheritance.chain;
   const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
   const ownsNode=(entry:any,node:any):boolean=>
     (entry.contract.subNodes||[]).includes(node)||
@@ -4069,7 +4073,7 @@ function sourceInternalMappingSetterExperiments(
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
   const owner=resolveInheritance(snapshot,contract,sources);
-  const owners=[{contract,snapshot},...owner.chain];
+  const owners=owner.chain;
   const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
   const ownsNode=(entry:any,node:any):boolean=>
     (entry.contract.subNodes||[]).includes(node)||

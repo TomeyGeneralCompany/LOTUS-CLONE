@@ -2145,12 +2145,142 @@ contract InternalScalar {
       targetSelector:'InternalScalar.update',sources:[internalScalarSnap],
       declarations:internalScalarMenu as any,skipLegacy:true});
     assert.equal(internalScalarPlan.ok,true,
-      'Source-exact helper delegation must construct a state obligation');
+      'Source-exact helper delegation must construct a state obligation: '+
+        JSON.stringify(internalScalarPlan));
     if(internalScalarPlan.ok)assert.ok(internalScalarPlan.experiments.some(e=>
       e.securityProperty.startsWith('source internal state assignment')&&
       e.sequence.steps.some(step=>step.operation==='call'&&
         step.function==='amount()'&&step.expect==='7')&&
       e.witnesses.some(w=>w.symbol.includes('_set'))));
+    // Inherited source must retain its own identities while planning a
+    // protocol-named supply pair. uint8 arguments use values that fit the
+    // compiler ABI, and the address parameter is explicitly bound.
+    const inheritedLedgerBaseText=`pragma solidity ^0.8.20;
+contract LedgerBase {
+  uint8 public total;
+  function issue(address recipient,uint8 quantity) external { total += quantity; }
+  function retire(address holder,uint8 quantity) external { total -= quantity; }
+}`;
+    const inheritedLedgerChildText=`pragma solidity ^0.8.20;
+import "./LedgerBase.sol";
+contract LedgerChild is LedgerBase {}`;
+    const inheritedLedgerBase={path:'source-1/contracts/LedgerBase.sol',
+      content:inheritedLedgerBaseText,sha256:hash(inheritedLedgerBaseText)};
+    const inheritedLedgerChild={path:'source-1/contracts/LedgerChild.sol',
+      content:inheritedLedgerChildText,sha256:hash(inheritedLedgerChildText)};
+    const inheritedLedgerPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:inheritedLedgerChild.path,
+      targetSelector:'LedgerChild.issue',
+      sources:[inheritedLedgerBase,inheritedLedgerChild],
+      declarations:[
+        {selector:'LedgerChild.issue',operation:'send',inputs:['address','uint8']},
+        {selector:'LedgerChild.retire',operation:'send',inputs:['address','uint8']},
+        {selector:'LedgerChild.total',operation:'call',inputs:[]}
+      ] as any,skipLegacy:true});
+    assert.equal(inheritedLedgerPlan.ok,true,
+      'Inherited protocol-named scalar accounting must yield a source-backed experiment');
+    if(inheritedLedgerPlan.ok){
+      const pair=inheritedLedgerPlan.experiments.find(experiment=>{
+        const sends=experiment.sequence.steps.filter(step=>step.operation==='send');
+        return sends.some(step=>step.function==='issue(address,uint8)'&&
+          JSON.stringify(step.args)===JSON.stringify(['$account0','100']))&&
+          sends.some(step=>step.function==='retire(address,uint8)'&&
+            JSON.stringify(step.args)===JSON.stringify(['$account0','40']))&&
+          experiment.sequence.steps.some(step=>step.operation==='call'&&
+            step.function==='total()'&&step.expect==='60');
+      });
+      assert.ok(pair,
+        'Source-derived issuance/redemption must bind the actor and keep every uint8 assertion in range');
+      assert.ok(pair?.witnesses.some(w=>w.sourceSha256===inheritedLedgerBase.sha256),
+        'Inherited function and state evidence must preserve the base source hash');
+    }
+    const inheritedMapBaseText=`pragma solidity ^0.8.20;
+contract MappingBase {
+  mapping(address=>uint256) public credits;
+  function credit(address account,uint256 amount) external { credits[account] += amount; }
+}`;
+    const inheritedMapChildText=`pragma solidity ^0.8.20;
+import "./MappingBase.sol";
+contract MappingChild is MappingBase {}`;
+    const inheritedMapBase={path:'source-1/contracts/MappingBase.sol',
+      content:inheritedMapBaseText,sha256:hash(inheritedMapBaseText)};
+    const inheritedMapChild={path:'source-1/contracts/MappingChild.sol',
+      content:inheritedMapChildText,sha256:hash(inheritedMapChildText)};
+    const inheritedMapPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:inheritedMapChild.path,
+      targetSelector:'MappingChild.credit',sources:[inheritedMapBase,inheritedMapChild],
+      declarations:[
+        {selector:'MappingChild.credit',operation:'send',inputs:['address','uint256']},
+        {selector:'MappingChild.credits',operation:'call',inputs:['address']}
+      ] as any,skipLegacy:true});
+    assert.equal(inheritedMapPlan.ok,true,
+      'Inherited public mapping transitions must construct an exact-key experiment');
+    if(inheritedMapPlan.ok)assert.ok(inheritedMapPlan.experiments.some(experiment=>
+      experiment.securityProperty.includes('mapping conservation')&&
+      experiment.witnesses.some(w=>w.sourceSha256===inheritedMapBase.sha256)),
+      'Inherited mapping experiments must preserve the storage source witness');
+
+    const inheritedHelperBaseText=`pragma solidity ^0.8.20;
+contract HelperBase {
+  uint256 private held;
+  function amount() external view returns(uint256) { return held; }
+  function update(uint256 value) external { _set(value); }
+  function _set(uint256 next) internal { held = next; }
+}`;
+    const inheritedHelperChildText=`pragma solidity ^0.8.20;
+import "./HelperBase.sol";
+contract HelperChild is HelperBase {}`;
+    const inheritedHelperBase={path:'source-1/contracts/HelperBase.sol',
+      content:inheritedHelperBaseText,sha256:hash(inheritedHelperBaseText)};
+    const inheritedHelperChild={path:'source-1/contracts/HelperChild.sol',
+      content:inheritedHelperChildText,sha256:hash(inheritedHelperChildText)};
+    const inheritedHelperPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:inheritedHelperChild.path,
+      targetSelector:'HelperChild.update',
+      sources:[inheritedHelperBase,inheritedHelperChild],
+      declarations:[
+        {selector:'HelperChild.update',operation:'send',inputs:['uint256']},
+        {selector:'HelperChild.amount',operation:'call',inputs:[]}
+      ] as any,skipLegacy:true});
+    assert.equal(inheritedHelperPlan.ok,true,
+      'Inherited helper assignments must retain their acquired source path');
+    if(inheritedHelperPlan.ok)assert.ok(inheritedHelperPlan.experiments.some(experiment=>
+      experiment.securityProperty.startsWith('source internal state assignment')&&
+      experiment.witnesses.some(w=>w.sourceSha256===inheritedHelperBase.sha256&&
+        w.symbol.includes('_set'))),
+      'Inherited helper and state witnesses must use the base source hash');
+    const inheritedOwnerBaseText=`pragma solidity ^0.8.20;
+contract OwnerBase {
+  address public administrator;
+  uint256 public value;
+  constructor(){ administrator=msg.sender; }
+  function update(uint256 next) external {
+    require(msg.sender==administrator, "administrator");
+    value=next;
+  }
+}`;
+    const inheritedOwnerChildText=`pragma solidity ^0.8.20;
+import "./OwnerBase.sol";
+contract OwnerChild is OwnerBase {}`;
+    const inheritedOwnerBase={path:'source-1/contracts/OwnerBase.sol',
+      content:inheritedOwnerBaseText,sha256:hash(inheritedOwnerBaseText)};
+    const inheritedOwnerChild={path:'source-1/contracts/OwnerChild.sol',
+      content:inheritedOwnerChildText,sha256:hash(inheritedOwnerChildText)};
+    const inheritedOwnerPlan=constructSolidityExperiments({
+      repositoryCommit:'b'.repeat(40),targetPath:inheritedOwnerChild.path,
+      targetSelector:'OwnerChild.update',
+      sources:[inheritedOwnerBase,inheritedOwnerChild],
+      declarations:[
+        {selector:'OwnerChild.update',operation:'send',inputs:['uint256']},
+        {selector:'OwnerChild.administrator',operation:'call',inputs:[]},
+        {selector:'OwnerChild.value',operation:'call',inputs:[]}
+      ] as any,skipLegacy:true});
+    assert.equal(inheritedOwnerPlan.ok,true,
+      'Inherited owner-guarded assignments must construct an authorized-vs-outsider experiment');
+    if(inheritedOwnerPlan.ok)assert.ok(inheritedOwnerPlan.experiments.some(experiment=>
+      experiment.securityProperty.startsWith('source-proof generic owner guard')&&
+      experiment.witnesses.some(w=>w.sourceSha256===inheritedOwnerBase.sha256)),
+      'Inherited owner constructor, guard, and state witnesses must retain the base hash');
     const unrelatedScalar=constructSolidityExperiments({
       repositoryCommit:'b'.repeat(40),targetPath:internalScalarSnap.path,
       targetSelector:'InternalScalar.updateUnrelated',sources:[internalScalarSnap],
