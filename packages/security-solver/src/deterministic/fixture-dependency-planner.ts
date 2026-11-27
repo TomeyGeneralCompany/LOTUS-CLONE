@@ -252,6 +252,14 @@ function constrainedFixtureArg(type:any,parameter:string,fn:any,nonzero:boolean,
     Array.isArray(call.arguments)&&call.arguments.length>0)apply(call.arguments[0]);
   if(lower>upper)return null;
   let candidate=typeof fallback==="string"&&/^-?[0-9]+$/.test(fallback)?BigInt(fallback):lower;
+  const normalizedName=parameter.replace(/^_/,'').toLowerCase();
+  if(/multiplierintercept/.test(normalizedName)){
+    // Use the acquired model's own scale constant for its initial multiplier;
+    // zero is ABI-valid but makes the only acquired interest model return no
+    // interest, so the source's deposit precondition can never be reached.
+    const scale=constants.has('PRECISION')?evaluateConstant(constants.get('PRECISION')):null;
+    if(scale!==null)candidate=scale;
+  }else if(/multiplierslope/.test(normalizedName))candidate=0n;
   if(candidate<lower)candidate=lower;
   if(candidate>upper)candidate=upper;
   while(excluded.has(candidate.toString())&&candidate<upper)candidate++;
@@ -361,6 +369,41 @@ function initializerStateBindings(
       if(visited.has(current.fn))continue;
       visited.add(current.fn);
       for(const n of descendants(current.fn.body)){
+        // Constructor adapters sometimes consume a token/contract argument
+        // only through a typed call such as `ERC20(_dai).decimals()` instead
+        // of storing it. This is still a real dependency edge: the constructor
+        // cannot execute with an EOA. Require the cast type to be declared in
+        // the acquired file/import namespace and preserve the original root
+        // constructor parameter as the deployment argument source.
+        if(n.type==="FunctionCall"&&n.expression?.type==="MemberAccess"&&
+          n.expression.expression?.type==="FunctionCall"&&
+          n.expression.expression.expression?.type==="Identifier"&&
+          Array.isArray(n.expression.expression.arguments)&&
+          n.expression.expression.arguments.length===1){
+          const castName=String(n.expression.expression.expression.name||"");
+          const argument=n.expression.expression.arguments[0];
+          const importedNames=new Set<string>();
+          for(const imp of (astOf(source)?.children||[])
+            .filter((item:any)=>item.type==="ImportDirective")){
+            for(const alias of imp.symbolAliases||[]){
+              const original=Array.isArray(alias)?alias[0]:alias.foreign;
+              const local=Array.isArray(alias)?alias[1]:alias.local;
+              if(original===castName||local===castName)importedNames.add(castName);
+            }
+          }
+          const declaredContract=(astOf(source)?.children||[]).some((item:any)=>
+            item.type==="ContractDefinition"&&item.name===castName);
+          const declaredInterface=(astOf(source)?.children||[]).some((item:any)=>
+            item.type==="ContractDefinition"&&item.kind==="interface"&&item.name===castName);
+          const parameter=argument?.type==="Identifier"?
+            current.originForParameter.get(String(argument.name||""))||"":"";
+          if(parameter&&/^[A-Za-z_]\w*$/.test(castName)&&
+            !nonDeployable.has(castName)&&
+            (declaredContract||declaredInterface||importedNames.has(castName)))
+            out.push({parameter,receiver:"$constructor-call:"+String(argument.name||""),
+              typeName:castName,line:n.loc?.start?.line||current.fn.loc?.start?.line||1,
+              kind:current.kind});
+        }
         if(n.type!=="BinaryOperation"||n.operator!=="=")continue;
         const receiver=String(n.left?.name||"");
         const declared=vars.get(receiver);
@@ -1507,6 +1550,15 @@ export function resolveSourceFixtureDependencies(
         if(param.typeName?.type==="UserDefinedTypeName")
           recordReceiverMethods(entry.source,typeOf(param.typeName),
             String(param.name||""),entry.node);
+    // A receiver is often copied from an injected state field into a local
+    // interface-typed variable before use. Include those local aliases when
+    // deriving the concrete fixture's required ABI. Otherwise the selected
+    // implementation can satisfy the stored field's visible calls while
+    // omitting a method invoked only through its local alias.
+    for(const declaration of descendants(entry.node).filter((n:any)=>
+      n.type==="VariableDeclaration"&&n.typeName?.type==="UserDefinedTypeName"))
+      recordReceiverMethods(entry.source,typeOf(declaration.typeName),
+        String(declaration.name||""),entry.node);
     for(const binding of initializerStateBindings(entry.node,entry.source,sources))
       recordReceiverMethods(entry.source,binding.typeName,binding.receiver,entry.node);
   }
@@ -1685,9 +1737,62 @@ export function resolveSourceFixtureDependencies(
   for(const deployment of deployments)if(!visit(deployment.id))
     return {status:"unresolved",missingDependencies:["deployment_graph_cycle_or_missing_node"],
       attemptedResolvers:[...new Set(attempts)],witnesses};
-  const rank=new Map(ordered.map((d,index)=>[d.id,index]));
-  const orderedInitializers=[...initializers].sort((a,b)=>
-    (rank.get(a.deploymentId)??Infinity)-(rank.get(b.deploymentId)??Infinity));
+  // Initializer calls may read or mutate another deployment immediately.
+  // Deployment order alone is insufficient: e.g. EMAOracle.initialize calls
+  // moneyMarket.incomeIndex(), so the market's initializer must already have
+  // completed. Derive initializer edges from the exact deployment references
+  // in each acquired argument list and topologically order them, preserving
+  // source discovery order when two operations are independent.
+  const initByDeployment=new Map(initializers.map(item=>[item.deploymentId,item]));
+  const sourceByPath=new Map(sources.map(item=>[item.path,item]));
+  const initializerUsesReceiver=(operation:PreparedInitializerOperation,
+    dependencyId:string):boolean=>{
+    const deployment=byId.get(operation.deploymentId);
+    const owner=deployment&&sourceByPath.get(deployment.file);
+    if(!deployment||!owner)return false;
+    const contract=(astOf(owner)?.children||[]).find((item:any)=>
+      item.type==="ContractDefinition"&&item.name===deployment.contract);
+    if(!contract)return false;
+    const open=operation.function.indexOf("("),name=operation.function.slice(0,open);
+    const signature=operation.function.slice(open+1,-1).split(",").filter(Boolean);
+    const fn=(contract.subNodes||[]).find((item:any)=>item.type==="FunctionDefinition"&&
+      item.name===name&&(item.parameters||[]).length===signature.length&&
+      (item.parameters||[]).every((parameter:any,index:number)=>
+        fixtureAbiType(parameter.typeName,contract,0,owner,sources)===signature[index]));
+    if(!fn)return false;
+    const boundReceivers=new Set<string>();
+    for(let index=0;index<operation.args.length;index++){
+      const arg=operation.args[index];
+      if(arg!=="$deployment:"+dependencyId)continue;
+      const parameter=String(fn.parameters?.[index]?.name||"");
+      if(parameter)boundReceivers.add(parameter);
+      for(const binding of initializerStateBindings(contract,owner,sources))
+        if(binding.kind==="initializer"&&binding.parameter===parameter)
+          boundReceivers.add(binding.receiver);
+    }
+    if(!boundReceivers.size)return false;
+    return descendants(fn.body).some((item:any)=>item.type==="FunctionCall"&&
+      item.expression?.type==="MemberAccess"&&
+      item.expression.expression?.type==="Identifier"&&
+      boundReceivers.has(String(item.expression.expression.name||"")));
+  };
+  const pendingInitializers=[...initializers];
+  const orderedInitializers:PreparedInitializerOperation[]=[];
+  const initialized=new Set<string>();
+  while(pendingInitializers.length){
+    const readyIndex=pendingInitializers.findIndex(item=>
+      item.args.filter((arg):arg is string=>typeof arg==="string"&&
+        arg.startsWith("$deployment:"))
+        .map(arg=>arg.slice("$deployment:".length))
+        .filter(dependency=>initByDeployment.has(dependency)&&
+          initializerUsesReceiver(item,dependency))
+        .every(dependency=>initialized.has(dependency)));
+    if(readyIndex<0)return {status:"unresolved",
+      missingDependencies:["initializer_dependency_cycle_or_missing_node"],
+      attemptedResolvers:[...new Set(attempts)],witnesses,ambiguousImplementations};
+    const [ready]=pendingInitializers.splice(readyIndex,1);
+    orderedInitializers.push(ready);initialized.add(ready.deploymentId);
+  }
   return {status:"resolved",deployments:ordered,substitutions,bindings,witnesses,
     initializerOperations:orderedInitializers,implementationChoices};
 }

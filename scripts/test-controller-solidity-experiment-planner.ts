@@ -142,6 +142,70 @@ if(injectedAssetPlan.status==='resolved'){
   assert.equal(injectedAssetPlan.substitutions.assetAddress,'$deployment:dependency1');
   assert.deepEqual(injectedAssetPlan.deployments.map(d=>d.contract),['LocalInjectedAsset']);
 }
+// Concrete fixture ABI requirements must include calls made through a local
+// copy of a source-injected interface receiver, not only calls made through
+// the stored state variable itself.
+const localAliasReceiverSource=`pragma solidity ^0.8.20;
+interface ILocalAliasReceiver { function perform() external; }
+contract LocalAliasVault {
+  ILocalAliasReceiver public receiver;
+  constructor(address receiverAddress) { receiver = ILocalAliasReceiver(receiverAddress); }
+  function run() external { ILocalAliasReceiver local = receiver; local.perform(); }
+}
+contract MissingLocalAliasMethod {}
+contract CompleteLocalAliasMethod { function perform() external {} }
+`;
+const localAliasReceiverSnapshot={path:'contracts/LocalAliasVault.sol',
+  content:localAliasReceiverSource,
+  sha256:createHash('sha256').update(localAliasReceiverSource).digest('hex')};
+const localAliasReceiverPlan=resolveSourceFixtureDependencies(localAliasReceiverSnapshot,
+  'LocalAliasVault',[localAliasReceiverSnapshot]);
+assert.equal(localAliasReceiverPlan.status,'resolved',
+  'A local interface alias must contribute its source-visible method to dependency resolution: '+
+  JSON.stringify(localAliasReceiverPlan));
+if(localAliasReceiverPlan.status==='resolved'){
+  assert.deepEqual(localAliasReceiverPlan.deployments.map(d=>d.contract),
+    ['CompleteLocalAliasMethod'],
+    'A selected fixture must implement methods invoked through a local source-typed alias');
+}
+// Initializer dependencies need their own topological order. The oracle reads
+// the market during initialize, so deployment order by itself is not enough.
+const initializerDependencySource=`pragma solidity ^0.8.20;
+interface IOrderMarket { function incomeIndex() external view returns(uint256); }
+interface IOrderOracle {}
+contract OrderMarket is IOrderMarket {
+  uint256 public index;
+  function initialize() external { index = 1; }
+  function incomeIndex() external view returns(uint256) { require(index == 1); return index; }
+}
+contract OrderOracle is IOrderOracle {
+  IOrderMarket public moneyMarket;
+  uint256 public lastIndex;
+  function initialize(address _moneyMarket) external {
+    moneyMarket = IOrderMarket(_moneyMarket);
+    lastIndex = moneyMarket.incomeIndex();
+  }
+}
+contract OrderRoot {
+  IOrderOracle public oracle;
+  function initialize(address _oracle) external { oracle = IOrderOracle(_oracle); }
+}
+`;
+const initializerDependencySnapshot={path:'contracts/InitializerDependency.sol',
+  content:initializerDependencySource,
+  sha256:createHash('sha256').update(initializerDependencySource).digest('hex')};
+const initializerDependencyPlan=resolveSourceFixtureDependencies(initializerDependencySnapshot,
+  'OrderRoot',[initializerDependencySnapshot]);
+assert.equal(initializerDependencyPlan.status,'resolved',
+  'A source-backed initializer dependency graph must resolve: '+JSON.stringify(initializerDependencyPlan));
+if(initializerDependencyPlan.status==='resolved'){
+  assert.deepEqual(initializerDependencyPlan.initializerOperations.map(op=>op.function.split('(')[0]),
+    ['initialize','initialize'],
+    'Both source-declared initialization transactions must be retained');
+  assert.equal(initializerDependencyPlan.initializerOperations[0].deploymentId,
+    initializerDependencyPlan.deployments.find(d=>d.contract==='OrderMarket')?.id,
+    'The market must be initialized before the oracle invokes incomeIndex()');
+}
 const transitiveConstructorSource=`pragma solidity ^0.8.20;
 interface IConstructorLeaf { function ping() external view returns(uint256); }
 interface IConstructorAdapter { function execute() external view returns(uint256); }
@@ -174,6 +238,37 @@ if(transitiveConstructorPlan.status==='resolved'){
     ['ConstructorLeaf','ConstructorAdapter'],JSON.stringify(transitiveConstructorPlan));
   const adapter=transitiveConstructorPlan.deployments.find(d=>d.contract==='ConstructorAdapter');
   assert.equal(adapter?.constructorArgs[0],'$deployment:dependency1');
+}
+// An address argument used only by an acquired typed constructor call is still
+// a dependency. The resolver must deploy its concrete receiver first and pass
+// that address into the adapter constructor instead of substituting an EOA.
+const typedConstructorCallSource=`pragma solidity ^0.8.20;
+interface IEdgeToken { function decimals() external view returns(uint8); }
+interface IEdgeAdapter { function readDecimals() external view returns(uint8); }
+contract EdgeToken is IEdgeToken { function decimals() external pure returns(uint8) { return 6; } }
+contract EdgeAdapter is IEdgeAdapter {
+  uint8 public tokenDecimals;
+  constructor(address tokenAddress) { tokenDecimals = IEdgeToken(tokenAddress).decimals(); }
+  function readDecimals() external view returns(uint8) { return tokenDecimals; }
+}
+contract EdgeRoot {
+  IEdgeAdapter public adapter;
+  constructor(address adapterAddress) { adapter = IEdgeAdapter(adapterAddress); }
+}
+`;
+const typedConstructorCallSnapshot={path:'contracts/TypedConstructorCall.sol',
+  content:typedConstructorCallSource,
+  sha256:createHash('sha256').update(typedConstructorCallSource).digest('hex')};
+const typedConstructorCallPlan=resolveSourceFixtureDependencies(typedConstructorCallSnapshot,
+  'EdgeRoot',[typedConstructorCallSnapshot]);
+assert.equal(typedConstructorCallPlan.status,'resolved',
+  'A source-typed address constructor call must resolve to acquired code: '+
+  JSON.stringify(typedConstructorCallPlan));
+if(typedConstructorCallPlan.status==='resolved'){
+  assert.deepEqual(typedConstructorCallPlan.deployments.map(d=>d.contract),
+    ['EdgeToken','EdgeAdapter']);
+  assert.equal(typedConstructorCallPlan.deployments.find(d=>d.contract==='EdgeAdapter')?.constructorArgs[0],
+    '$deployment:dependency1');
 }
 
 const typedAbiSource=`pragma solidity ^0.8.20;
@@ -221,6 +316,8 @@ assert.equal(pickFlexibleArg('uint8','maturityTimestamp'),null,
   'An ABI that cannot represent a future timestamp must remain an explicit fixture failure');
 assert.equal(pickFlexibleArg('uint32','maturityTimestamp'),'2000000000',
   'An absolute timestamp fixture must be future-dated relative to the deterministic EVM clock');
+assert.equal(pickFlexibleArg('uint64','MaxDepositPeriod'),'3000000000',
+  'A maximum duration fixture must accommodate a source-selected future maturation timestamp');
 
 const a=constructSolidityExperiments(input);
 assert.equal(a.ok,true,JSON.stringify(a));

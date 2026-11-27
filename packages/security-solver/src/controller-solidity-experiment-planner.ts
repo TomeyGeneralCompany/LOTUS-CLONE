@@ -38,6 +38,9 @@ export type InvariantUnresolvedCategory =
 export interface SourceInvariantTransitionPlan {
   mode: 'eth_deposit_withdraw' | 'internal_deposit_withdraw' | 'erc20_deposit_withdraw' | 'mint_burn_supply';
   usesMockToken?: boolean;
+  /** ID of an acquired ERC20 fixture already injected through a transitive
+   * constructor/initializer edge. */
+  mockTokenDeploymentId?:string;
   inflowMethod: string;
   inflowSig: string;
   inflowArgs: string[];
@@ -1720,10 +1723,12 @@ export function pickFlexibleArg(abiType:string,paramName:string,options:{
     const maximum=intType[1]==='uint'?(1n<<BigInt(bits))-1n:
       (1n<<BigInt(bits-1))-1n;
     const absoluteTimestamp=/(?:timestamp|maturation|deadline|expiry|expiration|unlocktime)/i.test(name);
+    const maximumWindow=/^(?:_)?max(?:imum)?.*(?:period|duration|interval|time)/i.test(name);
     if(absoluteTimestamp&&maximum<2000000000n)return null;
     const preferred=options.tupleComponent&&bits===8?'0':
       /^(?:status|state|mode|kind|role|action|phase|stage|reason|category|strategy|operation)$/i.test(name)?'0':
       /(?:decimal|precision|scale)/i.test(name)?'18':
+      maximumWindow?'3000000000':
       absoluteTimestamp?'2000000000':
       /(?:period|duration|epoch|lock|interval|delay|window|time)/i.test(name)?'86400':
       /(?:fee|bps|rate|ratio|percent)/i.test(name)?'100':options.amount??'1000';
@@ -2720,6 +2725,24 @@ export function extractSourceInvariantDescriptor(
       })
       .map((v: any) => String(v.name)),
   );
+  // Helper bodies frequently bind an acquired interface to a local alias
+  // before making an external call (for example
+  // `MoneyMarket _moneyMarket = moneyMarket()`). Treating that local name as
+  // an unknown receiver loses the source-typed dependency edge and incorrectly
+  // blocks otherwise complete fixture graphs. Only declarations with an
+  // acquired contract type are admitted here; lexical variable names alone
+  // never establish a receiver type.
+  const localReceiverTypes=new Map<string,string>();
+  const localReceiverPattern=/\b([A-Za-z_][A-Za-z0-9_.]*)\s+([A-Za-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\s*\([^;]*\)|[^;]{1,160})\s*;/g;
+  for(let aliasMatch;(aliasMatch=localReceiverPattern.exec(combinedBody));){
+    const typeName=String(aliasMatch[1]).split('.').pop()||'';
+    const alias=String(aliasMatch[2]);
+    if(/^(?:ERC20|IERC20|ERC20Upgradeable|IERC20Metadata|MoneyMarket|I[A-Z][A-Za-z0-9_]*)$/.test(typeName))
+      localReceiverTypes.set(alias,typeName);
+  }
+  for(const [alias,typeName] of localReceiverTypes)
+    if(/^(?:I?ERC20|ERC20Upgradeable|IERC20Metadata)$/i.test(typeName))
+      erc20StateVars.add(alias);
   const erc20MethodsRe = /^(?:safeTransferFrom|transferFrom|safeTransfer|transfer|approve|safeApprove|safeIncreaseAllowance|safeDecreaseAllowance|balanceOf|allowance)$/;
   const unresolvedExt: string[] = [];
   let usesErc20Transfer = false;
@@ -2742,15 +2765,35 @@ export function extractSourceInvariantDescriptor(
       }
       continue;
     }
-    if (externalContractVars.has(recv) || knownExternalMethods.test(fnCalled)) {
+    if (externalContractVars.has(recv) || localReceiverTypes.has(recv) || knownExternalMethods.test(fnCalled)) {
       unresolvedExt.push(`${recv}.${fnCalled}`);
     }
   }
   const dependencyPlan=resolveSourceFixtureDependencies(snapshot,contract.name,
     [...sources.values()],{choiceByType:fixtureChoices});
+  const dependencyMockToken=dependencyPlan.status==='resolved'&&mockToken?
+    dependencyPlan.deployments.find(deployment=>deployment.file===mockToken.snapshot.path&&
+      deployment.contract===mockToken.contractName):undefined;
   const unresolvedRemaining=unresolvedExt.filter(call=>{
     if(dependencyPlan.status!=="resolved")return true;
     const [recv,methodCalled]=call.split('.');
+    const localType=localReceiverTypes.get(recv);
+    if(localType){
+      // ERC20 transfer extensions are checked against the acquired token
+      // fixture below. For protocol receivers, verify the exact selected
+      // acquired implementation's ABI for the call made through this local
+      // alias. The resolver has already source-bound its constructor or
+      // initializer edge in the deployment graph.
+      if(/^(?:I?ERC20|ERC20Upgradeable|IERC20Metadata)$/i.test(localType))
+        return !mockToken;
+      const selectedImplementation=dependencyPlan.implementationChoices?.[localType];
+      if(!selectedImplementation)return true;
+      const split=selectedImplementation.lastIndexOf(':');
+      if(split<0)return true;
+      const file=selectedImplementation.slice(0,split),contractName=selectedImplementation.slice(split+1);
+      return !verifyAcquiredReceiverMethods(localType,[methodCalled],file,contractName,
+        [...sources.values()]).ok;
+    }
     const binding=dependencyPlan.bindings.find(b=>b.receiver===recv);
     if(!binding||dependencyPlan.substitutions[recv]!=='$deployment:'+binding.deploymentId)return true;
     const deployment=dependencyPlan.deployments.find(d=>d.id===binding.deploymentId);
@@ -2913,11 +2956,11 @@ export function extractSourceInvariantDescriptor(
       witnesses: pairWitnesses,
     };
   }
-  if (usesErc20Transfer && (!mockToken || !setup.usesToken)) {
+  if (usesErc20Transfer && (!mockToken || (!setup.usesToken&&!dependencyMockToken))) {
     return {
       ok: false,
       category: 'missing_fixture',
-      reason: `ERC20 token transfer in ${contract.name}.${inflowFn.name}/${outflowFn.name} requires a configurable token fixture wired via constructor or initializer`,
+      reason: `ERC20 token transfer in ${contract.name}.${inflowFn.name}/${outflowFn.name} requires an acquired token fixture wired through the root or a source-resolved dependency initializer`,
       witnesses: pairWitnesses,
     };
   }
@@ -3194,7 +3237,8 @@ export function extractSourceInvariantDescriptor(
       witnesses: pairWitnesses,
       transitionPlan: {
         mode,
-        ...(mode === 'erc20_deposit_withdraw' ? { usesMockToken: true } : {}),
+        ...(usesErc20Transfer&&mockToken?{usesMockToken:true}:{}),
+        ...(dependencyMockToken?{mockTokenDeploymentId:dependencyMockToken.id}:{}),
         inflowMethod: inflowFn.name,
         inflowSig,
         inflowArgs,
@@ -3278,10 +3322,11 @@ export function constructCoreInvariantExperiment(
         tp.typedObservation!.expectPath[0]===obs.fieldIndex)));
     if(!supported)return null;
   }
-  if (tp.mode === 'erc20_deposit_withdraw' && (!mockToken || !setup.usesToken)) return null;
+  if (tp.mode === 'erc20_deposit_withdraw' &&
+    (!mockToken || (!setup.usesToken&&!tp.mockTokenDeploymentId))) return null;
 
   const deployments=[
-    ...(setup.usesToken&&mockToken?[{
+    ...(setup.usesToken&&mockToken&&!tp.mockTokenDeploymentId?[{
       id:'token',file:mockToken.snapshot.path,contract:mockToken.contractName,
       constructorArgs:mockToken.constructorArgs,
     }]:[]),
@@ -3301,12 +3346,61 @@ export function constructCoreInvariantExperiment(
       requiredSetup: true,
     });
   }
-  if (tp.mode === 'erc20_deposit_withdraw' && mockToken) {
+  // Some source families require the target to own a separately deployed
+  // token/NFT before its first operation (DInterest calls depositNFT.mint,
+  // whose acquired implementation is onlyOwner). When both sides of that
+  // relationship are source-bound, establish it as fixture setup and verify
+  // the ownership change. Do not infer or transfer roles from receiver names.
+  const selectedFns=[tp.inflowSig,tp.outflowSig].map(signature=>{
+    const name=signature.slice(0,signature.indexOf('('));
+    return (contract.subNodes||[]).find((node:any)=>node.type==='FunctionDefinition'&&
+      node.name===name&&canonicalFunctionIdentity(node)===signature);
+  }).filter(Boolean);
+  const selectedSourceClosure=selectedFns.map((fn:any)=>
+    reachableAccountingSource(snapshot,contract,fn,sources)).join('\n')
+      .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
+  const ownershipTransfers=new Set<string>();
+  for(const [receiver,reference] of Object.entries(tp.dependencyBindings||{})){
+    const deploymentId=typeof reference==='string'&&reference.startsWith('$deployment:')?
+      reference.slice('$deployment:'.length):'';
+    const dependency=(tp.dependencyDeployments||[]).find(item=>item.id===deploymentId);
+    if(!dependency||!identifier.test(receiver))continue;
+    const source=sources.get(dependency.file);
+    if(!source)continue;
+    const depAst=parseAstCached(source);
+    const depContract=(depAst.children||[]).find((node:any)=>
+      node.type==='ContractDefinition'&&node.name===dependency.contract);
+    if(!depContract)continue;
+    const dependencyMethods=[...selectedSourceClosure.matchAll(
+      new RegExp('\\b'+receiver+'\\s*\\.\\s*([A-Za-z_]\\w*)\\s*\\(','g'))]
+      .map(match=>String(match[1]));
+    for(const method of dependencyMethods){
+      const guarded=(depContract.subNodes||[]).some((node:any)=>
+        node.type==='FunctionDefinition'&&node.name===method&&
+        ((node.modifiers||[]).some((modifier:any)=>modifier.name==='onlyOwner')||
+          /\bowner\s*\(\s*\)/.test(body(source.content,node))&&
+          /\bmsg\s*\.\s*sender\b/.test(body(source.content,node))));
+      if(!guarded)continue;
+      const ownerAbi=verifyAcquiredReceiverMethods(dependency.contract,
+        ['owner','transferOwnership'],dependency.file,dependency.contract,[...sources.values()]);
+      if(!ownerAbi.ok)continue;
+      const key=deploymentId+':'+receiver;
+      if(ownershipTransfers.has(key))continue;
+      ownershipTransfers.add(key);
+      steps.push({operation:'call',deploymentId,function:'owner()',args:[],expect:'$account0'});
+      steps.push({operation:'send',deploymentId,function:'transferOwnership(address)',
+        args:['$contract'],sender:0,requiredSetup:true});
+      steps.push({operation:'call',deploymentId,function:'owner()',args:[],expect:'$contract'});
+      break;
+    }
+  }
+  if (tp.usesMockToken && mockToken) {
+    const tokenDeploymentId=tp.mockTokenDeploymentId||'token';
     const mintAmount = '10000';
     if (mockToken.mintHasRecipient) {
       steps.push({
         operation: 'send',
-        deploymentId: 'token',
+        deploymentId: tokenDeploymentId,
         function: mockToken.mintSig,
         args: ['$account0', mintAmount],
         sender: 0,
@@ -3315,7 +3409,7 @@ export function constructCoreInvariantExperiment(
     } else {
       steps.push({
         operation: 'send',
-        deploymentId: 'token',
+        deploymentId: tokenDeploymentId,
         function: mockToken.mintSig,
         args: [mintAmount],
         sender: 0,
@@ -3324,7 +3418,7 @@ export function constructCoreInvariantExperiment(
     }
     steps.push({
       operation: 'send',
-      deploymentId: 'token',
+      deploymentId: tokenDeploymentId,
       function: 'approve(address,uint256)',
       args: ['$contract', mintAmount],
       sender: 0,
