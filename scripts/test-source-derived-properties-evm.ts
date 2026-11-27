@@ -172,6 +172,44 @@ assert.ok(delegatedEvm.steps.every((step:any)=>step.passed!==false),
   'Acquired interprocedural source witness failed in actual EVM: '+JSON.stringify(delegatedEvm));
 assert.ok(delegatedEvm.steps.some((step:any)=>step.operation==='call'&&
   step.function==='amount()'&&step.actual==='7'));
+const typedScalarSource=[
+  'pragma solidity ^0.8.20;',
+  'contract TypedScalar {',
+  ' uint256 public totalDeposits;',
+  ' function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {',
+  '   require(maturityTimestamp>block.timestamp);',
+  '   enabled;',
+  '   totalDeposits+=wad;',
+  ' }',
+  '}',
+].join('\n');
+const typedScalarFile='source-1/contracts/TypedScalar.sol';
+const typedScalar=constructSolidityExperiments({
+  repositoryCommit:'d'.repeat(40),targetPath:typedScalarFile,
+  targetSelector:'TypedScalar.deposit',
+  sources:[{path:typedScalarFile,content:typedScalarSource,
+    sha256:sha(typedScalarSource)}],
+  declarations:[
+    {selector:'TypedScalar.deposit',operation:'send',inputs:['uint64','uint256','bool']},
+    {selector:'TypedScalar.totalDeposits',operation:'call',inputs:[]},
+  ],skipLegacy:true,
+});
+assert.equal(typedScalar.ok,true,JSON.stringify(typedScalar));
+if(!typedScalar.ok)throw new Error('Typed scalar delta property missing');
+const typedScalarProperty=typedScalar.experiments.find(e=>
+  e.sequence.sourceProperty?.kind==='scalar_delta');
+assert.ok(typedScalarProperty,'Source should bind the non-final uint amount parameter');
+assert.deepEqual(typedScalarProperty.sequence.steps.find((step:any)=>
+  step.operation==='send')&&
+  (typedScalarProperty.sequence.steps.find((step:any)=>step.operation==='send') as any).args,
+  ['2000000000','1000',false]);
+const typedScalarEvm=await execute(
+  compile(typedScalarFile,typedScalarSource,'TypedScalar'),
+  typedScalarProperty.sequence);
+assert.ok(typedScalarEvm.steps.every((step:any)=>step.passed!==false),
+  'Source-derived future timestamp and typed arguments must execute: '+JSON.stringify(typedScalarEvm));
+assert.ok(typedScalarEvm.steps.some((step:any)=>step.operation==='call'&&
+  step.function==='totalDeposits()'&&step.actual==='1000'));
 const guardedSource=[
   'pragma solidity ^0.8.20;',
   'contract GuardedState {',

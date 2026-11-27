@@ -478,39 +478,68 @@ def _asserted_source_scalar_delta(
         return None
     if not isinstance(amount,str) or not re.fullmatch(r"(?:0|[1-9][0-9]{0,29})",amount) or int(amount)==0:
         return None
-    if not isinstance(method,str) or not re.fullmatch(r"[A-Za-z_]\w*\(uint(?:[0-9]{1,3})?\)",method):
+    method_match = re.fullmatch(r"([A-Za-z_]\w*)\(([^()]*)\)", method) if isinstance(method,str) else None
+    if not method_match:
         return None
-    if selector.rsplit(".",1)[-1]!=method.split("(",1)[0]:
+    method_name=method_match.group(1)
+    declared_types=[] if not method_match.group(2) else method_match.group(2).split(",")
+    if not declared_types or selector.rsplit(".",1)[-1]!=method_name:
         return None
     source=_strip_comments(text)
-    if not re.search(r"\buint(?:[0-9]{1,3})?\s+public\s+"+re.escape(state)+r"\s*;",source):
-        return None
-    name=method.split("(",1)[0]
-    header,fn_body=_extract_fn_body(source,name)
+    public_state=bool(re.search(r"\buint(?:[0-9]{1,3})?\s+public\s+"+re.escape(state)+r"\s*;",source))
+    header,fn_body=_extract_fn_body(source,method_name)
     if not header or not fn_body:
         return None
-    signature_match=re.search(r"\bfunction\s+"+re.escape(name)+r"\s*\(([^)]*)\)",header)
+    signature_match=re.search(r"\bfunction\s+"+re.escape(method_name)+r"\s*\(([^)]*)\)",header)
     if not signature_match:
         return None
-    declaration=signature_match.group(1).strip()
-    # Only exactly one declared scalar parameter; never select a different
-    # overload by name or infer an ABI from a guessed signature.
-    declared=re.fullmatch(r"(uint(?:[0-9]{1,3})?)\s+(?:(?:memory|calldata)\s+)?"+
-                          re.escape(parameter),declaration)
-    if not declared or method!=name+"("+declared.group(1)+")":
+    declarations=[part.strip() for part in signature_match.group(1).split(",")]
+    if len(declarations)!=len(declared_types):
+        return None
+    source_parameters=[]
+    for declaration in declarations:
+        item=re.fullmatch(
+            r"(uint(?:[0-9]{1,3})?|int(?:[0-9]{1,3})?|address(?:\s+payable)?|bool|string|bytes(?:[1-9]|[12][0-9]|3[012])?)"
+            r"\s+(?:(?:memory|calldata|storage)\s+)?([A-Za-z_]\w*)",declaration)
+        if not item:return None
+        abi_type=re.sub(r"\s+payable$","",item.group(1))
+        if abi_type=="uint":abi_type="uint256"
+        if abi_type=="int":abi_type="int256"
+        source_parameters.append((abi_type,item.group(2)))
+    if [item[0] for item in source_parameters]!=declared_types:
+        return None
+    amount_indexes=[i for i,(abi_type,param_name) in enumerate(source_parameters)
+                    if param_name==parameter and abi_type.startswith("uint")]
+    if len(amount_indexes)!=1:
         return None
     if not re.search(r"\b"+re.escape(state)+r"\s*\+=\s*"+
                      re.escape(parameter)+r"\s*;",fn_body):
         return None
     if len(actual_steps)!=len(requested_steps):
         return None
-    getter=state+"()"
+    getter=state+"()" if public_state else None
+    if not getter:
+        for step in requested_steps:
+            if step.get("operation")!="call" or step.get("args")!=[]:
+                continue
+            candidate=str(step.get("function",""))
+            getter_name=candidate.split("(",1)[0]
+            getter_header,getter_body=_extract_fn_body(source,getter_name)
+            if (getter_header and getter_body and
+                re.search(r"\breturns\s*\(\s*uint(?:[0-9]{1,3})?\s*(?:[A-Za-z_]\w*)?\s*\)",getter_header) and
+                re.search(r"\breturn\s+"+re.escape(state)+r"\s*;",getter_body)):
+                getter=candidate
+                break
+    if not getter:return None
     calls=[i for i,step in enumerate(requested_steps)
            if step.get("operation")=="call" and step.get("function")==getter
            and step.get("args")==[]]
     sends=[i for i,step in enumerate(requested_steps)
            if step.get("operation")=="send" and step.get("function")==method
-           and step.get("args")==[amount] and not step.get("deploymentId")]
+           and isinstance(step.get("args"),list) and
+           len(step.get("args"))==len(source_parameters) and
+           step.get("args")[amount_indexes[0]]==amount and
+           not step.get("deploymentId")]
     if len(calls)!=2 or len(sends)!=1 or not(calls[0]<sends[0]<calls[1]):
         return None
     pre,transaction,post=(actual_steps[i] for i in (calls[0],sends[0],calls[1]))

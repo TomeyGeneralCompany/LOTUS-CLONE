@@ -710,7 +710,7 @@ if (typedLedgerRes.ok) {
   const steps = plan!.sequence.steps;
   const deposit = steps.find((s) => s.operation === 'send' && s.function === 'deposit(uint64,uint256)');
   const withdraw = steps.find((s) => s.operation === 'send' && s.function === 'withdraw(uint64,uint256,bool)');
-  assert.deepEqual(deposit && 'args' in deposit ? deposit.args : null, ['86400', '1000']);
+  assert.deepEqual(deposit && 'args' in deposit ? deposit.args : null, ['2000000000', '1000']);
   assert.deepEqual(withdraw && 'args' in withdraw ? withdraw.args : null, ['1', '400', false]);
 }
 
@@ -1219,7 +1219,7 @@ if(typedScalarPlan.ok){
   const experiment=typedScalarPlan.experiments.find(x=>x.sequence.sourceProperty?.kind==='scalar_delta');
   assert.ok(experiment,'The source-exact amount parameter must produce a scalar delta experiment');
   const send=experiment!.sequence.steps.find(step=>step.operation==='send');
-  assert.deepEqual(send&&'args'in send?send.args:null,['86400','1000',false]);
+  assert.deepEqual(send&&'args'in send?send.args:null,['2000000000','1000',false]);
 }
 // An external dependency is not converted into a certified local scalar proof.
 const externalLedgerSource=ledgerSource.replace('reserve += amount;',

@@ -430,6 +430,51 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
             self.assertEqual(security_experiment_disposition(
                 root,source,"Ledger.accrue",evidence,unrelated)[0],"observation_only")
 
+    def test_source_scalar_delta_binds_nonfinal_amount_and_typed_arguments(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            source=root/"TypedLedger.sol"
+            source.write_text("""pragma solidity ^0.8.20;
+contract TypedLedger {
+uint256 public totalDeposits;
+function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {
+require(maturityTimestamp>block.timestamp);
+enabled;
+totalDeposits+=wad;
+}
+}
+""",encoding="utf8")
+            sha=hashlib.sha256(source.read_bytes()).hexdigest()
+            requested=[
+                {"operation":"call","function":"totalDeposits()","args":[],"expect":"0"},
+                {"operation":"send","function":"deposit(uint64,uint256,bool)",
+                 "args":["2000000000","1000",False],"sender":0},
+                {"operation":"call","function":"totalDeposits()","args":[],"expect":"1000"},
+            ]
+            actual=[
+                {"operation":"call","actual":"0","passed":True},
+                {"operation":"send","reverted":False,"passed":True},
+                {"operation":"call","actual":"1000","passed":True},
+            ]
+            prop={"kind":"scalar_delta","state":"totalDeposits",
+                  "method":"deposit(uint64,uint256,bool)","parameter":"wad",
+                  "amount":"1000","direction":"increase","sourceSha256":sha}
+            spec={"sequence":{"constructorArgs":[],"steps":requested,
+                              "sourceProperty":prop}}
+            result=security_experiment_disposition(root,source,"TypedLedger.deposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual},spec)
+            self.assertEqual(result[0],"behavior_not_observed")
+            self.assertEqual(result[1],"source_scalar_delta_negative")
+            wrong_args=[dict(step) for step in requested]
+            wrong_args[1]=dict(wrong_args[1],args=["2000000000","1",False])
+            wrong_spec={"sequence":{"constructorArgs":[],"steps":wrong_args,
+                                    "sourceProperty":prop}}
+            self.assertEqual(security_experiment_disposition(
+                root,source,"TypedLedger.deposit",{"accounts":ACCOUNTS,
+                "contract":CONTRACT_ADDR,"steps":actual},wrong_spec)[0],
+                "observation_only")
+
     def test_bounded_funding_source_and_state_negative(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
