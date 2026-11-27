@@ -2499,6 +2499,38 @@ function sourceExactScalarFormula(
   return {multiplier:match[1]||'1',divisor:match[2]};
 }
 
+/** Resolve a simple bool-parameter branch only when the exact scalar write is
+ * inside that branch. `undefined` means no bool gate was found; `null` means
+ * a gate exists but cannot be assigned unambiguously from the ABI. */
+function sourceBooleanGateForScalarWrite(
+  text:string,state:string,amount:string,boolParameters:readonly string[]
+):{parameter:string;value:boolean}|null|undefined {
+  const writes=(source:string)=>sourceExactAccountingDelta(source,state,amount,'increase')||
+    sourceExactScalarFormula(source,state,amount)!==null;
+  const gates:Array<{parameter:string;value:boolean}>=[];
+  const unsupported:{value:boolean}={value:false};
+  const ifStart=/\bif\s*\(\s*(!?\s*[A-Za-z_]\w*)\s*\)\s*\{/g;
+  for(let match;(match=ifStart.exec(text));){
+    let depth=1,pos=ifStart.lastIndex;
+    for(;pos<text.length&&depth>0;pos++){
+      if(text[pos]==='{')depth++;
+      else if(text[pos]==='}')depth--;
+    }
+    if(depth!==0)continue;
+    const branch=text.slice(ifStart.lastIndex,pos-1);
+    if(!writes(branch))continue;
+    const condition=match[1].replace(/\s+/g,'');
+    const negated=condition.startsWith('!');
+    const parameter=negated?condition.slice(1):condition;
+    if(!boolParameters.includes(parameter)){unsupported.value=true;continue;}
+    gates.push({parameter,value:!negated});
+  }
+  if(unsupported.value)return null;
+  const unique=[...new Map(gates.map(g=>[g.parameter+':'+g.value,g])).values()];
+  if(unique.length>1)return null;
+  return unique[0];
+}
+
 /** Number of writes to one source state symbol in a reachable method closure.
  * Used to reject an exact-looking delta when the same operation also mutates
  * that ledger through a second, unmodeled path. */
@@ -3433,10 +3465,15 @@ function sourceScalarDeltaExperiments(
         (BigInt(amount)*BigInt(formula.multiplier)/BigInt(formula.divisor)).toString():amount;
       if(BigInt(amount)>(1n<<BigInt(amountWidth))-1n||
         BigInt(expectedDelta)>(1n<<BigInt(stateWidth))-1n||expectedDelta==='0')continue;
+      const boolGate=sourceBooleanGateForScalarWrite(fnText,state.name,param.name,
+        (fn.parameters||[]).filter((p:any)=>canonicalAbiType(p.typeName)==='bool')
+          .map((p:any)=>String(p.name||'')).filter(identifier.test.bind(identifier)));
+      if(boolGate===null)continue;
       const args=(fn.parameters||[]).map((p:any,index:number)=>{
         if(p===param)return amount;
         const type=inputs[index]||'';
         if(type==='address')return '$account0';
+        if(type==='bool'&&boolGate?.parameter===String(p.name||''))return boolGate.value;
         if(/(?:deposit|funding|position|record|token|share|fund)?(?:id|index)$/i.test(String(p.name||''))&&
           /^uint/.test(type))return '1';
         return pickFlexibleArg(type,String(p.name||''),{ownerAccount:'$account0',amount});

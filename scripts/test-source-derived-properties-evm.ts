@@ -179,8 +179,7 @@ const typedScalarSource=[
   ' function deposit(uint256 amount) external { totalDeposits+=amount; }',
   ' function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {',
   '   require(maturityTimestamp>block.timestamp);',
-  '   enabled;',
-  '   totalDeposits+=wad;',
+  '   if (enabled) { totalDeposits+=wad; }',
   ' }',
   '}',
 ].join('\n');
@@ -204,7 +203,7 @@ assert.ok(typedScalarProperty,'Source should bind the non-final uint amount para
 assert.deepEqual(typedScalarProperty.sequence.steps.find((step:any)=>
   step.operation==='send')&&
   (typedScalarProperty.sequence.steps.find((step:any)=>step.operation==='send') as any).args,
-  ['2000000000','1000',false]);
+  ['2000000000','1000',true]);
 const typedScalarEvm=await execute(
   compile(typedScalarFile,typedScalarSource,'TypedScalar'),
   typedScalarProperty.sequence);

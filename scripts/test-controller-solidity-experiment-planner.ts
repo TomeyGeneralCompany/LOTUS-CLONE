@@ -1240,8 +1240,7 @@ contract TypedScalar {
   function deposit(uint256 amount) external { totalDeposits += amount; }
   function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {
     require(maturityTimestamp>block.timestamp);
-    enabled;
-    totalDeposits+=wad;
+    if (enabled) { totalDeposits+=wad; }
   }
 }`;
 const typedScalarSnapshot={path:'contracts/TypedScalar.sol',content:typedScalarSource,
@@ -1261,7 +1260,7 @@ if(typedScalarPlan.ok){
     x.sequence.sourceProperty.method==='deposit(uint64,uint256,bool)');
   assert.ok(experiment,'The source-exact amount parameter must produce a scalar delta experiment');
   const send=experiment!.sequence.steps.find(step=>step.operation==='send');
-  assert.deepEqual(send&&'args'in send?send.args:null,['2000000000','1000',false]);
+  assert.deepEqual(send&&'args'in send?send.args:null,['2000000000','1000',true]);
 }
 // An external dependency is not converted into a certified local scalar proof.
 const externalLedgerSource=ledgerSource.replace('reserve += amount;',
