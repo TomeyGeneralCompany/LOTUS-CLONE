@@ -4051,8 +4051,16 @@ function sourceInternalMappingSetterExperiments(
 ):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
-  const mappingNodes=nodes.filter(n=>n.type==='StateVariableDeclaration')
+  const owner=resolveInheritance(snapshot,contract,sources);
+  const owners=[{contract,snapshot},...owner.chain];
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(entry:any,node:any):boolean=>
+    (entry.contract.subNodes||[]).includes(node)||
+    (entry.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const mappingNodes=allNodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>
       identifier.test(v.name||'')&&v.typeName?.type==='Mapping'&&
       v.typeName?.keyType?.name==='address'&&
@@ -4070,7 +4078,7 @@ function sourceInternalMappingSetterExperiments(
     return parent&&(identifier.test(name)||name==='msg.sender')?
       {name:parent.name,keys:[...parent.keys,name]}:null;
   };
-  const functions=nodes.filter(n=>n.type==='FunctionDefinition'&&n.name&&n.body);
+  const functions=allNodes.filter(n=>n.type==='FunctionDefinition'&&n.name&&n.body);
   const getterCandidates=functions.filter(fn=>
     ['public','external'].includes(fn.visibility)&&
     fn.stateMutability==='view'&&(fn.parameters||[]).length===2&&
@@ -4078,7 +4086,6 @@ function sourceInternalMappingSetterExperiments(
     (fn.body?.statements||[]).length===1&&
     fn.body.statements[0].type==='ReturnStatement');
 
-  const owner=resolveInheritance(snapshot,contract,sources);
   const setup=resolveFlexibleSetup(snapshot,contract,owner.chain,
     sources,declarations,null);
   if(!setup||setup.usesToken)return [];
@@ -4175,17 +4182,18 @@ function sourceInternalMappingSetterExperiments(
       steps.push({operation:'send',function:sig,args:stepArgs,sender:0});
       steps.push({operation:'call',function:getterSig,
         args:resolvedKeys as string[],expect:'7'});
+      const mappingState=mappingNodes.find(m=>m.name===left.name);
+      if(!mappingState)continue;
       out.push({
         hypothesis:'Source-internal helper writes 7 to the exact private mapping keys and the independent public getter must expose that value',
         property:'source-backed internal setter and public mapping getter '+contract.name+'.'+sig,
         sequence:{constructorArgs:setup.constructorArgs,
           ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
           steps},
-        witnesses:[witness(snapshot,fn,contract.name+'.'+sig),
-          witness(snapshot,helper,contract.name+'.'+helperName),
-          witness(snapshot,getter,contract.name+'.'+getterSig),
-          witness(snapshot,mappingNodes.find(m=>m.name===left.name),
-            contract.name+'.'+left.name)],
+        witnesses:[witness(sourceForNode(fn),fn,contract.name+'.'+sig),
+          witness(sourceForNode(helper),helper,contract.name+'.'+helperName),
+          witness(sourceForNode(getter),getter,contract.name+'.'+getterSig),
+          witness(sourceForNode(mappingState),mappingState,contract.name+'.'+left.name)],
       });
     }
   }
