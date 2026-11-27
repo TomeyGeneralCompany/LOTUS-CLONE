@@ -292,16 +292,11 @@ contract InitialState is Initializable {
     // resolver with solc's ABI so getter behavior is compiler-verified.
     const dividendGetterText=`pragma solidity ^0.8.4;
 contract DividendGetter {
-  struct NestedAccounting {
-    uint64 index;
-    mapping(address => uint256) perAccount;
-  }
   struct DividendTokenData {
     address dividendToken;
     mapping(uint256 => uint256) magnifiedDividendPerShare;
     mapping(address => int256) magnifiedDividendCorrections;
     mapping(address => uint256) withdrawnDividends;
-    NestedAccounting accounting;
   }
   mapping(uint256 => DividendTokenData) public dividendTokenDataList;
 }`;

@@ -989,8 +989,7 @@ function splitCanonicalTupleFields(tuple:string):string[]|null {
  * compiler ABI evidence is available for that nested shape.
  */
 function publicGetterStructFields(type:any,owner:ContractEntry,
-  entries:readonly ContractEntry[],depth=0):string[]|null {
-  if(depth>8)return null;
+  entries:readonly ContractEntry[]):string[]|null {
   const declaration=acquiredValueDeclaration(type,owner.node,owner.source,
     entries.map(entry=>entry.source));
   if(declaration?.node.type!=="StructDefinition")return null;
@@ -998,16 +997,6 @@ function publicGetterStructFields(type:any,owner:ContractEntry,
   for(const member of declaration.node.members||[]){
     const memberType=member.typeName;
     if(memberType?.type==="Mapping"||memberType?.type==="ArrayTypeName")continue;
-    if(memberType?.type==="UserDefinedTypeName"){
-      const nested=acquiredValueDeclaration(memberType,owner.node,owner.source,
-        entries.map(entry=>entry.source));
-      if(nested?.node.type==="StructDefinition"){
-        const nestedFields=publicGetterStructFields(memberType,owner,entries,depth+1);
-        if(!nestedFields)return null;
-        outputs.push("("+nestedFields.join(",")+")");
-        continue;
-      }
-    }
     const canonical=callableType(memberType,owner,entries);
     if(!canonical)return null;
     outputs.push(canonical);
