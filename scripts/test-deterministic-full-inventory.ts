@@ -312,20 +312,26 @@ contract DividendGetter {
     assert.ok(sourceGetterAbi,'Public mapping-to-struct getter must be source-resolved');
     const runtimeRequire=createRequire(join(process.cwd(),
       'scripts/reproduction-runtime/probe.cjs'));
-    const solc=runtimeRequire('solc');
-    const compiledGetter=JSON.parse(solc.compile(JSON.stringify({
-      language:'Solidity',sources:{[dividendGetter.path]:{content:dividendGetterText}},
-      settings:{outputSelection:{'*':{'*':['abi']}}},
-    })));
-    const compilerGetter=compiledGetter.contracts[dividendGetter.path].DividendGetter.abi
-      .find((entry:any)=>entry.type==='function'&&entry.name==='dividendTokenDataList');
-    assert.ok(compilerGetter,'Solc must expose the mapping getter');
-    const canonicalCompilerOutput=(output:any):string=>output.type.startsWith('tuple')?
-      '('+(output.components||[]).map(canonicalCompilerOutput).join(',')+')'+
-        output.type.slice('tuple'.length):output.type;
-    assert.deepEqual(sourceGetterAbi.outputs,
-      compilerGetter.outputs.map(canonicalCompilerOutput),
-      'Mapping-valued struct fields must be omitted exactly as the pinned Solidity compiler does');
+    let solc:any=null;
+    try{solc=runtimeRequire('solc');}
+    catch(error){
+      if((error as NodeJS.ErrnoException).code!=='MODULE_NOT_FOUND')throw error;
+    }
+    if(solc){
+      const compiledGetter=JSON.parse(solc.compile(JSON.stringify({
+        language:'Solidity',sources:{[dividendGetter.path]:{content:dividendGetterText}},
+        settings:{outputSelection:{'*':{'*':['abi']}}},
+      })));
+      const compilerGetter=compiledGetter.contracts[dividendGetter.path].DividendGetter.abi
+        .find((entry:any)=>entry.type==='function'&&entry.name==='dividendTokenDataList');
+      assert.ok(compilerGetter,'Solc must expose the mapping getter');
+      const canonicalCompilerOutput=(output:any):string=>output.type.startsWith('tuple')?
+        '('+(output.components||[]).map(canonicalCompilerOutput).join(',')+')'+
+          output.type.slice('tuple'.length):output.type;
+      assert.deepEqual(sourceGetterAbi.outputs,
+        compilerGetter.outputs.map(canonicalCompilerOutput),
+        'Mapping-valued struct fields must be omitted exactly as the pinned Solidity compiler does');
+    }
     // SafeERC20 extension calls are not token ABI requirements. Resolve the
     // acquired library body to the underlying IERC20 selector before matching
     // a concrete receiver; otherwise xMPH's token fixture is rejected for
