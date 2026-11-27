@@ -564,9 +564,9 @@ def _asserted_source_scalar_delta(
        requested_steps[calls[1]].get("expect")!=amount:
         return None
     return ("source_scalar_delta_negative",
-            "Source-identified public scalar increment executed in the isolated EVM; "
+            "Source-identified scalar increment executed in the isolated EVM; "
             "the prestate, successful transaction and poststate agree with the "
-            "source-derived bounded conservation equation. This proves only "
+            "source-derived bounded state-transition equation. This proves only "
             "the tested input and fixture state.")
 
 def _source_witnessed_direct_assignment_negative(

@@ -212,6 +212,37 @@ assert.ok(typedScalarEvm.steps.every((step:any)=>step.passed!==false),
   'Source-derived future timestamp and typed arguments must execute: '+JSON.stringify(typedScalarEvm));
 assert.ok(typedScalarEvm.steps.some((step:any)=>step.operation==='call'&&
   step.function==='totalDeposits()'&&step.actual==='1000'));
+const privateScalarSource=[
+  'pragma solidity ^0.8.20;',
+  'contract PrivateScalar {',
+  ' uint256 private held;',
+  ' function observedAmount() external view returns(uint256) { return held; }',
+  ' function accrue(uint256 value) external { held+=value; }',
+  '}',
+].join('\n');
+const privateScalarFile='source-1/contracts/PrivateScalar.sol';
+const privateScalar=constructSolidityExperiments({
+  repositoryCommit:'d'.repeat(40),targetPath:privateScalarFile,
+  targetSelector:'PrivateScalar.accrue',
+  sources:[{path:privateScalarFile,content:privateScalarSource,
+    sha256:sha(privateScalarSource)}],
+  declarations:[
+    {selector:'PrivateScalar.accrue',operation:'send',inputs:['uint256']},
+    {selector:'PrivateScalar.observedAmount',operation:'call',inputs:[]},
+  ],skipLegacy:true,
+});
+assert.equal(privateScalar.ok,true,JSON.stringify(privateScalar));
+if(!privateScalar.ok)throw new Error('Private scalar getter property missing');
+const privateScalarProperty=privateScalar.experiments.find(e=>
+  e.sequence.sourceProperty?.kind==='scalar_delta');
+assert.ok(privateScalarProperty,'Private source state needs a legitimate getter witness');
+const privateScalarEvm=await execute(
+  compile(privateScalarFile,privateScalarSource,'PrivateScalar'),
+  privateScalarProperty.sequence);
+assert.ok(privateScalarEvm.steps.every((step:any)=>step.passed!==false),
+  'Source-declared private-state getter must observe the EVM transition: '+JSON.stringify(privateScalarEvm));
+assert.ok(privateScalarEvm.steps.some((step:any)=>step.operation==='call'&&
+  step.function==='observedAmount()'&&step.actual==='1000'));
 const guardedSource=[
   'pragma solidity ^0.8.20;',
   'contract GuardedState {',

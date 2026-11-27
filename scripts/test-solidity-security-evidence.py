@@ -476,6 +476,39 @@ totalDeposits+=wad;
                 "contract":CONTRACT_ADDR,"steps":actual},wrong_spec)[0],
                 "observation_only")
 
+    def test_source_scalar_delta_accepts_exact_private_state_getter(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            source=root/"PrivateScalar.sol"
+            source.write_text("""pragma solidity ^0.8.20;
+contract PrivateScalar {
+uint256 private held;
+function observedAmount() external view returns(uint256) { return held; }
+function accrue(uint256 value) external { held+=value; }
+}
+""",encoding="utf8")
+            sha=hashlib.sha256(source.read_bytes()).hexdigest()
+            requested=[
+                {"operation":"call","function":"observedAmount()","args":[],"expect":"0"},
+                {"operation":"send","function":"accrue(uint256)","args":["1000"],"sender":0},
+                {"operation":"call","function":"observedAmount()","args":[],"expect":"1000"},
+            ]
+            actual=[
+                {"operation":"call","actual":"0","passed":True},
+                {"operation":"send","reverted":False,"passed":True},
+                {"operation":"call","actual":"1000","passed":True},
+            ]
+            prop={"kind":"scalar_delta","state":"held","method":"accrue(uint256)",
+                  "parameter":"value","amount":"1000","direction":"increase",
+                  "sourceSha256":sha}
+            spec={"sequence":{"constructorArgs":[],"steps":requested,
+                              "sourceProperty":prop}}
+            result=security_experiment_disposition(root,source,"PrivateScalar.accrue",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual},spec)
+            self.assertEqual(result[0],"behavior_not_observed")
+            self.assertEqual(result[1],"source_scalar_delta_negative")
+
     def test_bounded_funding_source_and_state_negative(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
