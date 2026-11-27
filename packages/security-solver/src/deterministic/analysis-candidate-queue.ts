@@ -7,6 +7,7 @@
  * retaining all remaining candidates in the persisted queue).
  */
 import { createHash } from "node:crypto";
+import { posix as pathPosix } from "node:path";
 import { parse as parseSolidity } from "@solidity-parser/parser";
 import type { StaticLeadHint } from "../controller-solidity-experiment-planner";
 import type { ProgramFactsGraph } from "./program-facts";
@@ -133,7 +134,10 @@ type LocatedFunctionSpan = {
   span: { start:number; end:number; lineStart:number; lineEnd:number; excerpt:string; truncated:boolean };
 } | { reason:string };
 
-function canonicalAbiType(type:any,sourceAst:any,depth=0,acquiredAsts:any[]=[sourceAst]):string|null {
+type AcquiredSourceAst={path:string;ast:any};
+
+function canonicalAbiType(type:any,sourceAst:any,depth=0,
+  acquiredAsts:AcquiredSourceAst[]=[{path:"",ast:sourceAst}],sourcePath=""):string|null {
   if(!type||depth>16)return null;
   if(type.type==="ElementaryTypeName"){
     const name=String(type.name||"");
@@ -143,7 +147,7 @@ function canonicalAbiType(type:any,sourceAst:any,depth=0,acquiredAsts:any[]=[sou
       name:null;
   }
   if(type.type==="ArrayTypeName"){
-    const base=canonicalAbiType(type.baseTypeName,sourceAst,depth+1,acquiredAsts);
+    const base=canonicalAbiType(type.baseTypeName,sourceAst,depth+1,acquiredAsts,sourcePath);
     if(!base)return null;
     const length=type.length?.value===undefined?"":String(type.length.value);
     if(length&&!/^\d+$/.test(length))return null;
@@ -152,17 +156,17 @@ function canonicalAbiType(type:any,sourceAst:any,depth=0,acquiredAsts:any[]=[sou
   if(type.type!=="UserDefinedTypeName")return null;
   const fullName=String(type.namePath||"");
   const name=fullName.split(".").pop()||"";
-  const collect=(asts:any[])=>{
+  const collect=(asts:any[],wantedName:string)=>{
     const found:any[]=[];
     for(const ast of asts){
       for(const top of ast?.children||[]){
         if(top.type==="ContractDefinition"){
           for(const child of top.subNodes||[]){
-            if(child.name===name&&["StructDefinition","EnumDefinition"].includes(child.type))
+            if(child.name===wantedName&&["StructDefinition","EnumDefinition"].includes(child.type))
               found.push(child);
           }
-          if(top.name===name)found.push(top);
-        }else if(top.name===name&&[
+          if(top.name===wantedName)found.push(top);
+        }else if(top.name===wantedName&&[
           "TypeDefinition","UserDefinedValueTypeDefinition","EnumDefinition","StructDefinition"
         ].includes(top.type)){
           found.push(top.definition||top.underlyingType||top.underlyingTypeName);
@@ -175,23 +179,58 @@ function canonicalAbiType(type:any,sourceAst:any,depth=0,acquiredAsts:any[]=[sou
   // resolved only when exactly one matching acquired declaration exists;
   // ambiguous same-name declarations stay blocked rather than receiving a
   // guessed ABI selector.
-  const localDefinitions=collect([sourceAst]);
-  const definitions=localDefinitions.length?localDefinitions:collect(acquiredAsts);
-  if(definitions.length!==1)return null;
-  const definition=definitions[0];
+  const localDefinitions=collect([sourceAst],name);
+  let resolved:{definition:any;ast:any;path:string}|null=null;
+  if(localDefinitions.length===1)resolved={definition:localDefinitions[0],ast:sourceAst,path:sourcePath};
+  else if(localDefinitions.length>1)return null;
+  else {
+    // Resolve explicit named imports and namespace imports against acquired
+    // files before considering the repository-wide unique-name fallback.
+    const imported:Array<{definition:any;ast:any;path:string}>=[];
+    for(const directive of sourceAst?.children||[]){
+      if(directive.type!=="ImportDirective"||typeof directive.path!=="string")continue;
+      let importedName="";
+      const aliases=directive.symbolAliases||[];
+      for(const pair of aliases){
+        const original=String(pair?.[0]||"");
+        const alias=String(pair?.[1]||original);
+        if(alias===fullName||alias===name)importedName=original;
+      }
+      const namespace=String(directive.unitAlias||"");
+      if(namespace&&fullName.startsWith(namespace+"."))importedName=fullName.slice(namespace.length+1);
+      if(!importedName)continue;
+      const importedPath=pathPosix.normalize(pathPosix.join(pathPosix.dirname(sourcePath),directive.path));
+      const acquired=acquiredAsts.find(item=>item.path===importedPath);
+      if(!acquired)continue;
+      const matches=collect([acquired.ast],importedName.split(".").pop()||importedName);
+      if(matches.length===1)imported.push({definition:matches[0],ast:acquired.ast,path:acquired.path});
+      else if(matches.length>1)return null;
+    }
+    if(imported.length===1)resolved=imported[0];
+    else if(imported.length>1)return null;
+    else {
+      const matches=collect(acquiredAsts.map(item=>item.ast),name);
+      if(matches.length!==1)return null;
+      const source=acquiredAsts.find(item=>collect([item.ast],name).includes(matches[0]));
+      if(!source)return null;
+      resolved={definition:matches[0],ast:source.ast,path:source.path};
+    }
+  }
+  if(!resolved)return null;
+  const definition=resolved.definition;
   if(definition.type==="EnumDefinition")return "uint8";
   if(definition.type==="ContractDefinition")return "address";
   if(definition.type==="StructDefinition"){
     const members=(definition.members||[]).map((member:any)=>
-      canonicalAbiType(member.typeName,sourceAst,depth+1,acquiredAsts));
+      canonicalAbiType(member.typeName,resolved!.ast,depth+1,acquiredAsts,resolved!.path));
     return members.length&&members.every(Boolean)?"("+members.join(",")+")":null;
   }
-  return canonicalAbiType(definition,sourceAst,depth+1,acquiredAsts);
+  return canonicalAbiType(definition,resolved.ast,depth+1,acquiredAsts,resolved.path);
 }
 
-function canonicalFunctionSignature(fn:any,sourceAst:any,acquiredAsts:any[]=[sourceAst]):string|null {
+function canonicalFunctionSignature(fn:any,sourceAst:any,acquiredAsts:AcquiredSourceAst[]=[{path:"",ast:sourceAst}],sourcePath=""):string|null {
   const inputs=(fn.parameters||[]).map((parameter:any)=>
-    canonicalAbiType(parameter.typeName,sourceAst,0,acquiredAsts));
+    canonicalAbiType(parameter.typeName,sourceAst,0,acquiredAsts,sourcePath));
   return fn.name&&inputs.every(Boolean)?
     String(fn.name)+"("+inputs.join(",")+")":null;
 }
@@ -201,7 +240,8 @@ function canonicalFunctionSignature(fn:any,sourceAst:any,acquiredAsts:any[]=[sou
  * inside comments or strings, and choosing the first same-name declaration is
  * unsafe for overloaded functions.
  */
-function locateFunctionSpan(content:string,selector:string,sourceAst:any,acquiredAsts:any[]=[sourceAst]):LocatedFunctionSpan {
+function locateFunctionSpan(content:string,selector:string,sourceAst:any,
+  acquiredAsts:AcquiredSourceAst[]=[{path:"",ast:sourceAst}],sourcePath=""):LocatedFunctionSpan {
   const separator=selector.lastIndexOf(".");
   const contractName=separator>0?selector.slice(0,separator):"";
   const selectorMethod=selector.slice(separator+1);
@@ -217,7 +257,7 @@ function locateFunctionSpan(content:string,selector:string,sourceAst:any,acquire
     !node.isFallback&&!node.isReceiveEther);
   if(declarations.length===0)return {reason:"function_declaration_not_located"};
   const selected=exactSignature?
-    declarations.filter((node:any)=>canonicalFunctionSignature(node,sourceAst,acquiredAsts)===selectorMethod):
+    declarations.filter((node:any)=>canonicalFunctionSignature(node,sourceAst,acquiredAsts,sourcePath)===selectorMethod):
     declarations;
   if(exactSignature&&selected.length===0)
     return {reason:"exact_function_abi_signature_not_resolved"};
@@ -276,11 +316,11 @@ export function buildAnalysisCandidateQueue(
   const rawCandidates: AnalysisCandidate[] = [];
   const seenIds = new Set<string>();
   const sourceAstByItem=new Map<AnalysisCandidateSourceItem,any>();
-  const acquiredSourceAsts:any[]=[];
+  const acquiredSourceAsts:AcquiredSourceAst[]=[];
   for(const item of options.items){
     try{
       const ast=parseSolidity(item.sourceContent,{range:true,loc:true});
-      sourceAstByItem.set(item,ast);acquiredSourceAsts.push(ast);
+      sourceAstByItem.set(item,ast);acquiredSourceAsts.push({path:item.path,ast});
     }catch{sourceAstByItem.set(item,null);}
   }
 
@@ -369,7 +409,7 @@ export function buildAnalysisCandidateQueue(
       }
 
       const located = sourceAst
-        ? locateFunctionSpan(item.sourceContent, selector, sourceAst,acquiredSourceAsts)
+        ? locateFunctionSpan(item.sourceContent, selector, sourceAst,acquiredSourceAsts,item.path)
         : {reason:"solidity_source_parse_failed"};
       if ("reason" in located) {
         blocked.push({path:item.path,selector,reason:located.reason});

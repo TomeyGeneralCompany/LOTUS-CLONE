@@ -690,9 +690,9 @@ contract MultiVault${idx} {
     const importedTypeSource=`pragma solidity ^0.8.20;
 type AccountId is uint128;`;
     const importedTypeContract=`pragma solidity ^0.8.20;
-import "../types/AccountId.sol";
+import {AccountId as Key} from "../types/AccountId.sol";
 contract ImportedOverload {
-  function set(AccountId id) external {}
+  function set(Key id) external {}
   function set(uint256 id) external {}
 }`;
     const importedTypeQueue=buildAnalysisCandidateQueue({items:[
