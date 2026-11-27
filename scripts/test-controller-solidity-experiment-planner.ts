@@ -1528,6 +1528,8 @@ library SafeMath { function div(uint256 a,uint256 b) internal pure returns(uint2
 contract DynamicVault {
   using SafeMath for uint256;
   uint256 public totalDeposit;
+  uint256 public totalInterestOwed;
+  uint256 public totalFeeOwed;
   uint256 constant PRECISION=1e18;
   struct Deposit { uint256 virtualTokenTotalSupply; uint256 interestRate; }
   Deposit[] internal deposits;
@@ -1536,6 +1538,7 @@ contract DynamicVault {
   }
   function _deposit(uint256 depositAmount,uint64 maturationTimestamp) internal {
     deposits.push(Deposit(depositAmount,0)); totalDeposit += depositAmount;
+    totalInterestOwed += depositAmount; totalFeeOwed += depositAmount;
   }
   function withdraw(uint64 depositID,uint256 virtualTokenAmount,bool early) external {
     _withdraw(depositID,virtualTokenAmount,early);
@@ -1547,6 +1550,7 @@ contract DynamicVault {
     uint256 interestRate=depositEntry.interestRate;
     uint256 depositAmount=virtualTokenAmount.div(interestRate+PRECISION);
     totalDeposit-=depositAmount;
+    totalInterestOwed-=depositAmount; totalFeeOwed-=depositAmount;
     depositEntry.virtualTokenTotalSupply-=virtualTokenAmount;
   }
   function getDeposit(uint64 depositID) external view returns(Deposit memory){return deposits[depositID-1];}
@@ -1559,6 +1563,8 @@ const dynamicPositionPlan=constructSolidityExperiments({repositoryCommit:'f'.rep
     {selector:'DynamicVault.deposit',operation:'send',inputs:['uint256','uint64']},
     {selector:'DynamicVault.withdraw',operation:'send',inputs:['uint64','uint256','bool']},
     {selector:'DynamicVault.totalDeposit',operation:'call',inputs:[]},
+    {selector:'DynamicVault.totalInterestOwed',operation:'call',inputs:[]},
+    {selector:'DynamicVault.totalFeeOwed',operation:'call',inputs:[]},
     {selector:'DynamicVault.getDeposit',operation:'call',inputs:['uint64']},
   ]});
 assert.equal(dynamicPositionPlan.ok,true,JSON.stringify(dynamicPositionPlan));
@@ -1574,6 +1580,11 @@ if(dynamicPositionPlan.ok){
   assert.deepEqual(withdrawal.args,['1','$lastObservation:0',true]);
   assert.ok(dynamicExperiment!.witnesses.some(w=>w.symbol==='DynamicVault.getDeposit(uint64)'));
   assert.ok(dynamicExperiment!.witnesses.some(w=>w.symbol==='DynamicVault.Deposit.virtualTokenTotalSupply'));
+  assert.deepEqual(dynamicExperiment!.sequence.steps.filter(step=>
+    step.operation==='call'&&['totalInterestOwed()','totalFeeOwed()'].includes(step.function||'')
+      &&step.expect==='0').map(step=>step.function),
+    ['totalInterestOwed()','totalFeeOwed()','totalInterestOwed()','totalFeeOwed()'],
+    'The fixture must prove both interest and fee ledgers start and finish at zero');
 }
 
 console.log('Standalone experiment construction passed');
