@@ -56,6 +56,19 @@ try {
  assert.deepEqual(sequence?.steps.map(step=>step.function),[
    'operator()','rotateOperator(address)','operator()'
  ],'Controller should observe the state actually modified by the selected function');
+ const overloadMenu=[
+   {selector:'OverloadedVault.deposit',operation:'send' as const,inputs:['uint256']},
+   {selector:'OverloadedVault.deposit',operation:'send' as const,inputs:['address']},
+   {selector:'OverloadedVault.balance',operation:'call' as const,inputs:[]},
+ ];
+ assert.equal(buildBaselineSequence(overloadMenu,'OverloadedVault.deposit'),null,
+   'A name-only request must not silently choose one overload');
+ const exactOverload=buildBaselineSequence(overloadMenu,'OverloadedVault.deposit(uint256)');
+ assert.deepEqual(exactOverload?.steps.map(step=>step.function),[
+   'balance()','deposit(uint256)','balance()'
+ ],'An exact ABI signature must select the intended overload');
+ assert.equal(buildBaselineSequence(overloadMenu,'OverloadedVault.deposit(bool)'),null,
+   'A signature absent from the acquired ABI must be rejected');
  // Mirror the real 88mph ERC1155 probe menu: the controller must transfer
  // positive balances to a distinct recipient and observe that recipient.
  const erc1155Menu=[
