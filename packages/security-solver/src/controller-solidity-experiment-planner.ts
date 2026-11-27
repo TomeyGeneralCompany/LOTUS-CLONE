@@ -3297,8 +3297,16 @@ function sourceScalarDeltaExperiments(
 ):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
-  const counters=nodes.filter(n=>n.type==='StateVariableDeclaration')
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=[{contract,snapshot},...inheritance.chain];
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(owner:any,node:any):boolean=>
+    (owner.contract.subNodes||[]).includes(node)||
+    (owner.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const counters=allNodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>
       identifier.test(v.name||'')&&
       v.typeName?.type==='ElementaryTypeName'&&
@@ -3309,37 +3317,40 @@ function sourceScalarDeltaExperiments(
   // Arbitrary functions with related names are not accepted as readbacks.
   const observations=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
   const setup=resolveFlexibleSetup(snapshot,contract,
-    resolveInheritance(snapshot,contract,sources).chain,
+    inheritance.chain,
     sources,declarations,null);
   if(!setup||setup.usesToken)return [];
-  const constructor=nodes.find(n=>n.type==='FunctionDefinition'&&n.isConstructor);
-  const bodySource=snapshot.content;
+  const initializingFunctions=allNodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&
+    (n.isConstructor||n.name==='initialize'||n.name==='init'));
   const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
-  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name===method&&
+  for(const fn of allNodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name===method&&
     ['public','external'].includes(n.visibility))){
     const inputs=(fn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
-    if(inputs.length!==1||!inputs[0]||!/^uint(?:[0-9]{1,3})?$/.test(inputs[0]))continue;
-    const param=fn.parameters[0];
+    const amountParameters=(fn.parameters||[]).filter((p:any)=>
+      /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p.typeName)||''));
+    const actorParameters=(fn.parameters||[]).filter((p:any)=>(
+      canonicalAbiType(p.typeName)==='address'));
+    if(amountParameters.length!==1||actorParameters.length>1||
+      amountParameters.length+actorParameters.length!==inputs.length||
+      inputs.some((type:string|null)=>!type))continue;
+    const param=amountParameters[0];
     if(!identifier.test(param.name||''))continue;
-    const signature=fn.name+'('+inputs[0]+')';
+    const signature=fn.name+'('+inputs.join(',')+')';
     if(!declarations.some(d=>d.operation==='send'&&
       d.selector===contract.name+'.'+method&&
       JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
     const modifiers=(fn.modifiers||[]).map((m:any)=>String(m.name||''));
     if(modifiers.some((m:string)=>/(?:only|owner|admin|auth|role|minter|permission)/i.test(m)))continue;
-    const fnText=body(bodySource,fn)
+    const fnSource=sourceForNode(fn);
+    const fnText=body(fnSource.content,fn)
       .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
     // Other contract calls create additional fixture prerequisites. Refuse until
     // their actual implementations and preconditions have been connected.
     if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText)||
       /\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText))continue;
     for(const state of counters){
-      if(constructor&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,constructor)))continue;
-      if(setup.initSignature){
-        const init=nodes.find(n=>n.type==='FunctionDefinition'&&
-          (n.name==='initialize'||n.name==='init')&&n.body);
-        if(init&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,init)))continue;
-      }
+      if(initializingFunctions.some(initializer=>new RegExp('\\b'+state.name+
+        '\\s*(?:\\+?=|-=)').test(body(sourceForNode(initializer).content,initializer))))continue;
       // Reuse exact-lvalue source accounting proof for assignment and SafeMath
       // forms. Never equate a different storage key or symbol with this state.
       if(!sourceExactAccountingDelta(fnText,state.name,param.name,'increase'))continue;
@@ -3347,13 +3358,15 @@ function sourceScalarDeltaExperiments(
         o.stateVariable===state.name);
       const getter=state.visibility==='public'?state.name+'()':observed?.getter;
       if(!getter)continue;
-      const width=Number(inputs[0].replace(/\D/g,''))||256;
-      const amount=width<=8?'100':'1000';
+      const stateSource=sourceForNode(state);
+      const amountWidth=Number(String(canonicalAbiType(param.typeName)||'').replace(/\D/g,''))||256;
+      const amount=amountWidth<=8?'100':'1000';
+      const args=(fn.parameters||[]).map((p:any)=>p===param?amount:'$account0');
       const steps:SoliditySequence['steps']=[];
       if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
         args:setup.initArgs,sender:0,requiredSetup:true});
       steps.push({operation:'call',function:getter,args:[],expect:'0'});
-      steps.push({operation:'send',function:signature,args:[amount],sender:0});
+      steps.push({operation:'send',function:signature,args,sender:0});
       steps.push({operation:'call',function:getter,args:[],expect:amount});
       out.push({
         hypothesis:'Source-declared increment of '+state.name+' by '+param.name+
@@ -3364,11 +3377,11 @@ function sourceScalarDeltaExperiments(
           sourceProperty:{kind:'scalar_delta',state:state.name,method:signature,
             parameter:param.name,amount,direction:'increase',sourceSha256:snapshot.sha256},
           steps},
-        witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
-          witness(snapshot,state,contract.name+'.'+state.name),
-          ...(state.visibility==='public'?[]:(nodes.filter((n:any)=>
+        witnesses:[witness(fnSource,fn,contract.name+'.'+signature),
+          witness(stateSource,state,contract.name+'.'+state.name),
+          ...(state.visibility==='public'?[]:(allNodes.filter((n:any)=>
             n.type==='FunctionDefinition'&&n.name===getter.split('(')[0]&&n.body)
-            .map((n:any)=>witness(snapshot,n,contract.name+'.'+getter))))],
+            .map((n:any)=>witness(sourceForNode(n),n,contract.name+'.'+getter))))],
       });
     }
   }
