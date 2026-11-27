@@ -865,6 +865,26 @@ contract UintKeyVault {
     assert.ok(uintKeyHypothesis.requiredObservations.includes("balances(uint256)"),
       "Public mapping observations must use the acquired source's exact key type");
 
+    const domainNamedLedger=`pragma solidity ^0.8.20;
+contract DomainNamedLedger {
+    uint256 public units;
+    function deposit(uint256 amount) external { units += amount; }
+    function withdraw(uint256 amount) external { units -= amount; }
+}`;
+    const domainNamedGraph=buildProgramFactsGraph({sources:[{
+      path:"source-0/contracts/DomainNamedLedger.sol",
+      content:domainNamedLedger,
+      sha256:sha(domainNamedLedger),
+    }]});
+    const domainNamedHypothesis=generateRelationalHypotheses(domainNamedGraph).find(r=>
+      r.entrypoints.includes("DomainNamedLedger.deposit")&&
+      r.entrypoints.includes("DomainNamedLedger.withdraw"));
+    assert.ok(domainNamedHypothesis,
+      "Source arithmetic must establish a relational accounting candidate without conventional state-variable names");
+    assert.equal(domainNamedHypothesis!.propertyKind,"conservation",
+      "The relational kind must follow the observed numeric increment/decrement source operations");
+    assert.deepEqual(domainNamedHypothesis!.stateDependencies,["DomainNamedLedger.units"]);
+
     const typedKeyVault=`// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 type AccountId is uint64;

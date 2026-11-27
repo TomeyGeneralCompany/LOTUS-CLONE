@@ -405,12 +405,26 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
 
   for (const pair of pairStates.values()) {
     const rawStateDeps = [...pair.vars].sort();
-    const accountingDeps = rawStateDeps.filter((v) => isAccountingStateVar(v, stateVarSymbols));
+    const sourceArithmeticDeps=rawStateDeps.filter(v=>{
+      const symbol=stateVarSymbols.get(v);
+      const type=symbol?.returnType?.trim()||"";
+      if(!/^(?:u?int(?:[0-9]{1,3})?|mapping)$/i.test(type))return false;
+      return (stateWriters.get(v)||[]).some(write=>
+        (write.fn===pair.a||write.fn===pair.b)&&
+        ["+=","-=","++","--"].includes(write.operator||""));
+    });
+    const accountingDeps = rawStateDeps.filter((v) =>
+      isAccountingStateVar(v, stateVarSymbols)||sourceArithmeticDeps.includes(v));
     const roleDeps = rawStateDeps.filter((v) => ROLE_STATE_RE.test(v));
     const nonConfigDeps = rawStateDeps.filter(
       (v) => !CONFIG_OR_ADDRESS_STATE_RE.test(v) && !isNonNumericAddressOrConfigType(v, stateVarSymbols),
     );
-    const propertyKind = classifyRelationalProperty(rawStateDeps, stateVarSymbols);
+    let propertyKind = classifyRelationalProperty(rawStateDeps, stateVarSymbols);
+    // A source-witnessed arithmetic mutation of a numeric or mapping state
+    // variable is accounting evidence even when the author chose a domain-
+    // specific name outside the controller's conventional name dictionary.
+    if(propertyKind==="state-coupling"&&sourceArithmeticDeps.length)
+      propertyKind="conservation";
     const isFinancial = isFinancialRelationalKind(propertyKind);
 
     // Do not elevate ordinary configuration/address references (e.g. initialize + withdraw
