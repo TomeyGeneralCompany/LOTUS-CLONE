@@ -125,10 +125,18 @@ export class SoliditySourceIndex {
             // contract references and structs are actual compiler ABI entrypoints.
             // Earlier scalar-only indexing hid independent readback witnesses
             // from the controller even when the deployed contract exposed them.
-            const canonical=(t:any):string|null=>{
-              if(t?.type!=='ElementaryTypeName')return null;
-              const name=String(t.name||'');
-              return canonicalElementaryAbiType(name);
+            const canonical=(t:any,seen=new Set<any>()):string|null=>{
+              if(!t||seen.has(t))return null;
+              seen.add(t);
+              if(t.type==='ElementaryTypeName')return canonicalElementaryAbiType(String(t.name||''));
+              if(t.type!=='UserDefinedTypeName')return null;
+              const name=String(t.namePath||'').split('.').pop()||'';
+              const definitions:any[]=[...(node.subNodes||[]),...(unit.ast.children||[])].filter((d:any)=>
+                d.name===name&&['EnumDefinition','UserDefinedValueTypeDefinition','TypeDefinition'].includes(d.type));
+              if(definitions.length!==1)return null;
+              const definition=definitions[0];
+              if(definition.type==='EnumDefinition')return (definition.members||[]).length<=256?'uint8':null;
+              return canonical(definition.underlyingType||definition.typeName||definition.definition,seen);
             };
             const keyTypes:string[]=[];
             let valueType:any=variable.typeName;
