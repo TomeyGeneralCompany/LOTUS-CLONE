@@ -3371,11 +3371,8 @@ function sourceScalarDeltaExperiments(
       /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p.typeName)||''));
     const actorParameters=(fn.parameters||[]).filter((p:any)=>(
       canonicalAbiType(p.typeName)==='address'));
-    if(amountParameters.length!==1||actorParameters.length>1||
-      amountParameters.length+actorParameters.length!==inputs.length||
+    if(!amountParameters.length||actorParameters.length>1||
       inputs.some((type:string|null)=>!type))continue;
-    const param=amountParameters[0];
-    if(!identifier.test(param.name||''))continue;
     const signature=fn.name+'('+inputs.join(',')+')';
     if(!declarations.some(d=>d.operation==='send'&&
       d.selector===contract.name+'.'+method&&
@@ -3392,9 +3389,16 @@ function sourceScalarDeltaExperiments(
     for(const state of counters){
       if(initializingFunctions.some(initializer=>new RegExp('\\b'+state.name+
         '\\s*(?:\\+?=|-=)').test(body(sourceForNode(initializer).content,initializer))))continue;
+      // The source lvalue, not parameter order or name, identifies which
+      // unsigned argument is the state delta. Multiple candidate amounts
+      // remain ambiguous and are refused.
+      const matchedAmounts=amountParameters.filter((candidate:any)=>
+        identifier.test(candidate.name||'')&&
+        sourceExactAccountingDelta(fnText,state.name,candidate.name,'increase'));
+      if(matchedAmounts.length!==1)continue;
+      const param=matchedAmounts[0];
       // Reuse exact-lvalue source accounting proof for assignment and SafeMath
       // forms. Never equate a different storage key or symbol with this state.
-      if(!sourceExactAccountingDelta(fnText,state.name,param.name,'increase'))continue;
       const observed=observations.find(o=>o.kind==='scalar'&&
         o.stateVariable===state.name);
       const getter=state.visibility==='public'?state.name+'()':observed?.getter;
@@ -3402,7 +3406,15 @@ function sourceScalarDeltaExperiments(
       const stateSource=sourceForNode(state);
       const amountWidth=Number(String(canonicalAbiType(param.typeName)||'').replace(/\D/g,''))||256;
       const amount=amountWidth<=8?'100':'1000';
-      const args=(fn.parameters||[]).map((p:any)=>p===param?amount:'$account0');
+      const args=(fn.parameters||[]).map((p:any,index:number)=>{
+        if(p===param)return amount;
+        const type=inputs[index]||'';
+        if(type==='address')return '$account0';
+        if(/(?:deposit|funding|position|record|token|share|fund)?(?:id|index)$/i.test(String(p.name||''))&&
+          /^uint/.test(type))return '1';
+        return pickFlexibleArg(type,String(p.name||''),{ownerAccount:'$account0',amount});
+      });
+      if(args.some((value:any)=>value===null))continue;
       const steps:SoliditySequence['steps']=[];
       if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
         args:setup.initArgs,sender:0,requiredSetup:true});

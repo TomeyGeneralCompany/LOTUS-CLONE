@@ -1195,6 +1195,32 @@ if(ledgerProof.ok){
   if(experiment!.sequence.steps[2].operation==='call')
     assert.equal(experiment!.sequence.steps[2].expect,'1000');
 }
+const typedScalarSource=`pragma solidity ^0.8.20;
+contract TypedScalar {
+  uint256 public totalDeposits;
+  function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {
+    require(maturityTimestamp>block.timestamp);
+    enabled;
+    totalDeposits+=wad;
+  }
+}`;
+const typedScalarSnapshot={path:'contracts/TypedScalar.sol',content:typedScalarSource,
+  sha256:createHash('sha256').update(typedScalarSource).digest('hex')};
+const typedScalarPlan=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:typedScalarSnapshot.path,
+  targetSelector:'TypedScalar.deposit',sources:[typedScalarSnapshot],
+  declarations:[
+    {selector:'TypedScalar.deposit',operation:'send',inputs:['uint64','uint256','bool']},
+    {selector:'TypedScalar.totalDeposits',operation:'call',inputs:[]},
+  ],
+});
+assert.equal(typedScalarPlan.ok,true,'Single-operation scalar deltas should support typed non-amount inputs');
+if(typedScalarPlan.ok){
+  const experiment=typedScalarPlan.experiments.find(x=>x.sequence.sourceProperty?.kind==='scalar_delta');
+  assert.ok(experiment,'The source-exact amount parameter must produce a scalar delta experiment');
+  const send=experiment!.sequence.steps.find(step=>step.operation==='send');
+  assert.deepEqual(send&&'args'in send?send.args:null,['86400','1000',false]);
+}
 // An external dependency is not converted into a certified local scalar proof.
 const externalLedgerSource=ledgerSource.replace('reserve += amount;',
   'IProtocol(protocol).deposit(amount); reserve += amount;');
