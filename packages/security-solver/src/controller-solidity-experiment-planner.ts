@@ -48,6 +48,7 @@ export interface SourceInvariantTransitionPlan {
   outflowAmount: string;
   expectedRemainder: string;
   balanceMappingGetter?: string;
+  balanceMappingGetterArgs?: string[];
   totalScalarGetter?: string;
   typedObservation?: {getter:string;args:string[];expectPath?:number[];baseline:string;afterInflow:string;afterOutflow:string};
   dependencyDeployments?:PreparedDeployment[];
@@ -2683,15 +2684,22 @@ export function extractSourceInvariantDescriptor(
   const publicTotal=accountingStateVars.find((v:any)=>v.visibility==="public"&&
     v.typeName?.type==="ElementaryTypeName"&&
     /^uint(?:[0-9]+)?$/.test(String(v.typeName.name||"")));
-  const publicBalance=accountingStateVars.find((v:any)=>v.visibility==="public"&&
-    v.typeName?.type==="Mapping"&&v.typeName.keyType?.name==="address"&&
-    /^uint(?:[0-9]+)?$/.test(String(v.typeName.valueType?.name||"")));
+  const publicBalance=accountingStateVars.find((v:any)=>{
+    if(v.visibility!=="public"||v.typeName?.type!=="Mapping"||
+      !/^uint(?:[0-9]+)?$/.test(String(v.typeName.valueType?.name||"")))return false;
+    if(v.typeName.keyType?.type!=="ElementaryTypeName")return false;
+    const keyType=canonicalAbiType(v.typeName.keyType);
+    return keyType==="address"||/^uint(?:[0-9]{1,3})?$/.test(String(keyType||""));
+  });
+  const publicBalanceKeyAbi=publicBalance?
+    canonicalAbiType(publicBalance.typeName.keyType)||undefined:undefined;
   // Solidity generates a getter for a public state declaration even if the
   // controller's function menu omitted the compiler-generated entry.
   const totalGetterDecl=publicTotal?
     {operation:"call" as const,selector:contract.name+"."+publicTotal.name,inputs:[] as string[]}:undefined;
   const balanceGetterDecl=publicBalance?
-    {operation:"call" as const,selector:contract.name+"."+publicBalance.name,inputs:["address"]}:undefined;
+    {operation:"call" as const,selector:contract.name+"."+publicBalance.name,
+      inputs:[publicBalanceKeyAbi!]}:undefined;
 
   // Source-backed collection and struct-return observations are distinct from
   // scalar balance getters. Admit only a directly witnessed transition.
@@ -2728,6 +2736,29 @@ export function extractSourceInvariantDescriptor(
   const balanceVarName = balanceGetterDecl ? balanceGetterDecl.selector.slice(contract.name.length + 1) : '';
   const totalReferenced = !!totalVarName && new RegExp(`\\b${totalVarName}\\b`).test(combinedBody);
   const balanceReferenced = !!balanceVarName && new RegExp(`\\b${balanceVarName}\\b`).test(combinedBody);
+  const mappingKeyFor=(fn:any):{sourceKey:string;parameterName?:string;getterArg:string}|null=>{
+    if(!publicBalance||!publicBalanceKeyAbi)return null;
+    const text=body(sourceOfFunction(fn).content,fn).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
+    const name=String(publicBalance.name);
+    const matches=[...text.matchAll(new RegExp("\\b"+name+"\\s*\\[\\s*(msg\\.sender|[A-Za-z_]\\w*)\\s*\\]","g"))];
+    const keys=[...new Set(matches.map(match=>String(match[1])))];
+    if(keys.length!==1)return null;
+    const sourceKey=keys[0];
+    if(sourceKey==="msg.sender")
+      return publicBalanceKeyAbi==="address"?{sourceKey,getterArg:"$account0"}:null;
+    const parameter=(fn.parameters||[]).find((item:any)=>item.name===sourceKey);
+    if(!parameter||canonicalAbiType(parameter.typeName)!==publicBalanceKeyAbi)return null;
+    const constraints=collectParamConstraints(fn.body,new Set([sourceKey]));
+    const keyValue=publicBalanceKeyAbi==="address"?"$account0":
+      constraints.get(sourceKey)?.has("gt_zero")?"1":"7";
+    return {sourceKey,parameterName:sourceKey,getterArg:keyValue};
+  };
+  const inflowMappingKey=balanceReferenced?mappingKeyFor(inflowFn):null;
+  const outflowMappingKey=balanceReferenced?mappingKeyFor(outflowFn):null;
+  const commonMappingKeyArg=inflowMappingKey&&outflowMappingKey?
+    (publicBalanceKeyAbi==="address"?"$account0":
+      inflowMappingKey.getterArg==="1"||outflowMappingKey.getterArg==="1"?"1":"7"):undefined;
+  const balanceMappingGetterArgs=commonMappingKeyArg?[commonMappingKeyArg]:undefined;
   if (!totalReferenced && !balanceReferenced && !typedObservation) {
     return {
       ok: false,
@@ -2781,6 +2812,33 @@ export function extractSourceInvariantDescriptor(
   let inflowArgs: string[] = [];
   let inflowValueWei: string | undefined;
   let outflowArgs: string[] = [];
+  const mappedArgs=(fn:any,key:{sourceKey:string;parameterName?:string}|null,
+    amount:string,keyValue:string|undefined):string[]|null=>{
+    if(!key||!keyValue)return null;
+    const params=fn.parameters||[];
+    // A direct caller-keyed ledger operation has no key ABI argument. It can
+    // pair with an explicit-key companion when the getter key is address and
+    // the scenario uses the same actor for both operations.
+    if(key.sourceKey==='msg.sender'&&!key.parameterName&&params.length===1){
+      const [only]=params;
+      return isUintType(canonicalAbiType(only.typeName)||'')&&
+        /^(?:amount|amt|value|wad|qty|quantity|principal|shares|tokens?)$/i.test(String(only.name||''))
+        ?[amount]:null;
+    }
+    if(!key.parameterName||params.length!==2)return null;
+    const namedAmount=params.filter((p:any)=>
+      /^(?:amount|amt|value|wad|qty|quantity|principal|shares|tokens?)$/i.test(String(p.name||'')));
+    const amountParam=namedAmount.length===1?namedAmount[0]:
+      params.find((p:any)=>p.name!==key.parameterName&&isUintType(canonicalAbiType(p.typeName)||''));
+    const keyParam=params.find((p:any)=>p.name===key.parameterName);
+    if(!amountParam||!keyParam||amountParam.name===keyParam.name||
+      !isUintType(canonicalAbiType(amountParam.typeName)||'')||
+      canonicalAbiType(keyParam.typeName)!==publicBalanceKeyAbi)return null;
+    return params.map((p:any)=>p.name===amountParam.name?amount:
+      p.name===key.parameterName?keyValue:null)
+      .every((arg:string|null)=>arg!==null)?
+      params.map((p:any)=>p.name===amountParam.name?amount:keyValue):null;
+  };
 
   // Mode A: Payable ETH deposit() + withdraw(uint256)
   if (
@@ -2822,6 +2880,18 @@ export function extractSourceInvariantDescriptor(
     }
     mode = 'mint_burn_supply';
   }
+  // Source-indexed public mapping plus an amount. Both operations must use a
+  // single key parameter whose ABI type matches the public getter.
+  else if(!usesErc20Transfer&&inflowMappingKey&&outflowMappingKey&&commonMappingKeyArg){
+    const inArgs=mappedArgs(inflowFn,inflowMappingKey,inflowAmount,commonMappingKeyArg);
+    const outArgs=mappedArgs(outflowFn,outflowMappingKey,outflowAmount,commonMappingKeyArg);
+    if(!inArgs||!outArgs){
+      return {ok:false,category:'missing_fixture',
+        reason:'Mapped accounting operations require one source-matched key and one unsigned amount parameter',
+        witnesses:pairWitnesses};
+    }
+    mode='internal_deposit_withdraw';inflowArgs=inArgs;outflowArgs=outArgs;
+  }
   // Mode C/D: Internal or acquired-ERC20 deposit(uint256)/stake(uint256) + withdraw(uint256)/unstake(uint256)
   else if (
     inflowDecl.inputs.length === 1 &&
@@ -2845,8 +2915,13 @@ export function extractSourceInvariantDescriptor(
   // proves direct matching updates without fees, exchange rates or accrual.
   // Contracts with dynamic economics require a separate measured property.
   const accountingTarget=totalReferenced?totalVarName:balanceReferenced?balanceVarName:'';
-  const amountParameter=(fn:any)=>String((fn.parameters||[]).find((param:any)=>
-    /^uint(?:[0-9]+)?$/.test(String(param.typeName?.name||'')))?.name||'');
+  const amountParameter=(fn:any)=>{
+    const params=(fn.parameters||[]).filter((param:any)=>
+      /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(param.typeName)||''));
+    const named=params.filter((param:any)=>
+      /^(?:amount|amt|value|wad|qty|quantity|principal|shares|tokens?)$/i.test(String(param.name||'')));
+    return String((named.length===1?named[0]:params[params.length-1])?.name||'');
+  };
   const inflowParameter=amountParameter(inflowFn);
   const outflowParameter=amountParameter(outflowFn);
   const inflowEffects=reachableAccountingSource(snapshot,contract,inflowFn,sources);
@@ -2903,7 +2978,7 @@ export function extractSourceInvariantDescriptor(
   }
 
   const totalGetterSig = totalReferenced ? `${totalVarName}()` : undefined;
-  const balanceGetterSig = balanceReferenced ? `${balanceVarName}(address)` : undefined;
+  const balanceGetterSig = balanceReferenced ? balanceVarName+'('+(publicBalanceKeyAbi||'address')+')' : undefined;
   const propertyKind: InvariantPropertyKind =
     mode === 'mint_burn_supply' || /supply/i.test(totalVarName)
       ? 'supply-accounting'
@@ -2918,8 +2993,9 @@ export function extractSourceInvariantDescriptor(
     postState.push({ expression: `${contract.name}.${totalVarName} == ${expectedRemainder}`, readback: totalGetterSig });
   }
   if (balanceGetterSig) {
-    preState.push({ expression: `${contract.name}.${balanceVarName}[$account0] == 0`, readback: balanceGetterSig });
-    postState.push({ expression: `${contract.name}.${balanceVarName}[$account0] == ${expectedRemainder}`, readback: balanceGetterSig });
+    const mappingKeyExpression=balanceMappingGetterArgs?.[0]||'$account0';
+    preState.push({ expression: contract.name+'.'+balanceVarName+'['+mappingKeyExpression+'] == 0', readback: balanceGetterSig });
+    postState.push({ expression: contract.name+'.'+balanceVarName+'['+mappingKeyExpression+'] == '+expectedRemainder, readback: balanceGetterSig });
   }
 
   const inflowSig = `${inflowFn.name}(${inflowDecl.inputs.join(',')})`;
@@ -2956,6 +3032,7 @@ export function extractSourceInvariantDescriptor(
         outflowAmount,
         expectedRemainder,
         balanceMappingGetter: balanceGetterSig,
+        ...(balanceMappingGetterArgs?{balanceMappingGetterArgs}:{}),
         totalScalarGetter: totalGetterSig,
         typedObservation,
         ...(dependencyPlan.status==='resolved'&&dependencyPlan.deployments.length?{
@@ -3091,7 +3168,7 @@ export function constructCoreInvariantExperiment(
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: '0' });
   }
   if (tp.balanceMappingGetter) {
-    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: '0' });
+    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: tp.balanceMappingGetterArgs||['$account0'], expect: '0' });
   }
   // 2. Inflow operation (+inflowAmount)
   steps.push({
@@ -3106,7 +3183,7 @@ export function constructCoreInvariantExperiment(
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: tp.inflowAmount });
   }
   if (tp.balanceMappingGetter) {
-    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: tp.inflowAmount });
+    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: tp.balanceMappingGetterArgs||['$account0'], expect: tp.inflowAmount });
   }
   const midTyped=typedReadback(tp.typedObservation?.afterInflow||'');
   if(midTyped)steps.push(midTyped);
@@ -3124,7 +3201,7 @@ export function constructCoreInvariantExperiment(
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: tp.expectedRemainder });
   }
   if (tp.balanceMappingGetter) {
-    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: tp.expectedRemainder });
+    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: tp.balanceMappingGetterArgs||['$account0'], expect: tp.expectedRemainder });
   }
 
   return {
