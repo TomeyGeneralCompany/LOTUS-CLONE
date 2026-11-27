@@ -953,7 +953,7 @@ def _dynamic_observation_arguments_match(requested_steps: list, actual_steps: li
             if operation == "observe":
                 if actual.get("operation") != "observe":
                     return False
-                if requested.get("args") != actual.get("args"):
+                if requested.get("args", []) != actual.get("args", []):
                     return False
                 observed_after_step = actual.get("actual")
             refs = []
