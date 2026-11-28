@@ -3218,7 +3218,7 @@ export async function runLocalAudit(
               const parsedSeq=soliditySequenceSchema.safeParse(action.sequence);
               if(!declared)acceptError='Undeclared Solidity Contract.function selector: '+action.query;
               else if(!parsedSeq.success)acceptError='Invalid solidity_sequence: '+parsedSeq.error.issues.map(i=>i.path.join('.')+': '+i.message).slice(0,4).join('; ');
-              else if(!parsedSeq.data.steps.some(s=>s.operation!=='eth_balance'&&s.function.split('(')[0]===fnName))acceptError='Sequence steps must invoke '+fnName;
+              else if(!parsedSeq.data.steps.some(s=>(s.operation==='send'||s.operation==='call'||s.operation==='observe')&&s.function.split('(')[0]===fnName))acceptError='Sequence steps must invoke '+fnName;
               else if(!parsedSeq.data.steps.some(step=>step.operation==='call'||(step.operation==='send'&&step.expectRevert===true)))
                 acceptError='Security experiment requires a source-derived call assertion or expected revert, not only exploratory observations.';
               else {

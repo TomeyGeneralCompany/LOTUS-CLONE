@@ -94,6 +94,13 @@ function validateSequence(s) {
   if(JSON.stringify(s).length>16000 || !Array.isArray(s.steps) || !s.steps.length || s.steps.length>16)throw new Error('Invalid sequence length');
   const prepDeployments=new Set((s.preparation?.deployments||[]).map(d=>d.id));
   for(const step of s.steps) {
+    if(step?.operation==='advance_time'){
+      object(step,['operation','seconds']);
+      if(typeof step.seconds!=='string'||!/^[1-9][0-9]{0,7}$/.test(step.seconds)||
+         BigInt(step.seconds)>31536000n)
+        throw new Error('Invalid bounded local EVM time advance');
+      continue;
+    }
     if(step?.operation==='eth_balance'){
       object(step,['operation','account']);
       if(typeof step.account!=='string'||!/^(?:\$account[012]|\$contract|\$deployment:[A-Za-z][A-Za-z0-9_-]{0,63})$/.test(step.account))
@@ -458,6 +465,19 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
     let stepIndex=0;
     for(const step of sequence.steps) {
       runtimeStepIndex=stepIndex++;runtimePhase=step.requiredSetup?'fixture_initialization':'target_action';
+      if(step.operation==='advance_time'){
+        const seconds=Number(step.seconds);
+        const before=await provider.getBlock('latest');
+        if(!before||!Number.isSafeInteger(before.timestamp))throw new Error('Missing local EVM timestamp before time advance');
+        await provider.send('evm_increaseTime',[seconds]);
+        await provider.send('evm_mine',[]);
+        const after=await provider.getBlock('latest');
+        if(!after||!Number.isSafeInteger(after.timestamp)||after.timestamp-before.timestamp<seconds)
+          throw new Error('Local EVM did not advance by the requested interval');
+        steps.push({operation:'advance_time',seconds:String(seconds),fromTimestamp:String(before.timestamp),
+          toTimestamp:String(after.timestamp),elapsedSeconds:String(after.timestamp-before.timestamp),passed:true});
+        continue;
+      }
       if(step.operation==='eth_balance') {
         const targetAddr=resolve(step.account);
         const bal=await provider.getBalance(targetAddr);

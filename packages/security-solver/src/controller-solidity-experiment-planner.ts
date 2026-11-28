@@ -2263,6 +2263,7 @@ function groundedShareAccountingExperiment(
     /mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*_mphAmount\)/,
     /mphAmount\s*=\s*_shareAmount\.mul\(getPricePerFullShare\(\)\)/,
     /_burn\(msg\.sender\s*,\s*_shareAmount\)/,
+    /totalSupply\(\)\s*>=\s*_shareAmount\s*\+\s*MIN_AMOUNT/,
     /mph\.safeTransfer\(msg\.sender\s*,\s*mphAmount\)/,
     /_lastRewardAmount\s*==\s*0/,
     /return\s+mphBalance\.div\(totalShares\)/,
@@ -2308,6 +2309,93 @@ function groundedShareAccountingExperiment(
   return {hypothesis:"With no reward distribution, the source-proven 1:1 initial exchange rate and minimum seed require deposit(1000) then withdraw(400) to conserve token holdings and leave 600 additional shares.",
     property:"source-proven zero-reward ERC20 share conservation",sequence,
     witnesses:sourceNodes.map((n:any)=>witness(snapshot,n,"xMPH."+n.name))};
+}
+/** Source-grounded xMPH distributor, unlock and share-price lifecycle. Unlike
+ * the zero-reward test above, this verifies the acquired linear unlock formula
+ * at its initial, midpoint, and completed states on a clock-controlled local
+ * EVM, and checks the distributor role with a real rejected transaction. */
+function groundedXMphRewardUnlockExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],sources:ReadonlyMap<string,SourceSnapshot>
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(contract.name!=="xMPH"||method!=="distributeReward")return null;
+  const source=snapshot.content.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,"");
+  const requiredSource=[
+    /MIN_AMOUNT\s*=\s*10\s*\*\*\s*9\s*;/,
+    /shareAmount\s*=\s*_mphAmount\.div\(getPricePerFullShare\(\)\)/,
+    /mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*_mphAmount\)/,
+    /mphAmount\s*=\s*_shareAmount\.mul\(getPricePerFullShare\(\)\)/,
+    /_burn\(msg\.sender\s*,\s*_shareAmount\)/,
+    /mph\.safeTransfer\(msg\.sender\s*,\s*mphAmount\)/,
+    /MAX_REWARD_UNLOCK_PERIOD\s*=\s*365\s*days\s*;/,
+    /_setupRole\(DISTRIBUTOR_ROLE\s*,\s*msg\.sender\)/,
+    /require\(hasRole\(DISTRIBUTOR_ROLE\s*,\s*msg\.sender\)/,
+    /mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*rewardAmount\)/,
+    /currentUnlockEndTimestamp\s*=\s*block\.timestamp\s*\+\s*rewardUnlockPeriod/,
+    /lastRewardTimestamp\s*=\s*block\.timestamp/,
+    /lastRewardAmount\s*=\s*rewardAmount/,
+    /lockedRewardAmount\s*=\s*\(\s*_lastRewardAmount\s*\*\s*\(\s*_currentUnlockEndTimestamp\s*-\s*block\.timestamp\s*\)\s*\)\s*\/\s*\(\s*_currentUnlockEndTimestamp\s*-\s*_lastRewardTimestamp\s*\)/,
+    /return\s*\(\s*mphBalance\s*-\s*lockedRewardAmount\s*\)\.div\(totalShares\)/,
+    /event\s+DistributeReward\(uint256\s+rewardAmount\)/,
+    /emit\s+DistributeReward\(rewardAmount\)/,
+  ];
+  if(!requiredSource.every(pattern=>pattern.test(source))||
+    !/contract\s+xMPH\s+is\s+ERC20Upgradeable\s*,\s*AccessControlUpgradeable/.test(source))return null;
+  const required=[
+    ["initialize",["address","uint256","address"],"send"],
+    ["distributeReward",["uint256"],"send"],
+    ["deposit",["uint256"],"send"],
+    ["getPricePerFullShare",[],"call"],
+    ["withdraw",["uint256"],"send"],
+  ] as const;
+  if(!required.every(([name,inputs,operation])=>declarations.some(d=>
+    d.selector==="xMPH."+name&&d.operation===operation&&
+    JSON.stringify(d.inputs)===JSON.stringify(inputs))))return null;
+  const mockToken=findRepositoryMockToken(sources);
+  if(!mockToken?.hasApprove||!mockToken.hasBalanceOf)return null;
+  const seed="1000000000",reward="1000000000",initial="3000000000";
+  const mintArgs=mockToken.mintHasRecipient?["$account0",initial]:[initial];
+  const sequence:SoliditySequence={constructorArgs:[],
+    preparation:{deployments:[{id:"token",file:mockToken.snapshot.path,
+      contract:mockToken.contractName,constructorArgs:mockToken.constructorArgs}],
+      operations:[{id:"mintRewardSeed",deploymentId:"token",function:mockToken.mintSig,
+        args:mintArgs,sender:0}],checks:[{id:"mintRewardSeedConfirmed",deploymentId:"token",
+          function:"balanceOf(address)",args:["$account0"],sender:0,expect:initial}]},
+    steps:[
+      {operation:"send",deploymentId:"token",function:"approve(address,uint256)",
+        args:["$contract",initial],sender:0,requiredSetup:true},
+      {operation:"send",function:"initialize(address,uint256,address)",
+        args:["$deployment:token","86400","$account0"],sender:0,requiredSetup:true},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",
+        args:["$contract"],expect:seed},
+      {operation:"send",function:"distributeReward(uint256)",args:[reward],sender:2,expectRevert:true},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",
+        args:["$contract"],expect:seed},
+      {operation:"send",function:"distributeReward(uint256)",args:[reward],sender:0,
+        expectEvents:[{signature:"DistributeReward(uint256)",args:[reward]}]},
+      {operation:"call",function:"getPricePerFullShare()",args:[],expect:"1000000000000000000"},
+      {operation:"advance_time",seconds:"43200"},
+      {operation:"observe",function:"getPricePerFullShare()",args:[]},
+      {operation:"advance_time",seconds:"43200"},
+      {operation:"call",function:"getPricePerFullShare()",args:[],expect:"2000000000000000000"},
+      {operation:"send",function:"deposit(uint256)",args:["1000"],sender:0},
+      {operation:"call",function:"getPricePerFullShare()",args:[],expect:"2000000000000000000"},
+      {operation:"send",function:"withdraw(uint256)",args:["400"],sender:0},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",
+        args:["$account0"],expect:"999999800"},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",
+        args:["$contract"],expect:"2000000200"},
+    ]};
+  const nodes=(contract.subNodes||[]).filter((node:any)=>
+    (node.type==="FunctionDefinition"&&["initialize","distributeReward","_distributeReward",
+      "getPricePerFullShare","withdraw","_withdraw"].includes(node.name))||
+    (node.type==="EventDefinition"&&node.name==="DistributeReward")||
+    (node.type==="StateVariableDeclaration"&&(node.variables||[]).some((v:any)=>
+      ["rewardUnlockPeriod","currentUnlockEndTimestamp","lastRewardTimestamp","lastRewardAmount"].includes(v.name))));
+  return {hypothesis:"The acquired xMPH distributor guard rejects a non-distributor without transferring tokens; the authorized reward starts a 24-hour linear unlock, with the observed share price moving from 1x to 1.5x halfway and 2x at expiry, and a later withdrawal pays the source-derived 2x amount.",
+    property:"source-proven xMPH distributor authorization and timed reward accounting",
+    sequence,witnesses:nodes.map((node:any)=>witness(snapshot,node,
+      "xMPH."+(node.name||node.variables?.map((v:any)=>v.name).join(","))))};
 }
 /** Acquired-source vest creation and authorization property, with explicit
  * ERC721 ownership and deposit-to-vest readbacks. No simulated payout. */
@@ -5483,6 +5571,9 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
   if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
   if(shareAccounting)choices.push(shareAccounting);
+  const rewardUnlock=groundedXMphRewardUnlockExperiment(
+    target,contract,method,input.declarations,indexed);
+  if(rewardUnlock)choices.push(rewardUnlock);
   // 3-stage financial-invariant pipeline: extract -> admit -> construct.
   // Runs alongside authorization probes because accounting conservation is a
   // distinct security property; refuses to fabricate when prerequisites fail.
@@ -5609,11 +5700,11 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
   }
   const targetIsFinancialEntry=/^(?:deposit|withdraw|borrow|repay|mint|burn|redeem|swap|stake|unstake|claim|liquidate|flash|vest|fund|rebalance|harvest|compound)/i
     .test(input.targetSelector.split('.').pop()||'');
-  // A source-specialized property may carry its own complete, source-bound
-  // preparation graph (for example xMPH's ERC20Mock seed/deposit/withdraw
-  // sequence). In that case unrelated generic fixture alternatives must not
-  // suppress the independently executable property. Keep the exception exact
-  // to this property; other incomplete financial fixture graphs remain blockers.
+  // A source-specialized xMPH property may carry its own complete, source-bound
+  // preparation graph. In that case unrelated generic fixture alternatives
+  // must not suppress the independently executable property. Keep exceptions
+  // exact to these fully checked xMPH properties; other incomplete financial
+  // fixture graphs remain blockers.
   const hasCompleteXmphAccountingFixture=out.some(experiment=>
     experiment.securityProperty==="source-proven zero-reward ERC20 share conservation"&&
     Boolean(experiment.sequence.preparation?.deployments.length&&
@@ -5622,8 +5713,17 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
     ["deposit(uint256)","withdraw(uint256)"].every(signature=>
       experiment.sequence.steps.some(step=>step.operation==="send"&&
         step.function===signature)));
+  const hasCompleteXmphRewardFixture=out.some(experiment=>
+    experiment.securityProperty==="source-proven xMPH distributor authorization and timed reward accounting"&&
+    Boolean(experiment.sequence.preparation?.deployments.length&&
+      experiment.sequence.preparation.operations.length&&
+      experiment.sequence.preparation.checks.length)&&
+    ["distributeReward(uint256)","deposit(uint256)","withdraw(uint256)"].every(signature=>
+      experiment.sequence.steps.some(step=>step.operation==="send"&&
+        step.function===signature))&&
+    experiment.sequence.steps.filter(step=>step.operation==="advance_time").length===2);
   if(fixtureSearchIncompleteReason&&targetIsFinancialEntry&&
-    !hasCompleteXmphAccountingFixture){
+    !hasCompleteXmphAccountingFixture&&!hasCompleteXmphRewardFixture){
     return {ok:false,code:'FIXTURE_ENUMERATION_INCOMPLETE',
       detail:fixtureSearchIncompleteReason,unresolvedCategory:'missing_fixture',
       partialExperiments:out};

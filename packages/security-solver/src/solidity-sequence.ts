@@ -35,6 +35,9 @@ const observe = z.object({operation:z.literal('observe'),deploymentId:prepId.opt
 const call = z.object({operation:z.literal("call"),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional(),expect:abiValue,expectPath:z.array(z.number().int().min(0).max(31)).min(1).max(4).optional()}).strict();
 const ethBalance = z.object({operation:z.literal("eth_balance"),
   account:z.string().regex(/^(?:\$account[012]|\$contract|\$deployment:[A-Za-z][A-Za-z0-9_-]{0,63})$/)}).strict();
+const advanceTime=z.object({operation:z.literal("advance_time"),
+  seconds:z.string().regex(/^[1-9][0-9]{0,7}$/).refine(value=>Number(value)<=31536000,
+    "Local EVM time advance is limited to one year")}).strict();
 const prepDeployment=z.object({id:prepId,file:deployment.shape.file,contract:deployment.shape.contract,
   constructorArgs:args,valueWei:wei.optional()}).strict();
 const prepSend=z.object({id:prepId,deploymentId:prepId,function:signature,args,
@@ -71,7 +74,7 @@ const scalarDeltaProperty=z.object({kind:z.literal("scalar_delta"),
 }).strict();
 const factoryCloneSchema=z.object({deploymentId:prepId,function:signature,args,sender}).strict();
 export const soliditySequenceSchema = z.object({constructorArgs:args,constructorValueWei:wei.optional(),deployment:deployment.optional(),preparation:solidityPreparationSchema.optional(),factoryClone:factoryCloneSchema.optional(),sourceProperty:scalarDeltaProperty.optional(),
-  steps:z.array(z.discriminatedUnion("operation",[send,call,observe,ethBalance])).min(1).max(16)}).strict()
+  steps:z.array(z.discriminatedUnion("operation",[send,call,observe,ethBalance,advanceTime])).min(1).max(16)}).strict()
   .superRefine((s,ctx)=>{
     for(const step of s.steps)
       if(step.operation==="send" && step.requiredSetup && step.expectRevert)
@@ -96,7 +99,7 @@ Set query to Contract.function for the primary function being tested. Sequence f
 {"constructorArgs":["5"],"steps":[{"operation":"send","function":"set(uint256)","args":["7"],"sender":0},{"operation":"call","function":"value()","args":[],"expect":"7"}]}.
 Use decimal strings for ABI integers and wei, booleans for bools, arrays for ABI arrays/tuples. $account0, $account1 and $account2 resolve to three local test accounts; $contract resolves to this deployment after construction.
 Optional constructorValueWei and send valueWei transfer only local test currency. send expectRevert=true tests a required revert. At most 16 steps; include at least one call with an expected result. A single return is a scalar; multiple returns are an array. Calls must be view/pure; sends must be nonpayable/payable. Optional expectPath is a bounded array of numeric tuple/array field positions, so a structured ABI return can be checked against a typed expected field without arbitrary evaluation. Use full ABI signatures for overloads.
-For a prerequisite initializer send, requiredSetup=true means its transaction must succeed before any hypothesis test executes. For a source-declared event observation, add expectEvents to a send step as [{"signature":"EventName(address,uint256)","args":["$account1","5"]}]. The executor validates the signature against the compiled acquired-source ABI, records the complete raw receipt including logs, and checks each expected event argument. An event mismatch is a failed assertion, never standalone vulnerability evidence. Use operation=observe with a source-declared view/pure method to record actual state without fabricating expect; pair observations before and after a send to establish baseline and transition. Observe records what happened, not proof of a violated invariant. Use operation=call with expect when a source-derived property justifies an assertion. Each sequence starts from a fresh deterministic local EVM. Output records actual receipts and read/assertion results. An assertion mismatch is only a test discrepancy, not evidence that the expected value or a vulnerability claim is correct. Compiler versions are selected from locally installed compatible compilers using each acquired source's pragma, and compilation retains the matching EVM version and ABI. Resolve constructor, initializer, inheritance, interface, and library dependencies only from acquired source; deploy and link a library only when its source and bytecode are available. Never invent external-chain state, addresses, or deployments. Test a proxy only when its proxy, implementation, initialization, and required state dependencies are acquired and constructible; otherwise preserve an explicit unresolved-dependency result.`;
+For a prerequisite initializer send, requiredSetup=true means its transaction must succeed before any hypothesis test executes. For a source-declared event observation, add expectEvents to a send step as [{"signature":"EventName(address,uint256)","args":["$account1","5"]}]. The executor validates the signature against the compiled acquired-source ABI, records the complete raw receipt including logs, and checks each expected event argument. An event mismatch is a failed assertion, never standalone vulnerability evidence. Use operation=observe with a source-declared view/pure method to record actual state without fabricating expect; pair observations before and after a send to establish baseline and transition. Observe records what happened, not proof of a violated invariant. Use operation=advance_time with a bounded positive seconds string only when the acquired source property depends on elapsed time; the executor advances and mines the isolated local EVM and records both timestamps. Use operation=call with expect when a source-derived property justifies an assertion. Each sequence starts from a fresh deterministic local EVM. Output records actual receipts and read/assertion results. An assertion mismatch is only a test discrepancy, not evidence that the expected value or a vulnerability claim is correct. Compiler versions are selected from locally installed compatible compilers using each acquired source's pragma, and compilation retains the matching EVM version and ABI. Resolve constructor, initializer, inheritance, interface, and library dependencies only from acquired source; deploy and link a library only when its source and bytecode are available. Never invent external-chain state, addresses, or deployments. Test a proxy only when its proxy, implementation, initialization, and required state dependencies are acquired and constructible; otherwise preserve an explicit unresolved-dependency result.`;
 
 const scalarJson = {anyOf:[{type:"string",maxLength:2048},{type:"boolean"}]};
 const valueJsonAt=(depth:number):any=>({anyOf:[...scalarJson.anyOf,
@@ -146,5 +149,8 @@ export const soliditySequenceJsonSchema = {type:"object",additionalProperties:fa
       {type:"object",additionalProperties:false,properties:{
         operation:{const:"eth_balance"},account:{type:"string",maxLength:80}},
         required:["operation","account"]},
+      {type:"object",additionalProperties:false,properties:{
+        operation:{const:"advance_time"},seconds:{type:"string",maxLength:8,pattern:"^[1-9][0-9]{0,7}$"}},
+        required:["operation","seconds"]},
     ]}}
   },required:["constructorArgs","steps"]};

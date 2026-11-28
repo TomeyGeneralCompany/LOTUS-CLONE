@@ -449,6 +449,67 @@ contract xMPH is ERC20Upgradeable, AccessControlUpgradeable {
     assert.ok(plan.sequence.preparation?.operations.some(x=>x.id==='mintSeedAndDeposit'));
     assert.ok(plan.sequence.steps.some(x=>x.operation==='call'&&x.function==='totalSupply()'));
   }
+  const rewardSource=`pragma solidity 0.8.4;
+contract xMPH is ERC20Upgradeable, AccessControlUpgradeable {
+ uint256 public constant MIN_AMOUNT=10**9;
+ uint256 internal constant MAX_REWARD_UNLOCK_PERIOD=365 days;
+ bytes32 public constant DISTRIBUTOR_ROLE=keccak256("DISTRIBUTOR_ROLE");
+ uint256 public rewardUnlockPeriod; uint256 public currentUnlockEndTimestamp;
+ uint256 public lastRewardTimestamp; uint256 public lastRewardAmount;
+ ERC20 public mph; event DistributeReward(uint256 rewardAmount);
+ function initialize(address _mph,uint256 _rewardUnlockPeriod,address _distributor) external initializer {
+   _setupRole(DISTRIBUTOR_ROLE,msg.sender); _setupRole(DISTRIBUTOR_ROLE,_distributor);
+   mph=ERC20(_mph); rewardUnlockPeriod=_rewardUnlockPeriod; _deposit(MIN_AMOUNT);
+ }
+ function getPricePerFullShare() public view returns(uint256) {
+   uint256 totalShares=totalSupply(); uint256 mphBalance=mph.balanceOf(address(this));
+   uint256 _lastRewardAmount=lastRewardAmount; uint256 _currentUnlockEndTimestamp=currentUnlockEndTimestamp;
+   if(_lastRewardAmount==0||block.timestamp>=_currentUnlockEndTimestamp) return mphBalance.div(totalShares);
+   uint256 _lastRewardTimestamp=lastRewardTimestamp;
+   uint256 lockedRewardAmount=(_lastRewardAmount*(_currentUnlockEndTimestamp-block.timestamp))/
+     (_currentUnlockEndTimestamp-_lastRewardTimestamp);
+   return (mphBalance-lockedRewardAmount).div(totalShares);
+ }
+ function distributeReward(uint256 rewardAmount) external {
+   require(totalSupply()>=MIN_AMOUNT,"supply"); require(rewardAmount>=MIN_AMOUNT,"reward");
+   require(hasRole(DISTRIBUTOR_ROLE,msg.sender),"not distributor");
+   mph.safeTransferFrom(msg.sender,address(this),rewardAmount);
+   currentUnlockEndTimestamp=block.timestamp+rewardUnlockPeriod;
+   lastRewardTimestamp=block.timestamp; lastRewardAmount=rewardAmount;
+   emit DistributeReward(rewardAmount);
+ }
+ function deposit(uint256 _mphAmount) external returns(uint256 shareAmount) { return _deposit(_mphAmount); }
+ function _deposit(uint256 _mphAmount) internal returns(uint256 shareAmount) {
+   shareAmount=_mphAmount.div(getPricePerFullShare()); _mint(msg.sender,shareAmount);
+   mph.safeTransferFrom(msg.sender,address(this),_mphAmount);
+ }
+ function withdraw(uint256 _shareAmount) external returns(uint256 mphAmount) {
+   require(totalSupply()>=_shareAmount+MIN_AMOUNT&&_shareAmount>0);
+   mphAmount=_shareAmount.mul(getPricePerFullShare()); _burn(msg.sender,_shareAmount);
+   mph.safeTransfer(msg.sender,mphAmount);
+ }
+}`;
+  const rewardPlan=constructSolidityExperiments({
+    repositoryCommit:'a'.repeat(40),targetPath:sharePath,targetSelector:'xMPH.distributeReward',
+    sources:[{path:sharePath,content:rewardSource,sha256:sha(rewardSource)},
+      {path:tokenPath,content:tokenSource,sha256:sha(tokenSource)}],
+    declarations:[
+      {selector:'xMPH.initialize',operation:'send',inputs:['address','uint256','address']},
+      {selector:'xMPH.distributeReward',operation:'send',inputs:['uint256']},
+      {selector:'xMPH.deposit',operation:'send',inputs:['uint256']},
+      {selector:'xMPH.getPricePerFullShare',operation:'call',inputs:[]},
+      {selector:'xMPH.withdraw',operation:'send',inputs:['uint256']},
+    ],skipFinancialInvariants:true,
+  });
+  assert.equal(rewardPlan.ok,true,'Source-backed timed reward property must yield an executable local-EVM plan');
+  if(rewardPlan.ok){
+    const plan=rewardPlan.experiments.find(p=>p.securityProperty.includes('timed reward accounting'));
+    assert.ok(plan,'The xMPH distributor lead must receive its dedicated reward-unlock property');
+    assert.deepEqual(plan.sequence.steps.filter(x=>x.operation==='advance_time').map(x=>x.seconds),
+      ['43200','43200'],'The reward property must test both acquired half-period and expiry states');
+    assert.ok(plan.sequence.steps.some(x=>x.operation==='send'&&x.function==='distributeReward(uint256)'&&
+      x.sender===2&&x.expectRevert===true),'The reward property must reject an unconfigured distributor');
+  }
   const nonCanonicalToken=tokenSource.replace(
     '@openzeppelin/contracts/token/ERC20/ERC20.sol','../unverified/ERC20.sol');
   const unverifiedToken=constructSolidityExperiments({

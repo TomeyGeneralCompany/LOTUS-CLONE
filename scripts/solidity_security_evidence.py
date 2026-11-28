@@ -869,6 +869,12 @@ def security_experiment_disposition(
     if dynamic_position is not None:
         return "behavior_not_observed", dynamic_position[0], dynamic_position[1]
 
+    reward_unlock = _asserted_xmph_reward_unlock_negative(
+        file, selector, requested_steps, actual_steps
+    )
+    if reward_unlock is not None:
+        return "behavior_not_observed", reward_unlock[0], reward_unlock[1]
+
     bounded = _asserted_financial_or_vesting_negative(
         file, selector, requested_steps, actual_steps,
         data.get("accounts"), data.get("contract"),
@@ -1050,6 +1056,148 @@ def _asserted_dynamic_position_withdrawal_negative(
         return None
     return ("dynamic_full_position_conservation",
             "The acquired source records a bounded position, exposes its virtual-token supply, caps withdrawal to that supply, burns the same amount, and debits the principal ledger. The local EVM used the observed supply as the withdrawal argument and verified totalDeposit returned to zero; this bounded property was observed without a violation.")
+
+
+def _asserted_xmph_reward_unlock_negative(
+    file: Path, selector: str, requested_steps: list, actual_steps: list,
+) -> Tuple[str, str] | None:
+    """Verify the exact acquired xMPH distributor/unlock sequence and readbacks."""
+    if selector != "xMPH.distributeReward" or len(requested_steps) != len(actual_steps):
+        return None
+    try:
+        source = _strip_comments(file.read_text(encoding="utf8"))
+    except (OSError, UnicodeError):
+        return None
+    required = (
+        r"contract\s+xMPH\s+is\s+ERC20Upgradeable\s*,\s*AccessControlUpgradeable",
+        r"_deposit\(MIN_AMOUNT\)",
+        r"MAX_REWARD_UNLOCK_PERIOD\s*=\s*365\s*days",
+        r"_setupRole\(DISTRIBUTOR_ROLE\s*,\s*msg\.sender\)",
+        r"function\s+initialize\s*\(\s*address\s+\w+\s*,\s*uint256\s+\w+\s*,\s*address\s+\w+\s*\)",
+        r"function\s+getPricePerFullShare\s*\(\s*\)",
+        r"function\s+deposit\s*\(\s*uint256\s+_mphAmount\s*\)",
+        r"function\s+withdraw\s*\(\s*uint256\s+_shareAmount\s*\)",
+        r"function\s+distributeReward\s*\(\s*uint256\s+rewardAmount\s*\)",
+        r"require\(hasRole\(DISTRIBUTOR_ROLE\s*,\s*msg\.sender\)",
+        r"mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*rewardAmount\)",
+        r"currentUnlockEndTimestamp\s*=\s*block\.timestamp\s*\+\s*rewardUnlockPeriod",
+        r"lastRewardTimestamp\s*=\s*block\.timestamp",
+        r"lastRewardAmount\s*=\s*rewardAmount",
+        r"shareAmount\s*=\s*_mphAmount\.div\(getPricePerFullShare\(\)\)",
+        r"mphAmount\s*=\s*_shareAmount\.mul\(getPricePerFullShare\(\)\)",
+        r"_burn\(msg\.sender\s*,\s*_shareAmount\)",
+        r"totalSupply\(\)\s*>=\s*_shareAmount\s*\+\s*MIN_AMOUNT",
+        r"mph\.safeTransfer\(msg\.sender\s*,\s*mphAmount\)",
+        r"lockedRewardAmount\s*=\s*\(_lastRewardAmount\s*\*\s*\(_currentUnlockEndTimestamp\s*-\s*block\.timestamp\)\)\s*/\s*\(_currentUnlockEndTimestamp\s*-\s*_lastRewardTimestamp\)",
+        r"return\s*\(mphBalance\s*-\s*lockedRewardAmount\)\.div\(totalShares\)",
+        r"emit\s+DistributeReward\(rewardAmount\)",
+    )
+    if not all(re.search(pattern, source) for pattern in required):
+        return None
+    if any(req.get("operation") != got.get("operation") for req, got in zip(requested_steps, actual_steps)):
+        return None
+    if any(got.get("passed") is not True for req,got in zip(requested_steps,actual_steps)
+           if req.get("operation") != "observe"):
+        return None
+    rejects = [(req, got) for req, got in zip(requested_steps, actual_steps)
+               if req.get("operation") == "send" and
+               req.get("function") == "distributeReward(uint256)" and
+               req.get("sender") == 2 and req.get("expectRevert") is True]
+    succeeds = [(req, got) for req, got in zip(requested_steps, actual_steps)
+                if req.get("operation") == "send" and
+                req.get("function") == "distributeReward(uint256)" and
+                req.get("sender") == 0 and req.get("expectRevert") is not True]
+    if (len(rejects) != 1 or rejects[0][1].get("reverted") is not True or
+            len(succeeds) != 1 or succeeds[0][1].get("reverted") is not False or
+            succeeds[0][1].get("eventsPassed") is not True or
+            not any(event.get("signature") == "DistributeReward(uint256)" and event.get("passed") is True
+                    for event in succeeds[0][1].get("expectedEvents", []))):
+        return None
+    rejected_at = next(i for i,(req,_) in enumerate(zip(requested_steps,actual_steps))
+                       if req is rejects[0][0])
+    contract_balances = [(i,req,got) for i,(req,got) in enumerate(zip(requested_steps,actual_steps))
+                         if req.get("operation") == "call" and
+                         req.get("deploymentId") == "token" and
+                         req.get("function") == "balanceOf(address)" and
+                         req.get("args") == ["$contract"]]
+    before = [(i,req,got) for i,req,got in contract_balances
+              if i < rejected_at and str(req.get("expect")) == "1000000000" and
+              str(got.get("actual")) == "1000000000"]
+    success_at = next(i for i,(req,_) in enumerate(zip(requested_steps,actual_steps))
+                      if req is succeeds[0][0])
+    after = [(i,req,got) for i,req,got in contract_balances
+             if i > rejected_at and i < success_at and
+             str(req.get("expect")) == "1000000000" and
+             str(got.get("actual")) == "1000000000"]
+    if not before or not after:
+        return None
+    times = [(req, got) for req, got in zip(requested_steps, actual_steps)
+             if req.get("operation") == "advance_time"]
+    if len(times) != 2 or any(req.get("seconds") != "43200" for req, _ in times):
+        return None
+    for _, got in times:
+        try:
+            time_before, time_after, elapsed = (int(got[key]) for key in
+                                                ("fromTimestamp", "toTimestamp", "elapsedSeconds"))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if elapsed < 43200 or time_after - time_before != elapsed:
+            return None
+    first_elapsed = int(times[0][1]["toTimestamp"]) - int(times[0][1]["fromTimestamp"])
+    full_elapsed = int(times[1][1]["toTimestamp"]) - int(times[0][1]["fromTimestamp"])
+    if not 43200 <= first_elapsed <= 43202 or full_elapsed < 86400:
+        return None
+    expected_prices = {"1000000000000000000": 1, "2000000000000000000": 2}
+    midpoint = None
+    for req, got in zip(requested_steps, actual_steps):
+        if req.get("operation") == "call" and req.get("function") == "getPricePerFullShare()":
+            expected = str(req.get("expect"))
+            if expected not in expected_prices or str(got.get("actual")) != expected:
+                return None
+            expected_prices[expected] -= 1
+        if req.get("operation") == "observe" and req.get("function") == "getPricePerFullShare()":
+            midpoint = str(got.get("actual"))
+    if any(count != 0 for count in expected_prices.values()):
+        return None
+    if midpoint is None:
+        return None
+    reward_args=succeeds[0][0].get("args", [])
+    initializers=[req for req in requested_steps if req.get("operation")=="send" and
+                  req.get("function")=="initialize(address,uint256,address)"]
+    if (not reward_args or not str(reward_args[0]).isdecimal() or len(initializers)!=1 or
+            len(initializers[0].get("args",[]))!=3 or
+            not str(initializers[0]["args"][1]).isdecimal()):
+        return None
+    reward = int(reward_args[0])
+    duration = int(initializers[0]["args"][1])
+    if duration != 86400:
+        return None
+    locked = reward * max(duration-first_elapsed,0) // duration
+    expected_midpoint = (2_000_000_000-locked) * 10**18 // 1_000_000_000
+    if midpoint != str(expected_midpoint) or not 10**18 < expected_midpoint < 2*10**18:
+        return None
+    deposits = [(req,got) for req,got in zip(requested_steps,actual_steps)
+                if req.get("operation") == "send" and
+                req.get("function") == "deposit(uint256)" and
+                req.get("args") == ["1000"] and got.get("passed") is True and
+                got.get("reverted") is False]
+    if len(deposits) != 1:
+        return None
+    withdrawal = [(req,got) for req,got in zip(requested_steps,actual_steps)
+                  if req.get("operation") == "send" and
+                  req.get("function") == "withdraw(uint256)" and
+                  req.get("args") == ["400"] and got.get("passed") is True and
+                  got.get("reverted") is False]
+    if len(withdrawal) != 1:
+        return None
+    for account, expected in (("$account0","999999800"),("$contract","2000000200")):
+        if not any(req.get("operation") == "call" and req.get("deploymentId") == "token" and
+                   req.get("function") == "balanceOf(address)" and req.get("args") == [account] and
+                   str(req.get("expect")) == expected and str(got.get("actual")) == expected
+                   for req,got in zip(requested_steps,actual_steps)):
+            return None
+    return ("source_xmph_reward_unlock_negative",
+            "The acquired xMPH source rejected an unauthorized distributor call without transferring tokens, accepted the configured distributor's reward with the declared event, and the isolated EVM verified source-derived locked, midpoint, and completed-unlock share prices from recorded timestamps. A post-unlock deposit and withdrawal retained the 2x accounting ratio and matched both token-balance readbacks. This is a bounded property result, not a claim that untested reward schedules or economic conditions are safe.")
 
 
 def security_behavior_observed(

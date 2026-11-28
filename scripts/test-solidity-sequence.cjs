@@ -22,6 +22,11 @@ contract Fixture {
    result=new uint256[][][](1);result[0]=new uint256[][](1);
    result[0][0]=new uint256[](2);result[0][0][0]=1;result[0][0][1]=2;
  }
+}
+contract TimestampGate {
+ uint256 public immutable unlockAt;
+ constructor(){unlockAt=block.timestamp+60;}
+ function ready() external view returns(bool){return block.timestamp>=unlockAt;}
 }`;
 const compiled=JSON.parse(solc.compile(JSON.stringify({language:'Solidity',sources:{'Fixture.sol':{content:source}},
  settings:{evmVersion:'shanghai',outputSelection:{'*':{'*':['abi','evm.bytecode.object']}}}})));
@@ -60,6 +65,29 @@ async function executePosition(positionArtifact,s) {
 }
 (async()=>{
  validateSequence(sequence);
+ const timedSequence={constructorArgs:[],steps:[
+  {operation:'call',function:'ready()',args:[],expect:false},
+  {operation:'advance_time',seconds:'60'},
+  {operation:'call',function:'ready()',args:[],expect:true}
+ ]};
+ validateSequence(timedSequence);
+ const timedProvider=ganache.provider({logging:{quiet:true},wallet:{deterministic:true,totalAccounts:3},
+  chain:{hardfork:'shanghai',chainId:1337,time:new Date('2020-01-01T00:00:00Z')},
+  miner:{blockGasLimit:12000000,timestampIncrement:1}});
+ let timedResult;
+ try {timedResult=await runSequence(compiled.contracts['Fixture.sol'].TimestampGate,
+  timedSequence,timedProvider,{},{});} finally {await timedProvider.disconnect();}
+ assert.deepEqual(timedResult.steps.map(step=>step.passed),[true,true,true],
+  'A bounded time advance must mine the isolated local EVM and unlock source-timed state');
+ assert.equal(BigInt(timedResult.steps[1].elapsedSeconds)>=60n,true);
+ assert.equal(BigInt(timedResult.steps[1].toTimestamp)-BigInt(timedResult.steps[1].fromTimestamp),
+  BigInt(timedResult.steps[1].elapsedSeconds));
+ assert.throws(()=>validateSequence({...timedSequence,steps:[
+  {operation:'advance_time',seconds:'0'},{operation:'call',function:'ready()',args:[],expect:false}
+ ]}),/time advance/);
+ assert.throws(()=>validateSequence({...timedSequence,steps:[
+  {operation:'advance_time',seconds:'31536001'},{operation:'call',function:'ready()',args:[],expect:false}
+ ]}),/time advance/);
  const first=await execute(sequence);
  assert.ok(first.steps.every(x=>x.passed),JSON.stringify(first));
  assert.equal(first.diagnostics.abiSha256,

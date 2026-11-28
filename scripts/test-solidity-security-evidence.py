@@ -444,6 +444,82 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                 {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":vestmissing},
                 {"sequence":{"steps":vestreq}})[0],"observation_only")
 
+    def test_xmph_reward_unlock_uses_observed_local_evm_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            source=root/"contracts"/"rewards"/"xMPH.sol"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "contract xMPH is ERC20Upgradeable, AccessControlUpgradeable {\n"
+                "uint256 public constant MIN_AMOUNT=10**9;\n"
+                "uint256 internal constant MAX_REWARD_UNLOCK_PERIOD=365 days;\n"
+                "uint256 public rewardUnlockPeriod; uint256 public currentUnlockEndTimestamp;\n"
+                "uint256 public lastRewardTimestamp; uint256 public lastRewardAmount;\n"
+                "function initialize(address,uint256,address) external { _setupRole(DISTRIBUTOR_ROLE,msg.sender); _deposit(MIN_AMOUNT); }\n"
+                "function distributeReward(uint256 rewardAmount) external { require(hasRole(DISTRIBUTOR_ROLE,msg.sender)); "
+                "mph.safeTransferFrom(msg.sender,address(this),rewardAmount); "
+                "currentUnlockEndTimestamp=block.timestamp+rewardUnlockPeriod; "
+                "lastRewardTimestamp=block.timestamp; lastRewardAmount=rewardAmount; emit DistributeReward(rewardAmount); }\n"
+                "function deposit(uint256 _mphAmount) external returns(uint256 shareAmount) { "
+                "shareAmount=_mphAmount.div(getPricePerFullShare()); _mint(msg.sender,shareAmount); "
+                "mph.safeTransferFrom(msg.sender,address(this),_mphAmount); }\n"
+                "function withdraw(uint256 _shareAmount) external returns(uint256 mphAmount) { "
+                "require(totalSupply() >= _shareAmount + MIN_AMOUNT); "
+                "mphAmount=_shareAmount.mul(getPricePerFullShare()); _burn(msg.sender,_shareAmount); "
+                "mph.safeTransfer(msg.sender,mphAmount); }\n"
+                "function getPricePerFullShare() external view returns(uint256) { uint256 lockedRewardAmount="
+                "(_lastRewardAmount*(_currentUnlockEndTimestamp-block.timestamp))/"
+                "(_currentUnlockEndTimestamp-_lastRewardTimestamp); return (mphBalance-lockedRewardAmount).div(totalShares); }\n"
+                "}",encoding="utf8")
+            req=[
+                {"operation":"send","function":"approve(address,uint256)","sender":0},
+                {"operation":"send","function":"initialize(address,uint256,address)",
+                 "args":["$deployment:token","86400","$account0"],"sender":0},
+                {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$contract"],"expect":"1000000000"},
+                {"operation":"send","function":"distributeReward(uint256)","args":["1000000000"],"sender":2,"expectRevert":True},
+                {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$contract"],"expect":"1000000000"},
+                {"operation":"send","function":"distributeReward(uint256)","args":["1000000000"],"sender":0},
+                {"operation":"call","function":"getPricePerFullShare()","expect":"1000000000000000000"},
+                {"operation":"advance_time","seconds":"43200"},
+                {"operation":"observe","function":"getPricePerFullShare()","args":[]},
+                {"operation":"advance_time","seconds":"43200"},
+                {"operation":"call","function":"getPricePerFullShare()","expect":"2000000000000000000"},
+                {"operation":"send","function":"deposit(uint256)","args":["1000"],"sender":0},
+                {"operation":"call","function":"getPricePerFullShare()","expect":"2000000000000000000"},
+                {"operation":"send","function":"withdraw(uint256)","args":["400"],"sender":0},
+                {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$account0"],"expect":"999999800"},
+                {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$contract"],"expect":"2000000200"},
+            ]
+            first_elapsed=43201
+            locked=1000000000*(86400-first_elapsed)//86400
+            midpoint=str((2000000000-locked)*10**18//1000000000)
+            actual=[]
+            local_time=1577836800
+            for i,step in enumerate(req):
+                item={"operation":step["operation"],"passed":True}
+                if step["operation"]=="call": item["actual"]=step["expect"]
+                if step["operation"]=="observe": item["actual"]=midpoint
+                if step["operation"]=="send":
+                    item.update({"reverted":step.get("expectRevert",False),"args":step.get("args",[])})
+                    if step["function"]=="distributeReward(uint256)" and step["sender"]==0:
+                        item.update({"eventsPassed":True,"expectedEvents":[
+                            {"signature":"DistributeReward(uint256)","passed":True}]})
+                if step["operation"]=="advance_time":
+                    item.update({"fromTimestamp":str(local_time),"toTimestamp":str(local_time+43201),
+                                 "elapsedSeconds":"43201"})
+                    local_time+=43201
+                actual.append(item)
+            result=security_experiment_disposition(root,source,"xMPH.distributeReward",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual},
+                {"sequence":{"steps":req}})
+            self.assertEqual(result[0],"behavior_not_observed")
+            self.assertEqual(result[1],"source_xmph_reward_unlock_negative")
+            bad_time=[dict(item) for item in actual]
+            bad_time[8]=dict(actual[8],actual="1500000000000000000")
+            self.assertEqual(security_experiment_disposition(root,source,"xMPH.distributeReward",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":bad_time},
+                {"sequence":{"steps":req}})[0],"observation_only")
+
     def test_general_source_scalar_conservation_is_independently_proven(self):
         import hashlib
         with tempfile.TemporaryDirectory() as tmp:
