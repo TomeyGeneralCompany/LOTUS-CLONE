@@ -22,10 +22,12 @@ import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependenciesDeta
 export function representativeFixtureGraphs<
   T extends {implementationChoices?:Readonly<Record<string,string>>}
 >(graphs:readonly T[]):T[] {
-  const remaining=[...graphs];
+  const selected=graphs.filter(graph=>
+    Object.keys(graph.implementationChoices||{}).length===0);
+  const remaining=graphs.filter(graph=>
+    Object.keys(graph.implementationChoices||{}).length>0);
   const uncovered=new Set(remaining.flatMap(graph=>
     Object.values(graph.implementationChoices||{})));
-  const selected:T[]=[];
   while(remaining.length&&uncovered.size){
     let bestIndex=0,bestCoverage=-1;
     for(let index=0;index<remaining.length;index++){

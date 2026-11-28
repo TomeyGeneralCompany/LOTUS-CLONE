@@ -1595,8 +1595,13 @@ const fixtureAlternatives=[
   {implementationChoices:{IToken:'TokenB.sol:TokenB',IMarket:'MarketB.sol:MarketB'}},
   {implementationChoices:{IToken:'TokenA.sol:TokenA',IMarket:'MarketB.sol:MarketB'}},
 ];
-const representativeAlternatives=representativeFixtureGraphs(fixtureAlternatives);
-assert.ok(representativeAlternatives.length<fixtureAlternatives.length,
+const representativeAlternatives=representativeFixtureGraphs([
+  ...fixtureAlternatives,{implementationChoices:{}},
+]);
+assert.ok(representativeAlternatives.some(graph=>
+  Object.keys(graph.implementationChoices).length===0),
+  'Unambiguous acquired fixture graphs must be retained');
+assert.ok(representativeAlternatives.length<fixtureAlternatives.length+1,
   'Redundant cross-product graphs should not all be retried');
 for(const typeName of ['IToken','IMarket']){
   const expected=new Set(fixtureAlternatives.map(graph=>graph.implementationChoices[typeName]));
