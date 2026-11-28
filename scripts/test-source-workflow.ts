@@ -12,6 +12,7 @@ await import("./test-java-sequence-runtime");
 
 // Normalize formatting without allowing guessed targets to bypass validation.
 const {decodeAuditAction}=await import("../packages/security-solver/src/local-audit-protocol");
+const {huntSchema}=await import("../packages/security-solver/src/local-program-flow");
 const {javaProbeSelectorCompatible}=await import("../packages/security-solver/src/probe-target-validation");
 const javaProbeFixtureDir=await mkdtemp(join(tmpdir(),"autohack-java-probe-intent-"));
 try {
@@ -270,6 +271,19 @@ assert.deepEqual(await sourceDeclarationHints(join(probeFixtures,"target.js")),[
 await writeFile(join(probeFixtures,"modern.js"),"export function actual(value) { return value; }");
 assert.deepEqual(await sourceDeclarationHints(join(probeFixtures,"modern.js")),["actual"],"JS exported function hints");
 assert.ok(recoveryRegexSource.includes("sourceDeclarationHints(target)"),"rejected probes must expose grounded source declarations");
+const manyVerifiedCandidates=Array.from({length:12},(_,index)=>({
+  caseId:(index+1).toString(16).padStart(64,"0"),severity:"low" as const,
+  confidence:0.8,ratingReason:"Source-backed execution and independent review evidence.",
+  title:`Verified source case ${index+1}`,
+  impact:"The isolated execution recorded the source-grounded expected behavior.",
+  callerFile:"source-1/Contract.sol",callerLine:index+1,
+  falsification:"Replay the recorded source-bound case and reject if any asserted state is absent.",
+}));
+assert.equal(huntSchema.parse({findings:manyVerifiedCandidates,outcome:"inspected"})
+  .findings.length,12,"report schema must preserve more than eight independently verified findings");
+const localFlowSource=await readFile(join(process.cwd(),"packages/security-solver/src/local-program-flow.ts"),"utf8");
+assert.ok(!localFlowSource.includes("routes.slice(0,16)"),"controller must attempt every indexed source route");
+assert.ok(!localFlowSource.includes("indexedVerifiedCandidates.length>=8"),"controller must not stop verified source collection at eight");
 const controllerText=await readFile(join(process.cwd(),"packages/security-solver/src/local-ollama-runner.ts"),"utf8");
 assert.ok(controllerText.includes("[CONTEXT_RECOVERY]"),"repeated completed source pages must recover rather than end a production hunt");
 assert.ok(controllerText.includes("maxItems:0"),"without recorded case IDs, typed final schema must prohibit invented findings");

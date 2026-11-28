@@ -58,7 +58,7 @@ export function normalizeNegativeHuntProse(text: unknown): { findings: []; outco
   }
   return { findings: [], outcome: "no_testable_candidate", reason: trimmed.slice(0, 1000) };
 }
-export const huntSchema=z.object({findings:z.array(candidateSchema).max(8),
+export const huntSchema=z.object({findings:z.array(candidateSchema),
   outcome:z.enum(["inspected","no_testable_candidate"]).optional(),
   reason:z.string().min(20).max(1000).optional()
 }).strict().superRefine((value,ctx)=>{
@@ -340,7 +340,7 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
       await writeFile(join(root,'audit-source-routes.json'),JSON.stringify(routes),
         {mode:0o600});
       let attempted=0,observed=0;
-      for(const route of routes.slice(0,16)){
+      for(const route of routes){
         signal.throwIfAborted();
         const repo=repos.find(r=>route.entry.startsWith(
           relative(root,r.directory).split(sep).join('/')+'/'));
@@ -432,7 +432,6 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
       const authorizedPeerSources=solidityPeers.map(peer=>peer.source);
       for(const path of eligiblePaths.filter(p=>p.endsWith('.sol'))) {
         signal.throwIfAborted();
-        if(indexedVerifiedCandidates.length>=8)break;
         const repo=repos.find(r=>path.startsWith(
           relative(root,r.directory).split(sep).join('/')+'/'));
         if(!repo || missingDependencies.has(repo.url))continue;
@@ -705,7 +704,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
     // independent technical reviewer. This does not approve any vulnerability.
     if(fullSourceIndex && indexedVerifiedCandidates.length) {
       parsed=huntSchema.parse({
-        findings:indexedVerifiedCandidates.slice(0,8),outcome:'inspected'
+        findings:indexedVerifiedCandidates,outcome:'inspected'
       });
       answer=JSON.stringify({controllerEvidenceHandoff:true,
         caseIds:indexedVerifiedCandidates.map(c=>c.caseId),
@@ -1407,7 +1406,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
       const candidate=independentlyProvenCandidate;
       const alreadyPresent=parsed?.findings.some(item=>item.caseId===candidate.caseId);
       if(!alreadyPresent) {
-        parsed={findings:[candidate,...(parsed?.findings||[])].slice(0,8),outcome:'inspected'};
+        parsed={findings:[candidate,...(parsed?.findings||[])],outcome:'inspected'};
         await appendFile(logFile,'[CONTROLLER_PROOF_FOR_REVIEW] '+JSON.stringify({
           caseId:candidate.caseId,source:'controller independent entry reproduction',
           reason:'model nomination is not a requirement for independently reviewed evidence',
