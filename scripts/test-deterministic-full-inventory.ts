@@ -415,7 +415,7 @@ contract DividendGetter {
     assert.deepEqual(reasonlessStore.markExplicitlyUnresolved(),[],
       'A lifecycle label without a source-grounded blocker is not a terminal disposition');
     assert.deepEqual(reasonlessStore.experimentCertificate.explicitlyUnresolvedIds,[]);
-    const explicitCheckpoint=join(dir,'explicitly-unresolved-resume.json');
+    const explicitCheckpoint=partialStore.path;
     await partialStore.save();
     const resumedExplicit=await AnalysisProgressStore.open(explicitCheckpoint,[partialLead]);
     assert.equal(resumedExplicit.records.get(partialLead.id)?.lifecycle,'explicitly_unresolved',
