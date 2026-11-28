@@ -412,9 +412,28 @@ contract DividendGetter {
     const reasonlessStore=await AnalysisProgressStore.open(
       join(dir,'reasonless-unresolved.json'),[partialLead]);
     reasonlessStore.records.get(partialLead.id)!.lifecycle='analysis_exhausted';
+    reasonlessStore.noteRepairAttempt(partialLead.id,'source-fixture-pass',
+      'no_distinct_sourced_experiment');
     assert.deepEqual(reasonlessStore.markExplicitlyUnresolved(),[],
-      'A lifecycle label without a source-grounded blocker is not a terminal disposition');
+      'A lifecycle label and no-op retry without a source-grounded blocker are not a terminal disposition');
     assert.deepEqual(reasonlessStore.experimentCertificate.explicitlyUnresolvedIds,[]);
+    const repairDispositionStore=await AnalysisProgressStore.open(
+      join(dir,'repair-attempt-blocker.json'),[partialLead]);
+    repairDispositionStore.records.get(partialLead.id)!.lifecycle='analysis_exhausted';
+    repairDispositionStore.noteRepairAttempt(partialLead.id,'source-fixture-pass',
+      'missing_source_declarations');
+    assert.deepEqual(repairDispositionStore.markExplicitlyUnresolved(),[partialLead.id],
+      'An exhausted source repair with a concrete blocker can be terminally dispositioned');
+    assert.ok(repairDispositionStore.experimentCertificate.pendingReasons[partialLead.id]
+      .some(reason=>reason.includes('missing_source_declarations')),
+      'The report certificate must retain the source repair blocker');
+    const unfinishedStore=await AnalysisProgressStore.open(
+      join(dir,'unfinished-experiment-not-unresolved.json'),[partialLead]);
+    unfinishedStore.nextBatch(1,1);
+    unfinishedStore.recordAssessment(partialLead.id,['pending-property'],[],['pending-experiment']);
+    assert.deepEqual(unfinishedStore.markExplicitlyUnresolved(),[],
+      'A constructed experiment must be executed or explicitly failed before lead disposition');
+    assert.deepEqual(unfinishedStore.experimentCertificate.explicitlyUnresolvedIds,[]);
     const explicitCheckpoint=partialStore.path;
     await partialStore.save();
     const resumedExplicit=await AnalysisProgressStore.open(explicitCheckpoint,[partialLead]);

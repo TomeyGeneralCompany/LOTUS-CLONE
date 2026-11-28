@@ -263,12 +263,19 @@ export class AnalysisProgressStore {
     for(const record of unresolved){
       if(["queued","admitted","analyzing"].includes(record.lifecycle))
         throw new Error("UNRESOLVED_LEAD_STILL_PENDING: "+record.id+":"+record.lifecycle);
+      if(record.experimentIds.some(id=>!this.completedExperimentIds.has(id))||
+        record.properties.some(property=>["unexamined","analyzing","test_constructed"]
+          .includes(property.state)))continue;
       const reasons=[
         ...record.properties.flatMap(property=>property.unresolvedPrerequisites),
         ...record.properties.filter(property=>property.state!=="test_completed")
           .map(property=>"property_state:"+property.state),
         ...(record.specialistAttempts||[]).map(attempt=>
           "specialist:"+attempt.adapter+":"+attempt.status+":"+attempt.reason),
+        ...(record.repairAttempts||[]).filter(attempt=>
+          !["no_constructed_experiment","no_distinct_sourced_experiment"].includes(attempt.result))
+          .map(attempt=>
+          "repair:"+attempt.strategy+":"+attempt.result),
         ...(record.lastError?["controller_error:"+record.lastError]:[]),
       ];
       // A lifecycle label or lack of a property is not a concrete blocker.
@@ -308,6 +315,9 @@ export class AnalysisProgressStore {
           ...e.properties.flatMap(p=>p.unresolvedPrerequisites),
           ...e.properties.filter(p=>p.state!=="test_completed").map(p=>"property_state:"+p.state),
           ...(e.specialistAttempts||[]).map(p=>"specialist:"+p.adapter+":"+p.status+":"+p.reason),
+          ...(e.repairAttempts||[]).filter(p=>
+            !["no_constructed_experiment","no_distinct_sourced_experiment"].includes(p.result))
+            .map(p=>"repair:"+p.strategy+":"+p.result),
           ...(e.lastError?["controller_error:"+e.lastError]:[]),
           ...(!e.properties.length?["lifecycle:"+e.lifecycle+":no_source_grounded_property_recorded"]:[]),
         ];
