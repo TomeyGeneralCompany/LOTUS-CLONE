@@ -51,7 +51,8 @@ export interface CandidateProgress {
 export interface CandidateCoverage {
   total:number; queued:number; admitted:number; dependenciesPending:number;
   experimentsPending:number; experimentsCompleted:number; sourceUnavailable:number; terminalExhausted:number;
-  blocked:number; unresolvedIds:string[]; unresolvedPrerequisites:Record<string,string[]>;
+  blocked:number; unresolvedIds:string[]; explicitlyUnresolvedIds:string[];
+  unresolvedReasons:Record<string,string[]>; unresolvedPrerequisites:Record<string,string[]>;
 }
 
 export interface AnalysisProgressSnapshot {
@@ -151,6 +152,7 @@ export class AnalysisProgressStore {
   }
   get counts():CandidateCoverage {
     const records=[...this.records.values()];
+    const certificate=this.experimentCertificate;
     const count=(state:CandidateLifecycle)=>records.filter(r=>r.lifecycle===state).length;
     // Source-unavailable is a separately verified disposition, not an EVM
     // result. Count it as accounted for while preserving its own ledger so a
@@ -166,6 +168,8 @@ export class AnalysisProgressStore {
       sourceUnavailable:records.filter(r=>this.hasSourceUnavailableEvidence(r)).length,
       terminalExhausted:count("analysis_exhausted"),blocked:count("blocked"),
       unresolvedIds:unresolved.map(r=>r.id).sort(),
+      explicitlyUnresolvedIds:certificate.explicitlyUnresolvedIds,
+      unresolvedReasons:certificate.pendingReasons,
       unresolvedPrerequisites:Object.fromEntries(unresolved
         .filter(r=>r.properties.some(p=>p.unresolvedPrerequisites.length))
         .map(r=>[r.id,[...new Set(r.properties.flatMap(p=>p.unresolvedPrerequisites))]])),

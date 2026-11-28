@@ -180,12 +180,19 @@ function buildDeterministicNegativeFinal(input: DeterministicAuditTurnInput): Re
   const readCount = input.sourceReadCount ?? input.readPaths?.length ?? input.sources.length;
   const indexedCount = input.sourceIndexedCount ?? Math.max(readCount, input.initialSourcePaths?.length ?? input.sources.length);
   const unresolvedCandidates=input.candidateCoverage?.unresolvedIds.length ?? 0;
+  const explicitlyUnresolved=input.candidateCoverage?.explicitlyUnresolvedIds.length ?? 0;
+  const blockerCounts=new Map<string,number>();
+  for(const reasons of Object.values(input.candidateCoverage?.unresolvedReasons||{}))
+    for(const reason of reasons)blockerCounts.set(reason,(blockerCounts.get(reason)||0)+1);
+  const blockerSummary=[...blockerCounts.entries()].sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]))
+    .slice(0,5).map(([reason,count])=>`${reason} (${count})`).join('; ');
   const incompleteTotal = o.observation_only + o.incomplete + o.unsupported + o.pending + unresolvedCandidates;
   const reason =
     `${readCount}/${indexedCount} source files inspected; ${totalSelected} experiments selected: ` +
     `${o.not_observed} source-supported negative experiments, ${o.observation_only} observation-only, ` +
     `${o.incomplete} failed/incomplete fixtures, ${o.unsupported} unsupported, ${o.observed} observed behaviors; ` +
-    `${unresolvedCandidates} candidate properties still unresolved. ` +
+    `${unresolvedCandidates} candidate properties unresolved (${explicitlyUnresolved} explicitly dispositioned`+
+    (blockerSummary?`; leading blockers: ${blockerSummary}`:'')+`). ` +
     (incompleteTotal > 0
       ? `Selected-experiment pass only; investigation partial. ${incompleteTotal} incomplete, observation-only, unsupported or pending items require resolution.`
       : `Deterministic analysis completed all ${totalSelected} selected experiments with zero observed security violations.`);
