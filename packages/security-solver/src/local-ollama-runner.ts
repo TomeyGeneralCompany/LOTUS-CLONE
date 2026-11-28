@@ -3651,8 +3651,11 @@ export async function runLocalAudit(
                 (limits.initialSourcePaths||[]).includes(caller)) {
               try {
                 const full=await safePath(caller);
-                let offset=0, pages=0, seenLines=0, reached=false;
-                while(pages++<32) {
+                let offset=0, seenLines=0, reached=false;
+                // Keep reading until the claimed line is covered or source
+                // pagination reaches a verified terminal/stalled condition.
+                // A fixed page count rejected valid late-file evidence.
+                while(true) {
                   const page=await readSourcePage(full,offset,pageSize);
                   if(!page.text || page.end<=page.start)break;
                   const action={action:'read_file',path:caller,query:'',answer:'',offset};

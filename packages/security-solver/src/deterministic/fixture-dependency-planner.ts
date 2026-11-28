@@ -645,9 +645,9 @@ export function resolveAcquiredConcreteImplementations(
   const targetDeclarations:Array<{entry:ContractEntry;fn:any}>=[];
   let targetInvalid=false;
   const seenTargetEntries=new Set<string>();
-  const visitTarget=(entry:ContractEntry,ancestors=new Set<string>(),depth=0):void=>{
+  const visitTarget=(entry:ContractEntry,ancestors=new Set<string>()):void=>{
     const identity=entry.source.path+":"+entry.node.name;
-    if(ancestors.has(identity)||depth>12){targetInvalid=true;return;}
+    if(ancestors.has(identity)){targetInvalid=true;return;}
     if(seenTargetEntries.has(identity))return;
     seenTargetEntries.add(identity);
     const nextAncestors=new Set(ancestors);nextAncestors.add(identity);
@@ -658,7 +658,7 @@ export function resolveAcquiredConcreteImplementations(
     for(let i=0;i<inherited.length;i++){
       const possibilities=parents[i]||[];
       if(possibilities.length!==1){targetInvalid=true;continue;}
-      visitTarget(possibilities[0],nextAncestors,depth+1);
+      visitTarget(possibilities[0],nextAncestors);
     }
   };
   visitTarget(rootEntry);
@@ -776,8 +776,7 @@ export function resolveAcquiredInterfaceCallers(
   // a name match in an unrelated source is not a source-grounded callsite.
   const byPath=new Map(sources.map(source=>[source.path,source]));
   const methodDeclared=(node:any,sourcePath:string,
-    ancestors=new Set<string>(),depth=0):boolean=>{
-    if(depth>12)return false;
+    ancestors=new Set<string>()):boolean=>{
     const id=sourcePath+':'+String(node.name||'');
     if(ancestors.has(id))return false;
     if((node.subNodes||[]).some((fn:any)=>
@@ -786,7 +785,7 @@ export function resolveAcquiredInterfaceCallers(
     if(!source)return false;
     const visited=new Set(ancestors);visited.add(id);
     const reachable=new Set<string>(),pending=[sourcePath];
-    while(pending.length&&reachable.size<=256){
+    while(pending.length){
       const path=pending.shift()!;
       if(reachable.has(path))continue;
       reachable.add(path);
@@ -831,7 +830,7 @@ export function resolveAcquiredInterfaceCallers(
       const unique=[...new Map(parents.map(entry=>[
         entry.path+':'+entry.node.name,entry])).values()];
       if(unique.length!==1)return false;
-      if(methodDeclared(unique[0].node,unique[0].path,visited,depth+1))
+      if(methodDeclared(unique[0].node,unique[0].path,visited))
         foundMethod=true;
     }
     return foundMethod;
@@ -873,9 +872,9 @@ export function resolveAcquiredInterfaceCallers(
       // contract. Resolve each inherited source edge through the same
       // authenticated import closure; never borrow a same-named foreign base.
       const getReceivers=(node:any,ownerPath:string,
-        seen=new Set<string>(),depth=0):string[]=>{
+        seen=new Set<string>()):string[]=>{
         const key=ownerPath+':'+String(node.name||'');
-        if(seen.has(key)||depth>12)return [];
+        if(seen.has(key))return [];
         seen.add(key);
         const own=(node.subNodes||[])
           .filter((x:any)=>x.type==='StateVariableDeclaration')
@@ -894,7 +893,7 @@ export function resolveAcquiredInterfaceCallers(
           const local=possible.filter(candidate=>candidate.source.path===ownerPath);
           const eligible=local.length?local:possible;
           if(eligible.length!==1)continue;
-          own.push(...getReceivers(eligible[0].node,eligible[0].source.path,seen,depth+1));
+          own.push(...getReceivers(eligible[0].node,eligible[0].source.path,seen));
         }
         return own;
       };
@@ -934,10 +933,10 @@ export function resolveAcquiredInterfaceCallers(
 /** Canonical Solidity ABI from authenticated source declarations. Contract,
  * struct, enum and value types are distinct; unresolvable names fail closed.
  * The isolated compiler and EVM must still verify the deployed ABI and receipt. */
-function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntry[],depth=0):string|null {
-  if(depth>8)return null;
+function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntry[],
+  resolving=new Set<string>()):string|null {
   if(type?.type==="ArrayTypeName"){
-    const item=callableType(type.baseTypeName,owner,entries,depth+1);
+    const item=callableType(type.baseTypeName,owner,entries,resolving);
     if(!item)return null;
     if(type.length&&(type.length.type!=="NumberLiteral"||
       !/^(?:0|[1-9][0-9]*)$/.test(String(type.length.number))))return null;
@@ -951,7 +950,7 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
       ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(n.type));
     const sourceByPath=new Map(entries.map(e=>[e.source.path,e.source]));
     const reachable=new Set<string>(),queue=[owner.source.path];
-    while(queue.length&&reachable.size<=256){
+    while(queue.length){
       const path=queue.shift()!;
       if(reachable.has(path))continue;
       reachable.add(path);
@@ -972,14 +971,18 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
     if(defs.length!==0){
       if(defs.length!==1)return null;
       const def=defs[0];
+      const identity=owner.source.path+":"+parts.join(".")+":"+name;
+      if(resolving.has(identity))return null;
+      const nextResolving=new Set(resolving);nextResolving.add(identity);
       if(def.type==="StructDefinition"){
         const fields=(def.members||[]).map((m:any)=>
-          callableType(m.typeName,owner,entries,depth+1));
+          callableType(m.typeName,owner,entries,nextResolving));
         return fields.length&&fields.every((t:any)=>t!==null)?
           "("+fields.join(",")+")":null;
       }
       if(def.type==="EnumDefinition")return (def.members||[]).length<=256?"uint8":null;
-      return callableType(def.underlyingType||def.typeName||def.definition,owner,entries,depth+1);
+      return callableType(def.underlyingType||def.typeName||def.definition,
+        owner,entries,nextResolving);
     }
     // solidity-parser releases used by the offline index can omit the
     // Solidity 0.8.8+ top-level "type X is T" AST. Preserve the *exact
@@ -1000,7 +1003,7 @@ function callableType(type:any,owner:ContractEntry,entries:readonly ContractEntr
     if(matchingValueTypes.length===1){
       const underlying=matchingValueTypes[0].underlying;
       return callableType({type:"ElementaryTypeName",name:underlying},
-        owner,entries,depth+1);
+        owner,entries,resolving);
     }
     const contractDefs=entries.filter(e=>e.node.name===name&&
       reachable.has(e.source.path)&&
@@ -1338,7 +1341,7 @@ export function resolveSourceFixtureDependencies(
       ["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition"].includes(n.type));
     if(local.length)return local.length===1?"value":"unknown";
     const reachable=new Set<string>(),pending=[source.path];
-    while(pending.length&&reachable.size<=256){
+    while(pending.length){
       const current=pending.shift()!;
       if(reachable.has(current))continue;
       reachable.add(current);
@@ -1426,7 +1429,7 @@ export function resolveSourceFixtureDependencies(
     if(direct.length===1){sourceTypePathCache.set(cacheKey,direct[0]);return direct[0];}
     if(direct.length>1){sourceTypePathCache.set(cacheKey,null);return null;}
     const reachable=new Set<string>(),pending=[owner.path];
-    while(pending.length&&reachable.size<=256){
+    while(pending.length){
       const current=pending.shift()!;if(reachable.has(current))continue;reachable.add(current);
       const src=acquiredByPath.get(current);if(!src)continue;
       for(const imp of (astOf(src)?.children||[]).filter((n:any)=>

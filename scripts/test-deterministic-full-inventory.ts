@@ -1966,6 +1966,27 @@ contract ClaimChild is ClaimBase {
     assert.equal(deepImplementations[0].sourceSha256,leafSnap.sha256);
     assert.ok(deepImplementations[0].witness.startsWith(middleSnap.path+':'+middleSnap.sha256),
       'Inherited executable method must retain the implementing source witness');
+    // Recovery must not stop at an arbitrary inheritance-depth ceiling.
+    const deepInheritance=[targetInterface];
+    let inheritedName='IWallet';
+    for(let i=0;i<14;i++){
+      const contract='WalletHop'+i;
+      const functionBody=i===0?
+        ' { function withdraw(uint256 value) external virtual override {} }':' {}';
+      const text='pragma solidity ^0.8.20; import "./'+inheritedName+
+        '.sol"; abstract contract '+contract+' is '+inheritedName+functionBody;
+      deepInheritance.push({path:'source-1/contracts/'+contract+'.sol',
+        content:text,sha256:hash(text)});
+      inheritedName=contract;
+    }
+    const deepLeafText='pragma solidity ^0.8.20; import "./'+inheritedName+
+      '.sol"; contract DeepWallet is '+inheritedName+' {}';
+    const deepLeaf={path:'source-1/contracts/DeepWallet.sol',
+      content:deepLeafText,sha256:hash(deepLeafText)};
+    deepInheritance.push(deepLeaf);
+    assert.deepEqual(resolveAcquiredConcreteImplementations(targetInterface,
+      'IWallet','withdraw',deepInheritance).map(x=>x.selector),['DeepWallet.withdraw'],
+      'A complete acquired implementation beyond twelve inheritance edges must remain discoverable');
     // An acquired intermediate import may re-export the base type. Resolve
     // that closure without admitting a disconnected same-name declaration.
     const bridgeText='pragma solidity ^0.8.0; import "./WalletBase.sol";';
@@ -2071,6 +2092,30 @@ contract StateChild is StateBase {
     assert.deepEqual(inheritedCallers.map(x=>x.selector),['StateChild.deposit'],
       'An acquired inherited source state receiver is a valid concrete caller');
     assert.equal(inheritedCallers[0].receiver,'cToken');
+    // Deep interface inheritance must retain a source-grounded callsite.
+    const deepTokenSources:typeof deepInheritance=[];
+    let deepTokenParent='IBaseToken';
+    const baseTokenText='pragma solidity ^0.8.20; interface IBaseToken { function mint(uint256 amount) external returns(uint256); }';
+    deepTokenSources.push({path:'source-1/contracts/IBaseToken.sol',
+      content:baseTokenText,sha256:hash(baseTokenText)});
+    for(let i=0;i<14;i++){
+      const name='ITokenHop'+i;
+      const text='pragma solidity ^0.8.20; import "./'+deepTokenParent+
+        '.sol"; interface '+name+' is '+deepTokenParent+' {}';
+      deepTokenSources.push({path:'source-1/contracts/'+name+'.sol',
+        content:text,sha256:hash(text)});
+      deepTokenParent=name;
+    }
+    const deepTokenConsumerText='pragma solidity ^0.8.20; import "./'+deepTokenParent+
+      '.sol"; contract DeepTokenConsumer { '+deepTokenParent+
+      ' public token; function use(uint256 amount) external { require(token.mint(amount)==0); } }';
+    const deepTokenConsumer={path:'source-1/contracts/DeepTokenConsumer.sol',
+      content:deepTokenConsumerText,sha256:hash(deepTokenConsumerText)};
+    deepTokenSources.push(deepTokenConsumer);
+    const deepTokenTop=deepTokenSources.find(source=>source.path.endsWith(deepTokenParent+'.sol'))!;
+    assert.deepEqual(resolveAcquiredInterfaceCallers(deepTokenTop,deepTokenParent,
+      'mint',deepTokenSources).map(x=>x.selector),['DeepTokenConsumer.use'],
+      'A source-proven caller beyond twelve interface inheritance edges must remain discoverable');
     // The selected interface may inherit its actual ABI without a local
     // declaration. Accept only the acquired unique parent and callsite.
     const inheritedTokenBase='pragma solidity ^0.8.20; interface IBaseToken { function mint(uint256 amount) external returns(uint256); }';
