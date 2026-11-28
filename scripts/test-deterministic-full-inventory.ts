@@ -432,6 +432,17 @@ contract DividendGetter {
     assert.deepEqual(reasonlessStore.markExplicitlyUnresolved(),[],
       'A lifecycle label and no-op retry without a source-grounded blocker are not a terminal disposition');
     assert.deepEqual(reasonlessStore.experimentCertificate.explicitlyUnresolvedIds,[]);
+    const frontierStore=await AnalysisProgressStore.open(
+      join(dir,'fixture-frontier-not-unresolved.json'),[partialLead]);
+    frontierStore.records.get(partialLead.id)!.lifecycle='analysis_exhausted';
+    frontierStore.noteRepairAttempt(partialLead.id,'source-fixture-pass',
+      'missing_source_declarations');
+    frontierStore.setFixtureSearchCheckpoint(partialLead.id,truncatedChoices.checkpoint);
+    assert.deepEqual(frontierStore.markExplicitlyUnresolved(),[],
+      'A lead with unexplored fixture selections cannot be terminally unresolved');
+    assert.ok(frontierStore.experimentCertificate.pendingReasons[partialLead.id]
+      .some(reason=>reason.startsWith('fixture_search_pending:')),
+      'The certificate reports durable fixture search work as pending');
     const repairDispositionStore=await AnalysisProgressStore.open(
       join(dir,'repair-attempt-blocker.json'),[partialLead]);
     repairDispositionStore.records.get(partialLead.id)!.lifecycle='analysis_exhausted';
@@ -620,6 +631,10 @@ contract Consumer {
       }]);
     const retryProgress=retryStore.records.get(retrySource[0].id)!;
     const firstRetryKey=repairAttemptIdentity(retryProgress);
+    retryStore.setFixtureSearchCheckpoint(retrySource[0].id,truncatedChoices.checkpoint);
+    assert.notEqual(repairAttemptIdentity(retryProgress),firstRetryKey,
+      'A changed durable fixture frontier must open a new deterministic repair generation');
+    retryStore.setFixtureSearchCheckpoint(retrySource[0].id,undefined);
     retryStore.noteRepairAttempt(retrySource[0].id,
       'source-property-controller:'+firstRetryKey,'no_new_experiment');
     assert.equal(repairAttemptIdentity(retryProgress),firstRetryKey,

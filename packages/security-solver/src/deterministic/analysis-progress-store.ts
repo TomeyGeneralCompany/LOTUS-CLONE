@@ -267,6 +267,10 @@ export class AnalysisProgressStore {
     for(const record of unresolved){
       if(["queued","admitted","analyzing"].includes(record.lifecycle))
         throw new Error("UNRESOLVED_LEAD_STILL_PENDING: "+record.id+":"+record.lifecycle);
+      // A durable fixture frontier represents unexamined acquired-source
+      // alternatives. It must be resumed before this lead can be called
+      // explicitly unresolved.
+      if(record.fixtureSearchCheckpoint)continue;
       if(record.experimentIds.some(id=>!this.completedExperimentIds.has(id))||
         record.properties.some(property=>["unexamined","analyzing","test_constructed"]
           .includes(property.state)))continue;
@@ -324,6 +328,9 @@ export class AnalysisProgressStore {
             .map(p=>"repair:"+p.strategy+":"+p.result),
           ...(e.lastError?["controller_error:"+e.lastError]:[]),
           ...(!e.properties.length?["lifecycle:"+e.lifecycle+":no_source_grounded_property_recorded"]:[]),
+          ...(e.fixtureSearchCheckpoint?[
+            "fixture_search_pending:"+e.fixtureSearchCheckpoint.exploredNodes+":"+
+              e.fixtureSearchCheckpoint.pending.length]:[]),
         ];
         if(!reasons.length)reasons.push(
           "lifecycle:"+e.lifecycle+":source_property_not_conclusively_verified");

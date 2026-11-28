@@ -20,6 +20,7 @@ export function repairAttemptIdentity(record:CandidateProgress):string {
   ]).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
   return createHash("sha256").update(JSON.stringify({
     sourceCommit:record.sourceCommit,sourceSha256:record.sourceSha256,
-    properties,incomplete,verified
+    properties,incomplete,verified,
+    fixtureSearchCheckpoint:record.fixtureSearchCheckpoint?.checksum||null
   })).digest("hex");
 }
