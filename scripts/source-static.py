@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import selectors
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,7 @@ STATIC_LIMITATION = (
     'Detectors produce advisory candidates, not verified findings. '
     'Inspect and independently reproduce before reporting.'
 )
+MAX_SCANNER_OUTPUT_BYTES = 64 * 1024**2
 
 
 def user_thread_count(proc=Path('/proc'), uid=None):
@@ -70,6 +72,57 @@ def limits(slither=False):
     nproc = scanner_nproc_limit()
     resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def run_bounded_scanner(command, timeout, preexec_fn):
+    """Drain scanner pipes into bounded parent-owned files without raising child limits."""
+    with tempfile.TemporaryFile() as captured:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   preexec_fn=preexec_fn)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+        selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
+        stderr = bytearray()
+        output_bytes = 0
+        output_limited = False
+        started = time.monotonic()
+        try:
+            while selector.get_map():
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                for key, _ in selector.select(min(remaining, 0.25)):
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    if key.data == 'stdout':
+                        output_bytes += len(chunk)
+                        if output_bytes > MAX_SCANNER_OUTPUT_BYTES:
+                            output_limited = True
+                            break
+                        captured.write(chunk)
+                    elif len(stderr) < 65536:
+                        stderr.extend(chunk[:65536 - len(stderr)])
+                if output_limited:
+                    break
+            if output_limited:
+                process.kill()
+            remaining = max(0.01, timeout - (time.monotonic() - started))
+            process.wait(timeout=remaining)
+        except (subprocess.TimeoutExpired, OSError):
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            selector.close()
+            if process.stdout and not process.stdout.closed:
+                process.stdout.close()
+            if process.stderr and not process.stderr.closed:
+                process.stderr.close()
+        captured.seek(0)
+        return process.returncode, captured.read(), bytes(stderr), output_limited
 
 
 def _prepare_slither_locked_imports(repository, source, sol_targets):
@@ -189,7 +242,7 @@ def analyze(repository, engine, target=None, targets=None):
         size = 0
         copied = 0
         skipped = 0
-        for name in paths[:10000]:
+        for name in paths:
             if not name:
                 continue
             path = repository / name
@@ -285,20 +338,24 @@ def analyze(repository, engine, target=None, targets=None):
                 '--json', '--metrics=off', '--disable-version-check', '--jobs=1', '--max-memory=512', '--timeout=5', '/repo'
             ]
             try:
-                with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-                    run = subprocess.run(command, stdout=out, stderr=err, timeout=90, preexec_fn=limits)
-                    out.seek(0)
-                    raw = out.read(8 * 1024**2)
-                    err.seek(0)
-                    diagnostic = err.read(1000).decode('utf-8', errors='replace').strip() or raw[:1000].decode('utf-8', errors='replace').strip()
-                    try:
-                        data = json.loads(raw)
-                    except ValueError:
-                        return {
-                            'status': 'failed', 'reason': 'Scanner returned no valid JSON',
-                            'exitCode': run.returncode, 'diagnostic': diagnostic, 'leads': [],
-                            'detectedLeads': 0, 'limitation': STATIC_LIMITATION,
-                        }
+                returncode, raw, stderr, output_limited = run_bounded_scanner(command, 90, limits)
+                diagnostic = stderr[:1000].decode('utf-8', errors='replace').strip() or raw[:1000].decode('utf-8', errors='replace').strip()
+                if output_limited or len(raw) >= MAX_SCANNER_OUTPUT_BYTES:
+                    return {
+                        'status': 'partial', 'reason': 'Scanner JSON reached the 64 MiB output safety limit',
+                        'leads': [], 'detectedLeads': 0,
+                        'coverage': {'copiedFiles': copied, 'skippedSizeFiles': skipped,
+                            'trackedPaths': len(paths), 'filesBeyondLimit': 0},
+                        'limitation': STATIC_LIMITATION,
+                    }
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    return {
+                        'status': 'failed', 'reason': 'Scanner returned no valid JSON',
+                        'exitCode': returncode, 'diagnostic': diagnostic, 'leads': [],
+                        'detectedLeads': 0, 'limitation': STATIC_LIMITATION,
+                    }
             except (subprocess.TimeoutExpired, ValueError, OSError) as error:
                 return {'status': 'failed', 'reason': type(error).__name__, 'leads': [], 'detectedLeads': 0, 'limitation': STATIC_LIMITATION}
 
@@ -317,16 +374,18 @@ def analyze(repository, engine, target=None, targets=None):
                 and '..' not in Path(lead['path']).parts and isinstance(lead['line'], int) and lead['line'] > 0
             ]
             leads.sort(key=lambda lead: ({'ERROR': 0, 'WARNING': 1}.get(lead.get('severity'), 2), lead['path'], lead['line']))
-            complete = run.returncode == 0 and not data.get('errors') and data.get('success', True)
+            coverage = {
+                'copiedFiles': copied, 'skippedSizeFiles': skipped,
+                'trackedPaths': len(paths), 'filesBeyondLimit': 0,
+            }
+            complete = returncode == 0 and not data.get('errors') and data.get('success', True)
+            complete = complete and skipped == 0
             return {
                 'status': 'completed' if complete else 'partial',
                 'complete': False,
                 'detectedLeads': len(leads),
-                'coverage': {
-                    'copiedFiles': copied, 'skippedSizeFiles': skipped,
-                    'filesBeyondLimit': max(0, len(paths) - 10000),
-                },
-                'leads': leads[:128],
+                'coverage': coverage,
+                'leads': leads,
                 'limitation': STATIC_LIMITATION,
             }
 
@@ -346,7 +405,7 @@ def analyze(repository, engine, target=None, targets=None):
             raw_targets = [target]
 
         valid_targets = []
-        for t in raw_targets[:24]:
+        for t in raw_targets:
             try:
                 resolved_t = (source / t).resolve()
             except OSError:
@@ -365,12 +424,7 @@ def analyze(repository, engine, target=None, targets=None):
         all_clean = True
         last_error = None
         last_exit = None
-        started = time.monotonic()
-
         for t in valid_targets:
-            if time.monotonic() - started > 75:
-                all_clean = False
-                break
             target_text = (source / t).read_text(errors='replace')
             pkg = detect_solc_pkg(target_text)
             native_0_8_30 = runtime / 'solc-0.8.30'
@@ -399,20 +453,23 @@ def analyze(repository, engine, target=None, targets=None):
                 '--disable-color',
             ]
             try:
-                with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-                    run = subprocess.run(command, stdout=out, stderr=err, timeout=45, preexec_fn=lambda: limits(slither=True))
-                    out.seek(0)
-                    raw = out.read(8 * 1024**2)
-                    err.seek(0)
-                    diagnostic = err.read(1000).decode('utf-8', errors='replace').strip() or raw[:1000].decode('utf-8', errors='replace').strip()
-                    try:
-                        data = json.loads(raw)
-                    except ValueError:
-                        failed_runs += 1
-                        all_clean = False
-                        last_error = diagnostic
-                        last_exit = run.returncode
-                        continue
+                returncode, raw, stderr, output_limited = run_bounded_scanner(
+                    command, 45, lambda: limits(slither=True))
+                diagnostic = stderr[:1000].decode('utf-8', errors='replace').strip() or raw[:1000].decode('utf-8', errors='replace').strip()
+                if output_limited or len(raw) >= MAX_SCANNER_OUTPUT_BYTES:
+                    failed_runs += 1
+                    all_clean = False
+                    last_error = 'Slither JSON reached the 64 MiB output safety limit'
+                    last_exit = returncode
+                    continue
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    failed_runs += 1
+                    all_clean = False
+                    last_error = diagnostic
+                    last_exit = returncode
+                    continue
             except (subprocess.TimeoutExpired, ValueError, OSError) as error:
                 failed_runs += 1
                 all_clean = False
@@ -420,11 +477,11 @@ def analyze(repository, engine, target=None, targets=None):
                 continue
 
             completed_runs += 1
-            if run.returncode != 0 or data.get('errors') or not data.get('success', True):
+            if returncode != 0 or data.get('errors') or not data.get('success', True):
                 all_clean = False
-            for item in data.get('results', {}).get('detectors', [])[:32]:
+            for item in data.get('results', {}).get('detectors', []):
                 sev = _slither_severity(item.get('impact'))
-                for element in item.get('elements', [])[:2]:
+                for element in item.get('elements', []):
                     mapping = element.get('source_mapping', {})
                     rel_path = str(mapping.get('filename_relative') or mapping.get('filename_absolute') or '').removeprefix('/repo/')
                     if not rel_path:
@@ -463,14 +520,14 @@ def analyze(repository, engine, target=None, targets=None):
             deduped.append(lead)
         deduped.sort(key=lambda lead: ({'ERROR': 0, 'WARNING': 1}.get(lead.get('severity'), 2), lead['path'], lead['line']))
         return {
-            'status': 'completed' if all_clean else 'partial',
+            'status': 'completed' if all_clean and skipped == 0 else 'partial',
             'complete': False,
             'detectedLeads': len(deduped),
             'coverage': {
                 'copiedFiles': copied, 'skippedSizeFiles': skipped,
-                'filesBeyondLimit': max(0, len(paths) - 10000),
+                'trackedPaths': len(paths), 'filesBeyondLimit': 0,
             },
-            'leads': deduped[:128],
+            'leads': deduped,
             'limitation': STATIC_LIMITATION,
         }
 

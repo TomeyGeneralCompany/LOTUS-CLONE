@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {constructSolidityExperiments} from '../packages/security-solver/src/controller-solidity-experiment-planner';
+import {constructSolidityExperiments,pickFlexibleArg,sourcePreparationGraph,representativeFixtureGraphs} from '../packages/security-solver/src/controller-solidity-experiment-planner';
+import {resolveSourceFixtureDependencies,verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 const content=`pragma solidity ^0.8.20;
 contract Vault {
   address public owner;
@@ -20,6 +21,304 @@ const input={
  {selector:'Vault.reserve',operation:'call' as const,inputs:[]},
  {selector:'Vault.owner',operation:'call' as const,inputs:[]}
  ]};
+
+// Preparation calls must bind the exact acquired ABI overload. A matching
+// name alone is insufficient for initializer transactions and state readbacks.
+const overloadFixture=`pragma solidity ^0.8.20;
+contract SetupToken {
+  uint8 public version;
+  function initialize(uint8 value) external { version = value; }
+  function initialize(uint256) external { version = 0; }
+}`;
+const overloadFixtureSnapshot={path:'contracts/SetupToken.sol',content:overloadFixture,
+  sha256:createHash('sha256').update(overloadFixture).digest('hex')};
+const preparationSequence={constructorArgs:[],preparation:{
+  deployments:[{id:'token',file:overloadFixtureSnapshot.path,contract:'SetupToken',constructorArgs:[]}],
+  operations:[{id:'setup',deploymentId:'token',function:'initialize(uint8)',args:['7'],sender:0 as const}],
+  checks:[{id:'version',deploymentId:'token',function:'version()',args:[],sender:0 as const,expect:'7'}]
+},steps:[{operation:'call' as const,deploymentId:'token',function:'version()',args:[],expect:'7'}]};
+const exactPreparation=sourcePreparationGraph(preparationSequence,
+  new Map([[overloadFixtureSnapshot.path,overloadFixtureSnapshot]]));
+assert.equal(exactPreparation.ok,true,
+  'An acquired exact overload and generated public getter must resolve through the preparation ABI');
+const wrongOverloadPreparation=sourcePreparationGraph({...preparationSequence,preparation:{
+  ...preparationSequence.preparation,
+  operations:[{...preparationSequence.preparation.operations[0],function:'initialize(address)'}]
+}},new Map([[overloadFixtureSnapshot.path,overloadFixtureSnapshot]]));
+assert.equal(wrongOverloadPreparation.ok,false,
+  'A same-name but source-undeclared initializer overload must be rejected before execution');
+const wrongConstructorPreparation=sourcePreparationGraph({...preparationSequence,preparation:{
+  ...preparationSequence.preparation,
+  deployments:[{...preparationSequence.preparation.deployments[0],constructorArgs:['1']}]
+}},new Map([[overloadFixtureSnapshot.path,overloadFixtureSnapshot]]));
+assert.equal(wrongConstructorPreparation.ok,false,
+  'A fixture with constructor arguments inconsistent with acquired source must be rejected before execution');
+
+// A receiver's ABI can be declared by an acquired inherited base rather than
+// directly in the concrete contract. Keep that source chain as the ABI witness.
+const inheritedToken='pragma solidity ^0.8.20;\n'+
+  'contract ERC1155Base { function mint(address,uint256,uint256) external {} '+
+  'function burn(address,uint256,uint256) external {} '+
+  'function balanceOf(address,uint256) external view returns(uint256) { return 0; } }\n'+
+  'contract FundingMultitoken is ERC1155Base {}';
+const inheritedTokenSnapshot={path:'contracts/tokens/FundingMultitoken.sol',
+  sha256:createHash('sha256').update(inheritedToken).digest('hex'),content:inheritedToken};
+const inheritedTokenAbi=verifyAcquiredReceiverMethods('FundingMultitoken',
+  ['mint','burn','balanceOf'],inheritedTokenSnapshot.path,'FundingMultitoken',
+  [inheritedTokenSnapshot]);
+assert.equal(inheritedTokenAbi.ok,true,
+  'Acquired inherited receiver methods must satisfy the concrete receiver ABI: '+
+  JSON.stringify(inheritedTokenAbi));
+const packageTokenAbiSource='pragma solidity ^0.8.20;\n'+
+  'import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";\n'+
+  'abstract contract MoneyMarket { function stablecoin() external view virtual returns(ERC20); }\n'+
+  'contract Adapter is MoneyMarket { ERC20 public override stablecoin; }';
+const packageTokenAbiSnapshot={path:'contracts/Adapter.sol',
+  sha256:createHash('sha256').update(packageTokenAbiSource).digest('hex'),
+  content:packageTokenAbiSource};
+const packageTokenAbi=verifyAcquiredReceiverMethods('MoneyMarket',['stablecoin'],
+  packageTokenAbiSnapshot.path,'Adapter',[packageTokenAbiSnapshot]);
+assert.equal(packageTokenAbi.ok,true,
+  'Compiler package contract types use the Solidity address ABI for inherited getters: '+
+  JSON.stringify(packageTokenAbi));
+const packageAccessControlSource='pragma solidity ^0.8.20;\n'+
+  'import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";\n'+
+  'contract Minter is AccessControlUpgradeable { function hasRole(bytes32,address) public view override returns(bool) { return false; } }';
+const packageAccessControlSnapshot={path:'contracts/Minter.sol',
+  sha256:createHash('sha256').update(packageAccessControlSource).digest('hex'),
+  content:packageAccessControlSource};
+const packageAccessControlAbi=verifyAcquiredReceiverMethods('Minter',['hasRole'],
+  packageAccessControlSnapshot.path,'Minter',[packageAccessControlSnapshot]);
+assert.equal(packageAccessControlAbi.ok,true,
+  'Canonical inherited OpenZeppelin access-control ABI must validate acquired minter fixtures: '+
+  JSON.stringify(packageAccessControlAbi));
+const packageMphTokenSource='pragma solidity ^0.8.20;\n'+
+  'import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";\n'+
+  'import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";\n'+
+  'contract MPHToken is ERC20Upgradeable, OwnableUpgradeable { function ownerMint(address,uint256) external returns(bool) { return true; } }';
+const packageMphTokenSnapshot={path:'contracts/MPHToken.sol',
+  sha256:createHash('sha256').update(packageMphTokenSource).digest('hex'),
+  content:packageMphTokenSource};
+const packageMphTokenAbi=verifyAcquiredReceiverMethods('MPHToken',
+  ['ownerMint','owner','increaseAllowance','transferOwnership','renounceOwnership'],
+  packageMphTokenSnapshot.path,'MPHToken',[packageMphTokenSnapshot]);
+assert.equal(packageMphTokenAbi.ok,true,
+  'Canonical ERC20Upgradeable and OwnableUpgradeable inherited ABI must validate the acquired MPH token fixture: '+
+  JSON.stringify(packageMphTokenAbi));
+const packageVestingSource='pragma solidity 0.8.4;\n'+
+  'import {ERC721URIStorageUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721URIStorageUpgradeable.sol";\n'+
+  'contract VestingFixture is ERC721URIStorageUpgradeable {}';
+const packageVestingSnapshot={path:'contracts/VestingFixture.sol',
+  sha256:createHash('sha256').update(packageVestingSource).digest('hex'),
+  content:packageVestingSource};
+const packageVestingAbi=verifyAcquiredReceiverMethods('VestingFixture',
+  ['safeTransferFrom'],packageVestingSnapshot.path,'VestingFixture',[packageVestingSnapshot]);
+assert.equal(packageVestingAbi.ok,true,
+  'Canonical inherited ERC721 safe-transfer overloads must satisfy the acquired Vesting02 receiver ABI: '+
+  JSON.stringify(packageVestingAbi));
+
+// A constructor fixture dependency may be injected through a unique internal
+// initializer helper. Resolve the address parameter back to the root
+// initializer and bind it to the acquired concrete implementation.
+const injectedAssetSource=`pragma solidity ^0.8.20;
+interface IInjectedAsset { function transferFrom(address,address,uint256) external returns(bool); }
+contract InjectedVault {
+  IInjectedAsset public asset;
+  function initialize(address assetAddress) external { _wireAsset(assetAddress); }
+  function _wireAsset(address candidate) internal { asset = IInjectedAsset(candidate); }
+  function deposit(uint256 amount) external { asset.transferFrom(msg.sender,address(this),amount); }
+}
+contract LocalInjectedAsset is IInjectedAsset {
+  function transferFrom(address,address,uint256) external pure returns(bool) { return true; }
+}`;
+const injectedAssetSnapshot={path:'contracts/InjectedVault.sol',content:injectedAssetSource,
+  sha256:createHash('sha256').update(injectedAssetSource).digest('hex')};
+const injectedAssetPlan=resolveSourceFixtureDependencies(injectedAssetSnapshot,
+  'InjectedVault',[injectedAssetSnapshot]);
+assert.equal(injectedAssetPlan.status,'resolved',
+  'An internal helper cast must preserve the initializer’s source-proven dependency binding: '+
+  JSON.stringify(injectedAssetPlan));
+if(injectedAssetPlan.status==='resolved'){
+  assert.equal(injectedAssetPlan.substitutions.assetAddress,'$deployment:dependency1');
+  assert.deepEqual(injectedAssetPlan.deployments.map(d=>d.contract),['LocalInjectedAsset']);
+}
+// Concrete fixture ABI requirements must include calls made through a local
+// copy of a source-injected interface receiver, not only calls made through
+// the stored state variable itself.
+const localAliasReceiverSource=`pragma solidity ^0.8.20;
+interface ILocalAliasReceiver { function perform() external; }
+contract LocalAliasVault {
+  ILocalAliasReceiver public receiver;
+  constructor(address receiverAddress) { receiver = ILocalAliasReceiver(receiverAddress); }
+  function run() external { ILocalAliasReceiver local = receiver; local.perform(); }
+}
+contract MissingLocalAliasMethod {}
+contract CompleteLocalAliasMethod { function perform() external {} }
+`;
+const localAliasReceiverSnapshot={path:'contracts/LocalAliasVault.sol',
+  content:localAliasReceiverSource,
+  sha256:createHash('sha256').update(localAliasReceiverSource).digest('hex')};
+const localAliasReceiverPlan=resolveSourceFixtureDependencies(localAliasReceiverSnapshot,
+  'LocalAliasVault',[localAliasReceiverSnapshot]);
+assert.equal(localAliasReceiverPlan.status,'resolved',
+  'A local interface alias must contribute its source-visible method to dependency resolution: '+
+  JSON.stringify(localAliasReceiverPlan));
+if(localAliasReceiverPlan.status==='resolved'){
+  assert.deepEqual(localAliasReceiverPlan.deployments.map(d=>d.contract),
+    ['CompleteLocalAliasMethod'],
+    'A selected fixture must implement methods invoked through a local source-typed alias');
+}
+// Initializer dependencies need their own topological order. The oracle reads
+// the market during initialize, so deployment order by itself is not enough.
+const initializerDependencySource=`pragma solidity ^0.8.20;
+interface IOrderMarket { function incomeIndex() external view returns(uint256); }
+interface IOrderOracle {}
+contract OrderMarket is IOrderMarket {
+  uint256 public index;
+  function initialize() external { index = 1; }
+  function incomeIndex() external view returns(uint256) { require(index == 1); return index; }
+}
+contract OrderOracle is IOrderOracle {
+  IOrderMarket public moneyMarket;
+  uint256 public lastIndex;
+  function initialize(address _moneyMarket) external {
+    moneyMarket = IOrderMarket(_moneyMarket);
+    lastIndex = moneyMarket.incomeIndex();
+  }
+}
+contract OrderRoot {
+  IOrderOracle public oracle;
+  function initialize(address _oracle) external { oracle = IOrderOracle(_oracle); }
+}
+`;
+const initializerDependencySnapshot={path:'contracts/InitializerDependency.sol',
+  content:initializerDependencySource,
+  sha256:createHash('sha256').update(initializerDependencySource).digest('hex')};
+const initializerDependencyPlan=resolveSourceFixtureDependencies(initializerDependencySnapshot,
+  'OrderRoot',[initializerDependencySnapshot]);
+assert.equal(initializerDependencyPlan.status,'resolved',
+  'A source-backed initializer dependency graph must resolve: '+JSON.stringify(initializerDependencyPlan));
+if(initializerDependencyPlan.status==='resolved'){
+  assert.deepEqual(initializerDependencyPlan.initializerOperations.map(op=>op.function.split('(')[0]),
+    ['initialize','initialize'],
+    'Both source-declared initialization transactions must be retained');
+  assert.equal(initializerDependencyPlan.initializerOperations[0].deploymentId,
+    initializerDependencyPlan.deployments.find(d=>d.contract==='OrderMarket')?.id,
+    'The market must be initialized before the oracle invokes incomeIndex()');
+}
+const transitiveConstructorSource=`pragma solidity ^0.8.20;
+interface IConstructorLeaf { function ping() external view returns(uint256); }
+interface IConstructorAdapter { function execute() external view returns(uint256); }
+contract ConstructorLeaf is IConstructorLeaf {
+  function ping() external pure returns(uint256) { return 7; }
+}
+contract ConstructorAdapter is IConstructorAdapter {
+  IConstructorLeaf public leaf;
+  constructor(address leafAddress) { _wireLeaf(leafAddress); }
+  function _wireLeaf(address candidate) internal { leaf=IConstructorLeaf(candidate); }
+  function execute() external view returns(uint256) { return leaf.ping(); }
+}
+contract ConstructorConsumer {
+  IConstructorAdapter public adapter;
+  constructor(address adapterAddress) { _wireAdapter(adapterAddress); }
+  function _wireAdapter(address candidate) internal { adapter=IConstructorAdapter(candidate); }
+  function run() external view returns(uint256) { return adapter.execute(); }
+}`;
+const transitiveConstructorSnapshot={path:'contracts/ConstructorConsumer.sol',
+  content:transitiveConstructorSource,
+  sha256:createHash('sha256').update(transitiveConstructorSource).digest('hex')};
+const transitiveConstructorPlan=resolveSourceFixtureDependencies(
+  transitiveConstructorSnapshot,'ConstructorConsumer',[transitiveConstructorSnapshot]);
+assert.equal(transitiveConstructorPlan.status,'resolved',
+  'Address-to-interface constructor injection through an internal helper must resolve transitively: '+
+  JSON.stringify(transitiveConstructorPlan));
+if(transitiveConstructorPlan.status==='resolved'){
+  assert.equal(transitiveConstructorPlan.substitutions.adapterAddress,'$deployment:dependency2');
+  assert.deepEqual(transitiveConstructorPlan.deployments.map(d=>d.contract),
+    ['ConstructorLeaf','ConstructorAdapter'],JSON.stringify(transitiveConstructorPlan));
+  const adapter=transitiveConstructorPlan.deployments.find(d=>d.contract==='ConstructorAdapter');
+  assert.equal(adapter?.constructorArgs[0],'$deployment:dependency1');
+}
+// An address argument used only by an acquired typed constructor call is still
+// a dependency. The resolver must deploy its concrete receiver first and pass
+// that address into the adapter constructor instead of substituting an EOA.
+const typedConstructorCallSource=`pragma solidity ^0.8.20;
+interface IEdgeToken { function decimals() external view returns(uint8); }
+interface IEdgeAdapter { function readDecimals() external view returns(uint8); }
+contract EdgeToken is IEdgeToken { function decimals() external pure returns(uint8) { return 6; } }
+contract EdgeAdapter is IEdgeAdapter {
+  uint8 public tokenDecimals;
+  constructor(address tokenAddress) { tokenDecimals = IEdgeToken(tokenAddress).decimals(); }
+  function readDecimals() external view returns(uint8) { return tokenDecimals; }
+}
+contract EdgeRoot {
+  IEdgeAdapter public adapter;
+  constructor(address adapterAddress) { adapter = IEdgeAdapter(adapterAddress); }
+}
+`;
+const typedConstructorCallSnapshot={path:'contracts/TypedConstructorCall.sol',
+  content:typedConstructorCallSource,
+  sha256:createHash('sha256').update(typedConstructorCallSource).digest('hex')};
+const typedConstructorCallPlan=resolveSourceFixtureDependencies(typedConstructorCallSnapshot,
+  'EdgeRoot',[typedConstructorCallSnapshot]);
+assert.equal(typedConstructorCallPlan.status,'resolved',
+  'A source-typed address constructor call must resolve to acquired code: '+
+  JSON.stringify(typedConstructorCallPlan));
+if(typedConstructorCallPlan.status==='resolved'){
+  assert.deepEqual(typedConstructorCallPlan.deployments.map(d=>d.contract),
+    ['EdgeToken','EdgeAdapter']);
+  assert.equal(typedConstructorCallPlan.deployments.find(d=>d.contract==='EdgeAdapter')?.constructorArgs[0],
+    '$deployment:dependency1');
+}
+
+const typedAbiSource=`pragma solidity ^0.8.20;
+enum Stage { Open, Closed }
+type SmallAmount is uint8;
+struct Position { uint256 shares; Stage stage; }
+contract TypedAbi {
+  Stage public stage;
+  SmallAmount public amount;
+  Position public position;
+  function setStage(Stage status) external { stage = status; }
+  function setAmount(SmallAmount amountInput) external { amount = amountInput; }
+  function setPosition(Position calldata next) external { position = next; }
+}`;
+const typedAbiSnapshot={path:'contracts/TypedAbi.sol',
+  sha256:createHash('sha256').update(typedAbiSource).digest('hex'),content:typedAbiSource};
+for(const [selector,signature,output] of [
+  ['TypedAbi.setStage','setStage(uint8)','0'],
+  ['TypedAbi.setAmount','setAmount(uint8)','255'],
+  ['TypedAbi.setPosition','setPosition((uint256,uint8))',['1000','0']],
+] as const){
+  const fn=selector.split('.')[1];
+  const inputs=signature.slice(signature.indexOf('(')+1,-1)==='(uint256,uint8)'?
+    ['(uint256,uint8)']:signature.slice(signature.indexOf('(')+1,-1).split(',');
+  const result=constructSolidityExperiments({
+    repositoryCommit:'f'.repeat(40),targetPath:typedAbiSnapshot.path,targetSelector:selector,
+    sources:[typedAbiSnapshot],declarations:[
+      {selector,operation:'send' as const,inputs},
+      {selector:'TypedAbi.stage',operation:'call' as const,inputs:[]},
+      {selector:'TypedAbi.amount',operation:'call' as const,inputs:[]},
+      {selector:'TypedAbi.position',operation:'call' as const,inputs:[]},
+    ],
+  });
+  assert.equal(result.ok,true,JSON.stringify(result));
+  if(result.ok)assert.ok(result.experiments.some(experiment=>
+    experiment.sequence.steps.some(step=>step.operation==='send'&&
+      step.function===signature&&JSON.stringify(step.args[0])===JSON.stringify(output))),
+    `Exact enum, user-defined value type and struct ABI must construct: ${signature}`);
+}
+assert.equal(pickFlexibleArg('uint8','amount'),'255',
+  'uint8 probe values must fit the exact ABI width');
+assert.equal(pickFlexibleArg('uint8','status'),'0',
+  'Enum parameters use a valid zero-based ordinal rather than an out-of-range int width');
+assert.equal(pickFlexibleArg('uint8','maturityTimestamp'),null,
+  'An ABI that cannot represent a future timestamp must remain an explicit fixture failure');
+assert.equal(pickFlexibleArg('uint32','maturityTimestamp'),'2000000000',
+  'An absolute timestamp fixture must be future-dated relative to the deterministic EVM clock');
+assert.equal(pickFlexibleArg('uint64','MaxDepositPeriod'),'3000000000',
+  'A maximum duration fixture must accommodate a source-selected future maturation timestamp');
+
 const a=constructSolidityExperiments(input);
 assert.equal(a.ok,true,JSON.stringify(a));
 if(a.ok){
@@ -32,7 +331,17 @@ assert.deepEqual(constructSolidityExperiments(changed).ok,false,'Source hash mus
 const unguarded={...input,sources:[{...input.sources[0],
  content:content.replace('require(msg.sender == owner, "owner only");','')}]};
 unguarded.sources[0].sha256=createHash('sha256').update(unguarded.sources[0].content).digest('hex');
-assert.equal(constructSolidityExperiments(unguarded).ok,false,'No authorization proof, no scenario');
+const unguardedResult=constructSolidityExperiments(unguarded);
+assert.equal(unguardedResult.ok,true,
+  'An unguarded direct setter still has a source-witnessed, getter-verifiable state property');
+if(unguardedResult.ok) {
+ assert.ok(unguardedResult.experiments.some(x=>
+   x.securityProperty.startsWith('source-defined direct state assignment')),
+   'Direct write is only admissible as a state transition, never an invented authorization guard');
+ assert.ok(unguardedResult.experiments.every(x=>
+   !/role mutation|owner-gated|authorization guard/i.test(x.securityProperty)),
+   'Removing the actual owner guard must remove all owner-authorization experiments');
+}
 
 // Regression derived from the 88mphV3 run's actual Vesting02 / BoringOwnable
 // initialization, owner guard and MPHMinter setter. Standalone; no reader.
@@ -42,7 +351,7 @@ const ownable='pragma solidity 0.8.4; contract BoringOwnable {'+
   'function owner() external view returns(address){return _owner;}'+
   'modifier onlyOwner(){require(msg.sender == _owner, "Ownable: caller is not the owner");_;}'+
   '}';
-const vesting='pragma solidity 0.8.4; import {BoringOwnable} from "../libs/BoringOwnable.sol";'+
+const vesting='pragma solidity 0.8.4; import {BoringOwnable} from "@lotus-acquired/boring/BoringOwnable.sol";'+
   'interface IERC20 {} interface MPHMinter {} contract Vesting02 is BoringOwnable {'+
   'IERC20 public token; MPHMinter public mphMinter;'+
   'function initialize(address _token,string calldata tokenName,string calldata tokenSymbol) external initializer {'+
@@ -57,7 +366,8 @@ const vestingInput={
  targetSelector:'Vesting02.setMPHMinter',
  sources:[
   {path:'contracts/rewards/Vesting02.sol',sha256:createHash('sha256').update(vesting).digest('hex'),content:vesting},
-  {path:'contracts/libs/BoringOwnable.sol',sha256:createHash('sha256').update(ownable).digest('hex'),content:ownable}
+  // Canonical package import specifiers are preserved as source identities.
+  {path:'@lotus-acquired/boring/BoringOwnable.sol',sha256:createHash('sha256').update(ownable).digest('hex'),content:ownable}
  ],
  declarations:[{selector:'Vesting02.setMPHMinter',operation:'send' as const,inputs:['address']}]
 };
@@ -131,13 +441,20 @@ contract MPHConverter is PausableUpgradeable, OwnableUpgradeable {
   }
 }`;
 const convSha = createHash('sha256').update(converterSrc).digest('hex');
+const erc20InterfaceSource='pragma solidity 0.8.4; interface IERC20 {}';
+const erc20InterfaceSnapshot={path:'@openzeppelin/contracts/token/ERC20/IERC20.sol',
+  sha256:createHash('sha256').update(erc20InterfaceSource).digest('hex'),content:erc20InterfaceSource};
 for (const sel of ['MPHConverter.pause', 'MPHConverter.unpause', 'MPHConverter.setForeignTokenWhitelist']) {
   const res = constructSolidityExperiments({
     repositoryCommit: 'f'.repeat(40),
     targetPath: 'contracts/rewards/MPHConverter.sol',
     targetSelector: sel,
-    sources: [{path: 'contracts/rewards/MPHConverter.sol', sha256: convSha, content: converterSrc}],
-    declarations: [{selector: sel, operation: 'send', inputs: []}]
+    sources: [
+      {path: 'contracts/rewards/MPHConverter.sol', sha256: convSha, content: converterSrc},
+      erc20InterfaceSnapshot,
+    ],
+    declarations: [{selector: sel, operation: 'send',
+      inputs: sel==='MPHConverter.setForeignTokenWhitelist'?['address','bool']:[]}]
   });
   assert.equal(res.ok, true, sel + ': ' + JSON.stringify(res));
 }
@@ -296,12 +613,13 @@ const boringTransferLib = ownable.replace(
   'modifier onlyOwner',
   'function transferOwnership(address newOwner, bool direct, bool renounce) public onlyOwner {} modifier onlyOwner'
 );
+const relativeVesting=vesting.replace('@lotus-acquired/boring/BoringOwnable.sol','../libs/BoringOwnable.sol');
 const transferBoringRes = constructSolidityExperiments({
   repositoryCommit: 'f'.repeat(40),
   targetPath: vestingInput.targetPath,
   targetSelector: 'Vesting02.transferOwnership',
   sources: [
-    vestingInput.sources[0],
+    {path: vestingInput.targetPath, sha256: createHash('sha256').update(relativeVesting).digest('hex'), content: relativeVesting},
     {path: 'contracts/libs/BoringOwnable.sol', sha256: createHash('sha256').update(boringTransferLib).digest('hex'), content: boringTransferLib},
   ],
   declarations: [
@@ -478,6 +796,124 @@ for (const [name, code] of [['BuggyAccountingVault', buggyVaultSrc], ['FixedAcco
   }
 }
 
+// A source-proven principal ledger remains testable when a separate fee
+// accumulator changes during deposit. The experiment must target principal
+// conservation without silently treating fees as principal.
+const feeAwareLedgerSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract FeeAwareLedger {
+    uint256 public totalDeposits;
+    uint256 public accruedFees;
+    function deposit(uint256 amount) external {
+        uint256 fee = amount / 10;
+        accruedFees += fee;
+        totalDeposits += amount;
+    }
+    function withdraw(uint256 amount) external {
+        totalDeposits -= amount;
+    }
+}`;
+const feeAwareLedgerRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: 'contracts/FeeAwareLedger.sol',
+  targetSelector: 'FeeAwareLedger.withdraw',
+  sources: [{path: 'contracts/FeeAwareLedger.sol', sha256: createHash('sha256').update(feeAwareLedgerSrc).digest('hex'), content: feeAwareLedgerSrc}],
+  declarations: [
+    {selector: 'FeeAwareLedger.deposit', operation: 'send', inputs: ['uint256']},
+    {selector: 'FeeAwareLedger.withdraw', operation: 'send', inputs: ['uint256']},
+    {selector: 'FeeAwareLedger.totalDeposits', operation: 'call', inputs: []},
+    {selector: 'FeeAwareLedger.accruedFees', operation: 'call', inputs: []},
+  ],
+});
+assert.equal(feeAwareLedgerRes.ok, true, 'A fee accumulator must not block principal-ledger conservation');
+if (feeAwareLedgerRes.ok) {
+  const principalExperiment = feeAwareLedgerRes.experiments.find((e) => e.securityProperty === 'financial conservation invariant (deposit->withdraw)');
+  assert.ok(principalExperiment, 'Fee-bearing deposit must retain a principal conservation experiment');
+  assert.ok(principalExperiment!.sequence.steps.some((s) => s.operation === 'call' && s.function === 'totalDeposits()' && s.expect === '600'),
+    'Principal conservation must assert totalDeposits() == 600');
+  assert.ok(!principalExperiment!.sequence.steps.some((s) => s.operation === 'call' && s.function === 'accruedFees()'),
+    'Principal experiment must not assert an unmodeled fee ledger');
+}
+
+// ABI order is not a reliable proxy for the accounting amount. Source deltas
+// identify wad even though it is not the last uint; the remaining timestamp,
+// position ID and bool arguments are filled from their typed names.
+const typedLedgerSrc = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract TypedLedger {
+    uint256 public totalDeposits;
+    function deposit(uint64 maturityTimestamp, uint256 wad) external {
+        require(maturityTimestamp > block.timestamp);
+        totalDeposits += wad;
+    }
+    function withdraw(uint64 depositId, uint256 shares, bool early) external {
+        require(depositId == 1);
+        early;
+        totalDeposits -= shares;
+    }
+}`;
+const typedLedgerRes = constructSolidityExperiments({
+  repositoryCommit: 'e'.repeat(40),
+  targetPath: 'contracts/TypedLedger.sol',
+  targetSelector: 'TypedLedger.withdraw',
+  sources: [{path: 'contracts/TypedLedger.sol', sha256: createHash('sha256').update(typedLedgerSrc).digest('hex'), content: typedLedgerSrc}],
+  declarations: [
+    {selector: 'TypedLedger.deposit', operation: 'send', inputs: ['uint64', 'uint256']},
+    {selector: 'TypedLedger.withdraw', operation: 'send', inputs: ['uint64', 'uint256', 'bool']},
+    {selector: 'TypedLedger.totalDeposits', operation: 'call', inputs: []},
+  ],
+});
+assert.equal(typedLedgerRes.ok, true, 'Source-proven accounting must support extra typed ABI inputs');
+if (typedLedgerRes.ok) {
+  const plan = typedLedgerRes.experiments.find((e) => e.securityProperty === 'financial conservation invariant (deposit->withdraw)');
+  assert.ok(plan, 'Typed deposit and withdrawal must yield financial conservation');
+  const steps = plan!.sequence.steps;
+  const deposit = steps.find((s) => s.operation === 'send' && s.function === 'deposit(uint64,uint256)');
+  const withdraw = steps.find((s) => s.operation === 'send' && s.function === 'withdraw(uint64,uint256,bool)');
+  assert.deepEqual(deposit && 'args' in deposit ? deposit.args : null, ['2000000000', '1000']);
+  assert.deepEqual(withdraw && 'args' in withdraw ? withdraw.args : null, ['1', '400', false]);
+}
+
+// Internal collection helpers need to feed both source-backed pair discovery
+// and the observable length getter. The asserted transition must be 0 -> 1 -> 0.
+{
+  const code=`pragma solidity ^0.8.20;
+contract PositionBook {
+  struct Position { uint256 amount; }
+  Position[] private positions;
+  function deposit(uint256 amount) external { _append(amount); }
+  function withdraw(uint256 amount) external { _remove(amount); }
+  function _append(uint256 amount) internal {
+    positions.push(Position({amount:amount}));
+  }
+  function _remove(uint256 amount) internal {
+    require(positions[positions.length-1].amount>=amount);
+    positions.pop();
+  }
+  function positionsLength() external view returns(uint256) { return positions.length; }
+}`;
+  const path='contracts/PositionBook.sol';
+  const result=constructSolidityExperiments({
+    repositoryCommit:'e'.repeat(40),targetPath:path,targetSelector:'PositionBook.withdraw',
+    sources:[{path,sha256:createHash('sha256').update(code).digest('hex'),content:code}],
+    declarations:[
+      {selector:'PositionBook.deposit',operation:'send' as const,inputs:['uint256']},
+      {selector:'PositionBook.withdraw',operation:'send' as const,inputs:['uint256']},
+      {selector:'PositionBook.positionsLength',operation:'call' as const,inputs:[]},
+    ],
+  });
+  assert.equal(result.ok,true,'Internal push/pop accounting must construct');
+  if(result.ok){
+    const experiment=result.experiments.find(e=>e.securityProperty==='financial other invariant (deposit->withdraw)');
+    assert.ok(experiment,'Collection lifecycle must be classified as an independent source property');
+    const steps=experiment!.sequence.steps;
+    assert.ok(steps.some(s=>s.operation==='call'&&s.function==='positionsLength()'&&s.expect==='0'));
+    assert.ok(steps.some(s=>s.operation==='call'&&s.function==='positionsLength()'&&s.expect==='1'));
+    assert.equal(steps.filter(s=>s.operation==='send'&&
+      ['deposit(uint256)','withdraw(uint256)'].includes(s.function)).length,2);
+  }
+}
+
 // Verified module operator rotation and bounded funding construction, source-only.
 {
   const operatorSrc=`pragma solidity ^0.8.20;
@@ -589,6 +1025,33 @@ const mintBurnRes = constructSolidityExperiments({
   ],
 });
 assert.equal(mintBurnRes.ok, true, 'Mint/burn conservation invariant must construct');
+
+// Equivalent source-proven financial ledgers can use commutative SafeMath
+// ordering. The deposited amount stays exact and is paired with the same
+// source-written outflow before the planner constructs a conservation probe.
+for(const [name,credit] of [
+  ['ReverseAddLedger','total = amount + total;'],
+  ['ReverseSafeMathLedger','total = amount.add(total);'],
+] as const){
+  const source=`pragma solidity ^0.8.20;
+contract ${name} {
+  uint256 public total;
+  function deposit(uint256 amount) external { ${credit} }
+  function withdraw(uint256 amount) external { total = total.sub(amount); }
+}`;
+  const path=`contracts/${name}.sol`;
+  const result=constructSolidityExperiments({repositoryCommit:'d'.repeat(40),
+    targetPath:path,targetSelector:`${name}.withdraw`,
+    sources:[{path,content:source,sha256:createHash('sha256').update(source).digest('hex')}],
+    declarations:[{selector:`${name}.deposit`,operation:'send',inputs:['uint256']},
+      {selector:`${name}.withdraw`,operation:'send',inputs:['uint256']},
+      {selector:`${name}.total`,operation:'call',inputs:[]}],
+  });
+  assert.equal(result.ok,true,`${name} must retain its source-exact amount and conservation proof: `+
+    JSON.stringify(result));
+  if(result.ok)assert.ok(result.experiments.some(item=>
+    item.securityProperty===`financial conservation invariant (deposit->withdraw)`));
+}
 
 // 4. Negative control: private state without public getters -> UNKNOWN_ASSERTION(missing_observable_state)
 const privateVaultSrc = `pragma solidity ^0.8.20;
@@ -729,7 +1192,7 @@ const erc20VaultRes = constructSolidityExperiments({
 assert.equal(erc20VaultRes.ok, true, 'Acquired-source ERC20 vault with MockERC20 must construct multi-contract fixture');
 if (erc20VaultRes.ok) {
   const exp = erc20VaultRes.experiments.find((e) => e.securityProperty.includes('conservation'));
-  assert.ok(exp, 'Expected conservation invariant experiment for CoreERC20Vault');
+  assert.ok(exp, 'Expected conservation invariant experiment for CoreERC20Vault: '+JSON.stringify(erc20VaultRes));
   assert.equal(exp!.sequence.preparation?.deployments?.[0]?.id, 'token');
   assert.equal(exp!.sequence.preparation?.deployments?.[0]?.file, mockErc20Snap.path);
   assert.deepEqual(exp!.sequence.constructorArgs, ['$deployment:token']);
@@ -793,7 +1256,8 @@ const benqiRes = constructSolidityExperiments({
 assert.equal(benqiRes.ok, false, 'External Benqi market adapter with ICERC20/IComptroller must refuse');
 if (!benqiRes.ok) {
   assert.equal(benqiRes.code, 'UNKNOWN_ASSERTION');
-  assert.equal(benqiRes.unresolvedCategory, 'unresolved_dependency');
+  assert.ok(['unresolved_dependency','missing_fixture'].includes(benqiRes.unresolvedCategory||''),
+    'Benqi must remain blocked with its concrete dependency or deployment-fixture reason');
 }
 
 // 8. Abstract contract with acquired concrete subclass reports subclass hint cleanly
@@ -919,6 +1383,90 @@ if(ledgerProof.ok){
   if(experiment!.sequence.steps[2].operation==='call')
     assert.equal(experiment!.sequence.steps[2].expect,'1000');
 }
+
+// A direct, literal fee formula is a separate source-derived scalar property;
+// its expected state change is computed with Solidity integer division.
+const feeFormulaSource=`pragma solidity ^0.8.20;
+contract FeeLedger {
+  uint256 public principal;
+  uint256 public fees;
+  function deposit(uint256 amount) external {
+    principal += amount;
+    fees += amount * 100 / 10000;
+  }
+}`;
+const feeFormulaSnapshot={path:'contracts/FeeLedger.sol',content:feeFormulaSource,
+  sha256:createHash('sha256').update(feeFormulaSource).digest('hex')};
+const feeFormulaPlan=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:feeFormulaSnapshot.path,
+  targetSelector:'FeeLedger.deposit',sources:[feeFormulaSnapshot],
+  declarations:[{selector:'FeeLedger.deposit',operation:'send',inputs:['uint256']},
+    {selector:'FeeLedger.principal',operation:'call',inputs:[]},
+    {selector:'FeeLedger.fees',operation:'call',inputs:[]}],
+});
+assert.equal(feeFormulaPlan.ok,true,JSON.stringify(feeFormulaPlan));
+if(feeFormulaPlan.ok){
+  const feeExperiment=feeFormulaPlan.experiments.find(x=>
+    x.sequence.sourceProperty?.kind==='scalar_delta'&&
+    x.sequence.sourceProperty.state==='fees');
+  assert.ok(feeExperiment,'A literal source-derived fee transition should be executable');
+  assert.deepEqual(feeExperiment!.sequence.sourceProperty?.formula,
+    {multiplier:'100',divisor:'10000'});
+  assert.equal(feeExperiment!.sequence.sourceProperty?.amount,'10001');
+  assert.equal(feeExperiment!.sequence.sourceProperty?.expectedDelta,'100');
+  const post=feeExperiment!.sequence.steps.at(-1);
+  assert.equal(post?.operation,'call');
+  if(post?.operation==='call')assert.equal(post.expect,'100');
+}
+const typedScalarSource=`pragma solidity ^0.8.20;
+contract TypedScalar {
+  uint256 public totalDeposits;
+  function deposit(uint256 amount) external { totalDeposits += amount; }
+  function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {
+    require(maturityTimestamp>block.timestamp);
+    if (enabled) { totalDeposits+=wad; }
+  }
+}`;
+const typedScalarSnapshot={path:'contracts/TypedScalar.sol',content:typedScalarSource,
+  sha256:createHash('sha256').update(typedScalarSource).digest('hex')};
+const typedScalarPlan=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:typedScalarSnapshot.path,
+  targetSelector:'TypedScalar.deposit',sources:[typedScalarSnapshot],
+  declarations:[
+    {selector:'TypedScalar.deposit',operation:'send',inputs:['uint64','uint256','bool']},
+    {selector:'TypedScalar.totalDeposits',operation:'call',inputs:[]},
+  ],
+});
+assert.equal(typedScalarPlan.ok,true,'Single-operation scalar deltas should support typed non-amount inputs');
+if(typedScalarPlan.ok){
+  const experiment=typedScalarPlan.experiments.find(x=>
+    x.sequence.sourceProperty?.kind==='scalar_delta'&&
+    x.sequence.sourceProperty.method==='deposit(uint64,uint256,bool)');
+  assert.ok(experiment,'The source-exact amount parameter must produce a scalar delta experiment');
+  const send=experiment!.sequence.steps.find(step=>step.operation==='send');
+  assert.deepEqual(send&&'args'in send?send.args:null,['2000000000','1000',true]);
+}
+const ambiguousBooleanSource=typedScalarSource.replace(
+  'if (enabled) { totalDeposits+=wad; }',
+  'if (enabled && wad > 0) { totalDeposits+=wad; }');
+const ambiguousBooleanSnapshot={path:'contracts/TypedScalar.sol',
+  content:ambiguousBooleanSource,
+  sha256:createHash('sha256').update(ambiguousBooleanSource).digest('hex')};
+const ambiguousBooleanPlan=constructSolidityExperiments({
+  repositoryCommit:'f'.repeat(40),targetPath:ambiguousBooleanSnapshot.path,
+  targetSelector:'TypedScalar.deposit',sources:[ambiguousBooleanSnapshot],
+  declarations:[
+    {selector:'TypedScalar.deposit',operation:'send',inputs:['uint256']},
+    {selector:'TypedScalar.deposit',operation:'send',inputs:['uint64','uint256','bool']},
+    {selector:'TypedScalar.totalDeposits',operation:'call',inputs:[]},
+  ],skipLegacy:true,
+});
+assert.equal(ambiguousBooleanPlan.ok,true,JSON.stringify(ambiguousBooleanPlan));
+if(ambiguousBooleanPlan.ok)
+  assert.equal(ambiguousBooleanPlan.experiments.some(e=>
+    e.sequence.sourceProperty?.kind==='scalar_delta'&&
+    e.sequence.sourceProperty.method==='deposit(uint64,uint256,bool)'),false,
+    'A compound bool guard must not receive an unproven false fixture');
 // An external dependency is not converted into a certified local scalar proof.
 const externalLedgerSource=ledgerSource.replace('reserve += amount;',
   'IProtocol(protocol).deposit(amount); reserve += amount;');
@@ -970,6 +1518,96 @@ if(clonedProperty.ok){
   assert.ok(plan!.witnesses.some(w=>w.path===cloneFactory.path));
   assert.equal(plan!.sequence.steps.some(step=>step.operation==='send'&&
     step.function==='initialize(address)'),false,'Factory already initialized the clone');
+}
+
+// A source-proven position getter may supply a withdrawal amount dynamically.
+// The planner must observe the exact stored field, use it as the withdrawal
+// argument, and retain getter/field witnesses instead of guessing a constant.
+const dynamicPositionSource=`pragma solidity ^0.8.20;
+library SafeMath { function div(uint256 a,uint256 b) internal pure returns(uint256){return a/b;} }
+contract DynamicVault {
+  using SafeMath for uint256;
+  uint256 public totalDeposit;
+  uint256 public totalInterestOwed;
+  uint256 public totalFeeOwed;
+  uint256 constant PRECISION=1e18;
+  struct Deposit { uint256 virtualTokenTotalSupply; uint256 interestRate; }
+  Deposit[] internal deposits;
+  function deposit(uint256 depositAmount,uint64 maturationTimestamp) external {
+    _deposit(depositAmount,maturationTimestamp);
+  }
+  function _deposit(uint256 depositAmount,uint64 maturationTimestamp) internal {
+    uint256 interestAmount=depositAmount; uint256 feeAmount=depositAmount;
+    deposits.push(Deposit(depositAmount,0)); totalDeposit += depositAmount;
+    totalInterestOwed += interestAmount; totalFeeOwed += feeAmount;
+  }
+  function withdraw(uint64 depositID,uint256 virtualTokenAmount,bool early) external {
+    _withdraw(depositID,virtualTokenAmount,early);
+  }
+  function _withdraw(uint64 depositID,uint256 virtualTokenAmount,bool early) internal {
+    Deposit storage depositEntry=deposits[depositID-1];
+    uint256 virtualTokenTotalSupply=depositEntry.virtualTokenTotalSupply;
+    if(virtualTokenAmount>virtualTokenTotalSupply){virtualTokenAmount=virtualTokenTotalSupply;}
+    uint256 interestRate=depositEntry.interestRate;
+    uint256 depositAmount=virtualTokenAmount.div(interestRate+PRECISION);
+    uint256 interestAmount=depositAmount; uint256 feeAmount=depositAmount;
+    totalDeposit-=depositAmount;
+    totalInterestOwed-=interestAmount; totalFeeOwed-=feeAmount;
+    depositEntry.virtualTokenTotalSupply-=virtualTokenAmount;
+  }
+  function getDeposit(uint64 depositID) external view returns(Deposit memory){return deposits[depositID-1];}
+}`;
+const dynamicPositionSnapshot={path:'contracts/DynamicVault.sol',content:dynamicPositionSource,
+  sha256:createHash('sha256').update(dynamicPositionSource).digest('hex')};
+const dynamicPositionPlan=constructSolidityExperiments({repositoryCommit:'f'.repeat(40),
+  targetPath:dynamicPositionSnapshot.path,targetSelector:'DynamicVault.deposit',
+  sources:[dynamicPositionSnapshot],skipLegacy:true,declarations:[
+    {selector:'DynamicVault.deposit',operation:'send',inputs:['uint256','uint64']},
+    {selector:'DynamicVault.withdraw',operation:'send',inputs:['uint64','uint256','bool']},
+    {selector:'DynamicVault.totalDeposit',operation:'call',inputs:[]},
+    {selector:'DynamicVault.totalInterestOwed',operation:'call',inputs:[]},
+    {selector:'DynamicVault.totalFeeOwed',operation:'call',inputs:[]},
+    {selector:'DynamicVault.getDeposit',operation:'call',inputs:['uint64']},
+  ]});
+assert.equal(dynamicPositionPlan.ok,true,JSON.stringify(dynamicPositionPlan));
+if(dynamicPositionPlan.ok){
+  const dynamicExperiment=dynamicPositionPlan.experiments.find(e=>
+    e.sequence.steps.some(step=>step.operation==='observe'&&step.function==='getDeposit(uint64)'));
+  assert.ok(dynamicExperiment,'A full-position readback must appear before withdrawal');
+  const observedAt=dynamicExperiment!.sequence.steps.findIndex(step=>
+    step.operation==='observe'&&step.function==='getDeposit(uint64)');
+  const withdrawal=dynamicExperiment!.sequence.steps[observedAt+1];
+  assert.equal(withdrawal.operation,'send');
+  assert.equal(withdrawal.function,'withdraw(uint64,uint256,bool)');
+  assert.deepEqual(withdrawal.args,['1','$lastObservation:0',true]);
+  assert.ok(dynamicExperiment!.witnesses.some(w=>w.symbol==='DynamicVault.getDeposit(uint64)'));
+  assert.ok(dynamicExperiment!.witnesses.some(w=>w.symbol==='DynamicVault.Deposit.virtualTokenTotalSupply'));
+  assert.deepEqual(dynamicExperiment!.sequence.steps.filter(step=>
+    step.operation==='call'&&['totalInterestOwed()','totalFeeOwed()'].includes(step.function||'')
+      &&step.expect==='0').map(step=>step.function),
+    ['totalInterestOwed()','totalFeeOwed()','totalInterestOwed()','totalFeeOwed()'],
+    'The fixture must prove both interest and fee ledgers start and finish at zero');
+}
+
+
+const fixtureAlternatives=[
+  {implementationChoices:{IToken:'TokenA.sol:TokenA',IMarket:'MarketA.sol:MarketA'}},
+  {implementationChoices:{IToken:'TokenB.sol:TokenB',IMarket:'MarketB.sol:MarketB'}},
+  {implementationChoices:{IToken:'TokenA.sol:TokenA',IMarket:'MarketB.sol:MarketB'}},
+];
+const representativeAlternatives=representativeFixtureGraphs([
+  ...fixtureAlternatives,{implementationChoices:{}},
+]);
+assert.ok(representativeAlternatives.some(graph=>
+  Object.keys(graph.implementationChoices).length===0),
+  'Unambiguous acquired fixture graphs must be retained');
+assert.ok(representativeAlternatives.length<fixtureAlternatives.length+1,
+  'Redundant cross-product graphs should not all be retried');
+for(const typeName of ['IToken','IMarket']){
+  const expected=new Set(fixtureAlternatives.map(graph=>graph.implementationChoices[typeName]));
+  const covered=new Set(representativeAlternatives.flatMap(graph=>graph.implementationChoices[typeName]?[graph.implementationChoices[typeName]]:[]));
+  assert.deepEqual(covered,expected,
+    'Every concrete acquired implementation must remain represented');
 }
 
 console.log('Standalone experiment construction passed');

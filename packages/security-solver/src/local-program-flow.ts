@@ -6,7 +6,8 @@ import {buildControllerSourceIndex,controllerEvidencePacket} from './controller-
 import {indexedEntryRoutes} from './controller-indexed-route';
 import {privilegedRoleMutationCandidate} from './solidity-security-candidates';
 import {controllerIndexedAuditPrompt} from './controller-index-prompt';
-import {roleConsumerImpactSequence,roleConsumerImpactObserved} from './controller-solidity-consumer-impact';
+import {roleConsumerImpactSequence,roleConsumerImpactObserved,
+  inheritedRoleConsumerImpactSequence,inheritedRoleConsumerImpactObserved} from './controller-solidity-consumer-impact';
 import {sourceCandidateEvidence,verifiedProbeSummary} from './source-candidate-evidence';
 import {rankTracedSourceCandidates} from './controller-source-candidates';
 import {traceSourceCalls,solidityDependentSources,controllerCallerChain} from './source-flow-facts';
@@ -57,7 +58,7 @@ export function normalizeNegativeHuntProse(text: unknown): { findings: []; outco
   }
   return { findings: [], outcome: "no_testable_candidate", reason: trimmed.slice(0, 1000) };
 }
-export const huntSchema=z.object({findings:z.array(candidateSchema).max(8),
+export const huntSchema=z.object({findings:z.array(candidateSchema),
   outcome:z.enum(["inspected","no_testable_candidate"]).optional(),
   reason:z.string().min(20).max(1000).optional()
 }).strict().superRefine((value,ctx)=>{
@@ -282,7 +283,8 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
       const sourceComplete=!!fullSourceIndex?.complete&&read===eligiblePaths.length;
       const candidatesResolved=!!candidateCoverage && candidateCoverage.unresolvedIds.length===0 &&
         candidateCoverage.total===candidateCoverage.experimentsCompleted+
-          candidateCoverage.terminalExhausted+candidateCoverage.blocked;
+          candidateCoverage.sourceUnavailable+candidateCoverage.terminalExhausted+
+          candidateCoverage.blocked;
       const experimentComplete=sourceComplete&&consistent&&fixtureFailed===0&&unsupported===0&&
         observationOnly===0&&unresolved===0&&candidatesResolved;
       return {sourceIndexed:eligiblePaths.length,sourceRead:read,
@@ -338,7 +340,7 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
       await writeFile(join(root,'audit-source-routes.json'),JSON.stringify(routes),
         {mode:0o600});
       let attempted=0,observed=0;
-      for(const route of routes.slice(0,16)){
+      for(const route of routes){
         signal.throwIfAborted();
         const repo=repos.find(r=>route.entry.startsWith(
           relative(root,r.directory).split(sep).join('/')+'/'));
@@ -419,27 +421,59 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
     // inspection determines the role, setter and protected consumer; actual
     // EVM receipt and before/after state determine behavior_observed.
     if(fullSourceIndex && !focus) {
+      // The role mutator and its protected consumer can live in different
+      // acquired files. Keep this source set read-only; the exact sequence
+      // constructor must prove imports, inheritance, guards and accounting.
+      const solidityPeers:Array<{path:string;source:string}>=[];
+      for(const peerPath of eligiblePaths.filter(p=>p.endsWith('.sol'))){
+        try{solidityPeers.push({path:peerPath,
+          source:await readFile(join(root,peerPath),'utf8')});}catch{}
+      }
+      const authorizedPeerSources=solidityPeers.map(peer=>peer.source);
       for(const path of eligiblePaths.filter(p=>p.endsWith('.sol'))) {
         signal.throwIfAborted();
-        if(indexedVerifiedCandidates.length>=8)break;
         const repo=repos.find(r=>path.startsWith(
           relative(root,r.directory).split(sep).join('/')+'/'));
         if(!repo || missingDependencies.has(repo.url))continue;
         try {
           const code=await readFile(join(root,path),'utf8');
-          const role=privilegedRoleMutationCandidate(path,code,[code]);
+          const role=privilegedRoleMutationCandidate(path,code,authorizedPeerSources);
           if(!role)continue;
           if(!new RegExp('\\bfunction\\s+'+role.method+
              '\\s*\\(\\s*address\\s+[A-Za-z_]\\w*\\s*\\)').test(code))continue;
           // The role setter alone is not impact. Require a source-declared
           // protected consumer and execute a negative control before the
           // mutation, then the same consumer after the role transition.
-          const sequence=roleConsumerImpactSequence(code,role.role,role.method);
+          // Try the narrow same-contract case first. For inherited
+          // consumers, prove the acquired peer's import, inheritance, guard
+          // and observable accounting before constructing the attack.
+          let sequence=roleConsumerImpactSequence(code,role.role,role.method);
+          let impactObserved=(observations:unknown)=>
+            roleConsumerImpactObserved(observations,role.role,role.method);
+          if(!sequence){
+            for(const peer of solidityPeers){
+              if(peer.path===path)continue;
+              for(const match of peer.source.matchAll(
+                /\bcontract\s+([A-Za-z_]\w*)\s+is\s+[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*\{/g)){
+                const inherited=inheritedRoleConsumerImpactSequence(
+                  code,peer.source,role.role,role.method,path,peer.path,match[1]);
+                if(!inherited)continue;
+                sequence=inherited;
+                impactObserved=(observations:unknown)=>
+                  inheritedRoleConsumerImpactObserved(observations,role.role,role.method);
+                break;
+              }
+              if(sequence)break;
+            }
+          }
           if(!sequence){
             await appendFile(logFile,'[CONTROLLER_SOLIDITY_IMPACT_UNSUPPORTED] '+
               JSON.stringify({path,role:role.role,reason:'No supported protected consumer sequence'})+'\n');
             continue;
           }
+          await appendFile(logFile,'[CONTROLLER_SOURCE_PROBE_SELECTED] '+JSON.stringify({
+            path,selector:role.selector,kind:'solidity_sequence',
+            origin:'controller-indexed-solidity-role'})+'\n');
           const observation=JSON.parse(await session.probe(
             path,role.selector,'solidity_sequence',sequence));
           await appendFile(logFile,'[PROBE_RESULT] '+JSON.stringify({
@@ -449,7 +483,7 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
           if(observation.status!=='behavior_observed'||
              typeof observation.caseId!=='string'||
              !session.cases.has(observation.caseId) ||
-             !roleConsumerImpactObserved(observation.observations,role.role,role.method)){
+             !impactObserved(observation.observations)){
             await appendFile(logFile,'[CONTROLLER_SOLIDITY_IMPACT_NOT_PROVEN] '+
               JSON.stringify({path,status:observation.status,caseId:observation.caseId||null})+'\n');
             continue;
@@ -488,12 +522,12 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
     if(!focus && process.env.LOCAL_CONTROLLER_OWNED_ACTIONS!=='false') {
       try {
         const ranked=await rankTracedSourceCandidates(root,
-          [...new Set([...sourceHints,...eligiblePaths])],96);
+          [...new Set([...sourceHints,...eligiblePaths])]);
         await appendFile(logFile,'[CONTROLLER_SOURCE_RANKING] '+JSON.stringify({
-          inspectedBudget:96,candidates:ranked.length,
+          inspectedFiles:new Set([...sourceHints,...eligiblePaths]).size,candidates:ranked.length,
           preview:ranked.slice(0,5).map(c=>({path:c.path,selector:c.selector,score:c.score}))
         })+'\n');
-        for(const selected of ranked.slice(0,8)) {
+        for(const selected of ranked) {
           signal.throwIfAborted();
           const repo=repos.find(r=>selected.path.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
           if(!repo || missingDependencies.has(repo.url))continue;
@@ -508,12 +542,12 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
           if(!record || !record.result.behavior_observed)continue;
           const prefix=relative(root,repo.directory).split(sep).join('/')+'/';
           const chain=await controllerCallerChain(root,prefix,selected.path,
-            selected.selector,[...new Set([...sourceHints,...eligiblePaths])],8);
+            selected.selector,[...new Set([...sourceHints,...eligiblePaths])],new Set([...sourceHints,...eligiblePaths]).size+1);
           // Reproduce each import-resolved intermediate caller, rather than
           // jumping directly from a nested helper to a handler.
           const progression=await promoteControllerCallChain({
             start:{path:selected.path,selector:selected.selector,kind:selected.kind,caseId:output.caseId},
-            chain,maxSteps:8,
+            chain,maxSteps:new Set([...sourceHints,...eligiblePaths]).size+1,
             read:path=>readFile(join(root,path),'utf8'),
             references:callerLineReferences,
             supported:async(path,selector)=>path.endsWith('.java')
@@ -577,17 +611,14 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
     const controllerStatefulObservations:Array<{path:string;selector:string;
       kind:string;caseId:string;steps:unknown}>= [];
     if(!focus && process.env.LOCAL_CONTROLLER_OWNED_ACTIONS!=='false') {
-      let budget=2;
-      for(const path of [...new Set(sourceHints)].slice(0,96)) {
-        if(budget<=0)break;
+      for(const path of new Set([...sourceHints,...eligiblePaths])) {
         if(!/\.(?:py|js|cjs|mjs)$/.test(path))continue;
         const repo=repos.find(r=>path.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
         if(!repo || missingDependencies.has(repo.url))continue;
         let code:string;
         try{code=await readFile(join(root,path),'utf8');}catch{continue;}
         for(const plan of sourceStatefulPlans(path,code)) {
-          if(budget<=0)break;
-          signal.throwIfAborted();budget--;
+          signal.throwIfAborted();
           reads.add(path,{start:0,end:code.length});
           try {
             const out=JSON.parse(await session.probe(path,plan.selector,plan.kind,plan.sequence));
@@ -670,7 +701,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
     // independent technical reviewer. This does not approve any vulnerability.
     if(fullSourceIndex && indexedVerifiedCandidates.length) {
       parsed=huntSchema.parse({
-        findings:indexedVerifiedCandidates.slice(0,8),outcome:'inspected'
+        findings:indexedVerifiedCandidates,outcome:'inspected'
       });
       answer=JSON.stringify({controllerEvidenceHandoff:true,
         caseIds:indexedVerifiedCandidates.map(c=>c.caseId),
@@ -951,7 +982,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
             const repository=repos.find(r=>r.url===record.repositoryUrl);
             if(!repository || !reads.has(sourceFileInWorkspace(repository,record.spec.file,root)))continue;
             const matches:Array<{path:string,line:number,code:string,qualified:boolean}>=[];
-            for(const sourcePath of [...new Set([...sourceHints,...eligiblePaths])].slice(0,192)) {
+            for(const sourcePath of new Set([...sourceHints,...eligiblePaths])) {
               if(!sourcePath.startsWith(relative(root,repository.directory).split(sep).join('/')+'/') ||
                  !reads.has(sourcePath))continue;
               try {
@@ -1109,7 +1140,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
                 }
                 if(candidate.reachability==='direct_transaction')continue;
                 const sites:{file:string,line:number,qualified:boolean}[]=[];
-                for(const path of [...new Set([...sourceHints,...eligiblePaths])].slice(0,192)) {
+                for(const path of new Set([...sourceHints,...eligiblePaths])) {
                   const sourceRepo=repos.find(r=>path.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
                   if(!sourceRepo || sourceRepo.url!==record.repositoryUrl || !reads.has(path))continue;
                   try {
@@ -1245,8 +1276,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
               }catch{}
               if(claimedValid)continue;
               const sites:{file:string,line:number}[]=[];
-              for(const candidatePath of [...new Set([...sourceHints,...eligiblePaths])].slice(0,192)) {
-                if(sites.length>=8)break;
+              for(const candidatePath of new Set([...sourceHints,...eligiblePaths])) {
                 const candidateRepo=repos.find(r=>candidatePath.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
                 if(!candidateRepo || candidateRepo.url!==record.repositoryUrl)continue;
                 try {
@@ -1308,8 +1338,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
                 const otherCallers:{file:string,line:number,code:string}[]=[];
                 // Offer exact, previously inspected call sites. Do not infer a
                 // vulnerability or forge caller evidence to fix model output.
-                for(const sourcePath of [...new Set([...sourceHints,...eligiblePaths])].slice(0,40)) {
-                  if(otherCallers.length>=5)break;
+                for(const sourcePath of [...new Set([...sourceHints,...eligiblePaths])]) {
                   const targetRepoPath=sourcePath.replace(/\\/g,'/');
                   const sourceRepo=repos.find(r=>targetRepoPath.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
                   if(!sourceRepo || sourceRepo.url!==record.repositoryUrl)continue;
@@ -1372,7 +1401,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
       const candidate=independentlyProvenCandidate;
       const alreadyPresent=parsed?.findings.some(item=>item.caseId===candidate.caseId);
       if(!alreadyPresent) {
-        parsed={findings:[candidate,...(parsed?.findings||[])].slice(0,8),outcome:'inspected'};
+        parsed={findings:[candidate,...(parsed?.findings||[])],outcome:'inspected'};
         await appendFile(logFile,'[CONTROLLER_PROOF_FOR_REVIEW] '+JSON.stringify({
           caseId:candidate.caseId,source:'controller independent entry reproduction',
           reason:'model nomination is not a requirement for independently reviewed evidence',

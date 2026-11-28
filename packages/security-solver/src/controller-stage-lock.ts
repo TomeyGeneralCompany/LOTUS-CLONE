@@ -117,6 +117,17 @@ export class ControllerStageLock {
    if(this.finalized||!id)throw new Error('DISCOVERY_CLOSED');
    if(!this.candidates.has(id))this.candidates.set(id,null);
  }
+ /** An EXPERIMENT-stage repair may only append a fresh source-witnessed
+  * candidate for a lead in the immutable, fully analyzed source inventory.
+  * Existing candidates, read coverage, and independent completion gates stay
+  * unchanged. No unverified outcome is recorded here. */
+ registerRepairedExperiment(id:string,leadId:string,sourceSha256:string,witnesses:readonly string[]){
+   if(this.stage!=='EXPERIMENT'||!this.inventoryIds?.has(leadId)||
+     !id||this.candidates.has(id)||!(/^[a-f0-9]{64}$/).test(sourceSha256)||
+     !witnesses.length||!witnesses.some(w=>w.includes(sourceSha256)))
+     throw new Error('EXPERIMENT_REPAIR_SOURCE_WITNESS_REQUIRED: '+leadId);
+   this.candidates.set(id,null);
+ }
  noteSourcePreclassified(path:string,status:'indexed-options-built'|'source-unavailable'){
     if(this.stage!=='ANALYZE'||!this.coverage.hasIndexed(path)||this.sourcePreclassified.has(path))
       throw new Error('INVALID_SOURCE_PRECLASSIFICATION');
@@ -205,6 +216,17 @@ export class ControllerStageLock {
    this.candidates.set(id,result);
    this.reviews.set(id,false);
  }
+ /** The caller must have independently validated source-bound evidence for
+  * the replacement across every lead sharing the original experiment. */
+ retireVerifiedInconclusive(oldId:string,replacementId:string){
+   if(this.stage!=='EXPERIMENT'||oldId===replacementId||
+     !['observation_only','incomplete','unsupported','rejected']
+       .includes(String(this.candidates.get(oldId)))||
+     !['observed','not_observed'].includes(String(this.candidates.get(replacementId))))
+     throw new Error('INCONCLUSIVE_RETIREMENT_REQUIRES_VERIFIED_REPLACEMENT');
+   this.candidates.delete(oldId);
+   this.reviews.delete(oldId);
+ }
  completeExperiments(certificate?:import('./deterministic/analysis-progress-store').LeadExperimentCertificate){
    if(this.stage!=='EXPERIMENT'||this.completedCount!==this.candidateCount)
      throw new Error('EXPERIMENTS_INCOMPLETE');
@@ -213,13 +235,32 @@ export class ControllerStageLock {
    if(this.inventoryIds!==null&&this.inventoryIds.size>0){
      const ids=[...this.inventoryIds].sort();
      const digest=createHash('sha256').update(JSON.stringify(ids)).digest('hex');
-     if(!certificate||certificate.version!==1||certificate.manifestDigest!==digest||
-        certificate.total!==ids.length||certificate.conclusive!==ids.length||
-        certificate.unresolvedIds.length!==0||!(/^[a-f0-9]{64}$/).test(certificate.evidenceDigest)||
-        certificate.evidenceCount<ids.length)
+     const unavailable=certificate?.version===2?certificate.sourceUnavailable:0;
+     const unavailableIds=certificate?.version===2?certificate.sourceUnavailableIds:[];
+     const unavailableDigest=certificate?.version===2?
+       certificate.unavailabilityEvidenceDigest:"";
+     const unresolvedIds=certificate?.unresolvedIds||[];
+     const explicitlyUnresolvedIds=certificate?.explicitlyUnresolvedIds||[];
+     const pendingReasons=certificate?.pendingReasons||{};
+     if(!certificate||![1,2].includes(certificate.version)||certificate.manifestDigest!==digest||
+        certificate.total!==ids.length||
+        certificate.conclusive+unavailable+unresolvedIds.length!==ids.length||
+        unavailableIds.length!==unavailable||
+        new Set(unavailableIds).size!==unavailable||
+        unavailableIds.some(id=>!this.inventoryIds!.has(id))||
+        unresolvedIds.some(id=>!this.inventoryIds!.has(id)||unavailableIds.includes(id))||
+        new Set(unresolvedIds).size!==unresolvedIds.length||
+        JSON.stringify([...explicitlyUnresolvedIds].sort())!==JSON.stringify([...unresolvedIds].sort())||
+        unresolvedIds.some(id=>!Array.isArray(pendingReasons[id])||
+          pendingReasons[id].length===0||pendingReasons[id].some(reason=>!reason.trim()))||
+        (certificate.version===2&&!(/^[a-f0-9]{64}$/).test(unavailableDigest))||
+        !(/^[a-f0-9]{64}$/).test(certificate.evidenceDigest)||
+        certificate.evidenceCount<certificate.conclusive)
         throw new Error('EXPERIMENT_LEAD_COVERAGE_INCOMPLETE: '+
-          (certificate?certificate.conclusive+'/'+certificate.total+' evidence-backed leads; '+
-            certificate.unresolvedIds.length+' unresolved':'missing completion certificate'));
+          (certificate?certificate.conclusive+' experimentally verified + '+
+            unavailable+' independently verified source-unavailable + '+
+            unresolvedIds.length+' explicitly unresolved / '+
+            certificate.total+' original leads':'missing completion certificate'));
      if(this.outcomeCounts.observation_only||this.outcomeCounts.incomplete||
         this.outcomeCounts.unsupported||this.outcomeCounts.rejected||
         this.outcomeCounts.pending)

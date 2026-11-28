@@ -27,11 +27,12 @@ def _strip_comments(text: str) -> str:
     return re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", text)
 
 
-def _extract_fn_body(source: str, fn_name: str) -> Tuple[str, str]:
+def _extract_fn_bodies(source: str, fn_name: str) -> list[Tuple[str, str]]:
     cleaned = _strip_comments(source)
     pattern = re.compile(
         r"\bfunction\s+" + re.escape(fn_name) + r"\s*\([^)]*\)\s*(?:external|public)\b[^;{]*\{"
     )
+    out=[]
     for m in pattern.finditer(cleaned):
         depth = 1
         pos = m.end()
@@ -42,7 +43,14 @@ def _extract_fn_body(source: str, fn_name: str) -> Tuple[str, str]:
                 depth -= 1
             pos += 1
         if depth == 0:
-            return m.group(0), cleaned[m.end():pos - 1]
+            out.append((m.group(0),cleaned[m.end():pos - 1]))
+    return out
+
+
+def _extract_fn_body(source: str, fn_name: str) -> Tuple[str, str]:
+    bodies=_extract_fn_bodies(source,fn_name)
+    if bodies:
+        return bodies[0]
     return "", ""
 
 
@@ -473,44 +481,101 @@ def _asserted_source_scalar_delta(
     parameter=property_spec.get("parameter")
     method=property_spec.get("method")
     amount=property_spec.get("amount")
+    formula=property_spec.get("formula")
+    expected_delta=property_spec.get("expectedDelta")
     if not all(isinstance(v,str) and re.fullmatch(r"[A-Za-z_]\w*",v)
                for v in (state,parameter)):
         return None
     if not isinstance(amount,str) or not re.fullmatch(r"(?:0|[1-9][0-9]{0,29})",amount) or int(amount)==0:
         return None
-    if not isinstance(method,str) or not re.fullmatch(r"[A-Za-z_]\w*\(uint(?:[0-9]{1,3})?\)",method):
+    method_match = re.fullmatch(r"([A-Za-z_]\w*)\(([^()]*)\)", method) if isinstance(method,str) else None
+    if not method_match:
         return None
-    if selector.rsplit(".",1)[-1]!=method.split("(",1)[0]:
+    method_name=method_match.group(1)
+    declared_types=[] if not method_match.group(2) else method_match.group(2).split(",")
+    if not declared_types or selector.rsplit(".",1)[-1]!=method_name:
         return None
     source=_strip_comments(text)
-    if not re.search(r"\buint(?:[0-9]{1,3})?\s+public\s+"+re.escape(state)+r"\s*;",source):
+    public_state=bool(re.search(r"\buint(?:[0-9]{1,3})?\s+public\s+"+re.escape(state)+r"\s*;",source))
+    def parse_parameters(header_text):
+        signature_match=re.search(r"\bfunction\s+"+re.escape(method_name)+r"\s*\(([^)]*)\)",header_text)
+        if not signature_match:return None
+        declarations=[part.strip() for part in signature_match.group(1).split(",")]
+        if len(declarations)!=len(declared_types):return None
+        parsed=[]
+        for declaration in declarations:
+            item=re.fullmatch(
+                r"(uint(?:[0-9]{1,3})?|int(?:[0-9]{1,3})?|address(?:\s+payable)?|bool|string|bytes(?:[1-9]|[12][0-9]|3[012])?)"
+                r"\s+(?:(?:memory|calldata|storage)\s+)?([A-Za-z_]\w*)",declaration)
+            if not item:return None
+            abi_type=re.sub(r"\s+payable$","",item.group(1))
+            if abi_type=="uint":abi_type="uint256"
+            if abi_type=="int":abi_type="int256"
+            parsed.append((abi_type,item.group(2)))
+        return parsed if [item[0] for item in parsed]==declared_types else None
+    selected=next(((candidate_header,candidate_body,parsed)
+        for candidate_header,candidate_body in _extract_fn_bodies(source,method_name)
+        if (parsed:=parse_parameters(candidate_header)) is not None),None)
+    if not selected:
         return None
-    name=method.split("(",1)[0]
-    header,fn_body=_extract_fn_body(source,name)
-    if not header or not fn_body:
+    header,fn_body,source_parameters=selected
+    amount_indexes=[i for i,(abi_type,param_name) in enumerate(source_parameters)
+                    if param_name==parameter and abi_type.startswith("uint")]
+    if len(amount_indexes)!=1:
         return None
-    signature_match=re.search(r"\bfunction\s+"+re.escape(name)+r"\s*\(([^)]*)\)",header)
-    if not signature_match:
-        return None
-    declaration=signature_match.group(1).strip()
-    # Only exactly one declared scalar parameter; never select a different
-    # overload by name or infer an ABI from a guessed signature.
-    declared=re.fullmatch(r"(uint(?:[0-9]{1,3})?)\s+(?:(?:memory|calldata)\s+)?"+
-                          re.escape(parameter),declaration)
-    if not declared or method!=name+"("+declared.group(1)+")":
-        return None
-    if not re.search(r"\b"+re.escape(state)+r"\s*\+=\s*"+
-                     re.escape(parameter)+r"\s*;",fn_body):
-        return None
+    if formula is None:
+        if expected_delta is not None or not re.search(
+            r"\b"+re.escape(state)+r"\s*\+=\s*"+
+            re.escape(parameter)+r"\s*;",fn_body):
+            return None
+        expected_state_delta=amount
+    else:
+        if (not isinstance(formula,dict) or
+                set(formula)!={"multiplier","divisor"} or
+                any(not isinstance(formula.get(k),str) or
+                    not re.fullmatch(r"[1-9][0-9]{0,9}",formula[k])
+                    for k in ("multiplier","divisor")) or
+                not isinstance(expected_delta,str) or
+                not re.fullmatch(r"(?:0|[1-9][0-9]{0,29})",expected_delta)):
+            return None
+        formula_match=re.search(
+            r"\b"+re.escape(state)+r"\s*\+=\s*"+re.escape(parameter)+
+            r"\s*(?:\*\s*([1-9][0-9]{0,9}))?\s*/\s*([1-9][0-9]{0,9})\s*;",
+            fn_body)
+        if (not formula_match or
+                (formula_match.group(1) or "1")!=formula["multiplier"] or
+                formula_match.group(2)!=formula["divisor"]):
+            return None
+        expected_state_delta=str(
+            int(amount)*int(formula["multiplier"])//int(formula["divisor"])
+        )
+        if expected_state_delta!=expected_delta or expected_state_delta=="0":
+            return None
     if len(actual_steps)!=len(requested_steps):
         return None
-    getter=state+"()"
+    getter=state+"()" if public_state else None
+    if not getter:
+        for step in requested_steps:
+            if step.get("operation")!="call" or step.get("args")!=[]:
+                continue
+            candidate=str(step.get("function",""))
+            getter_name=candidate.split("(",1)[0]
+            getter_header,getter_body=_extract_fn_body(source,getter_name)
+            if (getter_header and getter_body and
+                re.search(r"\breturns\s*\(\s*uint(?:[0-9]{1,3})?\s*(?:[A-Za-z_]\w*)?\s*\)",getter_header) and
+                re.search(r"\breturn\s+"+re.escape(state)+r"\s*;",getter_body)):
+                getter=candidate
+                break
+    if not getter:return None
     calls=[i for i,step in enumerate(requested_steps)
            if step.get("operation")=="call" and step.get("function")==getter
            and step.get("args")==[]]
     sends=[i for i,step in enumerate(requested_steps)
            if step.get("operation")=="send" and step.get("function")==method
-           and step.get("args")==[amount] and not step.get("deploymentId")]
+           and isinstance(step.get("args"),list) and
+           len(step.get("args"))==len(source_parameters) and
+           step.get("args")[amount_indexes[0]]==amount and
+           not step.get("deploymentId")]
     if len(calls)!=2 or len(sends)!=1 or not(calls[0]<sends[0]<calls[1]):
         return None
     pre,transaction,post=(actual_steps[i] for i in (calls[0],sends[0],calls[1]))
@@ -520,16 +585,233 @@ def _asserted_source_scalar_delta(
     if pre.get("operation")!="call" or post.get("operation")!="call" or \
        transaction.get("operation")!="send":
         return None
-    if str(pre.get("actual"))!="0" or str(post.get("actual"))!=amount:
+    if str(pre.get("actual"))!="0" or str(post.get("actual"))!=expected_state_delta:
         return None
     if requested_steps[calls[0]].get("expect")!="0" or \
-       requested_steps[calls[1]].get("expect")!=amount:
+       requested_steps[calls[1]].get("expect")!=expected_state_delta:
         return None
     return ("source_scalar_delta_negative",
-            "Source-identified public scalar increment executed in the isolated EVM; "
+            "Source-identified scalar increment executed in the isolated EVM; "
             "the prestate, successful transaction and poststate agree with the "
-            "source-derived bounded conservation equation. This proves only "
+            "source-derived bounded state-transition equation"+
+            (" including the exact integer multiplier/divisor formula" if formula else "")+
+            ". This proves only "
             "the tested input and fixture state.")
+
+def _source_witnessed_direct_assignment_negative(
+    file: Path, selector: str, requested_steps: list,
+    actual_steps: list, accounts: list | None,
+) -> tuple[str, str] | None:
+    """Complete a narrowly falsifiable exact-source storage assignment test.
+
+    This is NOT proof of authorization, absence of a vulnerability, or
+    production reachability. It verifies the selected direct assignment
+    through a real successful EVM send and the compiler-generated getter.
+    The positive unauthorized-transition classifier runs first.
+    """
+    if not isinstance(accounts, list) or len(accounts) != 3:
+        return None
+    if not isinstance(requested_steps, list) or len(requested_steps) != len(actual_steps):
+        return None
+    method = selector.rsplit(".", 1)[-1]
+    try:
+        source = _strip_comments(file.read_text(encoding="utf8"))
+    except OSError:
+        return None
+    header, body = _extract_fn_body(source, method)
+    if not header or not body:
+        return None
+    # Binding must be the actual ABI parameter, with a matching source
+    # public getter. A made-up getter or storage alias is not sufficient.
+    declared = re.search(
+        r"\bfunction\s+" + re.escape(method) +
+        r"\s*\(\s*(address|bool|u?int(?:\d{0,3})?)\s+([A-Za-z_]\w*)\s*\)"
+        r"\s*(?:external|public)\b",
+        header)
+    if not declared:
+        return None
+    param_type, parameter = declared.groups()
+    assignments = re.findall(
+        r"\b([A-Za-z_]\w*)\s*=\s*" + re.escape(parameter) + r"\s*;", body)
+    if len(assignments) != 1:
+        return None
+    state = assignments[0]
+    if not re.search(
+        r"\b" + re.escape(param_type) + r"\s+public\s+" +
+        re.escape(state) + r"\s*;", source):
+        return None
+    if len(re.findall(r"\b" + re.escape(state) + r"\s*(?:=|\+=|-=)", body)) != 1:
+        return None
+    # A direct source observation must have the exact same getter name,
+    # a real old-value observation, and a successful post-state readback.
+    getter = state + "()"
+    before = next((i for i, step in enumerate(requested_steps)
+                   if step.get("operation") in ("observe", "call")
+                   and step.get("function") == getter
+                   and actual_steps[i].get("operation") in ("observe", "call")
+                   and actual_steps[i].get("actual") is not None), None)
+    target = next((i for i, step in enumerate(requested_steps)
+                   if step.get("operation") == "send"
+                   and step.get("function", "").split("(", 1)[0] == method
+                   and step.get("sender") == 0
+                   and len(step.get("args", [])) == 1
+                   and actual_steps[i].get("passed") is True
+                   and actual_steps[i].get("reverted") is False), None)
+    if before is None or target is None or before >= target:
+        return None
+    after = next((i for i in range(target + 1, len(requested_steps))
+                  if requested_steps[i].get("operation") == "call"
+                  and requested_steps[i].get("function") == getter
+                  and actual_steps[i].get("passed") is True), None)
+    if after is None:
+        return None
+    requested_value = requested_steps[target]["args"][0]
+    if isinstance(requested_value, str) and re.fullmatch(r"\$account[0-2]", requested_value):
+        expected = accounts[int(requested_value[-1])]
+    elif isinstance(requested_value, (str, int, bool)):
+        expected = requested_value
+    else:
+        return None
+    actual = actual_steps[after].get("actual")
+    if str(actual).lower() != str(expected).lower():
+        return None
+    if str(actual_steps[before].get("actual")).lower() == str(actual).lower():
+        return None  # not a witnessed state transition
+    return (
+        "source_direct_assignment_negative",
+        "Acquired public state "+state+" was observed before and after a successful "
+        "selected EVM transaction. Exact source assignment, concrete ABI argument "
+        "and compiler getter agree. This is a bounded property test, not a "
+        "claim that other security properties or threats are absent."
+    )
+
+
+def _source_witnessed_funded_mapping_negative(
+    file: Path, selector: str, requested_steps: list,
+    actual_steps: list,
+) -> tuple[str, str] | None:
+    """A tested cross-function source relation, not inferred security absence.
+
+    Both the funding and settlement lvalue arithmetic must be present in the
+    acquired file, and the isolated EVM must confirm each actual transaction
+    plus independent before/after readbacks for BOTH storage values.
+    """
+    if not isinstance(requested_steps, list) or not requested_steps or \
+       len(requested_steps) != len(actual_steps):
+        return None
+    try:
+        source = _strip_comments(file.read_text(encoding="utf8"))
+    except OSError:
+        return None
+    method = selector.rsplit(".", 1)[-1]
+    header, body = _extract_fn_body(source, method)
+    if not header or not body:
+        return None
+    signature = re.search(
+        r"\bfunction\s+" + re.escape(method) +
+        r"\s*\(\s*address\s+([A-Za-z_]\w*)\s*,\s*uint(?:256)?\s+([A-Za-z_]\w*)\s*\)",
+        header,
+    )
+    if not signature:
+        return None
+    account_key, amount_key = signature.groups()
+    mapping = re.search(
+        r"\bmapping\s*\(\s*address\s*=>\s*uint(?:256)?\s*\)\s*public\s+([A-Za-z_]\w*)\s*;",
+        source,
+    )
+    total = re.search(r"\buint(?:256)?\s+public\s+([A-Za-z_]\w*)\s*;", source)
+    if not mapping or not total:
+        return None
+    account, scalar = mapping.group(1), total.group(1)
+    if not re.search(r"\b" + re.escape(account) +
+                     r"\s*\[\s*" + re.escape(account_key) +
+                     r"\s*\]\s*\+=\s*" + re.escape(amount_key) + r"\s*;", body):
+        return None
+    if not re.search(r"\b" + re.escape(scalar) +
+                     r"\s*-=\s*" + re.escape(amount_key) + r"\s*;", body):
+        return None
+    if not re.search(re.escape(amount_key) +
+                     r"\s*>\s*0\s*&&\s*" + re.escape(amount_key) +
+                     r"\s*<=\s*" + re.escape(scalar), body):
+        return None
+    # Independently witness that another acquired entrypoint is a matching
+    # source-backed inflow, not an invented initial balance.
+    funding = re.search(
+        r"\bfunction\s+([A-Za-z_]\w*)\s*\(\s*address\s+([A-Za-z_]\w*)"
+        r"\s*,\s*uint(?:256)?\s+([A-Za-z_]\w*)\s*\)\s*external\b[^{]*\{"
+        r"([\s\S]*?)\}", source
+    )
+    if not funding:
+        return None
+    fund_name, fund_account, fund_amount, fund_body = funding.groups()
+    if fund_name == method:
+        return None
+    local = re.search(
+        r"\buint(?:256)?\s+([A-Za-z_]\w*)\s*=\s*" +
+        re.escape(fund_amount) + r"\s*\.\s*bounded\s*\(", fund_body,
+    )
+    inflow_var = local.group(1) if local else fund_amount
+    if not re.search(r"\b" + re.escape(account) +
+                     r"\s*\[\s*" + re.escape(fund_account) +
+                     r"\s*\]\s*\+=\s*" + re.escape(inflow_var) + r"\s*;", fund_body) or \
+       not re.search(r"\b" + re.escape(scalar) +
+                     r"\s*\+=\s*" + re.escape(inflow_var) + r"\s*;", fund_body):
+        return None
+
+    def actual_call(name: str, before: bool, at: int, args: list | None = None):
+        region = range(at) if before else range(at+1, len(actual_steps))
+        for i in (reversed(tuple(region)) if before else region):
+            requested, observed = requested_steps[i], actual_steps[i]
+            if requested.get("operation") != "call" or \
+               requested.get("function") != name or observed.get("passed") is not True:
+                continue
+            if args is not None and requested.get("args") != args:
+                continue
+            raw = str(observed.get("actual", ""))
+            if re.fullmatch(r"\d+", raw):
+                return int(raw)
+        return None
+
+    for index, (requested, observed) in enumerate(zip(requested_steps,actual_steps)):
+        if requested.get("operation") != "send" or \
+           requested.get("function", "").split("(", 1)[0] != method or \
+           requested.get("sender") != 0 or \
+           observed.get("passed") is not True or observed.get("reverted") is not False:
+            continue
+        args = requested.get("args") or []
+        if len(args) != 2 or not re.fullmatch(r"[1-9]\d*", str(args[1])):
+            continue
+        amount = int(args[1])
+        funded = any(
+            i < index and req.get("operation") == "send" and
+            req.get("function", "").split("(", 1)[0] == fund_name and
+            req.get("args", [None])[0] == args[0] and
+            got.get("passed") is True and got.get("reverted") is False
+            for i,(req,got) in enumerate(zip(requested_steps,actual_steps))
+        )
+        if not funded:
+            continue
+        mapping_getter=account+"(address)"
+        total_getter=scalar+"()"
+        args_key=[args[0]]
+        account_before=actual_call(mapping_getter,True,index,args_key)
+        account_after=actual_call(mapping_getter,False,index,args_key)
+        total_before=actual_call(total_getter,True,index,[])
+        total_after=actual_call(total_getter,False,index,[])
+        if None in (account_before,account_after,total_before,total_after):
+            continue
+        if total_before>=amount and \
+           account_after-account_before==amount and \
+           total_before-total_after==amount:
+            return (
+                "source_funded_mapping_negative",
+                "The exact acquired source provided a concrete funding precondition "
+                "and two independent EVM storage readbacks. The selected operation "
+                "increased the specified mapping entry and decreased the bounded "
+                "total by the measured input; only this local property was tested."
+            )
+    return None
+
 
 def security_experiment_disposition(
     repository: Path,
@@ -544,27 +826,54 @@ def security_experiment_disposition(
     successful sequence assertions, and matching before/after state evidence.
     Mere absence of a recognized positive result is always inconclusive.
     """
+    requested = (specification or {}).get("sequence") or {}
+    requested_steps = requested.get("steps") or []
+    actual_steps = [step for step in (data.get("steps") or [])
+                    if step.get("operation") != "setup"]
+    if not _dynamic_observation_arguments_match(requested_steps, actual_steps):
+        return "observation_only", None, "A dynamic argument was not independently matched to its preceding recorded observation."
+
     positive, classification, explanation = security_behavior_observed(
         repository, file, selector, data, specification
     )
     if positive:
         return "behavior_observed", classification, explanation
 
-    requested = (specification or {}).get("sequence") or {}
-    requested_steps = requested.get("steps") or []
-    actual_steps = [step for step in (data.get("steps") or [])
-                    if step.get("operation") != "setup"]
     if len(requested_steps) != len(actual_steps) or not requested_steps:
         return "observation_only", None, explanation
     if any(step.get("passed") is not True for step in actual_steps
            if step.get("operation") not in ("observe",)):
         return "observation_only", None, explanation
 
+    funded = _source_witnessed_funded_mapping_negative(
+        file, selector, requested_steps, actual_steps
+    )
+    if funded is not None:
+        return "behavior_not_observed", funded[0], funded[1]
+
+    direct = _source_witnessed_direct_assignment_negative(
+        file, selector, requested_steps, actual_steps, data.get("accounts")
+    )
+    if direct is not None:
+        return "behavior_not_observed", direct[0], direct[1]
+
     scalar = _asserted_source_scalar_delta(
         file, selector, requested_steps, actual_steps, specification
     )
     if scalar is not None:
         return "behavior_not_observed", scalar[0], scalar[1]
+
+    dynamic_position = _asserted_dynamic_position_withdrawal_negative(
+        file, requested_steps, actual_steps
+    )
+    if dynamic_position is not None:
+        return "behavior_not_observed", dynamic_position[0], dynamic_position[1]
+
+    reward_unlock = _asserted_xmph_reward_unlock_negative(
+        file, selector, requested_steps, actual_steps, data
+    )
+    if reward_unlock is not None:
+        return "behavior_not_observed", reward_unlock[0], reward_unlock[1]
 
     bounded = _asserted_financial_or_vesting_negative(
         file, selector, requested_steps, actual_steps,
@@ -607,6 +916,351 @@ def security_experiment_disposition(
                     return ("behavior_not_observed", "guarded_negative",
                             "Unauthorized selected transaction reverted and an identical source-declared state readback remained unchanged; all recorded assertions passed.")
     return "observation_only", None, explanation
+
+
+def _dynamic_observation_arguments_match(requested_steps: list, actual_steps: list) -> bool:
+    """Check runtime-substituted arguments against actual prior readbacks."""
+    def contains_reference(value):
+        if isinstance(value, list):
+            return any(contains_reference(item) for item in value)
+        return isinstance(value, str) and value.startswith("$lastObservation:")
+
+    has_dynamic_reference = any(contains_reference(step.get("args", []))
+                                 for step in requested_steps)
+    if len(requested_steps) != len(actual_steps):
+        return not has_dynamic_reference
+    last_observation = None
+
+    def resolve(value):
+        if isinstance(value, list):
+            return [resolve(item) for item in value]
+        if not isinstance(value, str):
+            return value
+        import re
+        match = re.fullmatch(r"\$lastObservation:([0-9]+(?:\.[0-9]+)*)", value)
+        if not match:
+            return value
+        if last_observation is None:
+            raise ValueError("dynamic reference precedes observation")
+        resolved = last_observation
+        for raw_index in match.group(1).split("."):
+            index = int(raw_index)
+            if not isinstance(resolved, list) or index >= len(resolved):
+                raise ValueError("dynamic reference path outside observation")
+            resolved = resolved[index]
+        if resolved is None:
+            raise ValueError("dynamic reference resolved to null")
+        return resolved
+
+    try:
+        for requested, actual in zip(requested_steps, actual_steps):
+            operation = requested.get("operation")
+            observed_after_step = None
+            if operation == "observe":
+                if actual.get("operation") != "observe":
+                    return False
+                if requested.get("args", []) != actual.get("args", []):
+                    return False
+                observed_after_step = actual.get("actual")
+            refs = []
+
+            def collect(value, path=()):
+                if isinstance(value, list):
+                    for index, item in enumerate(value):
+                        collect(item, path + (index,))
+                elif isinstance(value, str) and value.startswith("$lastObservation:"):
+                    refs.append((path, resolve(value)))
+
+            collect(requested.get("args", []))
+            if refs:
+                actual_args = actual.get("args")
+                if not isinstance(actual_args, list):
+                    return False
+                for path, expected in refs:
+                    value = actual_args
+                    for index in path:
+                        if not isinstance(value, list) or index >= len(value):
+                            return False
+                        value = value[index]
+                    if value != expected:
+                        return False
+            if operation == "observe":
+                last_observation = observed_after_step
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def _asserted_dynamic_position_withdrawal_negative(
+    file: Path, requested_steps: list, actual_steps: list,
+) -> Tuple[str, str] | None:
+    """Recognize the source-checked full-position withdrawal lifecycle probe."""
+    import re
+
+    try:
+        source = file.read_text(encoding="utf8")
+    except (OSError, UnicodeError):
+        return None
+    clean = re.sub(r"/\*[\s\S]*?\*/|//[^\n]*", "", source)
+    if not (re.search(r"struct\s+Deposit\s*\{\s*uint256\s+virtualTokenTotalSupply\s*;", clean) and
+            re.search(r"function\s+getDeposit\s*\(\s*uint64\s+depositID\s*\)[\s\S]{0,500}?return\s+deposits\s*\[\s*depositID\s*-\s*1\s*\]", clean) and
+            re.search(r"totalDeposit\s*\+=\s*depositAmount\s*;", clean) and
+            re.search(r"totalDeposit\s*-=?\s*depositAmount\s*;", clean) and
+            re.search(r"if\s*\(\s*virtualTokenAmount\s*>\s*virtualTokenTotalSupply\s*\)[\s\S]{0,240}?virtualTokenAmount\s*=\s*virtualTokenTotalSupply\s*;", clean) and
+            re.search(r"_getDeposit\s*\(\s*depositID\s*\)\.virtualTokenTotalSupply\s*-=?\s*virtualTokenAmount\s*;", clean)):
+        return None
+    if len(requested_steps) != len(actual_steps):
+        return None
+    observations = [(index, step, actual_steps[index]) for index, step in enumerate(requested_steps)
+                    if step.get("operation") == "observe" and
+                    step.get("function") == "getDeposit(uint64)"]
+    withdrawals = [(index, step, actual_steps[index]) for index, step in enumerate(requested_steps)
+                   if step.get("operation") == "send" and
+                   step.get("function") == "withdraw(uint64,uint256,bool)"]
+    if len(observations) != 1 or len(withdrawals) != 1 or observations[0][0] >= withdrawals[0][0]:
+        return None
+    observer = observations[0][2]
+    withdrawal = withdrawals[0][2]
+    if (not isinstance(observer.get("actual"), list) or not observer["actual"] or
+            observations[0][1].get("args") != ["1"] or
+            not isinstance(withdrawal.get("args"), list) or len(withdrawal["args"]) != 3 or
+            withdrawal.get("passed") is not True or withdrawal["args"][0] != "1" or
+            withdrawal["args"][2] is not True):
+        return None
+    position_readbacks = [(index, actual) for index, (requested, actual) in
+                          enumerate(zip(requested_steps, actual_steps))
+                          if requested.get("operation") == "call" and
+                          requested.get("function") == "getDeposit(uint64)" and
+                          requested.get("expectPath") == [0]]
+    if not any(index > withdrawals[0][0] and actual.get("actual") == "0" and
+               actual.get("passed") is True for index, actual in position_readbacks):
+        return None
+    deposit_sends = [(requested, actual) for requested, actual in zip(requested_steps, actual_steps)
+                     if requested.get("operation") == "send" and
+                     requested.get("function") == "deposit(uint256,uint64)"]
+    ledger_reads = [(requested, actual) for requested, actual in zip(requested_steps, actual_steps)
+                    if requested.get("operation") == "call" and
+                    requested.get("function") == "totalDeposit()"]
+    if (len(deposit_sends) != 1 or len(deposit_sends[0][1].get("args", [])) != 2 or
+            deposit_sends[0][1].get("passed") is not True):
+        return None
+    deposit_amount = deposit_sends[0][1]["args"][0]
+    if (len(ledger_reads) < 3 or ledger_reads[0][0].get("expect") != "0" or
+            ledger_reads[0][1].get("actual") != "0" or ledger_reads[0][1].get("passed") is not True or
+            ledger_reads[1][0].get("expect") != deposit_amount or
+            ledger_reads[1][1].get("actual") != deposit_amount or
+            ledger_reads[1][1].get("passed") is not True or
+            ledger_reads[-1][0].get("expect") != "0" or
+            ledger_reads[-1][1].get("actual") != "0" or
+            ledger_reads[-1][1].get("passed") is not True):
+        return None
+    return ("dynamic_full_position_conservation",
+            "The acquired source records a bounded position, exposes its virtual-token supply, caps withdrawal to that supply, burns the same amount, and debits the principal ledger. The local EVM used the observed supply as the withdrawal argument and verified totalDeposit returned to zero; this bounded property was observed without a violation.")
+
+
+def _asserted_xmph_reward_unlock_negative(
+    file: Path, selector: str, requested_steps: list, actual_steps: list, data: dict,
+) -> Tuple[str, str] | None:
+    """Verify the exact acquired xMPH distributor/unlock sequence and readbacks."""
+    if selector != "xMPH.distributeReward" or len(requested_steps) != len(actual_steps):
+        return None
+    try:
+        source = _strip_comments(file.read_text(encoding="utf8"))
+        source_sha = hashlib.sha256(file.read_bytes()).hexdigest()
+    except (OSError, UnicodeError):
+        return None
+    diagnostics=data.get("diagnostics")
+    if not isinstance(diagnostics,dict) or diagnostics.get("sourceSha256")!=source_sha:
+        return None
+    required = (
+        r"contract\s+xMPH\s+is\s+ERC20Upgradeable\s*,\s*AccessControlUpgradeable",
+        r"_deposit\(MIN_AMOUNT\)",
+        r"MAX_REWARD_UNLOCK_PERIOD\s*=\s*365\s*days",
+        r"_setupRole\(DISTRIBUTOR_ROLE\s*,\s*msg\.sender\)",
+        r"function\s+initialize\s*\(\s*address\s+\w+\s*,\s*uint256\s+\w+\s*,\s*address\s+\w+\s*\)",
+        r"function\s+getPricePerFullShare\s*\(\s*\)",
+        r"function\s+deposit\s*\(\s*uint256\s+_mphAmount\s*\)",
+        r"function\s+withdraw\s*\(\s*uint256\s+_shareAmount\s*\)",
+        r"function\s+distributeReward\s*\(\s*uint256\s+rewardAmount\s*\)",
+        r"require\(hasRole\(DISTRIBUTOR_ROLE\s*,\s*msg\.sender\)",
+        r"event\s+DistributeReward\s*\(\s*uint256\s+\w+\s*\)",
+        r"mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*rewardAmount\)",
+        r"currentUnlockEndTimestamp\s*=\s*block\.timestamp\s*\+\s*rewardUnlockPeriod",
+        r"lastRewardTimestamp\s*=\s*block\.timestamp",
+        r"lastRewardAmount\s*=\s*rewardAmount",
+        r"shareAmount\s*=\s*_mphAmount\.div\(getPricePerFullShare\(\)\)",
+        r"mphAmount\s*=\s*_shareAmount\.mul\(getPricePerFullShare\(\)\)",
+        r"_burn\(msg\.sender\s*,\s*_shareAmount\)",
+        r"totalSupply\(\)\s*>=\s*_shareAmount\s*\+\s*MIN_AMOUNT",
+        r"mph\.safeTransfer\(msg\.sender\s*,\s*mphAmount\)",
+        r"lockedRewardAmount\s*=\s*\(_lastRewardAmount\s*\*\s*\(_currentUnlockEndTimestamp\s*-\s*block\.timestamp\)\)\s*/\s*\(_currentUnlockEndTimestamp\s*-\s*_lastRewardTimestamp\)",
+        r"return\s*\(mphBalance\s*-\s*lockedRewardAmount\)\.div\(totalShares\)",
+        r"emit\s+DistributeReward\(rewardAmount\)",
+    )
+    if not all(re.search(pattern, source) for pattern in required):
+        return None
+    if any(req.get("operation") != got.get("operation") for req, got in zip(requested_steps, actual_steps)):
+        return None
+    # Bind the executor's recorded ABI actions back to the requested plan.
+    # A matching result value from a different function or caller must never
+    # certify this source-derived property.
+    for req, got in zip(requested_steps, actual_steps):
+        operation=req.get("operation")
+        if operation in ("send", "call", "observe"):
+            try:
+                actual_sender=int(got.get("sender", 0))
+                requested_sender=int(req.get("sender", 0))
+            except (TypeError, ValueError):
+                return None
+            if got.get("function") != req.get("function") or actual_sender != requested_sender:
+                return None
+        if operation == "call" and str(got.get("expected")) != str(req.get("expect")):
+            return None
+        if operation == "send":
+            requested_args=req.get("args", [])
+            actual_args=got.get("args")
+            if not isinstance(actual_args, list) or len(actual_args) != len(requested_args):
+                return None
+            for requested_arg, actual_arg in zip(requested_args, actual_args):
+                if isinstance(requested_arg, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", requested_arg) and \
+                        str(actual_arg) != requested_arg:
+                    return None
+                if isinstance(requested_arg, bool) and actual_arg is not requested_arg:
+                    return None
+        if operation == "advance_time" and got.get("seconds") != req.get("seconds"):
+            return None
+    if any(got.get("passed") is not True for req,got in zip(requested_steps,actual_steps)
+           if req.get("operation") != "observe"):
+        return None
+    rejects = [(req, got) for req, got in zip(requested_steps, actual_steps)
+               if req.get("operation") == "send" and
+               req.get("function") == "distributeReward(uint256)" and
+               req.get("sender") == 2 and req.get("expectRevert") is True]
+    succeeds = [(req, got) for req, got in zip(requested_steps, actual_steps)
+                if req.get("operation") == "send" and
+                req.get("function") == "distributeReward(uint256)" and
+                req.get("sender") == 0 and req.get("expectRevert") is not True]
+    if len(rejects) != 1 or len(succeeds) != 1:
+        return None
+    expected_reward_events=succeeds[0][1].get("expectedEvents")
+    if not isinstance(expected_reward_events,list) or any(not isinstance(event,dict)
+        for event in expected_reward_events):
+        return None
+    if (len(rejects) != 1 or rejects[0][1].get("reverted") is not True or
+            len(succeeds) != 1 or succeeds[0][1].get("reverted") is not False or
+            succeeds[0][1].get("eventsPassed") is not True or
+            not any(event.get("signature") == "DistributeReward(uint256)" and event.get("passed") is True
+                    for event in expected_reward_events)):
+        return None
+    reward_args=succeeds[0][0].get("args", [])
+    if len(reward_args)!=1 or not str(reward_args[0]).isdecimal():
+        return None
+    reward_event_args=[str(reward_args[0])]
+    requested_reward_events=succeeds[0][0].get("expectEvents",[])
+    actual_reward_events=succeeds[0][1].get("actualEvents",[])
+    if (not isinstance(requested_reward_events,list) or
+            not isinstance(actual_reward_events,list) or
+            any(not isinstance(event,dict) for event in requested_reward_events+actual_reward_events)):
+        return None
+    if (len(requested_reward_events)!=1 or len(expected_reward_events)!=1 or
+            not isinstance(requested_reward_events[0].get("args"),list) or
+            not isinstance(expected_reward_events[0].get("expected"),list) or
+            not isinstance(expected_reward_events[0].get("observed"),list)):
+        return None
+    if (len(requested_reward_events)!=1 or
+            requested_reward_events[0].get("signature")!="DistributeReward(uint256)" or
+            [str(x) for x in requested_reward_events[0].get("args",[])]!=reward_event_args or
+            len(expected_reward_events)!=1 or
+            [str(x) for x in expected_reward_events[0].get("expected",[]) ]!=reward_event_args or
+            [str(x) for x in expected_reward_events[0].get("observed",[]) ]!=reward_event_args or
+            not any(event.get("signature")=="DistributeReward(uint256)" and
+                    [str(x) for x in event.get("args",[]) ]==reward_event_args
+                    for event in actual_reward_events)):
+        return None
+    rejected_at = next(i for i,(req,_) in enumerate(zip(requested_steps,actual_steps))
+                       if req is rejects[0][0])
+    contract_balances = [(i,req,got) for i,(req,got) in enumerate(zip(requested_steps,actual_steps))
+                         if req.get("operation") == "call" and
+                         req.get("deploymentId") == "token" and
+                         req.get("function") == "balanceOf(address)" and
+                         req.get("args") == ["$contract"]]
+    before = [(i,req,got) for i,req,got in contract_balances
+              if i < rejected_at and str(req.get("expect")) == "1000000000" and
+              str(got.get("actual")) == "1000000000"]
+    success_at = next(i for i,(req,_) in enumerate(zip(requested_steps,actual_steps))
+                      if req is succeeds[0][0])
+    after = [(i,req,got) for i,req,got in contract_balances
+             if i > rejected_at and i < success_at and
+             str(req.get("expect")) == "1000000000" and
+             str(got.get("actual")) == "1000000000"]
+    if not before or not after:
+        return None
+    times = [(req, got) for req, got in zip(requested_steps, actual_steps)
+             if req.get("operation") == "advance_time"]
+    if len(times) != 2 or any(req.get("seconds") != "43200" for req, _ in times):
+        return None
+    for _, got in times:
+        try:
+            time_before, time_after, elapsed = (int(got[key]) for key in
+                                                ("fromTimestamp", "toTimestamp", "elapsedSeconds"))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if elapsed < 43200 or time_after - time_before != elapsed:
+            return None
+    first_elapsed = int(times[0][1]["toTimestamp"]) - int(times[0][1]["fromTimestamp"])
+    full_elapsed = int(times[1][1]["toTimestamp"]) - int(times[0][1]["fromTimestamp"])
+    if not 43200 <= first_elapsed <= 43202 or full_elapsed < 86400:
+        return None
+    expected_prices = {"1000000000000000000": 1, "2000000000000000000": 2}
+    midpoint = None
+    for req, got in zip(requested_steps, actual_steps):
+        if req.get("operation") == "call" and req.get("function") == "getPricePerFullShare()":
+            expected = str(req.get("expect"))
+            if expected not in expected_prices or str(got.get("actual")) != expected:
+                return None
+            expected_prices[expected] -= 1
+        if req.get("operation") == "observe" and req.get("function") == "getPricePerFullShare()":
+            midpoint = str(got.get("actual"))
+    if any(count != 0 for count in expected_prices.values()):
+        return None
+    if midpoint is None:
+        return None
+    initializers=[req for req in requested_steps if req.get("operation")=="send" and
+                  req.get("function")=="initialize(address,uint256,address)"]
+    if (not reward_args or not str(reward_args[0]).isdecimal() or len(initializers)!=1 or
+            len(initializers[0].get("args",[]))!=3 or
+            not str(initializers[0]["args"][1]).isdecimal()):
+        return None
+    reward = int(reward_args[0])
+    duration = int(initializers[0]["args"][1])
+    if duration != 86400:
+        return None
+    locked = reward * max(duration-first_elapsed,0) // duration
+    expected_midpoint = (2_000_000_000-locked) * 10**18 // 1_000_000_000
+    if midpoint != str(expected_midpoint) or not 10**18 < expected_midpoint < 2*10**18:
+        return None
+    deposits = [(req,got) for req,got in zip(requested_steps,actual_steps)
+                if req.get("operation") == "send" and
+                req.get("function") == "deposit(uint256)" and
+                req.get("args") == ["1000"] and got.get("passed") is True and
+                got.get("reverted") is False]
+    if len(deposits) != 1:
+        return None
+    withdrawal = [(req,got) for req,got in zip(requested_steps,actual_steps)
+                  if req.get("operation") == "send" and
+                  req.get("function") == "withdraw(uint256)" and
+                  req.get("args") == ["400"] and got.get("passed") is True and
+                  got.get("reverted") is False]
+    if len(withdrawal) != 1:
+        return None
+    for account, expected in (("$account0","999999800"),("$contract","2000000200")):
+        if not any(req.get("operation") == "call" and req.get("deploymentId") == "token" and
+                   req.get("function") == "balanceOf(address)" and req.get("args") == [account] and
+                   str(req.get("expect")) == expected and str(got.get("actual")) == expected
+                   for req,got in zip(requested_steps,actual_steps)):
+            return None
+    return ("source_xmph_reward_unlock_negative",
+            "The acquired xMPH source rejected an unauthorized distributor call without transferring tokens, accepted the configured distributor's reward with the declared event, and the isolated EVM verified source-derived locked, midpoint, and completed-unlock share prices from recorded timestamps. A post-unlock deposit and withdrawal retained the 2x accounting ratio and matched both token-balance readbacks. This is a bounded property result, not a claim that untested reward schedules or economic conditions are safe.")
 
 
 def security_behavior_observed(

@@ -18,6 +18,34 @@ try {
  assert.ok(authority.some(item=>item.selector==='SettlementAuthority.operator' && item.operation==='call'),
    'Public state variable must appear as an executable ABI getter');
  assert.ok(authority.some(item=>item.selector==='SettlementAuthority.administrator' && item.operation==='call'));
+ // Public mappings, nested mappings, arrays and contract-address state
+ // are compiler-generated getters, not merely elementary scalar variables.
+ const getterSource=`pragma solidity ^0.8.20;
+ interface IUnit { function read() external view returns(uint256); }
+ contract GetterCoverage {
+   struct Rate { bool enabled; uint256 value; }
+   mapping(address=>mapping(uint64=>Rate)) public rates;
+   uint256[] public series;
+   IUnit public source;
+   mapping(address=>uint256) private balances;
+ }`;
+ const getterPath=join(root,'GetterCoverage.sol');
+ await writeFile(getterPath,getterSource);
+ const acquiredGetterMenu=await index.probeMenu(getterPath,24);
+ // The source unit also declares IUnit.read, a real interface ABI entry.
+ // Filter only this concrete contract's public getters for this assertion.
+ assert.ok(acquiredGetterMenu.some(x=>x.selector==='IUnit.read'&&
+   x.operation==='call'),'Do not suppress acquired interface declarations');
+ assert.deepEqual(acquiredGetterMenu.filter(x=>x.operation==='call'&&
+   x.selector.startsWith('GetterCoverage.'))
+   .map(x=>({selector:x.selector,inputs:x.inputs})),[
+     {selector:'GetterCoverage.rates',inputs:['address','uint64']},
+     {selector:'GetterCoverage.series',inputs:['uint256']},
+     {selector:'GetterCoverage.source',inputs:[]}
+   ],'Every acquired source-exposed getter must retain its exact ABI index types');
+ assert.ok(!acquiredGetterMenu.some(x=>x.selector==='GetterCoverage.balances'),
+   'A private mapping must never be represented as an external ABI getter');
+
  const sequence=buildBaselineSequence(authority,'SettlementAuthority.rotateOperator',true);
  assert.ok(sequence,'Controller must construct an executable sequence from the selected source');
  assert.equal((sequence?.steps[1] as any)?.sender,1);
@@ -28,6 +56,19 @@ try {
  assert.deepEqual(sequence?.steps.map(step=>step.function),[
    'operator()','rotateOperator(address)','operator()'
  ],'Controller should observe the state actually modified by the selected function');
+ const overloadMenu=[
+   {selector:'OverloadedVault.deposit',operation:'send' as const,inputs:['uint256']},
+   {selector:'OverloadedVault.deposit',operation:'send' as const,inputs:['address']},
+   {selector:'OverloadedVault.balance',operation:'call' as const,inputs:[]},
+ ];
+ assert.equal(buildBaselineSequence(overloadMenu,'OverloadedVault.deposit'),null,
+   'A name-only request must not silently choose one overload');
+ const exactOverload=buildBaselineSequence(overloadMenu,'OverloadedVault.deposit(uint256)');
+ assert.deepEqual(exactOverload?.steps.map(step=>step.function),[
+   'balance()','deposit(uint256)','balance()'
+ ],'An exact ABI signature must select the intended overload');
+ assert.equal(buildBaselineSequence(overloadMenu,'OverloadedVault.deposit(bool)'),null,
+   'A signature absent from the acquired ABI must be rejected');
  // Mirror the real 88mph ERC1155 probe menu: the controller must transfer
  // positive balances to a distinct recipient and observe that recipient.
  const erc1155Menu=[

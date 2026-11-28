@@ -83,6 +83,14 @@ const analysis=consumeTelemetryChunk('',
   '[OLLAMA] turn 246/280: request started\n');
 assert.equal(analysis.lines.length,3);
 assert.ok(analysis.lines[0].startsWith('[ANALYSIS_LEAD_SELECTED]'));
+
+const repairTelemetry=consumeTelemetryChunk('',
+  '[EXPERIMENT_REPAIR_LEAD_STARTED] {"phase":"initial","index":2,"total":76,"leadId":"lead-2"}\n'+
+  '[EXPERIMENT_REPAIR_LEAD_DONE] {"phase":"initial","index":2,"total":76,"leadId":"lead-2","status":"constructed"}\n');
+assert.equal(repairTelemetry.lines.length,2,
+  'Per-lead source repair progress must stay visible in the one-bounty live log');
+assert.ok(repairTelemetry.lines[0].startsWith('[EXPERIMENT_REPAIR_LEAD_STARTED]'));
+assert.ok(repairTelemetry.lines[1].startsWith('[EXPERIMENT_REPAIR_LEAD_DONE]'));
 assert.ok(analysis.lines[1].startsWith('[ANALYSIS_FINALIZATION_REJECTED]'));
 assert.equal(latestModelLifecycleEvent(
   '[OLLAMA] turn 245: response received in 293504ms\n'+

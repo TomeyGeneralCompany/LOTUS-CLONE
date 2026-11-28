@@ -180,12 +180,21 @@ function buildDeterministicNegativeFinal(input: DeterministicAuditTurnInput): Re
   const readCount = input.sourceReadCount ?? input.readPaths?.length ?? input.sources.length;
   const indexedCount = input.sourceIndexedCount ?? Math.max(readCount, input.initialSourcePaths?.length ?? input.sources.length);
   const unresolvedCandidates=input.candidateCoverage?.unresolvedIds.length ?? 0;
+  const explicitlyUnresolved=input.candidateCoverage?.explicitlyUnresolvedIds.length ?? 0;
+  const sourceUnavailable=input.candidateCoverage?.sourceUnavailable ?? 0;
+  const blockerCounts=new Map<string,number>();
+  for(const reasons of Object.values(input.candidateCoverage?.unresolvedReasons||{}))
+    for(const reason of reasons)blockerCounts.set(reason,(blockerCounts.get(reason)||0)+1);
+  const blockerSummary=[...blockerCounts.entries()].sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]))
+    .slice(0,5).map(([reason,count])=>`${reason} (${count})`).join('; ');
   const incompleteTotal = o.observation_only + o.incomplete + o.unsupported + o.pending + unresolvedCandidates;
   const reason =
     `${readCount}/${indexedCount} source files inspected; ${totalSelected} experiments selected: ` +
     `${o.not_observed} source-supported negative experiments, ${o.observation_only} observation-only, ` +
     `${o.incomplete} failed/incomplete fixtures, ${o.unsupported} unsupported, ${o.observed} observed behaviors; ` +
-    `${unresolvedCandidates} candidate properties still unresolved. ` +
+    `${sourceUnavailable} independently verified source-unavailable; `+
+    `${unresolvedCandidates} candidate properties unresolved (${explicitlyUnresolved} explicitly dispositioned`+
+    (blockerSummary?`; leading blockers: ${blockerSummary}`:'')+`). ` +
     (incompleteTotal > 0
       ? `Selected-experiment pass only; investigation partial. ${incompleteTotal} incomplete, observation-only, unsupported or pending items require resolution.`
       : `Deterministic analysis completed all ${totalSelected} selected experiments with zero observed security violations.`);
@@ -198,39 +207,49 @@ function buildDeterministicNegativeFinal(input: DeterministicAuditTurnInput): Re
 
 function buildDeterministicPositiveFinal(
   observedCases: readonly DeterministicObservedCase[],
+  maxFindings?: number,
 ): Record<string, unknown> {
-  const findings = observedCases.slice(0, 8).map((obs) => {
-    const isSolidity = obs.kind === "solidity_sequence" || obs.path.endsWith(".sol");
-    const callerFile = obs.callerFile || obs.path;
-    const callerLine = Math.max(1, obs.callerLine || 1);
-    const reachability: "caller" | "direct_transaction" =
-      obs.reachability || (isSolidity ? "direct_transaction" : "caller");
-    const kindLabel =
-      obs.kind === "html_reflection"
-        ? "unescaped HTML reflection"
-        : obs.kind === "path_construction"
-          ? "unconfined path construction"
-          : "local Solidity security invariant violation";
-    return {
-      caseId: obs.caseId,
-      severity: "low" as const,
-      confidence: 0.65,
-      ratingReason:
-        `Deterministic controller reproduction observed ${kindLabel} on ${obs.selector} (${obs.path}) with recorded differential evidence; external deployment context and impact require independent verification.`,
-      title: `Deterministic replay observed ${kindLabel} in ${obs.selector}`.slice(0, 195),
-      impact:
-        `Verified local execution of ${obs.selector} in ${obs.path} violated the expected security assertion; actual production impact depends on deployment reachability and external controls.`,
-      callerFile,
-      callerLine,
-      reachability,
-      falsification:
-        `Independently replay recorded case ${obs.caseId.slice(0, 12)} against ${obs.path} (${obs.selector}) and inspect caller/deployment guards at ${callerFile}:${callerLine}; reject if a source-backed mitigation blocks exploitation.`,
-    };
-  });
+  const findings = observedCases
+    .slice(0, maxFindings ?? observedCases.length)
+    .map((obs) => {
+      const isSolidity = obs.kind === "solidity_sequence" || obs.path.endsWith(".sol");
+      const callerFile = obs.callerFile || obs.path;
+      const callerLine = Math.max(1, obs.callerLine || 1);
+      const reachability: "caller" | "direct_transaction" =
+        obs.reachability || (isSolidity ? "direct_transaction" : "caller");
+      const kindLabel =
+        obs.kind === "html_reflection"
+          ? "unescaped HTML reflection"
+          : obs.kind === "path_construction"
+            ? "unconfined path construction"
+            : "local Solidity security invariant violation";
+      return {
+        caseId: obs.caseId,
+        severity: "low" as const,
+        confidence: 0.65,
+        ratingReason:
+          `Deterministic controller reproduction observed ${kindLabel} on ${obs.selector} (${obs.path}) with recorded differential evidence; external deployment context and impact require independent verification.`,
+        title: `Deterministic replay observed ${kindLabel} in ${obs.selector}`.slice(0, 195),
+        impact:
+          `Verified local execution of ${obs.selector} in ${obs.path} violated the expected security assertion; actual production impact depends on deployment reachability and external controls.`,
+        callerFile,
+        callerLine,
+        reachability,
+        falsification:
+          `Independently replay recorded case ${obs.caseId.slice(0, 12)} against ${obs.path} (${obs.selector}) and inspect caller/deployment guards at ${callerFile}:${callerLine}; reject if a source-backed mitigation blocks exploitation.`,
+      };
+    });
   return {
     findings,
     outcome: "inspected",
   };
+}
+
+function requestedFindingLimit(requestSchema:Record<string,any>|undefined):number|undefined {
+  const resultSchema=requestSchema?.properties?.result;
+  const findingsSchema=resultSchema?.properties?.findings||requestSchema?.properties?.findings;
+  const limit=findingsSchema?.maxItems;
+  return Number.isSafeInteger(limit)&&limit>=0?limit:undefined;
 }
 
 function runnerExperimentId(
@@ -501,7 +520,7 @@ export function driveDeterministicAuditTurn(
       const observed = (input.observedCases || []).filter((c) => /^[a-f0-9]{64}$/.test(c.caseId));
       payload =
         observed.length > 0
-          ? buildDeterministicPositiveFinal(observed)
+          ? buildDeterministicPositiveFinal(observed,requestedFindingLimit(input.requestSchema))
           : buildDeterministicNegativeFinal(input);
     }
     if (wantsResultObject) {

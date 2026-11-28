@@ -21,10 +21,14 @@ assert.deepEqual(rankSolidityStaticTargets(paths,prefix),[
   'contracts/vaults/Vault.sol',
   'contracts/libs/Math.sol',
   'contracts/token/ERC20.sol',
-], 'Core project contracts should outrank generic files and excluded test assets');
+  'contracts/helpers/Address.sol',
+], 'Every eligible contract is ranked, with core project contracts first and excluded test assets omitted');
 assert.deepEqual(rankSolidityStaticTargets(paths,prefix,2),[
   'contracts/vesting/Vesting02.sol','contracts/core/DInterest.sol'
 ], 'Target count is bounded and deterministic');
+const wide=Array.from({length:48},(_,index)=>`source-1/contracts/protocol/Contract${index}.sol`);
+assert.equal(rankSolidityStaticTargets(wide,prefix).length,48,
+  'The default static sweep must not silently cap eligible Solidity contracts');
 assert.deepEqual(rankSolidityStaticTargets(['other/contracts/Vault.sol'],prefix),[],
   'A repository must not scan paths belonging to a different acquired repository');
 console.log('Static Solidity target ranking tests passed');

@@ -5,23 +5,34 @@ function validateSequence(s) {
     if (!o || typeof o !== 'object' || Array.isArray(o) || required.some(k=>!Object.hasOwn(o,k)) ||
         Object.keys(o).some(k=>!allowed.includes(k))) throw new Error('Invalid sequence fields');
   };
-  const value = (v, depth=0) => {
+  const value = (v, depth=0, budget={nodes:0}) => {
+    if(++budget.nodes>256)throw new Error('ABI value exceeds 256 nodes');
     if (typeof v === 'boolean' || typeof v === 'string' && v.length<=2048) return;
-    if (Array.isArray(v) && depth<2 && v.length<=32) {v.forEach(x=>value(x,depth+1));return;}
+    if (Array.isArray(v) && depth<8 && v.length<=32) {v.forEach(x=>value(x,depth+1,budget));return;}
     throw new Error('ABI values must be strings, booleans or bounded arrays; encode integers as strings');
   };
-  const args = a => {if(!Array.isArray(a)||a.length>32)throw new Error('Invalid ABI arguments');a.forEach(v=>value(v));};
+  const args = a => {if(!Array.isArray(a)||a.length>32)throw new Error('Invalid ABI arguments');const budget={nodes:0};a.forEach(v=>value(v,0,budget));};
   const wei = v => {if(v!==undefined && (typeof v!=='string'||!/^(0|[1-9][0-9]{0,29})$/.test(v)))throw new Error('Invalid wei amount');};
   object(s,['constructorArgs','steps'],['constructorArgs','constructorValueWei','steps','deployment','preparation','factoryClone','sourceProperty']);
   if(s.sourceProperty!==undefined){
     const p=s.sourceProperty;
-    object(p,['kind','state','method','parameter','amount','direction','sourceSha256']);
+    object(p,['kind','state','method','parameter','amount','direction','sourceSha256'],
+      ['kind','state','method','parameter','amount','formula','expectedDelta','direction','sourceSha256']);
     if(p.kind!=='scalar_delta'||p.direction!=='increase'||
       !/^[A-Za-z_]\w*$/.test(p.state)||!/^[A-Za-z_]\w*$/.test(p.parameter)||
       !/^[A-Za-z_]\w*\([A-Za-z0-9_,()[\]]*\)$/.test(p.method)||
       !/^(0|[1-9][0-9]{0,29})$/.test(p.amount)||
       !/^[a-f0-9]{64}$/.test(p.sourceSha256))
       throw new Error('Invalid source-identified scalar obligation');
+    if(p.formula!==undefined){
+      object(p.formula,['multiplier','divisor']);
+      if(!/^[1-9][0-9]{0,9}$/.test(p.formula.multiplier)||
+         !/^[1-9][0-9]{0,9}$/.test(p.formula.divisor)||
+         typeof p.expectedDelta!=='string'||
+         !/^(0|[1-9][0-9]{0,29})$/.test(p.expectedDelta))
+        throw new Error('Invalid bounded scalar formula obligation');
+    }else if(p.expectedDelta!==undefined)
+      throw new Error('Scalar expectedDelta requires a source formula');
   }
   if(s.deployment!==undefined) {
     object(s.deployment,['file','contract']);
@@ -36,7 +47,7 @@ function validateSequence(s) {
   if(s.preparation!==undefined) {
     const p=s.preparation;
     object(p,['deployments','operations','checks']);
-    if(!Array.isArray(p.deployments)||p.deployments.length>8 ||
+    if(!Array.isArray(p.deployments)||p.deployments.length>16 ||
        !Array.isArray(p.operations)||p.operations.length>24 ||
        !Array.isArray(p.checks)||p.checks.length>16)
       throw new Error('Invalid preparation bounds');
@@ -83,6 +94,13 @@ function validateSequence(s) {
   if(JSON.stringify(s).length>16000 || !Array.isArray(s.steps) || !s.steps.length || s.steps.length>16)throw new Error('Invalid sequence length');
   const prepDeployments=new Set((s.preparation?.deployments||[]).map(d=>d.id));
   for(const step of s.steps) {
+    if(step?.operation==='advance_time'){
+      object(step,['operation','seconds']);
+      if(typeof step.seconds!=='string'||!/^[1-9][0-9]{0,7}$/.test(step.seconds)||
+         BigInt(step.seconds)>31536000n)
+        throw new Error('Invalid bounded local EVM time advance');
+      continue;
+    }
     if(step?.operation==='eth_balance'){
       object(step,['operation','account']);
       if(typeof step.account!=='string'||!/^(?:\$account[012]|\$contract|\$deployment:[A-Za-z][A-Za-z0-9_-]{0,63})$/.test(step.account))
@@ -93,7 +111,7 @@ function validateSequence(s) {
     }
     if(step?.operation==='call')object(step,['operation','function','args','expect'],['operation','deploymentId','function','args','expect','sender','expectPath']);
     else if(step?.operation==='observe')object(step,['operation','function','args'],['operation','deploymentId','function','args','sender']);
-    else if(step?.operation==='send')object(step,['operation','function','args'],['operation','deploymentId','function','args','sender','valueWei','expectRevert','requiredSetup']);
+    else if(step?.operation==='send')object(step,['operation','function','args'],['operation','deploymentId','function','args','sender','valueWei','expectRevert','requiredSetup','expectEvents']);
     else throw new Error('Unknown sequence operation');
     if(step.deploymentId!==undefined && (typeof step.deploymentId!=='string' || !prepDeployments.has(step.deploymentId)))
       throw new Error('Unknown step deploymentId '+String(step.deploymentId));
@@ -107,7 +125,19 @@ function validateSequence(s) {
     }
     else {wei(step.valueWei);if(step.expectRevert!==undefined&&typeof step.expectRevert!=='boolean')throw new Error('Invalid revert expectation');
       if(step.requiredSetup!==undefined && (step.operation!=='send' || typeof step.requiredSetup!=='boolean' ||
-         (step.requiredSetup && step.expectRevert===true)))throw new Error('Invalid required setup flag');}
+         (step.requiredSetup && step.expectRevert===true)))throw new Error('Invalid required setup flag');
+      if(step.expectEvents!==undefined){
+        if(step.operation!=='send'||!Array.isArray(step.expectEvents)||step.expectEvents.length>16)
+          throw new Error('Invalid event expectations');
+        for(const event of step.expectEvents){
+          object(event,['signature','args']);
+          if(typeof event.signature!=='string'||event.signature.length>200||
+             !/^[A-Za-z_][A-Za-z0-9_]*\([A-Za-z0-9_,()[\]]*\)$/.test(event.signature))
+            throw new Error('Invalid event signature');
+          args(event.args);
+        }
+      }
+    }
   }
   if(!s.steps.some(step=>step.operation==='call'||step.operation==='observe'||step.operation==='eth_balance'))throw new Error('Include a read observation');
   return s;
@@ -119,15 +149,50 @@ function normalize(v) {
   if(typeof v==='string'||typeof v==='boolean')return v;
   throw new Error('Unsupported ABI result');
 }
+function receiptEvidence(receipt) {
+  return {
+    status:Number(receipt.status),
+    transactionHash:receipt.hash||receipt.transactionHash||null,
+    blockNumber:Number.isSafeInteger(receipt.blockNumber)?receipt.blockNumber:null,
+    from:typeof receipt.from==='string'?receipt.from.toLowerCase():null,
+    to:typeof receipt.to==='string'?receipt.to.toLowerCase():null,
+    contractAddress:typeof receipt.contractAddress==='string'?receipt.contractAddress.toLowerCase():null,
+    gasUsed:receipt.gasUsed?.toString?.()||null,
+    logs:Array.from(receipt.logs||[],(log,index)=>({
+      address:typeof log.address==='string'?log.address.toLowerCase():null,
+      topics:Array.from(log.topics||[]),
+      data:typeof log.data==='string'?log.data:null,
+      index:Number.isSafeInteger(log.index)?log.index:
+        Number.isSafeInteger(log.logIndex)?log.logIndex:index,
+      transactionHash:log.transactionHash||receipt.hash||null,
+      blockNumber:Number.isSafeInteger(log.blockNumber)?log.blockNumber:
+        (Number.isSafeInteger(receipt.blockNumber)?receipt.blockNumber:null)
+    }))
+  };
+}
+function receiptEvents(contractInterface,receipt) {
+  const events=[];
+  for(const log of receipt.logs||[]){
+    try{
+      const parsed=contractInterface.parseLog({topics:log.topics,data:log.data});
+      if(parsed)events.push({name:parsed.name,signature:parsed.fragment.format('sighash'),
+        address:typeof log.address==='string'?log.address.toLowerCase():null,
+        args:normalize(Array.from(parsed.args))});
+    }catch{}
+  }
+  return events;
+}
 async function runSequence(artifact, sequence, transport, preparationArtifacts={},metadata={}) {
   validateSequence(sequence);
   const {BrowserProvider, ContractFactory, Contract}=require('ethers');
   const {createHash}=require('node:crypto');
-  if(!artifact?.evm?.bytecode?.object || !/^[0-9a-fA-F]+$/.test(artifact.evm.bytecode.object))
-    throw new Error('A deployable contract without unresolved library links is required');
+  if(!artifact?.evm?.bytecode?.object)
+    throw new Error('A deployable contract with compiler bytecode is required');
   const provider=new BrowserProvider(transport,undefined,{cacheTimeout:-1,pollingInterval:10});
   let runtimePhase='fixture_preparation';
   let runtimeStepIndex=null;
+  const receiptHistory=[];
+  const recordReceipt=(phase,action,receipt)=>receiptHistory.push({phase,action,receipt:receiptEvidence(receipt)});
   const diagnosticError=(error)=>{
     const cause=error instanceof Error?error:new Error(String(error));
     const receipt=cause.receipt||null;
@@ -146,11 +211,15 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       contractName:metadata.contractName||null,compilerVersion:metadata.compilerVersion||null,
       evmVersion:metadata.evmVersion||null,cacheHit:metadata.cacheHit??null,
       bytecodeSha256:metadata.bytecodeSha256||null,
+      abiSha256:metadata.abiSha256||null,
+      preparationAbiSha256:metadata.preparationAbiSha256||{},
       constructorTypes:metadata.constructorTypes||[],stepIndex:runtimeStepIndex,
       receiptStatus:typeof status==='number'?status:null,
       receiptTo:receipt?.to??null,
       transactionHash:receipt?.hash||null,
-      gasUsed:receipt?.gasUsed?.toString?.()||null
+      gasUsed:receipt?.gasUsed?.toString?.()||null,
+      receipt:receipt?receiptEvidence(receipt):undefined,
+      receiptHistory
     };
     return cause;
   };
@@ -160,8 +229,72 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
     let address;
     const deployed=new Map();
     const setupSteps=[];
+    const linkedLibraries=new Map();
+    const linking=new Set();
+    const deployableArtifact=async(sourceFile,contractName,compiledArtifact)=>{
+      const bytecode=compiledArtifact?.evm?.bytecode?.object;
+      if(typeof bytecode!=='string'||!bytecode.length)
+        throw new Error('Missing compiler bytecode for '+sourceFile+':'+contractName);
+      const references=compiledArtifact.evm.bytecode.linkReferences||{};
+      let linkedBytecode=bytecode;
+      for(const [libraryFile,libraries] of Object.entries(references)){
+        for(const [libraryName,locations] of Object.entries(libraries||{})){
+          const key=libraryFile+':'+libraryName;
+          let libraryAddress=linkedLibraries.get(key);
+          if(!libraryAddress){
+            if(linking.has(key))throw new Error('Circular Solidity library link: '+key);
+            const libraryArtifact=preparationArtifacts[libraryFile]?.[libraryName];
+            if(!libraryArtifact)throw new Error('Compiler library artifact unavailable: '+key);
+            linking.add(key);
+            try {
+              const linkedLibrary=await deployableArtifact(libraryFile,libraryName,libraryArtifact);
+              const library=await new ContractFactory(linkedLibrary.abi,
+                linkedLibrary.evm.bytecode.object,signers[0]).deploy({gasLimit:10000000});
+              const receipt=await library.deploymentTransaction().wait();
+              if(receipt)recordReceipt(runtimePhase,'deploy-library:'+key,receipt);
+              if(!receipt||receipt.status!==1)throw new Error('Solidity library deployment failed: '+key);
+              libraryAddress=(await library.getAddress()).toLowerCase();
+              linkedLibraries.set(key,libraryAddress);
+              setupSteps.push({operation:'setup',function:'deploy-library:'+key,
+                sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),
+                receipt:receiptEvidence(receipt),
+                purpose:'link compiler-declared source library '+libraryAddress});
+            } finally {linking.delete(key);}
+          }
+          for(const location of locations){
+            const start=location.start*2;
+            const length=location.length*2;
+            if(location.length!==20||start<0||start+length>linkedBytecode.length)
+              throw new Error('Unsupported compiler library link location: '+key);
+            const replacement=libraryAddress.slice(2).padStart(length,'0');
+            linkedBytecode=linkedBytecode.slice(0,start)+replacement+
+              linkedBytecode.slice(start+length);
+          }
+        }
+      }
+      if(!/^[0-9a-fA-F]+$/.test(linkedBytecode))
+        throw new Error('Unresolved compiler library link in '+sourceFile+':'+contractName);
+      return {...compiledArtifact,evm:{...compiledArtifact.evm,
+        bytecode:{...compiledArtifact.evm.bytecode,object:linkedBytecode}}};
+    };
+    let lastObservation = null;
     const resolve = v => {
       if(Array.isArray(v))return v.map(resolve);
+      if(typeof v==='string'){
+        const observedReference=/^\$lastObservation:([0-9]+(?:\.[0-9]+)*)$/.exec(v);
+        if(observedReference){
+          if(lastObservation===null)throw new Error('Dynamic observation reference has no preceding observe step');
+          let value=lastObservation;
+          for(const segment of observedReference[1].split('.')){
+            const index=Number(segment);
+            if(!Array.isArray(value)||index>=value.length)
+              throw new Error('Dynamic observation reference path is outside the observed value');
+            value=value[index];
+          }
+          if(value===null||value===undefined)throw new Error('Dynamic observation reference resolved to no value');
+          return value;
+        }
+      }
       if(typeof v==='string' && /^\$account[012]$/.test(v))return accounts[Number(v.at(-1))];
       if(typeof v==='string'&&/^\$deployment:[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(v)){
         const item=deployed.get(v.slice('$deployment:'.length));
@@ -179,17 +312,19 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       for(const d of preparation.deployments) {
         runtimePhase='fixture_deployment';
         const depArtifact=preparationArtifacts[d.file]?.[d.contract];
-        if(!depArtifact?.evm?.bytecode?.object ||
-           !/^[a-fA-F0-9]+$/.test(depArtifact.evm.bytecode.object))
-          throw new Error('Missing or unlinked preparation contract '+d.file+':'+d.contract);
-        const dep=await new ContractFactory(depArtifact.abi,depArtifact.evm.bytecode.object,signers[0])
+        if(!depArtifact?.evm?.bytecode?.object)
+          throw new Error('Missing preparation contract '+d.file+':'+d.contract);
+        const linkedDependency=await deployableArtifact(d.file,d.contract,depArtifact);
+        const dep=await new ContractFactory(linkedDependency.abi,linkedDependency.evm.bytecode.object,signers[0])
           .deploy(...d.constructorArgs.map(resolve),{value:d.valueWei||'0',gasLimit:10000000});
         const receipt=await dep.deploymentTransaction().wait();
+        if(receipt)recordReceipt(runtimePhase,'deploy:'+d.id,receipt);
         if(receipt?.status!==1)throw new Error('Preparation deployment failed: '+d.id);
         const depAddress=await dep.getAddress();
         deployed.set(d.id,{contract:dep,address:depAddress,receipt});
         setupSteps.push({operation:'setup',function:'deploy:'+d.file+':'+d.contract,
-          sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),purpose:'prepare '+d.id});
+          sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),
+          receipt:receiptEvidence(receipt),purpose:'prepare '+d.id});
       }
       for(const op of preparation.operations) {
         runtimePhase='fixture_initialization';
@@ -205,12 +340,14 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         let receipt;
         try {const tx=await fn.send(...values,{value:op.valueWei||'0',gasLimit:2000000});receipt=await tx.wait();}
         catch(error) {if(error.receipt?.status!==0)throw error;receipt=error.receipt;}
+        if(receipt)recordReceipt(runtimePhase,'preparation:'+op.id,receipt);
         if(!receipt||![0,1].includes(receipt.status))
           throw new Error('Preparation missing transaction receipt: '+op.id);
         const actualReverted=receipt.status===0;
         setupSteps.push({operation:'setup',function:fragment.format('sighash'),
           sender:op.sender,gasUsed:receipt.gasUsed.toString(),
-          passed:actualReverted===!!op.expectRevert,purpose:'preparation operation '+op.id});
+          passed:actualReverted===!!op.expectRevert,receipt:receiptEvidence(receipt),
+          purpose:'preparation operation '+op.id});
         if(actualReverted!==!!op.expectRevert)
           throw new Error('Preparation transaction expectation failed: '+op.id);
       }
@@ -228,13 +365,16 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       }
     }
     runtimePhase='target_deployment';
+    const linkedTarget=await deployableArtifact(metadata.selectedFile||metadata.file||'<target>',
+      metadata.contractName||'<target>',artifact);
     const latestBlock=await provider.getBlock('latest');
     const deployGasLimit=latestBlock?.gasLimit && latestBlock.gasLimit > 12000000n
       ? (latestBlock.gasLimit * 9n) / 10n
       : 10000000n;
-    let contract=await new ContractFactory(artifact.abi,artifact.evm.bytecode.object,signers[0])
+    let contract=await new ContractFactory(linkedTarget.abi,linkedTarget.evm.bytecode.object,signers[0])
       .deploy(...sequence.constructorArgs.map(resolve),{value:sequence.constructorValueWei||'0',gasLimit:deployGasLimit});
     const deployment=await contract.deploymentTransaction().wait();
+    if(deployment)recordReceipt(runtimePhase,'target-deployment',deployment);
     if(!deployment || deployment.status!==1)throw new Error('Constructor deployment failed');
     address=await contract.getAddress();
     // Source-defined 88mph Factory creates deterministic EIP-1167 clones of
@@ -257,6 +397,7 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         throw new Error('Factory returned no independently deployed clone address');
       const tx=await fn.send(...values,{gasLimit:deployGasLimit});
       const cloneReceipt=await tx.wait();
+      if(cloneReceipt)recordReceipt(runtimePhase,'factory-clone:'+call.deploymentId,cloneReceipt);
       if(!cloneReceipt||cloneReceipt.status!==1)
         throw new Error('Factory clone creation or initialization failed');
       const code=await provider.getCode(predicted);
@@ -265,10 +406,10 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
       const cloneDigest=createHash('sha256').update(Buffer.from(code.slice(2),'hex')).digest('hex');
       setupSteps.push({operation:'setup',function:'factoryClone:'+fn.fragment.format('sighash'),
         sender:call.sender,gasUsed:cloneReceipt.gasUsed.toString(),passed:true,
-        purpose:'acquired factory '+call.deploymentId+' created clone '+predicted.toLowerCase()+
+        receipt:receiptEvidence(cloneReceipt),purpose:'acquired factory '+call.deploymentId+' created clone '+predicted.toLowerCase()+
           ' with runtime code sha256 '+cloneDigest});
       address=predicted;
-      contract=new Contract(address,artifact.abi,signers[0]);
+      contract=new Contract(address,linkedTarget.abi,signers[0]);
     }
     runtimePhase='target_action';
     const steps=[...setupSteps];
@@ -299,9 +440,11 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
         const mint=contract.getFunction('tomeyMintBatch(address,uint256[],uint256[])');
         const tx=await mint.send(from,pairs.map(p=>p[0]),pairs.map(p=>p[1]),{gasLimit:2000000});
         const receipt=await tx.wait();
+        if(receipt)recordReceipt(runtimePhase,'erc1155-mint-setup',receipt);
         if(receipt?.status!==1)throw new Error('ERC1155 harness mint setup failed');
         steps.push({operation:'setup',function:'tomeyMintBatch(address,uint256[],uint256[])',
-          sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),purpose:'fund transfer prerequisites'});
+          sender:0,passed:true,gasUsed:receipt.gasUsed.toString(),receipt:receiptEvidence(receipt),
+          purpose:'fund transfer prerequisites'});
         prepared.add(key);
       }
       if(ownerIndex!==sender){
@@ -311,15 +454,30 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
           const tx=await contract.connect(signers[ownerIndex])
             .getFunction('setApprovalForAll(address,bool)').send(accounts[sender],true,{gasLimit:2000000});
           const receipt=await tx.wait();
+          if(receipt)recordReceipt(runtimePhase,'erc1155-approval-setup',receipt);
           if(receipt?.status!==1)throw new Error('ERC1155 harness approval setup failed');
           steps.push({operation:'setup',function:'setApprovalForAll(address,bool)',
-            sender:ownerIndex,passed:true,gasUsed:receipt.gasUsed.toString(),purpose:'authorize transfer sender'});
+            sender:ownerIndex,passed:true,gasUsed:receipt.gasUsed.toString(),
+            receipt:receiptEvidence(receipt),purpose:'authorize transfer sender'});
         }
       }
     }
     let stepIndex=0;
     for(const step of sequence.steps) {
       runtimeStepIndex=stepIndex++;runtimePhase=step.requiredSetup?'fixture_initialization':'target_action';
+      if(step.operation==='advance_time'){
+        const seconds=Number(step.seconds);
+        const before=await provider.getBlock('latest');
+        if(!before||!Number.isSafeInteger(before.timestamp))throw new Error('Missing local EVM timestamp before time advance');
+        await provider.send('evm_increaseTime',[seconds]);
+        await provider.send('evm_mine',[]);
+        const after=await provider.getBlock('latest');
+        if(!after||!Number.isSafeInteger(after.timestamp)||after.timestamp-before.timestamp<seconds)
+          throw new Error('Local EVM did not advance by the requested interval');
+        steps.push({operation:'advance_time',seconds:String(seconds),fromTimestamp:String(before.timestamp),
+          toTimestamp:String(after.timestamp),elapsedSeconds:String(after.timestamp-before.timestamp),passed:true});
+        continue;
+      }
       if(step.operation==='eth_balance') {
         const targetAddr=resolve(step.account);
         const bal=await provider.getBalance(targetAddr);
@@ -350,9 +508,20 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
           const expected=normalize(resolve(step.expect));
           steps.push({operation:'call',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,
             actual,expected,...(step.expectPath?{expectPath:step.expectPath}:{}),passed:JSON.stringify(actual)===JSON.stringify(expected)});
-        } else steps.push({operation:'observe',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,actual:observed});
+        } else {
+          lastObservation=observed;
+          steps.push({operation:'observe',...depMeta,function:fragment.format('sighash'),
+            sender:step.sender??0,args:normalize(args),actual:observed});
+        }
       } else {
         if(!['nonpayable','payable'].includes(fragment.stateMutability))throw new Error('send requires a state-changing function');
+        const expectedEvents=step.expectEvents||[];
+        const expectedEventFragments=expectedEvents.map(event=>{
+          let eventFragment;
+          try{eventFragment=targetContract.interface.getEvent(event.signature);}catch{}
+          if(!eventFragment)throw new Error('Event is not declared in the compiled acquired-source ABI: '+event.signature);
+          return eventFragment;
+        });
         if(fragment.stateMutability!=='payable' && BigInt(step.valueWei||'0')!==0n)throw new Error('Nonpayable function cannot receive value');
         let receipt;
         try {const tx=await fn.send(...args,{value:step.valueWei||'0',gasLimit:2000000});receipt=await tx.wait();}
@@ -361,27 +530,40 @@ async function runSequence(artifact, sequence, transport, preparationArtifacts={
           if(error.receipt?.status!==0)throw error;
           receipt=error.receipt;
         }
+        if(receipt)recordReceipt(runtimePhase,'target-send:'+fragment.format('sighash'),receipt);
         if(!receipt || ![0,1].includes(receipt.status))throw new Error('No transaction receipt');
         if(receipt.status===0 && receipt.gasUsed>=2000000n)throw new Error('Transaction exhausted its gas limit');
         const reverted=receipt.status===0;
-        // A mined revert is evidence, even when the hypothesis expected success.
-        // Record the mismatch rather than aborting and losing the receipt and
-        // subsequent read observations. A revert never proves a vulnerability.
+        const actualEvents=receiptEvents(targetContract.interface,receipt);
+        const checkedEvents=expectedEvents.map((expected,index)=>{
+          const expectedArgs=normalize(resolve(expected.args));
+          const actual=actualEvents.find(event=>event.signature===expectedEventFragments[index].format('sighash')&&
+            JSON.stringify(event.args)===JSON.stringify(expectedArgs));
+          return {signature:expectedEventFragments[index].format('sighash'),
+            expected:expectedArgs,observed:actual?.args??null,passed:!!actual};
+        });
+        const eventsPassed=checkedEvents.every(event=>event.passed);
+        // Preserve raw receipt logs for independent review; display fitting
+        // must never become the canonical evidence record.
         steps.push({operation:'send',...depMeta,function:fragment.format('sighash'),sender:step.sender??0,
+          args:normalize(args),
           valueWei:step.valueWei||'0',reverted,gasUsed:receipt.gasUsed.toString(),
-          passed:reverted===!!step.expectRevert});
+          receipt:receiptEvidence(receipt),actualEvents,expectedEvents:checkedEvents,
+          eventsPassed,passed:reverted===!!step.expectRevert&&eventsPassed});
         if(step.requiredSetup && reverted)
           throw new Error('PREPARATION_INITIALIZATION_FAILED: required successful setup '+fragment.format('sighash')+' reverted; security experiment not executed');
       }
     }
     const observations={contract:address.toLowerCase(),accounts:accounts.map(a=>a.toLowerCase()),
-      deploymentGasUsed:deployment.gasUsed.toString(),steps,
+      deploymentGasUsed:deployment.gasUsed.toString(),deploymentReceipt:receiptEvidence(deployment),steps,
       diagnostics:{experimentId:metadata.experimentId||null,fixtureId:metadata.fixtureId||null,
         sourceSha256:metadata.sourceSha256||null,bytecodeSha256:metadata.bytecodeSha256||null,
         compilerVersion:metadata.compilerVersion||null,evmVersion:metadata.evmVersion||null,
         selectedFile:metadata.selectedFile||null,contractName:metadata.contractName||null,
-        constructorTypes:metadata.constructorTypes||[]}};
-    if(JSON.stringify(observations).length>64000)throw new Error('Sequence observations exceed 64KB');
+        constructorTypes:metadata.constructorTypes||[],
+        abiSha256:metadata.abiSha256||null,
+        preparationAbiSha256:metadata.preparationAbiSha256||{}}};
+    if(JSON.stringify(observations).length>1024*1024)throw new Error('Sequence evidence exceeds 1MB; refusing to truncate verifier receipts');
     return observations;
   } catch(error) {throw diagnosticError(error);}
   finally {provider.destroy();}

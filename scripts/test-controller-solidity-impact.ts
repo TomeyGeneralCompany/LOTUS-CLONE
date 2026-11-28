@@ -124,9 +124,20 @@ assert.equal(controllerGroundedSolidityOptions(
 const wrongSource=directSource.replace('require(msg.sender == owner, "owner only");','');
 const wrongSnapshots=[{path:directPath,content:wrongSource,
  sha256:createHash('sha256').update(wrongSource).digest('hex')}];
-assert.equal(controllerGroundedSolidityOptions(directPath,wrongSource,directMenu,
- wrongSnapshots,'a'.repeat(40)).length,0,
- 'An unguarded state mutation must never acquire a fabricated security assertion');
+const wrongHandoff=controllerGroundedSolidityOptions(directPath,wrongSource,directMenu,
+ wrongSnapshots,'a'.repeat(40));
+assert.equal(wrongHandoff.length,1,
+ 'Source-verified unguarded setter retains its actual observable direct state transition');
+const unguardedSteps=wrongHandoff[0].probe.sequence.steps;
+const unguardedWrite=unguardedSteps.find(step=>step.operation==='send'&&step.sender===0);
+const unguardedReadback=unguardedSteps.find(step=>
+ step.operation==='call'&&step.function==='reserve()');
+assert.ok(wrongHandoff[0].probe.hypothesis.includes('direct assignment')&&
+ unguardedWrite?.operation==='send'&&
+ unguardedReadback?.operation==='call'&&
+ unguardedReadback.expect===unguardedWrite.args[0]&&
+ !wrongHandoff[0].probe.hypothesis.includes('owner'),
+ 'A missing owner guard must retain only the real source transition and its exact readback');
 assert.equal(controllerGroundedSolidityOptions(directPath,directSource,directMenu,
  [{...directSnapshots[0],sha256:'b'.repeat(64)}],'a'.repeat(40)).length,0,
  'Source-hash mismatch cannot authorize a new experiment');

@@ -49,3 +49,7 @@ assert.ok(esm,'Source-declared ESM arrow factories remain eligible');
 assert.deepEqual(esm.sequence.constructor,[0]);assert.deepEqual(esm.sequence.steps[0].args,[1]);
 assert.deepEqual(sourceStatefulPlans('bad.mjs','export const make=(start=arbitrary())=>{return {advance(){return 1;}};}'),[],
  'Never evaluate or guess a source expression as a constructor default');
+const widePython=Array.from({length:40},(_,index)=>
+  `class Counter${index}:\n    def advance(self,by=1):\n        return by\ndef make${index}():\n    return Counter${index}()\n`).join('\n');
+assert.equal(sourceStatefulPlans('wide.py',widePython).length,40,
+ 'Stateful plan enumeration must retain every source-declared class and factory beyond prior fixed caps');

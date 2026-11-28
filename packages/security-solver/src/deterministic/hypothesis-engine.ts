@@ -8,6 +8,7 @@
  */
 import { createHash } from "node:crypto";
 import {summarizeEntrypointEffects} from "./entrypoint-effects";
+import {canonicalElementaryAbiType} from "../solidity-abi-types";
 import type {
   FactLanguage,
   ProgramFact,
@@ -144,8 +145,25 @@ const FIXTURE_CALL_TARGET_RE =
 const TOKEN_ONLY_FIXTURE_RE =
   /(?:^|:)(?:ERC20|IERC20|SafeERC20|token|stablecoin|underlying|asset)(?:\.(?:transfer|transferFrom|safeTransfer|safeTransferFrom|approve|safeApprove|safeIncreaseAllowance|safeDecreaseAllowance|balanceOf|allowance))?$/i;
 
-function isAccountingStateVar(stateVar: string): boolean {
+function isNonNumericAddressOrConfigType(
+  stateVar: string,
+  stateVarSymbols?: ReadonlyMap<string, ProgramSymbol>,
+): boolean {
+  const rt = stateVarSymbols?.get(stateVar)?.returnType?.trim();
+  if (!rt) return false;
+  // Only integer counters and mappings can represent numeric financial accounting state.
+  // An `address public rewards` or contract reference is configuration/recipient state.
+  return canonicalElementaryAbiType(rt)===null&&rt!=='mapping';
+}
+
+function isAccountingStateVar(
+  stateVar: string,
+  stateVarSymbols?: ReadonlyMap<string, ProgramSymbol>,
+): boolean {
   if (CONFIG_OR_ADDRESS_STATE_RE.test(stateVar) || ROLE_STATE_RE.test(stateVar)) {
+    return false;
+  }
+  if (isNonNumericAddressOrConfigType(stateVar, stateVarSymbols)) {
     return false;
   }
   return (
@@ -156,8 +174,11 @@ function isAccountingStateVar(stateVar: string): boolean {
   );
 }
 
-function classifyRelationalProperty(stateVars: readonly string[]): RelationalPropertyKind {
-  const accountingVars = stateVars.filter(isAccountingStateVar);
+function classifyRelationalProperty(
+  stateVars: readonly string[],
+  stateVarSymbols?: ReadonlyMap<string, ProgramSymbol>,
+): RelationalPropertyKind {
+  const accountingVars = stateVars.filter((v) => isAccountingStateVar(v, stateVarSymbols));
   if (accountingVars.some((v) => INTEREST_STATE_RE.test(v))) return "interest-accrual";
   if (accountingVars.some((v) => SHARE_STATE_RE.test(v))) return "share-accounting";
   if (accountingVars.some((v) => SUPPLY_STATE_RE.test(v))) return "supply-accounting";
@@ -385,10 +406,26 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
 
   for (const pair of pairStates.values()) {
     const rawStateDeps = [...pair.vars].sort();
-    const accountingDeps = rawStateDeps.filter(isAccountingStateVar);
+    const sourceArithmeticDeps=rawStateDeps.filter(v=>{
+      const symbol=stateVarSymbols.get(v);
+      const type=symbol?.returnType?.trim()||"";
+      if(canonicalElementaryAbiType(type)===null&&type!=='mapping')return false;
+      return (stateWriters.get(v)||[]).some(write=>
+        (write.fn===pair.a||write.fn===pair.b)&&
+        ["+=","-=","++","--"].includes(write.operator||""));
+    });
+    const accountingDeps = rawStateDeps.filter((v) =>
+      isAccountingStateVar(v, stateVarSymbols)||sourceArithmeticDeps.includes(v));
     const roleDeps = rawStateDeps.filter((v) => ROLE_STATE_RE.test(v));
-    const nonConfigDeps = rawStateDeps.filter((v) => !CONFIG_OR_ADDRESS_STATE_RE.test(v));
-    const propertyKind = classifyRelationalProperty(rawStateDeps);
+    const nonConfigDeps = rawStateDeps.filter(
+      (v) => !CONFIG_OR_ADDRESS_STATE_RE.test(v) && !isNonNumericAddressOrConfigType(v, stateVarSymbols),
+    );
+    let propertyKind = classifyRelationalProperty(rawStateDeps, stateVarSymbols);
+    // A source-witnessed arithmetic mutation of a numeric or mapping state
+    // variable is accounting evidence even when the author chose a domain-
+    // specific name outside the controller's conventional name dictionary.
+    if(propertyKind==="state-coupling"&&sourceArithmeticDeps.length)
+      propertyKind="conservation";
     const isFinancial = isFinancialRelationalKind(propertyKind);
 
     // Do not elevate ordinary configuration/address references (e.g. initialize + withdraw
@@ -427,8 +464,11 @@ export function generateRelationalHypotheses(graph: ProgramFactsGraph): Relation
     for (const sv of stateDeps) {
       const svSym = stateVarSymbols.get(sv);
       if (svSym?.visibility === "public") {
-        const getterSig = svSym.returnType === "mapping" ? `${svSym.name}(address)` : `${svSym.name}()`;
-        requiredObservations.push(getterSig);
+        if(svSym.returnType==="mapping"||svSym.returnType?.endsWith("[]")){
+          const inputs=svSym.publicGetterInputs;
+          if(inputs?.length)requiredObservations.push(`${svSym.name}(${inputs.join(",")})`);
+          else propertyRequiredPrerequisites.push(`unsupported_public_getter_inputs:${sv}`);
+        }else requiredObservations.push(`${svSym.name}()`);
       } else {
         propertyRequiredPrerequisites.push(`missing_public_getter:${sv}`);
       }

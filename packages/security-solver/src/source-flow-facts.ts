@@ -6,7 +6,7 @@ export type FlowFact={path:string;line:number;source:string;relationship:string}
 export type FlowTrace={facts:FlowFact[];unresolved:string[];limitation:string};
 
 /** Source-backed and bounded, never an exploitability proof. */
-export async function traceSourceCalls(repository:string,file:string,selector:string,maxDepth=5):Promise<FlowTrace> {
+export async function traceSourceCalls(repository:string,file:string,selector:string,maxDepth=Number.MAX_SAFE_INTEGER):Promise<FlowTrace> {
   const base=await realpath(repository);
   const facts:FlowFact[]=[]; const unresolved:string[]=[];
   const visited=new Set<string>();
@@ -79,7 +79,7 @@ export async function traceSourceCalls(repository:string,file:string,selector:st
  */
 export async function solidityDependentSources(
   workspace:string,testedPath:string,contract:string,
-  candidates:string[],limit=6
+  candidates:string[],limit=Number.MAX_SAFE_INTEGER
 ):Promise<string[]> {
   if(!/^[A-Za-z_$][\w$]*$/.test(contract)||!testedPath.endsWith('.sol'))return [];
   const root=await realpath(workspace);
@@ -87,7 +87,7 @@ export async function solidityDependentSources(
   const includesBase=new RegExp('\\bis\\s+[^\\{;\\n]*\\b'+contract+'\\b');
   const importsBase=new RegExp('\\bimport\\s+[^;\\n]*[\\x22\\x27][^\\x22\\x27]*'+name.replaceAll('.','\\.')+'[\\x22\\x27]');
   const eligible:Array<{path:string;score:number}>=[];
-  for(const candidate of [...new Set(candidates)].slice(0,256)){
+  for(const candidate of [...new Set(candidates)]){
     if(!candidate.endsWith('.sol')||candidate===testedPath||
        candidate.startsWith('/')||candidate.split(/[\\/]/).includes('..'))continue;
     try{
@@ -101,7 +101,7 @@ export async function solidityDependentSources(
     }catch{}
   }
   return eligible.sort((a,b)=>b.score-a.score||a.path.localeCompare(b.path))
-    .slice(0,Math.max(0,Math.min(12,limit))).map(x=>x.path);
+    .slice(0,Math.max(0,limit)).map(x=>x.path);
 }
 
 
@@ -150,7 +150,7 @@ export type CallerEvidence={path:string;line:number;code:string;selector:string}
  */
 export async function controllerCallerChain(
   workspace:string,repositoryPrefix:string,testedPath:string,selector:string,
-  sourcePaths:string[],maxDepth=4
+  sourcePaths:string[],maxDepth=Number.MAX_SAFE_INTEGER
 ):Promise<CallerEvidence[]> {
   const root=await realpath(workspace);
   const visited=new Set<string>([testedPath]);
@@ -174,9 +174,9 @@ export async function controllerCallerChain(
     return code;
   };
   let currentSource=testedPath,currentSelector=selector;
-  for(let depth=0;depth<Math.min(8,Math.max(1,maxDepth));depth++){
+  for(let depth=0;depth<Math.max(0,Math.min(maxDepth,new Set(sourcePaths).size));depth++){
     const found:Array<CallerEvidence & {qualified:boolean;source:string}>=[];
-    for(const path of [...new Set(sourcePaths)].slice(0,5000)) {
+    for(const path of [...new Set(sourcePaths)]) {
       if(visited.has(path) || !path.startsWith(repositoryPrefix) ||
          path.startsWith('/') || path.split(/[\\/]/).includes('..'))continue;
       try {

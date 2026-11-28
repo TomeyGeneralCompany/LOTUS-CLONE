@@ -7,6 +7,8 @@
  * retaining all remaining candidates in the persisted queue).
  */
 import { createHash } from "node:crypto";
+import { posix as pathPosix } from "node:path";
+import { parse as parseSolidity } from "@solidity-parser/parser";
 import type { StaticLeadHint } from "../controller-solidity-experiment-planner";
 import type { ProgramFactsGraph } from "./program-facts";
 
@@ -43,6 +45,10 @@ export interface AnalysisCandidateQueueOptions {
   maxPerFile?: number;
   /** Explicitly opt into admitting test/mock/echidna harness contracts (default: false). */
   includeTestContracts?: boolean;
+  /** Synchronous bounded heartbeat for long CPU-only queue builds. */
+  onProgress?: (progress:Readonly<{
+    completedItems:number;totalItems:number;candidates:number;blocked:number;currentPath:string;
+  }>)=>void;
 }
 
 export interface AnalysisCandidateQueueResult {
@@ -124,50 +130,157 @@ function stableStaticLeadId(lead: StaticLeadHint): string {
  * Locate the target function span inside Solidity source without losing
  * multi-function files to first-selector-only truncation.
  */
-function locateFunctionSpan(
-  content: string,
-  selector: string,
-): { start: number; end: number; lineStart: number; lineEnd: number; excerpt: string; truncated: boolean } | null {
-  const method = selector.split(".").pop() || "";
-  const safeMethod = method.replace(/[^A-Za-z0-9_]/g, "");
-  if (!safeMethod) return null;
-  const re = new RegExp(`\\bfunction\\s+${safeMethod}\\s*\\(`);
-  const match = re.exec(content);
-  if (!match) return null;
+type LocatedFunctionSpan = {
+  span: { start:number; end:number; lineStart:number; lineEnd:number; excerpt:string; truncated:boolean };
+} | { reason:string };
 
-  const start = Math.max(0, match.index - 160);
-  const end = Math.min(content.length, match.index + 1100);
-  const lineStart = computeLineNumber(content, match.index);
-  // Locate the exact closing brace (or semicolon for interface decl) of this function
-  // so static leads localize strictly to this function rather than neighboring functions.
-  let fnEndIdx = Math.min(content.length, match.index + 1100);
-  let braceDepth = 0;
-  let seenBrace = false;
-  for (let i = match.index; i < content.length; i++) {
-    const ch = content[i];
-    if (ch === "{") {
-      braceDepth++;
-      seenBrace = true;
-    } else if (ch === "}") {
-      braceDepth--;
-      if (seenBrace && braceDepth === 0) {
-        fnEndIdx = i;
-        break;
+type AcquiredSourceAst={path:string;ast:any};
+
+function canonicalAbiType(type:any,sourceAst:any,depth=0,
+  acquiredAsts:AcquiredSourceAst[]=[{path:"",ast:sourceAst}],sourcePath=""):string|null {
+  if(!type||depth>16)return null;
+  if(type.type==="ElementaryTypeName"){
+    const name=String(type.name||"");
+    if(name==="uint")return "uint256";
+    if(name==="int")return "int256";
+    const integer=/^(u?int)([0-9]+)$/.exec(name);
+    if(integer){
+      const width=Number(integer[2]);
+      return width>=8&&width<=256&&width%8===0?name:null;
+    }
+    if(/^(?:address|bool|string|bytes)$/.test(name))return name;
+    const fixedBytes=/^bytes([0-9]+)$/.exec(name);
+    if(fixedBytes){const width=Number(fixedBytes[1]);return width>=1&&width<=32?name:null;}
+    return null;
+  }
+  if(type.type==="ArrayTypeName"){
+    const base=canonicalAbiType(type.baseTypeName,sourceAst,depth+1,acquiredAsts,sourcePath);
+    if(!base)return null;
+    const length=type.length?.value===undefined?"":String(type.length.value);
+    if(length&&!/^\d+$/.test(length))return null;
+    return base+"["+length+"]";
+  }
+  if(type.type!=="UserDefinedTypeName")return null;
+  const fullName=String(type.namePath||"");
+  const name=fullName.split(".").pop()||"";
+  const collect=(asts:any[],wantedName:string)=>{
+    const found:any[]=[];
+    for(const ast of asts){
+      for(const top of ast?.children||[]){
+        if(top.type==="ContractDefinition"){
+          for(const child of top.subNodes||[]){
+            if(child.name===wantedName&&["StructDefinition","EnumDefinition"].includes(child.type))
+              found.push(child);
+          }
+          if(top.name===wantedName)found.push(top);
+        }else if(top.name===wantedName&&[
+          "TypeDefinition","UserDefinedValueTypeDefinition","EnumDefinition","StructDefinition"
+        ].includes(top.type)){
+          found.push(top.definition||top.underlyingType||top.underlyingTypeName);
+        }
       }
-    } else if (ch === ";" && !seenBrace) {
-      fnEndIdx = i;
-      break;
+    }
+    return [...new Set(found.filter(Boolean))];
+  };
+  // Prefer the declaration in the implementation file. Imported types may be
+  // resolved only when exactly one matching acquired declaration exists;
+  // ambiguous same-name declarations stay blocked rather than receiving a
+  // guessed ABI selector.
+  const localDefinitions=collect([sourceAst],name);
+  let resolved:{definition:any;ast:any;path:string}|null=null;
+  if(localDefinitions.length===1)resolved={definition:localDefinitions[0],ast:sourceAst,path:sourcePath};
+  else if(localDefinitions.length>1)return null;
+  else {
+    // Resolve explicit named imports and namespace imports against acquired
+    // files before considering the repository-wide unique-name fallback.
+    const imported:Array<{definition:any;ast:any;path:string}>=[];
+    for(const directive of sourceAst?.children||[]){
+      if(directive.type!=="ImportDirective"||typeof directive.path!=="string")continue;
+      let importedName="";
+      const aliases=directive.symbolAliases||[];
+      for(const pair of aliases){
+        const original=String(pair?.[0]||"");
+        const alias=String(pair?.[1]||original);
+        if(alias===fullName||alias===name)importedName=original;
+      }
+      const namespace=String(directive.unitAlias||"");
+      if(namespace&&fullName.startsWith(namespace+"."))importedName=fullName.slice(namespace.length+1);
+      if(!importedName)continue;
+      const importedPath=pathPosix.normalize(pathPosix.join(pathPosix.dirname(sourcePath),directive.path));
+      const acquired=acquiredAsts.find(item=>item.path===importedPath);
+      if(!acquired)continue;
+      const matches=collect([acquired.ast],importedName.split(".").pop()||importedName);
+      if(matches.length===1)imported.push({definition:matches[0],ast:acquired.ast,path:acquired.path});
+      else if(matches.length>1)return null;
+    }
+    if(imported.length===1)resolved=imported[0];
+    else if(imported.length>1)return null;
+    else {
+      const matches=collect(acquiredAsts.map(item=>item.ast),name);
+      if(matches.length!==1)return null;
+      const source=acquiredAsts.find(item=>collect([item.ast],name).includes(matches[0]));
+      if(!source)return null;
+      resolved={definition:matches[0],ast:source.ast,path:source.path};
     }
   }
-  const lineEnd = computeLineNumber(content, fnEndIdx);
-  return {
-    start,
-    end,
-    lineStart,
-    lineEnd,
-    excerpt: content.slice(start, end),
-    truncated: end < content.length,
-  };
+  if(!resolved)return null;
+  const definition=resolved.definition;
+  if(definition.type==="EnumDefinition")return "uint8";
+  if(definition.type==="ContractDefinition")return "address";
+  if(definition.type==="StructDefinition"){
+    const members=(definition.members||[]).map((member:any)=>
+      canonicalAbiType(member.typeName,resolved!.ast,depth+1,acquiredAsts,resolved!.path));
+    return members.length&&members.every(Boolean)?"("+members.join(",")+")":null;
+  }
+  return canonicalAbiType(definition,resolved.ast,depth+1,acquiredAsts,resolved.path);
+}
+
+function canonicalFunctionSignature(fn:any,sourceAst:any,acquiredAsts:AcquiredSourceAst[]=[{path:"",ast:sourceAst}],sourcePath=""):string|null {
+  const inputs=(fn.parameters||[]).map((parameter:any)=>
+    canonicalAbiType(parameter.typeName,sourceAst,0,acquiredAsts,sourcePath));
+  return fn.name&&inputs.every(Boolean)?
+    String(fn.name)+"("+inputs.join(",")+")":null;
+}
+
+/**
+ * Locate source declarations through the Solidity AST. Brace scanning can stop
+ * inside comments or strings, and choosing the first same-name declaration is
+ * unsafe for overloaded functions.
+ */
+function locateFunctionSpan(content:string,selector:string,sourceAst:any,
+  acquiredAsts:AcquiredSourceAst[]=[{path:"",ast:sourceAst}],sourcePath=""):LocatedFunctionSpan {
+  const separator=selector.lastIndexOf(".");
+  const contractName=separator>0?selector.slice(0,separator):"";
+  const selectorMethod=selector.slice(separator+1);
+  const exactSignature=/^([A-Za-z_]\w*\(.*\))$/.test(selectorMethod);
+  const method=exactSignature?selectorMethod.slice(0,selectorMethod.indexOf("(")):selectorMethod;
+  if(!/^[A-Za-z_]\w*$/.test(contractName)||!(/^[A-Za-z_]\w*$/.test(method)||exactSignature))
+    return {reason:"function_selector_not_canonical"};
+  const contracts=(sourceAst?.children||[]).filter((node:any)=>
+    node.type==="ContractDefinition"&&node.name===contractName);
+  if(contracts.length!==1)return {reason:"function_contract_not_unique"};
+  const declarations=(contracts[0].subNodes||[]).filter((node:any)=>
+    node.type==="FunctionDefinition"&&node.name===method&&!node.isConstructor&&
+    !node.isFallback&&!node.isReceiveEther);
+  if(declarations.length===0)return {reason:"function_declaration_not_located"};
+  const selected=exactSignature?
+    declarations.filter((node:any)=>canonicalFunctionSignature(node,sourceAst,acquiredAsts,sourcePath)===selectorMethod):
+    declarations;
+  if(exactSignature&&selected.length===0)
+    return {reason:"exact_function_abi_signature_not_resolved"};
+  if(selected.length>1)
+    return {reason:"overloaded_function_requires_exact_abi_signature"};
+  const declaration=selected[0],range=declaration.range,location=declaration.loc;
+  if(!Array.isArray(range)||range.length!==2||!location?.start||!location?.end||
+    !Number.isInteger(range[0])||!Number.isInteger(range[1]))
+    return {reason:"function_source_range_missing"};
+  const start=range[0],excerptStart=Math.max(0,start-160);
+  // Keep the complete declaration available to source-grounded analysis. The
+  // old fixed 1,100-character window silently cut off long accounting paths.
+  const excerptEnd=Math.min(content.length,range[1]+1);
+  return {span:{start:excerptStart,end:excerptEnd,
+    lineStart:location.start.line,lineEnd:location.end.line,
+    excerpt:content.slice(excerptStart,excerptEnd),truncated:excerptEnd<content.length}};
 }
 
 /**
@@ -209,6 +322,14 @@ export function buildAnalysisCandidateQueue(
   const blocked: Array<{ path: string; selector: string; reason: string }> = [];
   const rawCandidates: AnalysisCandidate[] = [];
   const seenIds = new Set<string>();
+  const sourceAstByItem=new Map<AnalysisCandidateSourceItem,any>();
+  const acquiredSourceAsts:AcquiredSourceAst[]=[];
+  for(const item of options.items){
+    try{
+      const ast=parseSolidity(item.sourceContent,{range:true,loc:true});
+      sourceAstByItem.set(item,ast);acquiredSourceAsts.push({path:item.path,ast});
+    }catch{sourceAstByItem.set(item,null);}
+  }
 
   // Pre-index graph coupling, unresolved external call dominance, and core protocol centrality
   const varWriters = new Map<string, Set<string>>();
@@ -251,6 +372,13 @@ export function buildAnalysisCandidateQueue(
     }
   }
 
+  let completedItems=0;
+  const reportItemProgress=(path:string)=>{
+    completedItems++;
+    if(completedItems%4===0||completedItems===options.items.length)
+      options.onProgress?.({completedItems,totalItems:options.items.length,
+        candidates:rawCandidates.length,blocked:blocked.length,currentPath:path});
+  };
   for (const item of options.items) {
     const isTestOrMock = isTestOrMockContractPath(item.path);
     if (isTestOrMock && !includeTestContracts) {
@@ -261,11 +389,15 @@ export function buildAnalysisCandidateQueue(
           reason: "test_or_mock_contract",
         });
       }
+      reportItemProgress(item.path);
       continue;
     }
 
     const sourceSha256 = createHash("sha256").update(item.sourceContent).digest("hex");
     const fileLeads = staticLeads.filter((l) => l.path === item.path);
+    const sourceAst=sourceAstByItem.get(item)||null;
+    // Each selector from an unparseable implementation is retained as an
+    // explicit parser blocker below.
     const isExternalAdapter = isExternalAdapterOrMarketPath(item.path);
     const isCoreProtocolName = CORE_PROTOCOL_NAME_RE.test(item.path) && !isExternalAdapter;
     const inboundRefCount = fileInboundReferrers.get(item.path)?.size || 0;
@@ -283,15 +415,14 @@ export function buildAnalysisCandidateQueue(
         continue;
       }
 
-      const span = locateFunctionSpan(item.sourceContent, selector);
-      if (!span) {
-        blocked.push({
-          path: item.path,
-          selector,
-          reason: "function_declaration_not_located",
-        });
+      const located = sourceAst
+        ? locateFunctionSpan(item.sourceContent, selector, sourceAst,acquiredSourceAsts,item.path)
+        : {reason:"solidity_source_parse_failed"};
+      if ("reason" in located) {
+        blocked.push({path:item.path,selector,reason:located.reason});
         continue;
       }
+      const span=located.span;
 
       const id = createHash("sha256")
         .update(JSON.stringify([item.sourceCommit, sourceSha256, item.path, selector]))
@@ -299,7 +430,9 @@ export function buildAnalysisCandidateQueue(
       if (seenIds.has(id)) continue;
       seenIds.add(id);
 
-      const method = selector.split(".").pop() || "";
+      const selectorMethod=selector.split(".").pop()||"";
+      const method=selectorMethod.slice(0,selectorMethod.indexOf("(")<0?
+        selectorMethod.length:selectorMethod.indexOf("("));
       let priority = 10;
       const selectionReasons: string[] = [];
       const staticLeadIds: string[] = [];
@@ -424,6 +557,7 @@ export function buildAnalysisCandidateQueue(
         lineEnd: span.lineEnd,
       });
     }
+    reportItemProgress(item.path);
   }
 
   // Deterministic ordering: highest priority first, then path, then selector, then id

@@ -274,14 +274,17 @@ contract GuardedVault is Ownable {
     }
 
     const parsed = JSON.parse(answer);
-    assert.equal(parsed.outcome, "suspended",
-      "An untested source function must not produce a completed report");
+    assert.equal(parsed.outcome, "no_testable_candidate",
+      "An exhausted source lead with a recorded blocker must produce a truthful incomplete-coverage report");
     assert.equal(parsed.findings.length, 0);
+    assert.match(parsed.reason,/candidate properties unresolved/,
+      "The report must identify that source coverage remains unresolved");
     const logText = await readFile(logFile, "utf8");
     assert.match(logText, /\[DETERMINISTIC_DRIVER_ACTION\]/, "Runner must invoke deterministic driver");
     assert.doesNotMatch(logText, /\[MODEL_REQUEST_RECOVERY\]/, "No Ollama retries may occur in deterministic mode");
-    assert.match(logText, /\[EXPERIMENT_GATE_BLOCKED\]/);
-    assert.doesNotMatch(logText, /\[STAGE_UNLOCK\] EXPERIMENT -> REVIEW/);
+    assert.match(logText, /\[EXPERIMENT_DISPOSITIONS_COMPLETE\]/,
+      "An assessed blocker is a distinct disposition after repair exhaustion");
+    assert.match(logText, /\[STAGE_UNLOCK\] EXPERIMENT -> REVIEW/);
 
     // 5b. Standalone runLocalAudit (productionWorkflow: false) must track terminalReadPages without stalling
     const standaloneLog = join(tmp, "standalone-audit.log");
@@ -591,6 +594,15 @@ contract MultiVault${idx} {
       maxAdmitted: 6,
       maxPerFile: 2,
     });
+    const queueProgress:Array<{completedItems:number;totalItems:number;candidates:number;blocked:number}>=[];
+    buildAnalysisCandidateQueue({
+      items, maxAdmitted:6, maxPerFile:2,
+      onProgress:progress=>queueProgress.push(progress),
+    });
+    assert.deepEqual(queueProgress.map(progress=>progress.completedItems),[4],
+      'Large candidate-queue work must emit a bounded heartbeat and a final inventory count');
+    assert.equal(queueProgress[0].totalItems,items.length);
+    assert.equal(queueProgress[0].candidates,12);
     assert.equal(q1.inventory.length, 12, "All 12 candidates across 4 files must be preserved");
     assert.equal(q1.admitted.length, 6, "Bounded admission must select exactly 6 candidates");
     assert.equal(q1.queued.length, 6, "Remaining 6 candidates must stay queued rather than discarded");
@@ -612,6 +624,104 @@ contract MultiVault${idx} {
       q2.inventory.map((c) => ({ id: c.id, selector: c.selector, priority: c.priority, status: c.status })),
       "Candidate inventory IDs, scores, and ordering must be 100% deterministic across repeated runs",
     );
+    // AST spans must ignore braces inside comments and strings. The prior
+    // brace scanner could stop inside a comment and capture only part of a body.
+    const spanSource=[
+      'pragma solidity ^0.8.20;',
+      'contract SpanFixture {',
+      '  uint256 private stored;',
+      '  function settle(uint256 amount) external {',
+      '    /* comment braces: } { */',
+      '    string memory marker = "}";',
+      '    stored += amount;',
+      '  }',
+      '  function next() external { stored = 0; }',
+      '}',
+    ].join("\n");
+    const spanQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/SpanFixture.sol",sourceCommit:commitSha,
+      sourceContent:spanSource,unqueuedSelectors:["SpanFixture.settle"],
+    }]});
+    assert.equal(spanQueue.inventory.length,1);
+    assert.equal(spanQueue.inventory[0].lineStart,4);
+    assert.equal(spanQueue.inventory[0].lineEnd,8,
+      "AST evidence span must include the whole body despite comment/string braces");
+
+    const longFunctionSource=[
+      'pragma solidity ^0.8.20;',
+      'contract LongFunctionFixture {',
+      '  function settle(uint256 value) external pure returns (uint256) {',
+      ...Array.from({length:80},(_,i)=>`    value += ${i+1};`),
+      '    return value;',
+      '  }',
+      '}',
+    ].join("\n");
+    const longFunctionQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/LongFunctionFixture.sol",sourceCommit:commitSha,
+      sourceContent:longFunctionSource,unqueuedSelectors:["LongFunctionFixture.settle"],
+    }]});
+    assert.equal(longFunctionQueue.inventory.length,1);
+    assert.ok(longFunctionQueue.inventory[0].sourceExcerpt.includes("value += 80;"),
+      "Source evidence must retain the end of long functions beyond the former 1,100-character window");
+    assert.ok(longFunctionQueue.inventory[0].sourceExcerpt.includes("return value;"),
+      "Source evidence must include the complete function body");
+
+    const overloadedSource=[
+      'pragma solidity ^0.8.20;',
+      'contract OverloadedFixture {',
+      '  function set(uint256 value) external {}',
+      '  function set(address value) external {}',
+      '}',
+    ].join("\n");
+    const overloadQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/OverloadedFixture.sol",sourceCommit:commitSha,
+      sourceContent:overloadedSource,unqueuedSelectors:["OverloadedFixture.set"],
+    }]});
+    assert.equal(overloadQueue.inventory.length,0,
+      "Name-only overloads must never be assigned to an arbitrary declaration");
+    assert.equal(overloadQueue.blocked[0]?.reason,
+      "overloaded_function_requires_exact_abi_signature");
+    const exactOverloadQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/OverloadedFixture.sol",sourceCommit:commitSha,
+      sourceContent:overloadedSource,
+      unqueuedSelectors:["OverloadedFixture.set(uint256)"],
+    }]});
+    assert.equal(exactOverloadQueue.inventory.length,1,
+      "An exact canonical ABI signature must select an overloaded declaration");
+    assert.equal(exactOverloadQueue.inventory[0].lineStart,3,
+      "The exact uint256 overload must map to its own source span");
+    const importedTypeSource=`pragma solidity ^0.8.20;
+type AccountId is uint128;`;
+    const importedTypeContract=`pragma solidity ^0.8.20;
+import {AccountId as Key} from "../types/AccountId.sol";
+contract ImportedOverload {
+  function set(Key id) external {}
+  function set(uint256 id) external {}
+}`;
+    const importedTypeQueue=buildAnalysisCandidateQueue({items:[
+      {path:"source-0/contracts/ImportedOverload.sol",sourceCommit:commitSha,
+        sourceContent:importedTypeContract,
+        unqueuedSelectors:["ImportedOverload.set(uint128)"]},
+      {path:"source-0/types/AccountId.sol",sourceCommit:commitSha,
+        sourceContent:importedTypeSource,unqueuedSelectors:[]}
+    ]});
+    assert.equal(importedTypeQueue.inventory.length,1,
+      "An exact overload with a UDVT declared in another acquired source must resolve");
+    assert.equal(importedTypeQueue.inventory[0].lineStart,4,
+      "Imported UDVT signatures must retain the exact matching source span");
+    const invalidWidthSource=`pragma solidity ^0.8.20;
+contract InvalidIntegerWidth {
+  function set(uint7 value) external {}
+}`;
+    const invalidWidthQueue=buildAnalysisCandidateQueue({items:[{
+      path:"source-0/contracts/InvalidIntegerWidth.sol",sourceCommit:commitSha,
+      sourceContent:invalidWidthSource,
+      unqueuedSelectors:["InvalidIntegerWidth.set(uint7)"]
+    }]});
+    assert.equal(invalidWidthQueue.inventory.length,0,
+      "Canonical ABI resolution must reject integer widths Solidity does not define");
+    assert.equal(invalidWidthQueue.blocked[0]?.reason,
+      "exact_function_abi_signature_not_resolved");
   }
 
   // Shared Toy Accounting-Defect Contracts (Buggy vs Corrected) for Tests 9-13
@@ -743,6 +853,87 @@ contract CallResolutionDemo is BaseA, BaseB {
       allHyps.some((h) => h.category === "accounting_invariant" && h.relational?.id === vaultRel!.id),
       "generateHypotheses must integrate RelationalHypothesis into prioritized output",
     );
+
+    const uintKeyVault=`// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract UintKeyVault {
+    mapping(uint256 => uint256) public balances;
+    uint256 public totalDeposits;
+    function deposit(uint256 account) external payable {
+        balances[account] += msg.value;
+        totalDeposits += msg.value;
+    }
+    function withdraw(uint256 account, uint256 amount) external {
+        balances[account] -= amount;
+        totalDeposits -= amount;
+    }
+}
+`;
+    const uintKeyGraph=buildProgramFactsGraph({sources:[{
+      path:"source-0/contracts/UintKeyVault.sol",
+      content:uintKeyVault,
+      sha256:sha(uintKeyVault),
+    }]});
+    const uintKeyHypothesis=generateRelationalHypotheses(uintKeyGraph).find(r=>
+      r.entrypoints.includes("UintKeyVault.deposit")&&
+      r.entrypoints.includes("UintKeyVault.withdraw"));
+    assert.ok(uintKeyHypothesis,"uint-key mapping accounting must produce a relational property");
+    assert.ok(uintKeyHypothesis.requiredObservations.includes("balances(uint256)"),
+      "Public mapping observations must use the acquired source's exact key type");
+
+    const domainNamedLedger=`pragma solidity ^0.8.20;
+contract DomainNamedLedger {
+    uint256 public units;
+    function deposit(uint256 amount) external { units += amount; }
+    function withdraw(uint256 amount) external { units -= amount; }
+}`;
+    const domainNamedGraph=buildProgramFactsGraph({sources:[{
+      path:"source-0/contracts/DomainNamedLedger.sol",
+      content:domainNamedLedger,
+      sha256:sha(domainNamedLedger),
+    }]});
+    const domainNamedHypothesis=generateRelationalHypotheses(domainNamedGraph).find(r=>
+      r.entrypoints.includes("DomainNamedLedger.deposit")&&
+      r.entrypoints.includes("DomainNamedLedger.withdraw"));
+    assert.ok(domainNamedHypothesis,
+      "Source arithmetic must establish a relational accounting candidate without conventional state-variable names");
+    assert.equal(domainNamedHypothesis!.propertyKind,"conservation",
+      "The relational kind must follow the observed numeric increment/decrement source operations");
+    assert.deepEqual(domainNamedHypothesis!.stateDependencies,["DomainNamedLedger.units"]);
+
+    const typedKeyVault=`// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+type AccountId is uint64;
+contract TypedKeyVault {
+    enum Phase { Open, Closed }
+    mapping(Phase => uint256) public balances;
+    mapping(AccountId => uint256) public shares;
+    uint256 public totalDeposits;
+    function deposit(Phase phase, AccountId account) external payable {
+        balances[phase] += msg.value;
+        shares[account] += msg.value;
+        totalDeposits += msg.value;
+    }
+    function withdraw(Phase phase, AccountId account, uint256 amount) external {
+        balances[phase] -= amount;
+        shares[account] -= amount;
+        totalDeposits -= amount;
+    }
+}
+`;
+    const typedKeyGraph=buildProgramFactsGraph({sources:[{
+      path:"source-0/contracts/TypedKeyVault.sol",
+      content:typedKeyVault,
+      sha256:sha(typedKeyVault),
+    }]});
+    const typedKeyHypothesis=generateRelationalHypotheses(typedKeyGraph).find(r=>
+      r.entrypoints.includes("TypedKeyVault.deposit")&&
+      r.entrypoints.includes("TypedKeyVault.withdraw"));
+    assert.ok(typedKeyHypothesis,"enum/UDVT mapping accounting must produce a relational property");
+    assert.ok(typedKeyHypothesis.requiredObservations.includes("balances(uint8)"),
+      "Enum mapping getter inputs must use Solidity's ABI uint8 representation");
+    assert.ok(typedKeyHypothesis.requiredObservations.includes("shares(uint64)"),
+      "UDVT mapping getter inputs must resolve through the declared underlying ABI type");
   }
 
   // 10. Regression Case 3: Insufficient evidence -> UNKNOWN_ASSERTION, zero fabricated experiments
@@ -1561,6 +1752,25 @@ contract MixedProtocolVault {
       "Driver must propose discover_experiment for constructible property even when a companion relational hypothesis was deferred",
     );
 
+    const allObservedCases=Array.from({length:10},(_,index)=>({
+      caseId:sha(`observed-case-${index}`),path:mixedPath,
+      selector:`MixedProtocolVault.withdraw${index}`,kind:"solidity_sequence",
+    }));
+    const completeReport=driveDeterministicAuditTurn({
+      stage:"REPORT",sources:[mixedSnap],observedCases:allObservedCases,
+      constraints:{action:["final"]},
+    });
+    assert.equal(completeReport.action,"final");
+    assert.equal(JSON.parse(completeReport.answer).findings.length,10,
+      "The deterministic report must preserve every observed case when its requested schema has no findings limit");
+    const schemaBoundReport=driveDeterministicAuditTurn({
+      stage:"REPORT",sources:[mixedSnap],observedCases:allObservedCases,
+      requestSchema:{type:"object",properties:{findings:{type:"array",maxItems:3}}},
+      constraints:{action:["final"]},
+    });
+    assert.equal(JSON.parse(schemaBoundReport.answer).findings.length,3,
+      "The deterministic report must retain an explicit caller-provided findings bound");
+
     // When Z3 proves smt_unsat_guard on the same lead, construction MUST be skipped
     const refutedGraph = buildProgramFactsGraph({ sources: [mixedSnap] });
     refutedGraph.byFile.get(mixedPath)!.facts.push({
@@ -1638,8 +1848,22 @@ contract MixedProtocolVault {
       const covLogText = await readFile(covLog, "utf8");
       const capsIdx = covLogText.indexOf("[DETERMINISTIC_HOST_CAPABILITIES]");
       const winIdx = covLogText.indexOf("[ANALYSIS_MODEL_WINDOW_STARTED]");
+      const propertyPass = covLogText.match(/\[ANALYSIS_SOURCE_PROPERTY_PASS_STARTED\]\s+(\{[^\n]+\})/);
+      const propertyProgress = covLogText.split("\n")
+        .filter(line=>line.startsWith("[ANALYSIS_SOURCE_PROPERTY_PROGRESS] "))
+        .map(line=>JSON.parse(line.slice("[ANALYSIS_SOURCE_PROPERTY_PROGRESS] ".length)) as {
+          completed:number;total:number;elapsedMs:number;
+        });
       assert.ok(capsIdx >= 0, "Audit log must emit [DETERMINISTIC_HOST_CAPABILITIES] upfront");
       assert.ok(winIdx < 0 || capsIdx < winIdx, "[DETERMINISTIC_HOST_CAPABILITIES] must precede ANALYZE window");
+      assert.ok(propertyPass, "Source-property construction pass must announce its bounded inventory");
+      const propertyTotal=JSON.parse(propertyPass![1]).total as number;
+      assert.ok(propertyTotal>0, "Source-property construction must have leads to resolve");
+      assert.ok(propertyProgress.length>0, "Source-property construction must emit progress during the pass");
+      assert.equal(propertyProgress.at(-1)!.completed,propertyTotal,
+        "Final source-property progress event must account for every lead");
+      assert.ok(propertyProgress.every(progress=>progress.elapsedMs>=0&&progress.completed<=progress.total),
+        "Progress events must report bounded, valid construction counts");
       const completeMatch = covLogText.match(/\[ANALYSIS_COMPLETE\]\s+(\{[^\n]+\})/);
       assert.ok(completeMatch, "Audit log must record [ANALYSIS_COMPLETE]");
       const completePayload = JSON.parse(completeMatch![1]);

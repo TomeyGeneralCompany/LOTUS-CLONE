@@ -40,25 +40,46 @@ export const sourceProbeSpecSchema = z.object({file:z.string().min(1).max(4096),
   });
 // ERC1155 reproduction may insert mined mint/approval prerequisite transactions
 // before a requested send. They are recorded as setup, never as vulnerability evidence.
-const fixtureDiagnosticsSchema=z.object({
+export const evmReceiptSchema=z.object({
+  status:z.number().int().min(0).max(1),transactionHash:z.string().nullable(),
+  blockNumber:z.number().int().nullable(),from:z.string().nullable(),to:z.string().nullable(),
+  contractAddress:z.string().nullable(),gasUsed:z.string().nullable(),
+  logs:z.array(z.object({address:z.string().nullable(),topics:z.array(z.string()),
+    data:z.string().nullable(),index:z.number().int().nonnegative(),
+    transactionHash:z.string().nullable(),blockNumber:z.number().int().nullable()}).strict()).max(10000)
+}).strict();
+export const fixtureDiagnosticsSchema=z.object({
   experimentId:digest.nullish(),fixtureId:digest.nullish(),sourceSha256:digest.nullish(),
   file:z.string().max(4096).nullish(),selector:z.string().max(160).nullish(),
   selectedFile:z.string().max(4096).nullish(),contractName:z.string().max(128).nullish(),
   compilerVersion:z.string().max(128).nullish(),evmVersion:z.string().max(64).nullish(),
   cacheHit:z.boolean().nullish(),bytecodeSha256:digest.nullish(),
+  // The isolated Solidity compiler emits these source-bound certificates
+  // for the selected contract and every acquired preparation deployment.
+  // Reject malformed or invented digests; do not silently strip the proof.
+  abiSha256:digest.nullish(),
+  preparationAbiSha256:z.record(z.string().min(1).max(128),digest).optional(),
   constructorTypes:z.array(z.string().max(128)).max(16).optional(),
   stepIndex:z.number().int().min(0).max(64).nullish(),
   receiptStatus:z.number().int().min(0).max(1).nullish(),
   receiptTo:z.string().max(128).nullish(),
-  transactionHash:z.string().max(128).nullish(),gasUsed:z.string().max(64).nullish()
+  transactionHash:z.string().max(128).nullish(),gasUsed:z.string().max(64).nullish(),
+  receipt:evmReceiptSchema.optional(),
+  receiptHistory:z.array(z.object({phase:z.string().max(60),action:z.string().max(200),
+    receipt:evmReceiptSchema}).strict()).max(128).optional()
 }).strict();
+const eventCheckSchema=z.object({signature:z.string(),expected:z.unknown(),
+  observed:z.unknown().nullable(),passed:z.boolean()}).strict();
 export const sequenceObservations = z.object({contract:z.string(),accounts:z.array(z.string()).length(3),deploymentGasUsed:z.string(),
-  diagnostics:fixtureDiagnosticsSchema.optional(),
+  deploymentReceipt:evmReceiptSchema.optional(),diagnostics:fixtureDiagnosticsSchema.optional(),
   steps:z.array(z.discriminatedUnion("operation",[
     z.object({operation:z.literal("call"),deploymentId:z.string().optional(),function:z.string(),sender:z.number(),actual:z.unknown(),expected:z.unknown(),passed:z.boolean()}),
     z.object({operation:z.literal("observe"),deploymentId:z.string().optional(),function:z.string(),sender:z.number(),actual:z.unknown()}),
-    z.object({operation:z.literal("send"),deploymentId:z.string().optional(),function:z.string(),sender:z.number(),valueWei:z.string(),reverted:z.boolean(),gasUsed:z.string(),passed:z.boolean()}),
-    z.object({operation:z.literal("setup"),deploymentId:z.string().optional(),function:z.string(),sender:z.number(),gasUsed:z.string(),passed:z.literal(true),purpose:z.string()}),
+    z.object({operation:z.literal("send"),deploymentId:z.string().optional(),function:z.string(),sender:z.number(),valueWei:z.string(),reverted:z.boolean(),gasUsed:z.string(),passed:z.boolean(),
+      receipt:evmReceiptSchema.optional(),actualEvents:z.array(z.object({name:z.string(),signature:z.string(),
+        address:z.string().nullable(),args:z.unknown()}).strict()).max(10000).optional(),
+      expectedEvents:z.array(eventCheckSchema).max(16).optional(),eventsPassed:z.boolean().optional()}),
+    z.object({operation:z.literal("setup"),deploymentId:z.string().optional(),function:z.string(),sender:z.number(),gasUsed:z.string(),passed:z.literal(true),purpose:z.string(),receipt:evmReceiptSchema.optional()}),
     z.object({operation:z.literal("eth_balance"),target:z.string(),address:z.string(),balanceWei:z.string(),passed:z.boolean()}),
   ])).min(1).max(48)});
 const javaSequenceObservations=z.object({constructor:z.array(z.unknown()),steps:z.array(z.object({operation:z.literal("call"),function:z.string(),actual:z.string(),expected:z.unknown().optional(),passed:z.boolean()})).min(1).max(12)});
@@ -66,7 +87,7 @@ const polyglotSequenceObservations=z.object({factory:z.string().nullable(),steps
   operation:z.literal("call"),function:z.string(),actual:z.unknown(),
   expected:z.unknown().optional(),passed:z.boolean()
 })).min(2).max(12)});
-const resultSchema = z.object({status:z.string(),behavior_observed:z.boolean(),classification:z.string().nullish(),phase:z.string().max(60).nullish(),diagnostics:fixtureDiagnosticsSchema.nullish(),source_sha256:digest.optional(),
+export const resultSchema = z.object({status:z.string(),behavior_observed:z.boolean(),classification:z.string().nullish(),phase:z.string().max(60).nullish(),diagnostics:fixtureDiagnosticsSchema.nullish(),source_sha256:digest.optional(),
   kind:z.string().optional(),observations:z.union([z.object({control_input:z.string(),control_output:z.string(),attack_input:z.string(),attack_output:z.string(),
     entry_control_url:z.string().optional(),entry_attack_url:z.string().optional(),
     entry_selector:z.string().optional(),entry_parameter:z.string().optional()}),sequenceObservations,javaSequenceObservations,polyglotSequenceObservations]).optional(),
@@ -94,7 +115,7 @@ async function executeProbe(directory:string,spec:z.infer<typeof sourceProbeSpec
     let output:string;
     try {
       output=(await execute("python3",[driver,"--repository",directory,"--spec",path],{
-        timeout:150000,maxBuffer:128000,signal,env:{PATH:process.env.PATH,NODE_ENV:process.env.NODE_ENV ?? "production"},
+        timeout:150000,maxBuffer:2*1024*1024,signal,env:{PATH:process.env.PATH,NODE_ENV:process.env.NODE_ENV ?? "production"},
       })).stdout;
     } catch(error:any) {
       signal?.throwIfAborted();

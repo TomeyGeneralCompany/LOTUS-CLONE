@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for multi-class Solidity security evidence, compile caching, and pragma selection."""
 import importlib.util
+import hashlib
 import os
 import sys
 import tempfile
@@ -10,7 +11,8 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from solidity_security_evidence import security_behavior_observed, security_experiment_disposition  # noqa: E402
+from solidity_security_evidence import (security_behavior_observed, security_experiment_disposition,
+    _dynamic_observation_arguments_match, _asserted_dynamic_position_withdrawal_negative)  # noqa: E402
 
 repro_spec = importlib.util.spec_from_file_location('source_repro', SCRIPTS_DIR / 'source-reproduction.py')
 repro_mod = importlib.util.module_from_spec(repro_spec)
@@ -30,6 +32,65 @@ CONTRACT_ADDR = "0x" + "44" * 20
 
 
 class SoliditySecurityEvidenceTests(unittest.TestCase):
+    def test_dynamic_withdrawal_argument_must_match_prior_struct_observation(self):
+        requested=[
+            {"operation":"observe","function":"getDeposit(uint64)","args":["1"]},
+            {"operation":"send","function":"withdraw(uint64,uint256,bool)",
+             "args":["1","$lastObservation:0",True]},
+        ]
+        actual=[
+            {"operation":"observe","function":"getDeposit(uint64)","args":["1"],
+             "actual":["1087","87000000000000000"]},
+            {"operation":"send","function":"withdraw(uint64,uint256,bool)",
+             "args":["1","1087",True]},
+        ]
+        self.assertTrue(_dynamic_observation_arguments_match(requested,actual))
+        tampered=[dict(actual[0]),dict(actual[1],args=["1","1088",True])]
+        self.assertFalse(_dynamic_observation_arguments_match(requested,tampered))
+        missing=[dict(actual[0]),{"operation":"send","args":["1",True]}]
+        self.assertFalse(_dynamic_observation_arguments_match(requested,missing))
+        out_of_range=[dict(requested[0]),dict(requested[1],args=["1","$lastObservation:8",True])]
+        self.assertFalse(_dynamic_observation_arguments_match(out_of_range,actual))
+
+    def test_dynamic_position_lifecycle_requires_source_and_two_final_readbacks(self):
+        source=("contract Vault { struct Deposit { uint256 virtualTokenTotalSupply; } "
+                "function getDeposit(uint64 depositID) external view returns(Deposit memory) "
+                "{ return deposits[depositID - 1]; } "
+                "function deposit(uint256 depositAmount,uint64) external "
+                "{ totalDeposit += depositAmount; } "
+                "function withdraw(uint64 depositID,uint256 virtualTokenAmount,bool) external "
+                "{ if(virtualTokenAmount > virtualTokenTotalSupply) "
+                "{ virtualTokenAmount = virtualTokenTotalSupply; } "
+                "totalDeposit -= depositAmount; "
+                "_getDeposit(depositID).virtualTokenTotalSupply -= virtualTokenAmount; } }")
+        requested=[
+            {"operation":"call","function":"totalDeposit()","expect":"0"},
+            {"operation":"send","function":"deposit(uint256,uint64)"},
+            {"operation":"call","function":"totalDeposit()","expect":"1000"},
+            {"operation":"observe","function":"getDeposit(uint64)","args":["1"]},
+            {"operation":"send","function":"withdraw(uint64,uint256,bool)",
+             "args":["1","$lastObservation:0",True]},
+            {"operation":"call","function":"getDeposit(uint64)","expectPath":[0]},
+            {"operation":"call","function":"totalDeposit()","expect":"0"},
+        ]
+        actual=[
+            {"operation":"call","actual":"0","passed":True},
+            {"operation":"send","args":["1000","2000000000"],"passed":True},
+            {"operation":"call","actual":"1000","passed":True},
+            {"operation":"observe","args":["1"],"actual":["1000"]},
+            {"operation":"send","args":["1","1000",True],"passed":True},
+            {"operation":"call","actual":"0","passed":True},
+            {"operation":"call","actual":"0","passed":True},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path=Path(tmp)/"Vault.sol"
+            source_path.write_text(source,encoding="utf8")
+            result=_asserted_dynamic_position_withdrawal_negative(source_path,requested,actual)
+            self.assertIsNotNone(result)
+            bad=actual[:-1]+[dict(actual[-1],actual="1",passed=False)]
+            self.assertIsNone(_asserted_dynamic_position_withdrawal_negative(
+                source_path,requested,bad))
+
     def test_imported_inherited_method_requires_acquired_executable_body(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
@@ -384,6 +445,98 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                 {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":vestmissing},
                 {"sequence":{"steps":vestreq}})[0],"observation_only")
 
+    def test_xmph_reward_unlock_uses_observed_local_evm_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            source=root/"contracts"/"rewards"/"xMPH.sol"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "contract xMPH is ERC20Upgradeable, AccessControlUpgradeable {\n"
+                "uint256 public constant MIN_AMOUNT=10**9;\n"
+                "uint256 internal constant MAX_REWARD_UNLOCK_PERIOD=365 days;\n"
+                "uint256 public rewardUnlockPeriod; uint256 public currentUnlockEndTimestamp;\n"
+                "uint256 public lastRewardTimestamp; uint256 public lastRewardAmount;\n"
+                "event DistributeReward(uint256 rewardAmount);\n"
+                "function initialize(address _mph,uint256 _rewardUnlockPeriod,address _distributor) external { "
+                "_setupRole(DISTRIBUTOR_ROLE,msg.sender); _deposit(MIN_AMOUNT); }\n"
+                "function distributeReward(uint256 rewardAmount) external { require(hasRole(DISTRIBUTOR_ROLE,msg.sender)); "
+                "mph.safeTransferFrom(msg.sender,address(this),rewardAmount); "
+                "currentUnlockEndTimestamp=block.timestamp+rewardUnlockPeriod; "
+                "lastRewardTimestamp=block.timestamp; lastRewardAmount=rewardAmount; emit DistributeReward(rewardAmount); }\n"
+                "function deposit(uint256 _mphAmount) external returns(uint256 shareAmount) { "
+                "shareAmount=_mphAmount.div(getPricePerFullShare()); _mint(msg.sender,shareAmount); "
+                "mph.safeTransferFrom(msg.sender,address(this),_mphAmount); }\n"
+                "function withdraw(uint256 _shareAmount) external returns(uint256 mphAmount) { "
+                "require(totalSupply() >= _shareAmount + MIN_AMOUNT); "
+                "mphAmount=_shareAmount.mul(getPricePerFullShare()); _burn(msg.sender,_shareAmount); "
+                "mph.safeTransfer(msg.sender,mphAmount); }\n"
+                "function getPricePerFullShare() external view returns(uint256) { uint256 lockedRewardAmount="
+                "(_lastRewardAmount*(_currentUnlockEndTimestamp-block.timestamp))/"
+                "(_currentUnlockEndTimestamp-_lastRewardTimestamp); return (mphBalance-lockedRewardAmount).div(totalShares); }\n"
+                "}",encoding="utf8")
+            req=[
+                {"operation":"send","function":"approve(address,uint256)","sender":0},
+                {"operation":"send","function":"initialize(address,uint256,address)",
+                 "args":["$deployment:token","86400","$account0"],"sender":0},
+                {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$contract"],"expect":"1000000000"},
+                {"operation":"send","function":"distributeReward(uint256)","args":["1000000000"],"sender":2,"expectRevert":True},
+                {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$contract"],"expect":"1000000000"},
+                {"operation":"send","function":"distributeReward(uint256)","args":["1000000000"],"sender":0,
+                 "expectEvents":[{"signature":"DistributeReward(uint256)","args":["1000000000"]}]},
+                {"operation":"call","function":"getPricePerFullShare()","expect":"1000000000000000000"},
+                {"operation":"advance_time","seconds":"43200"},
+                {"operation":"observe","function":"getPricePerFullShare()","args":[]},
+                {"operation":"advance_time","seconds":"43200"},
+                {"operation":"call","function":"getPricePerFullShare()","expect":"2000000000000000000"},
+                {"operation":"send","function":"deposit(uint256)","args":["1000"],"sender":0},
+                {"operation":"call","function":"getPricePerFullShare()","expect":"2000000000000000000"},
+                {"operation":"send","function":"withdraw(uint256)","args":["400"],"sender":0},
+                {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$account0"],"expect":"999999800"},
+                {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$contract"],"expect":"2000000200"},
+            ]
+            first_elapsed=43201
+            locked=1000000000*(86400-first_elapsed)//86400
+            midpoint=str((2000000000-locked)*10**18//1000000000)
+            actual=[]
+            local_time=1577836800
+            for i,step in enumerate(req):
+                item={"operation":step["operation"],"passed":True}
+                if step["operation"] in ("call","observe","send"):
+                    item.update({"function":step["function"],"sender":step.get("sender",0)})
+                if step["operation"]=="call":
+                    item.update({"actual":step["expect"],"expected":step["expect"]})
+                if step["operation"]=="observe":
+                    item.update({"actual":midpoint,"args":step.get("args",[])})
+                if step["operation"]=="send":
+                    item.update({"reverted":step.get("expectRevert",False),"args":step.get("args",[])})
+                    if step["function"]=="distributeReward(uint256)" and step["sender"]==0:
+                        item.update({"eventsPassed":True,"expectedEvents":[
+                            {"signature":"DistributeReward(uint256)","expected":["1000000000"],
+                             "observed":["1000000000"],"passed":True}],"actualEvents":[
+                            {"signature":"DistributeReward(uint256)","args":["1000000000"]}]})
+                if step["operation"]=="advance_time":
+                    item.update({"seconds":step["seconds"],"fromTimestamp":str(local_time),"toTimestamp":str(local_time+43201),
+                                 "elapsedSeconds":"43201"})
+                    local_time+=43201
+                actual.append(item)
+            result=security_experiment_disposition(root,source,"xMPH.distributeReward",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual,
+                 "diagnostics":{"sourceSha256":hashlib.sha256(source.read_bytes()).hexdigest()}},
+                {"sequence":{"steps":req}})
+            self.assertEqual(result[0],"behavior_not_observed")
+            self.assertEqual(result[1],"source_xmph_reward_unlock_negative")
+            bad_time=[dict(item) for item in actual]
+            bad_time[8]=dict(actual[8],actual="1500000000000000000")
+            self.assertEqual(security_experiment_disposition(root,source,"xMPH.distributeReward",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":bad_time,
+                 "diagnostics":{"sourceSha256":hashlib.sha256(source.read_bytes()).hexdigest()}},
+                {"sequence":{"steps":req}})[0],"observation_only")
+            self.assertEqual(security_experiment_disposition(root,source,"xMPH.distributeReward",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual,
+                 "diagnostics":{"sourceSha256":"0"*64}},
+                {"sequence":{"steps":req}})[0],"observation_only",
+                "A source-hash mismatch must not certify the reward-unlock property")
+
     def test_general_source_scalar_conservation_is_independently_proven(self):
         import hashlib
         with tempfile.TemporaryDirectory() as tmp:
@@ -429,6 +582,127 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                 "sourceProperty":{**prop,"method":"accrue(uint8)"}}}
             self.assertEqual(security_experiment_disposition(
                 root,source,"Ledger.accrue",evidence,unrelated)[0],"observation_only")
+
+    def test_source_scalar_delta_binds_nonfinal_amount_and_typed_arguments(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            source=root/"TypedLedger.sol"
+            source.write_text("""pragma solidity ^0.8.20;
+contract TypedLedger {
+uint256 public totalDeposits;
+function deposit(uint256 amount) external { totalDeposits+=amount; }
+function deposit(uint64 maturityTimestamp,uint256 wad,bool enabled) external {
+require(maturityTimestamp>block.timestamp);
+enabled;
+totalDeposits+=wad;
+}
+}
+""",encoding="utf8")
+            sha=hashlib.sha256(source.read_bytes()).hexdigest()
+            requested=[
+                {"operation":"call","function":"totalDeposits()","args":[],"expect":"0"},
+                {"operation":"send","function":"deposit(uint64,uint256,bool)",
+                 "args":["2000000000","1000",False],"sender":0},
+                {"operation":"call","function":"totalDeposits()","args":[],"expect":"1000"},
+            ]
+            actual=[
+                {"operation":"call","actual":"0","passed":True},
+                {"operation":"send","reverted":False,"passed":True},
+                {"operation":"call","actual":"1000","passed":True},
+            ]
+            prop={"kind":"scalar_delta","state":"totalDeposits",
+                  "method":"deposit(uint64,uint256,bool)","parameter":"wad",
+                  "amount":"1000","direction":"increase","sourceSha256":sha}
+            spec={"sequence":{"constructorArgs":[],"steps":requested,
+                              "sourceProperty":prop}}
+            result=security_experiment_disposition(root,source,"TypedLedger.deposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual},spec)
+            self.assertEqual(result[0],"behavior_not_observed")
+            self.assertEqual(result[1],"source_scalar_delta_negative")
+            wrong_args=[dict(step) for step in requested]
+            wrong_args[1]=dict(wrong_args[1],args=["2000000000","1",False])
+            wrong_spec={"sequence":{"constructorArgs":[],"steps":wrong_args,
+                                    "sourceProperty":prop}}
+            self.assertEqual(security_experiment_disposition(
+                root,source,"TypedLedger.deposit",{"accounts":ACCOUNTS,
+                "contract":CONTRACT_ADDR,"steps":actual},wrong_spec)[0],
+                "observation_only")
+
+    def test_source_scalar_delta_accepts_exact_private_state_getter(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            source=root/"PrivateScalar.sol"
+            source.write_text("""pragma solidity ^0.8.20;
+contract PrivateScalar {
+uint256 private held;
+function observedAmount() external view returns(uint256) { return held; }
+function accrue(uint256 value) external { held+=value; }
+}
+""",encoding="utf8")
+            sha=hashlib.sha256(source.read_bytes()).hexdigest()
+            requested=[
+                {"operation":"call","function":"observedAmount()","args":[],"expect":"0"},
+                {"operation":"send","function":"accrue(uint256)","args":["1000"],"sender":0},
+                {"operation":"call","function":"observedAmount()","args":[],"expect":"1000"},
+            ]
+            actual=[
+                {"operation":"call","actual":"0","passed":True},
+                {"operation":"send","reverted":False,"passed":True},
+                {"operation":"call","actual":"1000","passed":True},
+            ]
+            prop={"kind":"scalar_delta","state":"held","method":"accrue(uint256)",
+                  "parameter":"value","amount":"1000","direction":"increase",
+                  "sourceSha256":sha}
+            spec={"sequence":{"constructorArgs":[],"steps":requested,
+                              "sourceProperty":prop}}
+            result=security_experiment_disposition(root,source,"PrivateScalar.accrue",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual},spec)
+            self.assertEqual(result[0],"behavior_not_observed")
+            self.assertEqual(result[1],"source_scalar_delta_negative")
+
+    def test_source_scalar_delta_verifies_literal_fee_formula(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            source=root/"FeeLedger.sol"
+            source.write_text("""pragma solidity ^0.8.20;
+contract FeeLedger {
+uint256 public fees;
+function deposit(uint256 amount) external { fees += amount * 100 / 10000; }
+}
+""",encoding="utf8")
+            sha=hashlib.sha256(source.read_bytes()).hexdigest()
+            requested=[
+                {"operation":"call","function":"fees()","args":[],"expect":"0"},
+                {"operation":"send","function":"deposit(uint256)",
+                 "args":["10001"],"sender":0},
+                {"operation":"call","function":"fees()","args":[],"expect":"100"},
+            ]
+            actual=[
+                {"operation":"call","actual":"0","passed":True},
+                {"operation":"send","reverted":False,"passed":True},
+                {"operation":"call","actual":"100","passed":True},
+            ]
+            prop={"kind":"scalar_delta","state":"fees",
+                  "method":"deposit(uint256)","parameter":"amount",
+                  "amount":"10001","formula":{"multiplier":"100",
+                  "divisor":"10000"},"expectedDelta":"100",
+                  "direction":"increase","sourceSha256":sha}
+            spec={"sequence":{"constructorArgs":[],"steps":requested,
+                              "sourceProperty":prop}}
+            result=security_experiment_disposition(root,source,"FeeLedger.deposit",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual},spec)
+            self.assertEqual(result[0],"behavior_not_observed")
+            self.assertEqual(result[1],"source_scalar_delta_negative")
+            wrong_formula={**prop,"expectedDelta":"101"}
+            wrong_spec={"sequence":{"constructorArgs":[],"steps":requested,
+                                    "sourceProperty":wrong_formula}}
+            self.assertEqual(security_experiment_disposition(
+                root,source,"FeeLedger.deposit",{"accounts":ACCOUNTS,
+                "contract":CONTRACT_ADDR,"steps":actual},wrong_spec)[0],
+                "observation_only")
 
     def test_bounded_funding_source_and_state_negative(self):
         with tempfile.TemporaryDirectory() as tmp:

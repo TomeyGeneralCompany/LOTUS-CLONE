@@ -5,13 +5,44 @@
  */
 import {createHash} from 'node:crypto';
 import {parse} from '@solidity-parser/parser';
+import {canonicalElementaryAbiType} from './solidity-abi-types';
 import {posix} from 'node:path';
 import type {SolidityProbeDeclaration} from './solidity-probe-inputs';
 import type {SoliditySequence} from './solidity-sequence';
 import {sourceGroundedSolidityProbes} from './controller-solidity-security-probes';
+import {inheritedRoleConsumerImpactSequence} from './controller-solidity-consumer-impact';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
 import {extractAccountingObservations} from './deterministic/accounting-observations';
-import {resolveSourceFixtureDependencies, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependenciesDetailed, verifyAcquiredReceiverMethods, verifyCanonicalInheritedPackageMethod, type PreparedDeployment, type PreparedInitializerOperation, type FixtureSearchCheckpoint} from './deterministic/fixture-dependency-planner';
+
+/** Select a compact set of complete deployment graphs that collectively
+ * exercises every acquired concrete implementation. The omitted graph
+ * combinations remain unresolved and are reported to the caller.
+ */
+export function representativeFixtureGraphs<
+  T extends {implementationChoices?:Readonly<Record<string,string>>}
+>(graphs:readonly T[]):T[] {
+  const selected=graphs.filter(graph=>
+    Object.keys(graph.implementationChoices||{}).length===0);
+  const remaining=graphs.filter(graph=>
+    Object.keys(graph.implementationChoices||{}).length>0);
+  const uncovered=new Set(remaining.flatMap(graph=>
+    Object.values(graph.implementationChoices||{})));
+  while(remaining.length&&uncovered.size){
+    let bestIndex=0,bestCoverage=-1;
+    for(let index=0;index<remaining.length;index++){
+      const coverage=Object.values(remaining[index].implementationChoices||{})
+        .filter(value=>uncovered.has(value)).length;
+      if(coverage>bestCoverage){bestCoverage=coverage;bestIndex=index;}
+    }
+    const [best]=remaining.splice(bestIndex,1);
+    selected.push(best);
+    for(const value of Object.values(best.implementationChoices||{}))
+      uncovered.delete(value);
+  }
+  if(!selected.length&&graphs.length)selected.push(graphs[0]);
+  return selected;
+}
 
 export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
@@ -34,21 +65,27 @@ export type InvariantUnresolvedCategory =
   | 'no_supported_property';
 
 export interface SourceInvariantTransitionPlan {
-  mode: 'eth_deposit_withdraw' | 'internal_deposit_withdraw' | 'erc20_deposit_withdraw' | 'mint_burn_supply';
+  mode: 'eth_deposit_withdraw' | 'internal_deposit_withdraw' | 'erc20_deposit_withdraw' | 'mint_burn_supply' | 'dynamic_full_position_withdraw';
   usesMockToken?: boolean;
+  /** ID of an acquired ERC20 fixture already injected through a transitive
+   * constructor/initializer edge. */
+  mockTokenDeploymentId?:string;
   inflowMethod: string;
   inflowSig: string;
   inflowArgs: string[];
   inflowValueWei?: string;
   outflowMethod: string;
   outflowSig: string;
-  outflowArgs: string[];
+  outflowArgs: Array<string|boolean>;
   inflowAmount: string;
   outflowAmount: string;
   expectedRemainder: string;
   balanceMappingGetter?: string;
+  balanceMappingGetterArgs?: string[];
   totalScalarGetter?: string;
   typedObservation?: {getter:string;args:string[];expectPath?:number[];baseline:string;afterInflow:string;afterOutflow:string};
+  dynamicPositionObservation?:{getter:string;args:string[];argumentPath:number[]};
+  dynamicPositionCompanionGetters?:string[];
   dependencyDeployments?:PreparedDeployment[];
   dependencyInitializerOperations?:PreparedInitializerOperation[];
   dependencyBindings?:Record<string,string>;
@@ -79,6 +116,8 @@ export interface ConstructionInput {
   skipFinancialInvariants?:boolean;
   staticLeads?:readonly StaticLeadHint[];
   invariants?:readonly SourceInvariant[];
+  fixtureSearchCheckpoint?:FixtureSearchCheckpoint;
+  fixtureSearchNodeBudget?:number;
 }
 export interface PreparedSecurityExperiment {
   version:1;id:string;language:'solidity';status:'constructed';
@@ -88,9 +127,23 @@ export interface PreparedSecurityExperiment {
 }
 export type ConstructionResult =
   | {ok:true;experiments:PreparedSecurityExperiment[]}
-  | {ok:false;code:string;detail:string;unresolvedCategory?:InvariantUnresolvedCategory};
+  | {ok:false;code:string;detail:string;unresolvedCategory?:InvariantUnresolvedCategory;
+      /** An independently executable alternative does not discharge another blocked source obligation. */
+      partialExperiments?:PreparedSecurityExperiment[];
+      fixtureSearchCheckpoint?:FixtureSearchCheckpoint};
 
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
+/** Resolve an acquired import without treating package imports as paths under
+ * the target file's directory. Package snapshots use the exact Solidity import
+ * specifier as their identity (for example @openzeppelin/contracts/...); local
+ * imports continue to use POSIX-normalized paths relative to the importing file.
+ */
+function importedSnapshot(sources:ReadonlyMap<string,SourceSnapshot>,fromPath:string,importPath:string):SourceSnapshot|undefined {
+  const resolved=importPath.startsWith('.')
+    ?posix.normalize(posix.join(posix.dirname(fromPath),importPath))
+    :importPath;
+  return sources.get(resolved);
+}
 const identifier=/^[A-Za-z_]\w*$/;
 const ZERO_ADDRESS='0x0000000000000000000000000000000000000000';
 const ZERO_BYTES32='0x'+'00'.repeat(32);
@@ -103,6 +156,78 @@ function parseAstCached(snapshot:SourceSnapshot):any {
   if(astCache.size>=256)astCache.delete(astCache.keys().next().value!);
   astCache.set(snapshot.sha256,parsed);
   return parsed;
+}
+const abiNodeOwner=new WeakMap<object,string>();
+type AbiTypeDefinition={kind:"contract"|"enum"|"struct"|"value";node:any;owner?:string};
+let activeAbiTypeDefinitions=new Map<string,AbiTypeDefinition[]>();
+function addAbiType(map:Map<string,AbiTypeDefinition[]>,name:string,definition:AbiTypeDefinition){
+  if(!name)return;
+  const values=map.get(name)||[];
+  if(!values.some(value=>value.node===definition.node))values.push(definition);
+  map.set(name,values);
+}
+function buildAbiTypeDefinitions(sources:readonly SourceSnapshot[]):Map<string,AbiTypeDefinition[]> {
+  const result=new Map<string,AbiTypeDefinition[]>();
+  const mark=(value:any,owner?:string,depth=0):void=>{
+    if(!value||typeof value!=="object"||depth>128)return;
+    if(Array.isArray(value)){for(const item of value)mark(item,owner,depth+1);return;}
+    let current=owner;
+    if(value.type==="ContractDefinition"&&typeof value.name==="string")current=value.name;
+    if(current)abiNodeOwner.set(value,current);
+    for(const [key,child] of Object.entries(value))
+      if(key!=="loc"&&key!=="range")mark(child,current,depth+1);
+  };
+  for(const source of sources){
+    let ast:any;
+    try{ast=parseAstCached(source);}catch{continue;}
+    mark(ast);
+    for(const node of ast.children||[]){
+      if(node.type==="ContractDefinition"&&node.name){
+        const contract:AbiTypeDefinition={kind:"contract",node,owner:node.name};
+        addAbiType(result,node.name,contract);
+        for(const child of node.subNodes||[]){
+          if(!child.name)continue;
+          const kind=child.type==="EnumDefinition"?"enum":
+            child.type==="StructDefinition"?"struct":
+            ["UserDefinedValueTypeDefinition","TypeDefinition"].includes(child.type)?"value":null;
+          if(!kind)continue;
+          const definition:AbiTypeDefinition={kind,node:child,owner:node.name};
+          addAbiType(result,node.name+"."+child.name,definition);
+          addAbiType(result,child.name,definition);
+        }
+      }else if(node.name){
+        const kind=node.type==="EnumDefinition"?"enum":
+          node.type==="StructDefinition"?"struct":
+          ["UserDefinedValueTypeDefinition","TypeDefinition"].includes(node.type)?"value":null;
+        if(kind)addAbiType(result,node.name,{kind,node,owner:undefined});
+      }
+    }
+  }
+  return result;
+}
+function resolveUserAbiType(typeName:any,seen=new Set<any>()):string|null {
+  const name=String(typeName?.namePath||"");
+  if(!identifier.test(name)&&!/^([A-Za-z_]\\w*\\.)+[A-Za-z_]\\w*$/.test(name))return null;
+  const owner=abiNodeOwner.get(typeName);
+  const choices=activeAbiTypeDefinitions.get(owner&& !name.includes(".")?owner+"."+name:name)||
+    activeAbiTypeDefinitions.get(name)||[];
+  if(!choices.length)return null;
+  const shapes=choices.map(definition=>{
+    if(seen.has(definition.node))return null;
+    if(definition.kind==="contract")return "address";
+    if(definition.kind==="enum")return "uint8";
+    const next=new Set(seen);next.add(definition.node);
+    if(definition.kind==="value"){
+      const underlying=definition.node.underlyingType||
+        definition.node.underlyingTypeName||definition.node.typeName||definition.node.definition;
+      return canonicalAbiType(underlying,next);
+    }
+    const members=definition.node.members||[];
+    const types=members.map((member:any)=>canonicalAbiType(member.typeName,next));
+    return types.some((item:string|null)=>item===null)?null:"("+types.join(",")+")";
+  });
+  const unique=[...new Set(shapes.filter((item):item is string=>typeof item==="string"))];
+  return unique.length===1&&shapes.every((item:string|null)=>item===unique[0])?unique[0]:null;
 }
 
 const clean=(s:string)=>s.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g,'');
@@ -130,10 +255,11 @@ function directOwnerExperiment(snapshot:SourceSnapshot,contract:any,menu:readonl
   if(!setter)return null;
   const parameter=setter.parameters[0];
   if(!identifier.test(parameter?.name||''))return null;
-  const type=parameter.typeName?.name;
-  if(!type || !/^uint(?:[0-9]{1,3})?$/.test(type))return null;
+  const type=canonicalElementaryAbiType(String(parameter.typeName?.name||''));
+  if(!type||!/^uint/.test(type))return null;
   const state=members.filter(n=>n.type==='StateVariableDeclaration').flatMap(n=>n.variables||[])
-    .find((v:any)=>v.visibility==='public'&&v.typeName?.name===type && v.name!==parameter.name);
+    .find((v:any)=>v.visibility==='public'&&
+      canonicalElementaryAbiType(String(v.typeName?.name||''))===type&&v.name!==parameter.name);
   if(!state || !identifier.test(state.name))return null;
   const fnBody=body(source,setter);
   if(!/\brequire\s*\(\s*msg\s*\.\s*sender\s*==\s*owner\b/.test(fnBody))return null;
@@ -184,8 +310,7 @@ function inheritedOwnerExperiment(
   const ownerImport=imports.find((n:any)=>typeof n.path==='string'&&
     posix.basename(n.path)==='BoringOwnable.sol');
   if(!ownerImport)return null;
-  const ownerPath=posix.normalize(posix.join(posix.dirname(snapshot.path),ownerImport.path));
-  const peer=sources.get(ownerPath);
+  const peer=importedSnapshot(sources,snapshot.path,ownerImport.path);
   if(!peer)return null;
   let peerAst:any;
   try{peerAst=parseAstCached(peer);}catch{return null;}
@@ -295,21 +420,37 @@ const SAFE_OZ_INITS=new Set([
   '_setupRole','_grantRole','_setRoleAdmin'
 ]);
 
-function canonicalAbiType(typeName:any):string|null {
+function canonicalAbiType(typeName:any,seen=new Set<any>()):string|null {
   if(!typeName)return null;
+  // The ABI does not collapse acquired array types to an unknown argument.
+  // In particular, a factory's address[] and a batch token operation's
+  // uint256[] are real, executable signatures rather than a scalar address.
+  if(typeName.type==='ArrayTypeName'){
+    const base=canonicalAbiType(typeName.baseTypeName,seen);
+    if(!base)return null;
+    const size=typeName.length;
+    if(size===null||size===undefined)return base+'[]';
+    const count=String(size.number??size.value??'');
+    if(!/^[1-9][0-9]*$/.test(count)||Number(count)>32)return null;
+    return base+'['+count+']';
+  }
   if(typeName.type==='ElementaryTypeName'){
-    const name=String(typeName.name||'');
-    if(name==='address')return 'address';
-    if(name==='uint')return 'uint256';
-    if(name==='int')return 'int256';
-    if(/^(?:u?int[0-9]{0,3}|bool|string|bytes(?:[0-9]{1,2})?)$/.test(name))return name;
-    return null;
+    return canonicalElementaryAbiType(String(typeName.name||''));
   }
-  if(typeName.type==='UserDefinedTypeName'&&identifier.test(typeName.namePath||'')){
-    // Contract/interface parameters compile to ABI type address.
-    return 'address';
-  }
+  if(typeName.type==='UserDefinedTypeName')return resolveUserAbiType(typeName,seen);
   return null;
+}
+
+function enumAbiCardinality(typeName:any):number|null {
+  if(typeName?.type!=='UserDefinedTypeName')return null;
+  const name=String(typeName.namePath||'');
+  if(!identifier.test(name)&&!/^([A-Za-z_]\w*\.)+[A-Za-z_]\w*$/.test(name))return null;
+  const owner=abiNodeOwner.get(typeName);
+  const choices=activeAbiTypeDefinitions.get(owner&&!name.includes('.')?owner+'.'+name:name)||
+    activeAbiTypeDefinitions.get(name)||[];
+  if(!choices.length||choices.some(choice=>choice.kind!=='enum'))return null;
+  const cardinalities=[...new Set(choices.map(choice=>(choice.node.members||[]).length))];
+  return cardinalities.length===1?cardinalities[0]:null;
 }
 
 function classifyScalarType(abiType:string|null):AbiScalarType|null {
@@ -353,8 +494,7 @@ function resolveInheritance(
           const matchesAlias=imp.symbolAliases.some(([orig,alias]:[string,string|null])=>(alias||orig)===baseName);
           if(!matchesAlias)continue;
         }
-        const resolved=posix.normalize(posix.join(posix.dirname(entry.snapshot.path),p));
-        const peer=sources.get(resolved);
+        const peer=importedSnapshot(sources,entry.snapshot.path,p);
         if(!peer)continue;
         let peerAst:any;
         try{peerAst=parseAstCached(peer);}catch{continue;}
@@ -804,6 +944,88 @@ function checkRequireSafetyAndBounds(
   return {safe:true,contractParams};
 }
 
+
+/**
+ * An NFT burn needs a real pre-existing token. A single unauthorized burn
+ * transaction can revert for a missing token even when authorization is broken.
+ * Build the authorized mint prerequisite and compare independently against
+ * the same existing token, only when the acquired source proves both bodies
+ * and the inherited ownership/initializer fixture.
+ */
+function guardedErc721BurnExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  sources:ReadonlyMap<string,SourceSnapshot>,menu:readonly SolidityProbeDeclaration[]
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(method!=='burn'||contract.kind!=='contract')return null;
+  const {chain,oz,localOwnables}=resolveInheritance(snapshot,contract,sources);
+  if(isAbstractContractNode(contract,chain))return null;
+  const setup=resolveVerifiedSetup(snapshot,contract,chain,oz,localOwnables,menu);
+  if(!setup||setup.kind!=='owner')return null;
+  const functions=(contract.subNodes||[]).filter((fn:any)=>
+    fn.type==='FunctionDefinition'&&fn.body&&
+    ['public','external'].includes(fn.visibility));
+  const types=(fn:any)=>(fn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
+  const burn=functions.find((fn:any)=>fn.name==='burn'&&
+    JSON.stringify(types(fn))===JSON.stringify(['uint256'])&&
+    hasAuthorizationGuard(fn,'owner',chain));
+  const mint=functions.find((fn:any)=>fn.name==='mint'&&
+    JSON.stringify(types(fn))===JSON.stringify(['address','uint256'])&&
+    hasAuthorizationGuard(fn,'owner',chain));
+  if(!burn||!mint)return null;
+  const sourceCall=(fn:any,callee:string,names:string[]):boolean=>{
+    const stmts=fn.body?.statements||[];
+    if(stmts.length!==1||stmts[0].type!=='ExpressionStatement')return false;
+    const exp=stmts[0].expression;
+    if(exp?.type!=='FunctionCall'||exprIdentifier(exp.expression)!==callee||
+      (exp.arguments||[]).length!==names.length)return false;
+    return exp.arguments.every((arg:any,i:number)=>
+      arg.type==='Identifier'&&arg.name===names[i]);
+  };
+  const burnName=burn.parameters?.[0]?.name;
+  const mintNames=(mint.parameters||[]).map((p:any)=>p.name);
+  if(!identifier.test(burnName||'')||mintNames.length!==2||
+    mintNames.some((name:string)=>!identifier.test(name))||
+    !sourceCall(burn,'_burn',[burnName])||
+    !sourceCall(mint,'_safeMint',mintNames))return null;
+  const has=(selector:string,operation:'send'|'call',inputs:string[])=>
+    menu.some(item=>item.selector===contract.name+'.'+selector&&
+      item.operation===operation&&JSON.stringify(item.inputs)===JSON.stringify(inputs));
+  // Inherited compiler ABI entries can be absent from the source-index menu:
+  // the acquired NFT source declares only its own functions. Admit the known
+  // inherited getters solely when BOTH the canonical OpenZeppelin import and
+  // corresponding explicit Solidity base contract are source-proven.
+  const inheritedNames=new Set<string>((contract.baseContracts||[])
+    .map((base:any)=>String(base.baseName?.namePath||'')));
+  const inheritedOwnerGetter=oz.has('ownable_upgradeable')&&
+    inheritedNames.has('OwnableUpgradeable');
+  const inheritedBalanceGetter=oz.has('erc721')&&
+    [...inheritedNames].some(name=>/^ERC721(?:URIStorage)?Upgradeable$/.test(name));
+  if(!has('burn','send',['uint256'])||!has('mint','send',['address','uint256'])||
+    !(has('balanceOf','call',['address'])||inheritedBalanceGetter)||
+    !(has('owner','call',[])||inheritedOwnerGetter))return null;
+  const steps:SoliditySequence['steps']=[];
+  if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
+    args:setup.initArgs,sender:0,requiredSetup:true});
+  steps.push(
+    {operation:'call',function:'owner()',args:[],expect:'$account0'},
+    {operation:'call',function:'balanceOf(address)',args:['$account2'],expect:'0'},
+    {operation:'send',function:'mint(address,uint256)',args:['$account2','1'],
+      sender:0,requiredSetup:true},
+    {operation:'call',function:'balanceOf(address)',args:['$account2'],expect:'1'},
+    {operation:'send',function:'burn(uint256)',args:['1'],sender:1,expectRevert:true},
+    {operation:'call',function:'balanceOf(address)',args:['$account2'],expect:'1'},
+    {operation:'send',function:'burn(uint256)',args:['1'],sender:0},
+    {operation:'call',function:'balanceOf(address)',args:['$account2'],expect:'0'},
+  );
+  return {hypothesis:'An unauthorized caller cannot burn an existing source-minted NFT; '+
+      'the initialized owner can burn that exact token.',
+    property:'source-proven ERC721 owner-gated burn and balance transition',
+    sequence:{constructorArgs:setup.constructorArgs,steps},
+    witnesses:[...setup.setupWitnesses,
+      witness(snapshot,mint,contract.name+'.mint(address,uint256)'),
+      witness(snapshot,burn,contract.name+'.burn(uint256)')]};
+}
+
 function broadenedAuthorizationExperiment(
   snapshot:SourceSnapshot,contract:any,method:string,
   sources:ReadonlyMap<string,SourceSnapshot>,menu:readonly SolidityProbeDeclaration[]
@@ -1071,12 +1293,13 @@ function defaultArgsForTypes(abiTypes:string[]):SolidityArgValue[]|null {
       values.push(Array.from({length:count},()=>elem));continue;
     }
     if(/\[\]$/.test(t)){values.push([]);continue;}
-    if(/^u?int(?:[0-9]{1,3})?$/.test(t)){values.push('7');continue;}
+    const elementary=canonicalElementaryAbiType(t);
+    if(elementary&&/^u?int/.test(elementary)){values.push('7');continue;}
     if(t==='bool'){values.push(true);continue;}
     if(t==='address'||t==='address payable'){values.push('$account2');continue;}
     if(t==='string'){values.push('LOTUS-Test');continue;}
     if(t==='bytes'){values.push('0x4142');continue;}
-    const sized=t.match(/^bytes([1-9]|[12][0-9]|3[012])$/);
+    const sized=elementary?.match(/^bytes([1-9]|[12][0-9]|3[012])$/);
     if(sized){values.push('0x'+'41'.repeat(Number(sized[1])));continue;}
     return null;
   }
@@ -1201,7 +1424,7 @@ function authorityTransferExperiment(
   snapshot:SourceSnapshot,contract:any,method:string,
   sources:ReadonlyMap<string,SourceSnapshot>,menu:readonly SolidityProbeDeclaration[]
 ):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
-  if(!['transferOwnership','renounceOwnership','grantRole'].includes(method))return null;
+  if(!['transferOwnership','renounceOwnership','grantRole','claimOwnership'].includes(method))return null;
   const {chain,oz,localOwnables}=resolveInheritance(snapshot,contract,sources);
   const setup=resolveVerifiedSetup(snapshot,contract,chain,oz,localOwnables,menu);
   if(!setup)return null;
@@ -1219,7 +1442,16 @@ function authorityTransferExperiment(
   }
 
   if(declaredFn){
-    if(!hasAuthorizationGuard(declaredFn.node,setup.kind,chain))return null;
+    if(method==='claimOwnership'){
+      const claimBody=body(declaredFn.snapshot.content,declaredFn.node);
+      // The actual BoringOwnable source uses _pendingOwner and a local
+      // __pendingOwner alias. Both identities are linked by an exact source
+      // assignment; a bare same-name method must not count as a guard.
+      const pendingAliases=[...claimBody.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*_?pendingOwner\b/g)].map(m=>m[1]);
+      const targets=['pendingOwner','_pendingOwner',...pendingAliases];
+      const checksPending=targets.some(t=>new RegExp(`\\bmsg\\.sender\\s*==\\s*${t}\\b|\\b${t}\\s*==\\s*msg\\.sender\\b`).test(claimBody));
+      if(!checksPending)return null;
+    } else if(!hasAuthorizationGuard(declaredFn.node,setup.kind,chain))return null;
   } else {
     const ozOwnerProven=setup.kind==='owner'&&(oz.has('ownable')||oz.has('ownable_upgradeable'))&&
       (method==='transferOwnership'||method==='renounceOwnership');
@@ -1268,6 +1500,35 @@ function authorityTransferExperiment(
       ]},
       witnesses
     };
+  }
+  if(setup.kind==='owner'&&method==='claimOwnership'&&abiEntry.inputs.length===0&&hasPendingOwner){
+    const boringTransfer=menu.find(m=>m.selector===`${contract.name}.transferOwnership`&&m.operation==='send'&&
+      JSON.stringify(m.inputs)===JSON.stringify(['address','bool','bool']));
+    const twoStepTransfer=menu.find(m=>m.selector===`${contract.name}.transferOwnership`&&m.operation==='send'&&
+      JSON.stringify(m.inputs)===JSON.stringify(['address']));
+    const initiateStep:SoliditySequence['steps'][number]|null=boringTransfer
+      ? {operation:'send',function:'transferOwnership(address,bool,bool)',args:['$account2',false,false],sender:0,requiredSetup:true}
+      : twoStepTransfer
+        ? {operation:'send',function:'transferOwnership(address)',args:['$account2'],sender:0,requiredSetup:true}
+        : null;
+    if(initiateStep){
+      return {
+        hypothesis:`Unauthorized caller ($account1) must not claim pending ${contract.name} ownership; designated pendingOwner ($account2) may.`,
+        property:'source-proven two-step ownership claim authorization',
+        sequence:{constructorArgs:setup.constructorArgs,steps:[
+          ...baseSteps,
+          initiateStep,
+          {operation:'call',function:'pendingOwner()',args:[],expect:'$account2'},
+          {operation:'send',function:'claimOwnership()',args:[],sender:1,expectRevert:true},
+          {operation:'call',function:'owner()',args:[],expect:'$account0'},
+          {operation:'call',function:'pendingOwner()',args:[],expect:'$account2'},
+          {operation:'send',function:'claimOwnership()',args:[],sender:2},
+          {operation:'call',function:'owner()',args:[],expect:'$account2'},
+          {operation:'call',function:'pendingOwner()',args:[],expect:ZERO_ADDRESS}
+        ]},
+        witnesses
+      };
+    }
   }
   if(setup.kind==='owner'&&method==='renounceOwnership'&&abiEntry.inputs.length===0){
     return {
@@ -1397,7 +1658,7 @@ function canonicalShapeType(node:any):string {
     const name=String(node.name||'');
     return name==='uint'?'uint256':name==='int'?'int256':name==='address payable'?'address':name;
   }
-  if(node.type==='UserDefinedTypeName')return 'address';
+  if(node.type==='UserDefinedTypeName')return canonicalAbiType(node)||'';
   if(node.type==='ArrayTypeName'){
     const base=canonicalShapeType(node.baseTypeName);
     const literal=node.length?.number;
@@ -1452,9 +1713,31 @@ function hasAnySourceAuthGuard(fn:any,fnBody:string):boolean {
   return false;
 }
 
-function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAccount?:string;tokenRef?:string;amount?:string}={}):SolidityArgValue|null {
+function splitCanonicalTupleTypes(value:string):string[]|null {
+  if(!value.startsWith("(")||!value.endsWith(")"))return null;
+  const fields:string[]=[];let depth=0,start=1;
+  for(let index=1;index<value.length-1;index++){
+    const char=value[index];
+    if(char==="(")depth++;
+    else if(char===")"){if(depth===0)return null;depth--;}
+    else if(char===","&&depth===0){const field=value.slice(start,index).trim();
+      if(!field)return null;fields.push(field);start=index+1;}
+  }
+  if(depth!==0)return null;
+  const last=value.slice(start,-1).trim();if(!last)return null;
+  fields.push(last);return fields;
+}
+export function pickFlexibleArg(abiType:string,paramName:string,options:{
+  ownerAccount?:string;tokenRef?:string;amount?:string;tupleComponent?:boolean
+}={}):SolidityArgValue|null {
   const t=abiType.trim();
   const name=paramName||'';
+  if(t.startsWith("(")&&t.endsWith(")")){
+    const fields=splitCanonicalTupleTypes(t);
+    if(!fields)return null;
+    const values=fields.map(field=>pickFlexibleArg(field,name,{...options,tupleComponent:true}));
+    return values.some(value=>value===null)?null:values as SolidityArgValue[];
+  }
   if(t==='address'||t==='address payable'){
     if(options.tokenRef && /(?:token|stablecoin|coin|mph|asset|underlying|stake|currency|erc20|want|collateral|reward|base|quote)/i.test(name))
       return options.tokenRef;
@@ -1464,10 +1747,37 @@ function pickFlexibleArg(abiType:string,paramName:string,options:{ownerAccount?:
   }
   if(t==='bool')return false;
   if(t==='string')return 'LOTUS-Test';
-  if(/^u?int(?:[0-9]{1,3})?$/.test(t)){
-    if(/(?:period|duration|epoch|lock|interval|delay|window|time)/i.test(name))return '86400';
-    if(/(?:fee|bps|rate|ratio|percent)/i.test(name))return '100';
-    return options.amount ?? '1000';
+  const intType=t.match(/^(u?int)([0-9]{0,3})$/);
+  if(intType){
+    const bits=intType[2]?Number(intType[2]):256;
+    if(bits<8||bits>256||bits%8!==0)return null;
+    // EVM ABI widths are authoritative. A generic 1000-unit fixture
+    // cannot be passed as uint8: the encoder rejects it before any actual
+    // experiment. Choose a bounded nonzero input, NEVER a passing receipt.
+    const maximum=intType[1]==='uint'?(1n<<BigInt(bits))-1n:
+      (1n<<BigInt(bits-1))-1n;
+    const absoluteTimestamp=/(?:timestamp|maturation|deadline|expiry|expiration|unlocktime)/i.test(name);
+    const maximumWindow=/^(?:_)?max(?:imum)?.*(?:period|duration|interval|time)/i.test(name);
+    if(absoluteTimestamp&&maximum<2000000000n)return null;
+    const preferred=options.tupleComponent&&bits===8?'0':
+      /^(?:status|state|mode|kind|role|action|phase|stage|reason|category|strategy|operation)$/i.test(name)?'0':
+      /(?:decimal|precision|scale)/i.test(name)?'18':
+      maximumWindow?'3000000000':
+      absoluteTimestamp?'2000000000':
+      /(?:period|duration|epoch|lock|interval|delay|window|time)/i.test(name)?'86400':
+      /(?:fee|bps|rate|ratio|percent)/i.test(name)?'100':options.amount??'1000';
+    if(!/^[0-9]+$/.test(preferred))return null;
+    const requested=BigInt(preferred);
+    return (requested>maximum?maximum:requested).toString();
+  }
+  const fixedArray=t.match(/^(.*)\[([0-9]+)\]$/);
+  if(fixedArray){
+    const count=Number(fixedArray[2]);
+    if(!Number.isSafeInteger(count)||count>8)return null;
+    const element=pickFlexibleArg(fixedArray[1],name,options);
+    if(element===null)return null;
+    const clone=(value:any):any=>Array.isArray(value)?value.map(clone):value;
+    return Array.from({length:count},()=>clone(element));
   }
   if(t==='bytes32')return ZERO_BYTES32;
   if(t==='bytes')return '0x4142';
@@ -1578,13 +1888,17 @@ function resolveFlexibleSetup(
   if(ctor){
     const cParams:any[]=ctor.parameters||[];
     if(cParams.length>12)return null;
+    const ctorParamNames=new Set<string>(cParams.map((p:any)=>p.name).filter((n:any)=>identifier.test(n||'')));
+    const ctorConstraints=collectParamConstraints(ctor,ctorParamNames);
     for(const cp of cParams){
       const abi=canonicalAbiType(cp.typeName);
       if(!abi)return null;
       const tokenRef=mockToken?'$deployment:token':undefined;
       const bound=dependencyBindings[cp.name||''];
+      if(abi==='address'&&ctorConstraints.get(cp.name||'')?.has('contract')&&!bound&&!tokenRef)return null;
       const arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,cp.name||'',{ownerAccount,tokenRef});
       if(arg===null)return null;
+      if(abi==='address'&&ctorConstraints.get(cp.name||'')?.has('contract')&&arg!=='$deployment:token'&&arg!==bound)return null;
       if(arg==='$deployment:token')usesToken=true;
       constructorArgs.push(arg);
     }
@@ -1597,6 +1911,8 @@ function resolveFlexibleSetup(
   if(initFn){
     const iParams:any[]=initFn.parameters||[];
     if(iParams.length<=12){
+      const initParamNames=new Set<string>(iParams.map((p:any)=>p.name).filter((n:any)=>identifier.test(n||'')));
+      const initConstraints=collectParamConstraints(initFn,initParamNames);
       const abiTypes:string[]=[];
       let ok=true;
       for(const ip of iParams){
@@ -1604,7 +1920,11 @@ function resolveFlexibleSetup(
         if(!abi){ok=false;break;}
         const tokenRef=mockToken?'$deployment:token':undefined;
         const bound=dependencyBindings[ip.name||''];
-        const arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,ip.name||'',{ownerAccount,tokenRef});
+        let arg=bound&&abi==='address'?bound:pickFlexibleArg(abi,ip.name||'',{ownerAccount,tokenRef});
+        if(abi==='address'&&initConstraints.get(ip.name||'')?.has('contract')&&
+          arg!=='$deployment:token'&&arg!==bound){
+          arg='$contract';
+        }
         if(arg===null){ok=false;break;}
         if(arg==='$deployment:token'){usesToken=true;tokenInitNeeded=true;}
         abiTypes.push(abi);
@@ -1617,6 +1937,121 @@ function resolveFlexibleSetup(
     constructorArgs,
     ...(ctor?.stateMutability==='payable'?{constructorValueWei:'1000000000000000'}:{}),
     initSignature,initArgs,usesToken,tokenInitNeeded
+  };
+}
+
+/**
+ * A genuine initializer replay property does not require an ownership getter.
+ * The acquired initializer must have an OpenZeppelin initializer guard, and
+ * contain only source-identifiable direct public-state assignments. Each
+ * assignment is checked against the actual generated ABI getter after the
+ * first mined transaction; an attempted replay must revert and leave those
+ * getters unchanged. An address cast does not create an external protocol.
+ *
+ * This admits ERC20Wrapper-like local initialization without asserting that
+ * an unrelated external receiver is available, or pretending that an
+ * arbitrary transaction revert proves authority.
+ */
+function sourceInitializerReplayExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  sources:ReadonlyMap<string,SourceSnapshot>,
+  declarations:readonly SolidityProbeDeclaration[]
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(!/^(?:initialize|init)$/.test(method)||isTestOrMockPath(snapshot.path))return null;
+  const {chain}=resolveInheritance(snapshot,contract,sources);
+  if(isAbstractContractNode(contract,chain))return null;
+  const ast=parseAstCached(snapshot);
+  const inheritsInitializable=(contract.baseContracts||[]).some((b:any)=>
+    /^(?:Initializable|[A-Za-z_][A-Za-z0-9_]*Upgradeable)$/.test(
+      String(b.baseName?.namePath||'')));
+  const importedInitializable=(ast.children||[]).some((n:any)=>
+    n.type==='ImportDirective'&&
+    /@openzeppelin\/contracts-upgradeable\/proxy\/utils\/Initializable\.sol$/.test(
+      String(n.path||'')));
+  if(!inheritsInitializable||!importedInitializable)return null;
+  const initialized=(contract.subNodes||[]).filter((n:any)=>
+    n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+    ['public','external'].includes(n.visibility)&&
+    (n.modifiers||[]).some((m:any)=>String(m.name?.namePath||m.name||'')==='initializer'));
+  if(initialized.length!==1)return null;
+  const fn=initialized[0],statements:any[]=fn.body?.statements||[];
+  const params:any[]=fn.parameters||[];
+  if(params.length>8||!statements.length||statements.length>10)return null;
+  const maybeTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
+  const abiTypes=maybeTypes.filter((t):t is string=>t!==null);
+  if(abiTypes.length!==params.length||abiTypes.some(t=>!t))return null;
+  if(!declarations.some(d=>
+    d.operation==='send'&&d.selector===contract.name+'.'+method&&
+    JSON.stringify(d.inputs)===JSON.stringify(abiTypes)))return null;
+  const args:SolidityArgValue[]=[];
+  const replayArgs:SolidityArgValue[]=[];
+  const paramIndex=new Map<string,number>();
+  for(let i=0;i<params.length;i++){
+    const p=params[i],name=String(p.name||'');
+    if(!identifier.test(name)||paramIndex.has(name))return null;
+    paramIndex.set(name,i);
+    const a=pickFlexibleArg(abiTypes[i],name);
+    if(a===null||Array.isArray(a))return null;
+    const changed=abiTypes[i]==='address'?'$account1':
+      abiTypes[i]==='string'?'LOTUS-Replay':
+      abiTypes[i]==='bool'?!a:
+      /^(?:u?int)(?:[0-9]{0,3})$/.test(abiTypes[i])?'2':
+      abiTypes[i]==='bytes32'?('0x'+'11'.repeat(32)):null;
+    if(changed===null)return null;
+    args.push(a);replayArgs.push(changed);
+  }
+  const state=new Map<string,any>((contract.subNodes||[])
+    .filter((n:any)=>n.type==='StateVariableDeclaration')
+    .flatMap((n:any)=>n.variables||[])
+    .filter((v:any)=>v.visibility==='public'&&identifier.test(v.name||''))
+    .map((v:any)=>[v.name,v]));
+  const asserted:Array<{getter:string;expect:SolidityArgValue;node:any}>=[];
+  for(const statement of statements){
+    if(statement.type!=='ExpressionStatement')return null;
+    const expr=statement.expression;
+    if(expr?.type!=='BinaryOperation'||expr.operator!=='='||
+      expr.left?.type!=='Identifier')return null;
+    const stateName=String(expr.left.name||''),variable=state.get(stateName);
+    if(!variable)return null;
+    let parameter:string|undefined;
+    if(expr.right?.type==='Identifier')parameter=expr.right.name;
+    else if(expr.right?.type==='FunctionCall'&&
+      expr.right.arguments?.length===1&&expr.right.arguments[0]?.type==='Identifier'&&
+      expr.right.expression?.type==='Identifier'&&
+      expr.right.expression.name===String(variable.typeName?.namePath||'')){
+      parameter=expr.right.arguments[0].name;
+    }else return null;
+    const index=paramIndex.get(String(parameter||''));
+    if(index===undefined)return null;
+    const stateAbi=canonicalAbiType(variable.typeName);
+    if(stateAbi!==abiTypes[index]&&
+      !(stateAbi==='address'&&abiTypes[index]==='address'))return null;
+    if(!/^(?:address|string|bool|u?int(?:[0-9]{0,3})?)$/.test(stateAbi))return null;
+    if(asserted.some(x=>x.getter===stateName+'()'))return null;
+    if(!declarations.some(d=>d.operation==='call'&&
+      d.selector===contract.name+'.'+stateName&&d.inputs.length===0))return null;
+    asserted.push({getter:stateName+'()',expect:args[index],node:variable});
+  }
+  if(!asserted.length)return null;
+  const setup=resolveFlexibleSetup(snapshot,contract,chain,sources,declarations,null);
+  if(!setup||setup.usesToken||setup.initSignature!==method+'('+abiTypes.join(',')+')')
+    return null;
+  const steps:SoliditySequence['steps']=[
+    {operation:'send',function:setup.initSignature,args,sender:0,requiredSetup:true},
+    ...asserted.map(x=>({operation:'call' as const,function:x.getter,
+      args:[],expect:x.expect})),
+    {operation:'send',function:setup.initSignature,args:replayArgs,
+      sender:1,expectRevert:true},
+    ...asserted.map(x=>({operation:'call' as const,function:x.getter,
+      args:[],expect:x.expect})),
+  ];
+  if(steps.length>16)return null;
+  return {
+    hypothesis:'A source-initialized '+contract.name+' has typed observable state after setup; an unauthorized replay must revert without changing that state',
+    property:'source-verified initializer replay protection '+contract.name+'.'+setup.initSignature,
+    sequence:{constructorArgs:setup.constructorArgs,steps},
+    witnesses:[witness(snapshot,fn,contract.name+'.'+setup.initSignature),
+      ...asserted.map(x=>witness(snapshot,x.node,contract.name+'.'+x.getter))]
   };
 }
 
@@ -1721,7 +2156,11 @@ function unprotectedFundDrainOrMintExperiment(
   const hasEthOut=/\.\s*(?:transfer|send)\s*\(|\.\s*call\s*\{[^}]*\bvalue\b/i.test(fnBody);
   if(hasEthOut && !/^(?:deposit|stake|mint)$/i.test(method)){
     const ctor=members.find(n=>n.type==='FunctionDefinition'&&n.isConstructor);
-    const payableFundFn=members.find(n=>n.type==='FunctionDefinition'&&['public','external'].includes(n.visibility)&&
+    // Require a named payable function; unnamed receive()/fallback() have name===null
+    // and would otherwise emit an invalid "null()" ABI selector.
+    const payableFundFn=members.find(n=>n.type==='FunctionDefinition'&&
+      typeof n.name==='string'&&n.name.length>0&&!n.isReceiveEther&&!n.isFallback&&
+      ['public','external'].includes(n.visibility)&&
       n.stateMutability==='payable'&&(n.parameters||[]).length===0&&n.name!==method&&n.body);
     const canFund=(ctor&&ctor.stateMutability==='payable')||!!payableFundFn;
     if(canFund){
@@ -1827,6 +2266,7 @@ function groundedShareAccountingExperiment(
     /mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*_mphAmount\)/,
     /mphAmount\s*=\s*_shareAmount\.mul\(getPricePerFullShare\(\)\)/,
     /_burn\(msg\.sender\s*,\s*_shareAmount\)/,
+    /totalSupply\(\)\s*>=\s*_shareAmount\s*\+\s*MIN_AMOUNT/,
     /mph\.safeTransfer\(msg\.sender\s*,\s*mphAmount\)/,
     /_lastRewardAmount\s*==\s*0/,
     /return\s+mphBalance\.div\(totalShares\)/,
@@ -1872,6 +2312,93 @@ function groundedShareAccountingExperiment(
   return {hypothesis:"With no reward distribution, the source-proven 1:1 initial exchange rate and minimum seed require deposit(1000) then withdraw(400) to conserve token holdings and leave 600 additional shares.",
     property:"source-proven zero-reward ERC20 share conservation",sequence,
     witnesses:sourceNodes.map((n:any)=>witness(snapshot,n,"xMPH."+n.name))};
+}
+/** Source-grounded xMPH distributor, unlock and share-price lifecycle. Unlike
+ * the zero-reward test above, this verifies the acquired linear unlock formula
+ * at its initial, midpoint, and completed states on a clock-controlled local
+ * EVM, and checks the distributor role with a real rejected transaction. */
+function groundedXMphRewardUnlockExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],sources:ReadonlyMap<string,SourceSnapshot>
+):{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}|null {
+  if(contract.name!=="xMPH"||method!=="distributeReward")return null;
+  const source=snapshot.content.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,"");
+  const requiredSource=[
+    /MIN_AMOUNT\s*=\s*10\s*\*\*\s*9\s*;/,
+    /shareAmount\s*=\s*_mphAmount\.div\(getPricePerFullShare\(\)\)/,
+    /mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*_mphAmount\)/,
+    /mphAmount\s*=\s*_shareAmount\.mul\(getPricePerFullShare\(\)\)/,
+    /_burn\(msg\.sender\s*,\s*_shareAmount\)/,
+    /mph\.safeTransfer\(msg\.sender\s*,\s*mphAmount\)/,
+    /MAX_REWARD_UNLOCK_PERIOD\s*=\s*365\s*days\s*;/,
+    /_setupRole\(DISTRIBUTOR_ROLE\s*,\s*msg\.sender\)/,
+    /require\(hasRole\(DISTRIBUTOR_ROLE\s*,\s*msg\.sender\)/,
+    /mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*rewardAmount\)/,
+    /currentUnlockEndTimestamp\s*=\s*block\.timestamp\s*\+\s*rewardUnlockPeriod/,
+    /lastRewardTimestamp\s*=\s*block\.timestamp/,
+    /lastRewardAmount\s*=\s*rewardAmount/,
+    /lockedRewardAmount\s*=\s*\(\s*_lastRewardAmount\s*\*\s*\(\s*_currentUnlockEndTimestamp\s*-\s*block\.timestamp\s*\)\s*\)\s*\/\s*\(\s*_currentUnlockEndTimestamp\s*-\s*_lastRewardTimestamp\s*\)/,
+    /return\s*\(\s*mphBalance\s*-\s*lockedRewardAmount\s*\)\.div\(totalShares\)/,
+    /event\s+DistributeReward\(uint256\s+rewardAmount\)/,
+    /emit\s+DistributeReward\(rewardAmount\)/,
+  ];
+  if(!requiredSource.every(pattern=>pattern.test(source))||
+    !/contract\s+xMPH\s+is\s+ERC20Upgradeable\s*,\s*AccessControlUpgradeable/.test(source))return null;
+  const required=[
+    ["initialize",["address","uint256","address"],"send"],
+    ["distributeReward",["uint256"],"send"],
+    ["deposit",["uint256"],"send"],
+    ["getPricePerFullShare",[],"call"],
+    ["withdraw",["uint256"],"send"],
+  ] as const;
+  if(!required.every(([name,inputs,operation])=>declarations.some(d=>
+    d.selector==="xMPH."+name&&d.operation===operation&&
+    JSON.stringify(d.inputs)===JSON.stringify(inputs))))return null;
+  const mockToken=findRepositoryMockToken(sources);
+  if(!mockToken?.hasApprove||!mockToken.hasBalanceOf)return null;
+  const seed="1000000000",reward="1000000000",initial="3000000000";
+  const mintArgs=mockToken.mintHasRecipient?["$account0",initial]:[initial];
+  const sequence:SoliditySequence={constructorArgs:[],
+    preparation:{deployments:[{id:"token",file:mockToken.snapshot.path,
+      contract:mockToken.contractName,constructorArgs:mockToken.constructorArgs}],
+      operations:[{id:"mintRewardSeed",deploymentId:"token",function:mockToken.mintSig,
+        args:mintArgs,sender:0}],checks:[{id:"mintRewardSeedConfirmed",deploymentId:"token",
+          function:"balanceOf(address)",args:["$account0"],sender:0,expect:initial}]},
+    steps:[
+      {operation:"send",deploymentId:"token",function:"approve(address,uint256)",
+        args:["$contract",initial],sender:0,requiredSetup:true},
+      {operation:"send",function:"initialize(address,uint256,address)",
+        args:["$deployment:token","86400","$account0"],sender:0,requiredSetup:true},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",
+        args:["$contract"],expect:seed},
+      {operation:"send",function:"distributeReward(uint256)",args:[reward],sender:2,expectRevert:true},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",
+        args:["$contract"],expect:seed},
+      {operation:"send",function:"distributeReward(uint256)",args:[reward],sender:0,
+        expectEvents:[{signature:"DistributeReward(uint256)",args:[reward]}]},
+      {operation:"call",function:"getPricePerFullShare()",args:[],expect:"1000000000000000000"},
+      {operation:"advance_time",seconds:"43200"},
+      {operation:"observe",function:"getPricePerFullShare()",args:[]},
+      {operation:"advance_time",seconds:"43200"},
+      {operation:"call",function:"getPricePerFullShare()",args:[],expect:"2000000000000000000"},
+      {operation:"send",function:"deposit(uint256)",args:["1000"],sender:0},
+      {operation:"call",function:"getPricePerFullShare()",args:[],expect:"2000000000000000000"},
+      {operation:"send",function:"withdraw(uint256)",args:["400"],sender:0},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",
+        args:["$account0"],expect:"999999800"},
+      {operation:"call",deploymentId:"token",function:"balanceOf(address)",
+        args:["$contract"],expect:"2000000200"},
+    ]};
+  const nodes=(contract.subNodes||[]).filter((node:any)=>
+    (node.type==="FunctionDefinition"&&["initialize","distributeReward","_distributeReward",
+      "getPricePerFullShare","withdraw","_withdraw"].includes(node.name))||
+    (node.type==="EventDefinition"&&node.name==="DistributeReward")||
+    (node.type==="StateVariableDeclaration"&&(node.variables||[]).some((v:any)=>
+      ["rewardUnlockPeriod","currentUnlockEndTimestamp","lastRewardTimestamp","lastRewardAmount"].includes(v.name))));
+  return {hypothesis:"The acquired xMPH distributor guard rejects a non-distributor without transferring tokens; the authorized reward starts a 24-hour linear unlock, with the observed share price moving from 1x to 1.5x halfway and 2x at expiry, and a later withdrawal pays the source-derived 2x amount.",
+    property:"source-proven xMPH distributor authorization and timed reward accounting",
+    sequence,witnesses:nodes.map((node:any)=>witness(snapshot,node,
+      "xMPH."+(node.name||node.variables?.map((v:any)=>v.name).join(","))))};
 }
 /** Acquired-source vest creation and authorization property, with explicit
  * ERC721 ownership and deposit-to-vest readbacks. No simulated payout. */
@@ -2004,28 +2531,246 @@ export function accountingTransitionPatterns(variable: string, field: string): {
     fieldDecrement:new RegExp(prefix+'\\[\\s*0\\s*\\]\\s*\\.\\s*'+escape(field)+'\\s*-='),
   };
 }
-/** Cycle-safe intra-contract effect closure, from acquired source AST spans. */
-function reachableAccountingSource(snapshot:SourceSnapshot,contract:any,seed:any):string {
-  const functions=(contract.subNodes||[]).filter((fn:any)=>fn.type==="FunctionDefinition"&&fn.body&&fn.name);
-  const byName=new Map<string,any[]>();
-  for(const fn of functions){const items=byName.get(fn.name)||[];items.push(fn);byName.set(fn.name,items);}
+/** Follow authenticated, inherited local source helpers without applying a
+ * parent AST's byte offsets to the child's unrelated source text. */
+function reachableAccountingSource(
+  snapshot:SourceSnapshot,contract:any,seed:any,
+  sources:ReadonlyMap<string,SourceSnapshot>
+):string {
+  const {chain}=resolveInheritance(snapshot,contract,sources);
+  const byName=new Map<string,Array<{source:SourceSnapshot;fn:any}>>();
+  const sourceOf=new Map<any,SourceSnapshot>();
+  for(const entry of chain){
+    for(const fn of (entry.contract.subNodes||[]).filter((n:any)=>
+      n.type==="FunctionDefinition"&&n.body&&n.name)){
+      sourceOf.set(fn,entry.snapshot);
+      const list=byName.get(fn.name)||[];
+      list.push({source:entry.snapshot,fn});
+      byName.set(fn.name,list);
+    }
+  }
   const pending=[seed],visited=new Set<any>(),parts:string[]=[];
-  while(pending.length&&visited.size<48){
-    const fn=pending.shift()!;if(visited.has(fn))continue;visited.add(fn);
-    const text=body(snapshot.content,fn);parts.push(text);
-    for(const match of text.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g))
-      for(const next of byName.get(match[1])||[])if(!visited.has(next))pending.push(next);
+  // The inherited function graph is finite, and visited prevents cycles.
+  // Do not truncate source-derived accounting after a fixed number of helpers.
+  while(pending.length){
+    const fn=pending.shift()!;
+    if(visited.has(fn))continue;
+    visited.add(fn);
+    const origin=sourceOf.get(fn);
+    if(!origin)continue; // no unverified cross-file text or synthetic helper
+    const text=body(origin.content,fn);parts.push(text);
+    for(const match of text.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)){
+      const candidates=byName.get(match[1])||[];
+      // Without parameter resolution, an overloaded helper is ambiguous.
+      // Never invent a particular call target based on the function name.
+      if(candidates.length===1&&!visited.has(candidates[0].fn))
+        pending.push(candidates[0].fn);
+    }
   }
   return parts.join("\n");
 }
 function accountingDirections(text:string,state:string):{increase:boolean;decrease:boolean}{
-  // Solidity state-variable names are lexical identifiers, not arbitrary regex input.
-  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state))return {increase:false,decrease:false};
-  // Mapping-valued state updates use indexed lvalues; source-backed
-  // accounting pairing must recognize balances[msg.sender] +=/-= amount.
-  const lvalue="\\b"+state+"\\s*(?:\\[[^\\]\\n]{1,128}\\]\\s*){0,2}";
-  return {increase:new RegExp(lvalue+"\\+=").test(text),
-    decrease:new RegExp(lvalue+"-=").test(text)};
+  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state))
+    return {increase:false,decrease:false};
+  // A source lvalue is the declared state symbol plus at most two identical
+  // mapping indices. The RHS must refer to that SAME source lvalue; unrelated
+  // names or different account keys never establish an accounting transition.
+  const indexed="(?:\\s*\\[[^\\]\\n]{1,128}\\])*";
+  const lvalue="\\b"+state+"("+indexed+")\\s*";
+  const simple="\\b"+state+"\\s*"+indexed+"\\s*";
+  const collectionPush=new RegExp("\\b"+state+"\\s*\\.\\s*push\\s*\\(");
+  const collectionPop=new RegExp("\\b"+state+"\\s*\\.\\s*pop\\s*\\(");
+  const assigned=(operation:"add"|"sub")=>{
+    const arithmetic=operation==="add"?"\\+":"-";
+    const forward=new RegExp(lvalue+"=\\s*"+state+"\\1\\s*(?:"+arithmetic+
+      "|\\.\\s*"+operation+"\\s*\\()");
+    if(operation!=="add")return (text:string)=>forward.test(text);
+    // Addition is commutative: real SafeMath code can put the new amount on
+    // the left while preserving the exact same ledger lvalue on the right.
+    const reverse=new RegExp(lvalue+"=\\s*(?:[A-Za-z_][A-Za-z0-9_]*\\s*\\+\\s*"+
+      state+"\\1|[A-Za-z_][A-Za-z0-9_]*\\s*\\.\\s*add\\s*\\(\\s*"+
+      state+"\\1\\s*\\))");
+    return (text:string)=>forward.test(text)||reverse.test(text);
+  };
+  const addition=assigned("add"),subtraction=assigned("sub");
+  return {
+    increase:collectionPush.test(text)||new RegExp(simple+"\\+=").test(text)||
+      addition(text),
+    decrease:collectionPop.test(text)||new RegExp(simple+"-=").test(text)||
+      subtraction(text),
+  };
+}
+
+/** Exact source-lvalue delta with a source-proven amount, including SafeMath.
+ * A shared symbol or a different mapping index is never enough for admission. */
+function sourceExactAccountingDelta(
+  text:string,state:string,amount:string,direction:"increase"|"decrease",
+  accountKey:string=""
+):boolean {
+  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(state)||
+    !/^(?:[A-Za-z_][A-Za-z0-9_]*|msg\.value)$/.test(amount))return false;
+  if(accountKey&&accountKey!=="msg.sender"&&!identifier.test(accountKey))return false;
+  const key=accountKey==="msg.sender"?String.raw`\s*\[\s*msg\.sender\s*\]`:
+    accountKey?String.raw`\s*\[\s*`+accountKey+String.raw`\s*\]`:"";
+  const ref="\\b"+state+key;
+  const value=amount==="msg.value"?"msg\\.value":amount;
+  const op=direction==="increase"?"\\+":"-";
+  const method=direction==="increase"?"add":"sub";
+  const augmented=new RegExp(ref+"\\s*"+op+"=\\s*"+value+"\\b");
+  const forward=new RegExp(ref+"\\s*=\\s*"+ref+"\\s*(?:"+op+"\\s*"+value+
+    "\\b|\\.\\s*"+method+"\\s*\\(\\s*"+value+"\\s*\\))");
+  const reverse=direction==="increase"?new RegExp(ref+"\\s*=\\s*"+value+
+    "\\s*\\+\\s*"+ref+"(?![A-Za-z0-9_$])|"+ref+"\\s*=\\s*"+value+
+    "\\s*\\.\\s*add\\s*\\(\\s*"+ref+"\\s*\\)"):null;
+  return augmented.test(text)||forward.test(text)||!!reverse?.test(text);
+}
+
+/** Accept only a direct source-written proportional increment whose complete
+ * integer formula is visible in one assignment. This intentionally excludes
+ * stateful rates, helper calls, chained rounding, and inferred fee policy. */
+function sourceExactScalarFormula(
+  text:string,state:string,amount:string
+):{multiplier:string;divisor:string}|null {
+  if(!identifier.test(state)||!identifier.test(amount))return null;
+  const escaped=(value:string)=>value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const expression=String.raw`\b${escaped(state)}\s*\+=\s*${escaped(amount)}`+
+    String.raw`\s*(?:\*\s*([1-9][0-9]{0,9}))?\s*\/\s*([1-9][0-9]{0,9})\s*;`;
+  const match=text.match(new RegExp(expression));
+  if(!match)return null;
+  return {multiplier:match[1]||'1',divisor:match[2]};
+}
+
+/** Resolve a simple bool-parameter branch only when the exact scalar write is
+ * inside that branch. `undefined` means no bool gate was found; `null` means
+ * a gate exists but cannot be assigned unambiguously from the ABI. */
+function sourceBooleanGateForScalarWrite(
+  text:string,state:string,amount:string,boolParameters:readonly string[]
+):{parameter:string;value:boolean}|null|undefined {
+  const writes=(source:string)=>sourceExactAccountingDelta(source,state,amount,'increase')||
+    sourceExactScalarFormula(source,state,amount)!==null;
+  const gates:Array<{parameter:string;value:boolean}>=[];
+  const unsupported:{value:boolean}={value:false};
+  const ifStart=/\bif\s*\(([^()]*)\)\s*\{/g;
+  for(let match;(match=ifStart.exec(text));){
+    let depth=1,pos=ifStart.lastIndex;
+    for(;pos<text.length&&depth>0;pos++){
+      if(text[pos]==='{')depth++;
+      else if(text[pos]==='}')depth--;
+    }
+    if(depth!==0)continue;
+    const branch=text.slice(ifStart.lastIndex,pos-1);
+    if(!writes(branch))continue;
+    const condition=match[1].replace(/\s+/g,'');
+    const gatedParameters=boolParameters.filter(parameter=>
+      new RegExp('(?:^|[^A-Za-z0-9_$])'+parameter+'(?:$|[^A-Za-z0-9_$])').test(condition));
+    if(!gatedParameters.length)continue;
+    if(gatedParameters.length!==1){unsupported.value=true;continue;}
+    const parameter=gatedParameters[0];
+    if(condition!==parameter&&condition!=='!'+parameter){unsupported.value=true;continue;}
+    const negated=condition.startsWith('!');
+    gates.push({parameter,value:!negated});
+  }
+  if(unsupported.value)return null;
+  const unique=[...new Map(gates.map(g=>[g.parameter+':'+g.value,g])).values()];
+  if(unique.length>1)return null;
+  return unique[0];
+}
+
+/** Number of writes to one source state symbol in a reachable method closure.
+ * Used to reject an exact-looking delta when the same operation also mutates
+ * that ledger through a second, unmodeled path. */
+function sourceAccountingWriteCount(text:string,state:string):number {
+  if(!identifier.test(state))return 0;
+  const escape=state.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const write=new RegExp('\\b'+escape+'(?:\\s*\\[[^\\]\\n]{1,128}\\])*\\s*(?:\\+=|-=|=(?!=))','g');
+  return [...text.matchAll(write)].length;
+}
+
+/** Prove a full-position withdrawal can be measured through an acquired
+ * source getter and fed back into the withdrawal amount. This is deliberately
+ * narrow: the amount must be capped by and burned from one stored position,
+ * and the principal ledger must be debited by a formula derived from that
+ * same amount. */
+function sourceDynamicFullPositionWithdrawal(
+  snapshot:SourceSnapshot,contract:any,declarations:readonly SolidityProbeDeclaration[],
+  outflowFn:any,inflowEffects:string,outflowEffects:string,
+  ledger:string,
+):{getter:string;args:string[];argumentPath:number[];depositIdIndex:number;amountIndex:number;earlyIndex:number;companionGetters:string[];witnesses:SourceWitness[]}|null {
+  const fail=(_reason:string):null=>null;
+  const clean=(value:string)=>value.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
+  const bodyText=clean(outflowEffects);
+  const params=outflowFn.parameters||[];
+  const idIndex=params.findIndex((p:any)=>/^(?:depositID|positionID|recordID|id)$/i.test(String(p.name||''))&&
+    /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p.typeName)||''));
+  const amountIndex=params.findIndex((p:any)=>/^(?:virtualTokenAmount|positionAmount|withdrawAmount|amount)$/i.test(String(p.name||''))&&
+    /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p.typeName)||''));
+  const earlyIndex=params.findIndex((p:any)=>canonicalAbiType(p.typeName)==='bool'&&
+    /^(?:early|earlyWithdraw)$/i.test(String(p.name||'')));
+  if(idIndex<0||amountIndex<0||earlyIndex<0||params.length!==3||
+    sourceAccountingWriteCount(bodyText,ledger)!==1)return fail('ABI or ledger write shape');
+  const idName=String(params[idIndex].name||'');
+  const storageMatch=bodyText.match(new RegExp(String.raw`\b[A-Za-z_]\w*\s+storage\s+([A-Za-z_]\w*)\s*=\s*deposits\s*\[\s*${idName}\s*-\s*1\s*\]`))||
+    bodyText.match(new RegExp(String.raw`\b[A-Za-z_]\w*\s+storage\s+([A-Za-z_]\w*)\s*=\s*_getDeposit\s*\(\s*${idName}\s*\)`));
+  if(!storageMatch)return fail('withdrawal ID does not select the observed stored position');
+  const entry=storageMatch[1];
+  if(storageMatch[0].includes('_getDeposit')){
+    const getterHelper=(contract.subNodes||[]).filter((node:any)=>node.type==='FunctionDefinition'&&
+      node.name==='_getDeposit'&&(node.parameters||[]).length===1&&
+      canonicalAbiType(node.parameters[0].typeName)==='uint64'&&
+      /\breturn\s+deposits\s*\[\s*depositID\s*-\s*1\s*\]\s*;/.test(clean(body(snapshot.content,node))));
+    if(getterHelper.length!==1||!bodyText.includes('return deposits['))
+      return fail('acquired _getDeposit helper does not map ID to observed array position');
+  }
+  const amountName=String(params[amountIndex].name||'');
+  const localNames=[...bodyText.matchAll(new RegExp(String.raw`\b([A-Za-z_]\w*)\s*=\s*${amountName}\s*\.\s*div\s*\(\s*([A-Za-z_]\w*)\s*\+\s*([A-Za-z_]\w*)\s*\)\s*;`,'g'))];
+  if(localNames.length!==1)return fail('principal formula count '+localNames.length);
+  const principal=localNames[0][1];
+  if(!sourceExactAccountingDelta(bodyText,ledger,principal,'decrease')||
+    !(new RegExp(String.raw`\b${entry}\.virtualTokenTotalSupply\s*-=\s*${amountName}\b`).test(bodyText)||
+      new RegExp(String.raw`_getDeposit\s*\(\s*${idName}\s*\)\.virtualTokenTotalSupply\s*-=\s*${amountName}\b`).test(bodyText)))return fail('ledger debit or position burn');
+  // The same requested amount is capped at the recorded supply before it is
+  // used for the accounting debit and the stored-token burn.
+  const capMatch=bodyText.match(new RegExp(String.raw`if\s*\(\s*${amountName}\s*>\s*([A-Za-z_]\w*)\s*\)\s*\{[\s\S]{0,240}?${amountName}\s*=\s*([A-Za-z_]\w*)\s*;`));
+  if(!capMatch||capMatch[1]!==capMatch[2]||
+    !new RegExp(String.raw`\b${capMatch[1]}\s*=\s*${entry}\.virtualTokenTotalSupply\s*;`).test(bodyText))
+    return fail('cap requested amount at stored supply');
+  const getter=(contract.subNodes||[]).find((n:any)=>n.type==='FunctionDefinition'&&n.name==='getDeposit'&&
+    ['public','external'].includes(n.visibility)&&n.stateMutability==='view'&&
+    (n.parameters||[]).length===1&&canonicalAbiType(n.parameters[0].typeName)==='uint64'&&
+    /\breturn\s+deposits\s*\[\s*depositID\s*-\s*1\s*\]\s*;/.test(clean(body(snapshot.content,n))));
+  if(!getter||!declarations.some(d=>d.operation==='call'&&d.selector===contract.name+'.getDeposit'&&
+    JSON.stringify(d.inputs)===JSON.stringify(['uint64'])))return fail('exact acquired getter unavailable');
+  const struct=(contract.subNodes||[]).find((n:any)=>n.type==='StructDefinition'&&n.name==='Deposit');
+  const first=(struct?.members||[])[0];
+  if(!first||first.name!=='virtualTokenTotalSupply'||canonicalAbiType(first.typeName)!=='uint256')return fail('position getter field layout');
+  // Also retain directly observable interest/fee/reward ledgers that this
+  // exact inflow increases and this exact full-position outflow decreases.
+  // Each must have one source write in each transition and a generated public
+  // zero-argument getter; no unrelated or merely named state is asserted.
+  const companionGetters:string[]=[];
+  const companionWitnesses:SourceWitness[]=[];
+  for(const declaration of (contract.subNodes||[]).filter((node:any)=>
+    node.type==='StateVariableDeclaration')){
+    for(const variable of declaration.variables||[]){
+      const name=String(variable.name||'');
+      if(variable.visibility!=='public'||!/(?:interest|fee|reward)/i.test(name)||
+        canonicalAbiType(variable.typeName)!=='uint256'||name===ledger||
+        sourceAccountingWriteCount(inflowEffects,name)!==1||
+        sourceAccountingWriteCount(bodyText,name)!==1)continue;
+      const incoming=accountingDirections(inflowEffects,name);
+      const outgoing=accountingDirections(bodyText,name);
+      if(!incoming.increase||incoming.decrease||outgoing.increase||!outgoing.decrease||
+        !declarations.some(d=>d.operation==='call'&&d.selector===contract.name+'.'+name&&
+          Array.isArray(d.inputs)&&d.inputs.length===0))continue;
+      companionGetters.push(name+'()');
+      companionWitnesses.push(witness(snapshot,variable,contract.name+'.'+name));
+    }
+  }
+  // The getter body and first struct field prove the observation path.
+  return {getter:'getDeposit(uint64)',args:['1'],argumentPath:[0],
+    depositIdIndex:idIndex,amountIndex,earlyIndex,companionGetters,
+    witnesses:[witness(snapshot,getter,contract.name+'.getDeposit(uint64)'),
+      witness(snapshot,struct,contract.name+'.Deposit.virtualTokenTotalSupply'),...companionWitnesses]};
 }
 
 export function extractSourceInvariantDescriptor(
@@ -2036,10 +2781,17 @@ export function extractSourceInvariantDescriptor(
   sources: ReadonlyMap<string, SourceSnapshot>,
   selectedCompanion?:string,
   selectedTargetSignature?:string,
+  fixtureChoices?:Readonly<Record<string,string>>,
 ): InvariantExtractionResult {
   if(isTestOrMockPath(snapshot.path))
     return {ok:false,category:'no_supported_property',
       reason:'Mock source is not an eligible financial property'};
+  // Keep every AST node in a source identity on the same cached parse tree.
+  // This also makes direct descriptor callers safe when they parsed the same
+  // acquired bytes independently before passing the contract node here.
+  const canonicalContract=(parseAstCached(snapshot).children||[]).find((node:any)=>
+    node.type==='ContractDefinition'&&node.name===contract.name);
+  if(canonicalContract)contract=canonicalContract;
   const { chain } = resolveInheritance(snapshot, contract, sources);
   if (isAbstractContractNode(contract, chain)) {
     const concreteSubclasses: string[] = [];
@@ -2067,6 +2819,8 @@ export function extractSourceInvariantDescriptor(
   }
 
   const allNodes: any[] = [contract, ...chain.map((c) => c.contract)].flatMap((c) => c.subNodes || []);
+  const sourceOfFunction=(fn:any):SourceSnapshot=>
+    chain.find(entry=>(entry.contract.subNodes||[]).includes(fn))?.snapshot||snapshot;
   const fns = [...new Set(allNodes)].filter(
     (n: any) =>
       n.type === 'FunctionDefinition' &&
@@ -2075,9 +2829,14 @@ export function extractSourceInvariantDescriptor(
       !['view', 'pure'].includes(n.stateMutability || '') &&
       n.body,
   );
-  const accountingStates=allNodes.filter((n:any)=>n.type==='StateVariableDeclaration')
-    .flatMap((n:any)=>n.variables||[]).map((v:any)=>String(v.name||''))
-    .filter(name=>/^(?:total|balance|deposit|share|reserve|principal|stake|asset|debt)/i.test(name));
+  // State names do not establish accounting semantics. Discover every declared
+  // state lvalue and let witnessed opposite writes determine candidates; a
+  // lexical prefix filter silently discards real acquired ledgers.
+  const accountingStates=[...new Set(allNodes
+    .filter((n:any)=>n.type==='StateVariableDeclaration')
+    .flatMap((n:any)=>n.variables||[])
+    .map((v:any)=>String(v.name||''))
+    .filter(name=>/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)))];
   const targetFn = fns.find((n: any) => n.name === method &&
     (!selectedTargetSignature || canonicalFunctionIdentity(n)===selectedTargetSignature));
   if (!targetFn) {
@@ -2092,7 +2851,7 @@ export function extractSourceInvariantDescriptor(
   // Do not choose the first function simply because of its name.
   const effects=new Map<any,{plus:string[];minus:string[]}>();
   for(const fn of fns){
-    const text=reachableAccountingSource(snapshot,contract,fn);
+    const text=reachableAccountingSource(snapshot,contract,fn,sources);
     const plus:string[]=[],minus:string[]=[];
     for(const state of accountingStates){
       const direction=accountingDirections(text,state);
@@ -2116,7 +2875,7 @@ export function extractSourceInvariantDescriptor(
         (counterparts.length?'ambiguous: ':'not established for ')+
         contract.name+'.'+canonicalFunctionIdentity(targetFn)+': '+
         counterparts.map(x=>canonicalFunctionIdentity(x.fn)).join(', '),
-      witnesses:[witness(snapshot,targetFn,contract.name+'.'+canonicalFunctionIdentity(targetFn))],
+      witnesses:[witness(sourceOfFunction(targetFn),targetFn,contract.name+'.'+canonicalFunctionIdentity(targetFn))],
       companionCandidates:[...new Set(counterparts.map(x=>canonicalFunctionIdentity(x.fn)))]};
   }
   const counterpart=selected[0];
@@ -2132,13 +2891,32 @@ export function extractSourceInvariantDescriptor(
     };
   }
 
-  const inflowBody = body(snapshot.content, inflowFn);
-  const outflowBody = body(snapshot.content, outflowFn);
-  const combinedBody = `${inflowBody}\n${outflowBody}`;
+  const inflowBody = body(sourceOfFunction(inflowFn).content, inflowFn);
+  const outflowBody = body(sourceOfFunction(outflowFn).content, outflowFn);
+  // Pair discovery already follows reachable local helper bodies. Observation
+  // and external-dependency validation must inspect that SAME witnessed call
+  // closure, otherwise source-visible accounting state written by a helper
+  // is incorrectly dismissed as an unobservable property.
+  const inflowEffects=reachableAccountingSource(snapshot,contract,inflowFn,sources);
+  const outflowEffects=reachableAccountingSource(snapshot,contract,outflowFn,sources);
+  const combinedBody=[inflowEffects,outflowEffects].join("\n");
   const pairWitnesses: SourceWitness[] = [
-    witness(snapshot, inflowFn, `${contract.name}.${inflowFn.name}`),
-    witness(snapshot, outflowFn, `${contract.name}.${outflowFn.name}`),
+    witness(sourceOfFunction(inflowFn), inflowFn, `${contract.name}.${inflowFn.name}`),
+    witness(sourceOfFunction(outflowFn), outflowFn, `${contract.name}.${outflowFn.name}`),
   ];
+
+  // Keep the measured values inside the narrowest amount ABI used by this
+  // transition. For example, 1000 is not a valid uint8 argument even though
+  // it fits the planner's JavaScript number representation.
+  const transitionUintWidths=[inflowFn,outflowFn].flatMap((fn:any)=>(fn.parameters||[])
+    .map((parameter:any)=>canonicalAbiType(parameter.typeName)||'')
+    .map((type:string)=>/^uint([0-9]+)?$/.exec(type))
+    .filter((match:RegExpExecArray|null):match is RegExpExecArray=>match!==null)
+    .map((match:RegExpExecArray)=>match[1]?Number(match[1]):256));
+  const narrowTransitionAmounts=transitionUintWidths.some(width=>width<10);
+  const inflowAmount=narrowTransitionAmounts?'100':'1000';
+  let outflowAmount:string=narrowTransitionAmounts?'40':'400';
+  let expectedRemainder:string=narrowTransitionAmounts?'60':'600';
 
   // Classify external contract/interface/token calls inside the inflow/outflow pair.
   // Acquired-source ERC20 token fixtures can be deployed locally; all other external
@@ -2164,6 +2942,24 @@ export function extractSourceInvariantDescriptor(
       })
       .map((v: any) => String(v.name)),
   );
+  // Helper bodies frequently bind an acquired interface to a local alias
+  // before making an external call (for example
+  // `MoneyMarket _moneyMarket = moneyMarket()`). Treating that local name as
+  // an unknown receiver loses the source-typed dependency edge and incorrectly
+  // blocks otherwise complete fixture graphs. Only declarations with an
+  // acquired contract type are admitted here; lexical variable names alone
+  // never establish a receiver type.
+  const localReceiverTypes=new Map<string,string>();
+  const localReceiverPattern=/\b([A-Za-z_][A-Za-z0-9_.]*)\s+([A-Za-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\s*\([^;]*\)|[^;]{1,160})\s*;/g;
+  for(let aliasMatch;(aliasMatch=localReceiverPattern.exec(combinedBody));){
+    const typeName=String(aliasMatch[1]).split('.').pop()||'';
+    const alias=String(aliasMatch[2]);
+    if(/^(?:ERC20|IERC20|ERC20Upgradeable|IERC20Metadata|MoneyMarket|I[A-Z][A-Za-z0-9_]*)$/.test(typeName))
+      localReceiverTypes.set(alias,typeName);
+  }
+  for(const [alias,typeName] of localReceiverTypes)
+    if(/^(?:I?ERC20|ERC20Upgradeable|IERC20Metadata)$/i.test(typeName))
+      erc20StateVars.add(alias);
   const erc20MethodsRe = /^(?:safeTransferFrom|transferFrom|safeTransfer|transfer|approve|safeApprove|safeIncreaseAllowance|safeDecreaseAllowance|balanceOf|allowance)$/;
   const unresolvedExt: string[] = [];
   let usesErc20Transfer = false;
@@ -2186,15 +2982,41 @@ export function extractSourceInvariantDescriptor(
       }
       continue;
     }
-    if (externalContractVars.has(recv) || knownExternalMethods.test(fnCalled)) {
+    if (externalContractVars.has(recv) || localReceiverTypes.has(recv) || knownExternalMethods.test(fnCalled)) {
       unresolvedExt.push(`${recv}.${fnCalled}`);
     }
   }
-  const dependencyPlan=resolveSourceFixtureDependencies(snapshot,contract.name,[...sources.values()]);
+  const dependencyPlan=resolveSourceFixtureDependencies(snapshot,contract.name,
+    [...sources.values()],{choiceByType:fixtureChoices});
+  const dependencyMockToken=dependencyPlan.status==='resolved'&&mockToken?
+    dependencyPlan.deployments.find(deployment=>deployment.file===mockToken.snapshot.path&&
+      deployment.contract===mockToken.contractName):undefined;
   const unresolvedRemaining=unresolvedExt.filter(call=>{
     if(dependencyPlan.status!=="resolved")return true;
-    const recv=call.split('.')[0];
-    return !Object.prototype.hasOwnProperty.call(dependencyPlan.substitutions,recv);
+    const [recv,methodCalled]=call.split('.');
+    const localType=localReceiverTypes.get(recv);
+    if(localType){
+      // ERC20 transfer extensions are checked against the acquired token
+      // fixture below. For protocol receivers, verify the exact selected
+      // acquired implementation's ABI for the call made through this local
+      // alias. The resolver has already source-bound its constructor or
+      // initializer edge in the deployment graph.
+      if(/^(?:I?ERC20|ERC20Upgradeable|IERC20Metadata)$/i.test(localType))
+        return !mockToken;
+      const selectedImplementation=dependencyPlan.implementationChoices?.[localType];
+      if(!selectedImplementation)return true;
+      const split=selectedImplementation.lastIndexOf(':');
+      if(split<0)return true;
+      const file=selectedImplementation.slice(0,split),contractName=selectedImplementation.slice(split+1);
+      return !verifyAcquiredReceiverMethods(localType,[methodCalled],file,contractName,
+        [...sources.values()]).ok;
+    }
+    const binding=dependencyPlan.bindings.find(b=>b.receiver===recv);
+    if(!binding||dependencyPlan.substitutions[recv]!=='$deployment:'+binding.deploymentId)return true;
+    const deployment=dependencyPlan.deployments.find(d=>d.id===binding.deploymentId);
+    if(!deployment)return true;
+    return !verifyAcquiredReceiverMethods(binding.typeName,[methodCalled],
+      deployment.file,deployment.contract,[...sources.values()]).ok;
   });
   if (unresolvedRemaining.length > 0) {
     return {
@@ -2210,57 +3032,81 @@ export function extractSourceInvariantDescriptor(
     .filter((n: any) => n.type === 'StateVariableDeclaration')
     .flatMap((n: any) => n.variables || [])
     .filter((v: any) => v?.name);
-  const accountingStateVars = stateDecls.filter(
-    (v: any) => TOTAL_SCALAR_RE.test(v.name) || BALANCE_MAPPING_RE.test(v.name),
-  );
-
-  // Solidity generates ABI getters for public state variables. The function
-  // menu does not necessarily list them, but their visibility and ABI shape
-  // are proven by the acquired AST, so they are valid readback witnesses.
-  const publicTotal=stateDecls.find((v:any)=>v.visibility==="public"&&
-    TOTAL_SCALAR_RE.test(v.name)&&
+  // The paired transition is established by opposite source-witnessed writes,
+  // but a second ledger may be updated on only one side: that missing write
+  // is precisely the falsifiable BuggyVault-style conservation violation.
+  // Retain every state written by either operation, with ABI shape from AST.
+  const pairedStates=new Set([
+    ...targetEffect.plus,...targetEffect.minus,
+    ...effects.get(counterpart.fn)!.plus,...effects.get(counterpart.fn)!.minus,
+  ]);
+  const accountingStateVars=stateDecls.filter((v:any)=>pairedStates.has(String(v.name)));
+  const amountParameters=(fn:any)=>(fn.parameters||[]).filter((param:any)=>
+    /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(param.typeName)||''));
+  const amountParameter=(fn:any)=>{
+    const params=amountParameters(fn);
+    const named=params.filter((param:any)=>
+      /^(?:amount|amt|value|wad|qty|quantity|principal|shares|tokens?)$/i.test(String(param.name||'')));
+    return String((named.length===1?named[0]:params[params.length-1])?.name||'');
+  };
+  const matchingAmountParameters=(fn:any,state:string,text:string,direction:"increase"|"decrease")=>
+    amountParameters(fn).filter((param:any)=>sourceExactAccountingDelta(text,state,
+      String(param.name||''),direction));
+  // Select a scalar only when source ties exactly one integer parameter to
+  // its inflow delta. A conventional name or ABI position alone cannot
+  // distinguish principal from fees, IDs, timestamps, or limits.
+  const publicTotalCandidateNames=[...new Set(accountingStateVars.filter((v:any)=>v.visibility==="public"&&
     v.typeName?.type==="ElementaryTypeName"&&
-    /^uint(?:[0-9]+)?$/.test(String(v.typeName.name||"")));
-  const publicBalance=stateDecls.find((v:any)=>v.visibility==="public"&&
-    BALANCE_MAPPING_RE.test(v.name)&&v.typeName?.type==="Mapping"&&
-    v.typeName.keyType?.name==="address"&&
-    /^uint(?:[0-9]+)?$/.test(String(v.typeName.valueType?.name||"")));
-  const totalGetterDecl = declarations.find(
-    (d) =>
-      d.operation === 'call' &&
-      d.inputs.length === 0 &&
-      d.selector.startsWith(contract.name+'.') &&
-      TOTAL_SCALAR_RE.test(d.selector.slice(contract.name.length + 1)),
-  ) || (publicTotal?{operation:'call' as const,selector:contract.name+'.'+publicTotal.name,inputs:[] as string[]}:undefined);
-  const balanceGetterDecl = declarations.find(
-    (d) =>
-      d.operation === 'call' &&
-      d.inputs.length === 1 &&
-      d.inputs[0] === 'address' &&
-      d.selector.startsWith(contract.name+'.') &&
-      BALANCE_MAPPING_RE.test(d.selector.slice(contract.name.length + 1)),
-  ) || (publicBalance?{operation:'call' as const,selector:contract.name+'.'+publicBalance.name,inputs:['address']}:undefined);
+    /^uint(?:[0-9]+)?$/.test(String(canonicalAbiType(v.typeName)||""))&&
+    (matchingAmountParameters(inflowFn,String(v.name),inflowEffects,'increase').length===1||
+      (inflowFn.stateMutability==='payable'&&inflowFn.parameters.length===0&&
+       sourceExactAccountingDelta(inflowEffects,String(v.name),'msg.value','increase'))))
+    .map((v:any)=>String(v.name)))];
+  const publicTotal=publicTotalCandidateNames.length===1?
+    accountingStateVars.find((v:any)=>v.name===publicTotalCandidateNames[0]):undefined;
+  const inflowAmountParameter=publicTotal?
+    String(matchingAmountParameters(inflowFn,String(publicTotal.name),inflowEffects,'increase')[0]?.name||''):
+    amountParameter(inflowFn);
+  const publicBalance=accountingStateVars.find((v:any)=>{
+    if(v.visibility!=="public"||v.typeName?.type!=="Mapping"||
+      !/^uint(?:[0-9]{1,3})?$/.test(String(canonicalAbiType(v.typeName.valueType)||"")))return false;
+    const keyType=canonicalAbiType(v.typeName.keyType);
+    return keyType==="address"||/^uint(?:[0-9]{1,3})?$/.test(String(keyType||""));
+  });
+  const publicBalanceKeyAbi=publicBalance?
+    canonicalAbiType(publicBalance.typeName.keyType)||undefined:undefined;
+  // Solidity generates a getter for a public state declaration even if the
+  // controller's function menu omitted the compiler-generated entry.
+  const totalGetterDecl=publicTotal?
+    {operation:"call" as const,selector:contract.name+"."+publicTotal.name,inputs:[] as string[]}:undefined;
+  const balanceGetterDecl=publicBalance?
+    {operation:"call" as const,selector:contract.name+"."+publicBalance.name,
+      inputs:[publicBalanceKeyAbi!]}:undefined;
 
   // Source-backed collection and struct-return observations are distinct from
   // scalar balance getters. Admit only a directly witnessed transition.
-  const sourceObservations=extractAccountingObservations(snapshot,contract.name,declarations);
+  const sourceObservations=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
   const findTypedObservation=():SourceInvariantTransitionPlan['typedObservation']|undefined=>{
     for(const observation of sourceObservations){
       const {push,pop,fieldDecrement}=accountingTransitionPatterns(observation.stateVariable,observation.kind==='struct_field'?observation.fieldName:'');
-      if(observation.kind==='collection_length' && push.test(inflowBody) && pop.test(outflowBody))
+      if(observation.kind==='collection_length' && push.test(inflowEffects) && pop.test(outflowEffects))
         return {getter:observation.getter,args:[],baseline:'0',afterInflow:'1',afterOutflow:'0'};
       // A struct field check requires literal storage updates witnessed in both
       // operations. A shared variable name or ABI compatibility is insufficient.
       if(observation.kind==='struct_field' && observation.keyType.startsWith('uint') &&
-         push.test(inflowBody) &&
-         fieldDecrement.test(outflowBody)){
-        return {getter:observation.getter,args:['0'],expectPath:[observation.fieldIndex],
-          baseline:'0',afterInflow:'1000',afterOutflow:'600'};
+         push.test(inflowEffects) &&
+         fieldDecrement.test(outflowEffects)){
+        return {getter:observation.getter,args:observation.getterArgs||['0'],expectPath:[observation.fieldIndex],
+          baseline:'0',afterInflow:inflowAmount,afterOutflow:expectedRemainder};
       }
     }
     return undefined;
   };
   const typedObservation=(!totalGetterDecl&&!balanceGetterDecl)?findTypedObservation():undefined;
+  const collectionLifecycleProven=!!typedObservation&&sourceObservations.some(observation=>
+    observation.kind==='collection_length'&&observation.getter===typedObservation.getter)&&
+    typedObservation.baseline==='0'&&typedObservation.afterInflow==='1'&&
+    typedObservation.afterOutflow==='0';
   if (!totalGetterDecl && !balanceGetterDecl && !typedObservation) {
     return {
       ok: false,
@@ -2276,6 +3122,37 @@ export function extractSourceInvariantDescriptor(
   const balanceVarName = balanceGetterDecl ? balanceGetterDecl.selector.slice(contract.name.length + 1) : '';
   const totalReferenced = !!totalVarName && new RegExp(`\\b${totalVarName}\\b`).test(combinedBody);
   const balanceReferenced = !!balanceVarName && new RegExp(`\\b${balanceVarName}\\b`).test(combinedBody);
+  const mappingKeyFor=(fn:any):{sourceKey:string;parameterName?:string;getterArg:string}|null=>{
+    if(!publicBalance||!publicBalanceKeyAbi)return null;
+    const text=body(sourceOfFunction(fn).content,fn).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
+    const name=String(publicBalance.name);
+    const matches=[...text.matchAll(new RegExp("\\b"+name+"\\s*\\[\\s*(msg\\.sender|[A-Za-z_]\\w*)\\s*\\]","g"))];
+    const keys=[...new Set(matches.map(match=>String(match[1])))];
+    if(keys.length!==1)return null;
+    const sourceKey=keys[0];
+    if(sourceKey==="msg.sender")
+      return publicBalanceKeyAbi==="address"?{sourceKey,getterArg:"$account0"}:null;
+    const parameter=(fn.parameters||[]).find((item:any)=>item.name===sourceKey);
+    if(!parameter||canonicalAbiType(parameter.typeName)!==publicBalanceKeyAbi)return null;
+    const constraints=collectParamConstraints(fn.body,new Set([sourceKey]));
+    const enumCardinality=enumAbiCardinality(parameter.typeName);
+    const requiresPositive=constraints.get(sourceKey)?.has("gt_zero")||
+      constraints.get(sourceKey)?.has("nonzero");
+    if(enumCardinality!==null&&enumCardinality===0)return null;
+    if(enumCardinality===1&&requiresPositive)return null;
+    const keyValue=publicBalanceKeyAbi==="address"?"$account0":
+      enumCardinality!==null?String(Math.min(1,enumCardinality-1)):
+      requiresPositive?"1":"7";
+    return {sourceKey,parameterName:sourceKey,getterArg:keyValue};
+  };
+  const inflowMappingKey=balanceReferenced?mappingKeyFor(inflowFn):null;
+  const outflowMappingKey=balanceReferenced?mappingKeyFor(outflowFn):null;
+  const commonMappingKeyArg=inflowMappingKey&&outflowMappingKey?
+    (publicBalanceKeyAbi==="address"?"$account0":
+      inflowMappingKey.getterArg==="1"||outflowMappingKey.getterArg==="1"?"1":
+      inflowMappingKey.getterArg===outflowMappingKey.getterArg?
+        inflowMappingKey.getterArg:undefined):undefined;
+  const balanceMappingGetterArgs=commonMappingKeyArg?[commonMappingKeyArg]:undefined;
   if (!totalReferenced && !balanceReferenced && !typedObservation) {
     return {
       ok: false,
@@ -2296,11 +3173,11 @@ export function extractSourceInvariantDescriptor(
       witnesses: pairWitnesses,
     };
   }
-  if (usesErc20Transfer && (!mockToken || !setup.usesToken)) {
+  if (usesErc20Transfer && (!mockToken || (!setup.usesToken&&!dependencyMockToken))) {
     return {
       ok: false,
       category: 'missing_fixture',
-      reason: `ERC20 token transfer in ${contract.name}.${inflowFn.name}/${outflowFn.name} requires a configurable token fixture wired via constructor or initializer`,
+      reason: `ERC20 token transfer in ${contract.name}.${inflowFn.name}/${outflowFn.name} requires an acquired token fixture wired through the root or a source-resolved dependency initializer`,
       witnesses: pairWitnesses,
     };
   }
@@ -2321,14 +3198,68 @@ export function extractSourceInvariantDescriptor(
   }
 
   const isUintType = (t: string) => /^uint(?:[0-9]{1,3})?$/.test(t);
-  const inflowAmount = '1000';
-  const outflowAmount = '400';
-  const expectedRemainder = '600';
+  // A source-proven scalar ledger may use protocol-specific entrypoint names
+  // (issue/redeem, create/destroy, etc.) and an actor parameter in addition
+  // to the amount. Admit only the unambiguous ABI shape of one unsigned amount
+  // plus at most one address; the source delta check below independently
+  // proves that this exact amount parameter mutates the observed ledger.
+  const scalarAmountParameter=(fn:any,state:string,text:string,direction:"increase"|"decrease"):any|null=>{
+    const matches=matchingAmountParameters(fn,state,text,direction);
+    return matches.length===1?matches[0]:null;
+  };
+  const scalarAccountingArgs=(fn:any,decl:any,amount:string,state:string,
+    text:string,direction:"increase"|"decrease"):string[]|null=>{
+    const amountParam=scalarAmountParameter(fn,state,text,direction);
+    const addressParameters=(fn.parameters||[]).filter((param:any)=>
+      canonicalAbiType(param.typeName)==='address');
+    if(!amountParam||addressParameters.length>1||
+      decl.inputs.length!==(fn.parameters||[]).length)return null;
+    const values=(fn.parameters||[]).map((param:any,index:number)=>{
+      if(param===amountParam)return amount;
+      const abi=decl.inputs[index];
+      if(!abi||canonicalAbiType(param.typeName)!==abi)return null;
+      if(abi==='address')return '$account0';
+      if(/(?:deposit|funding|position|record|token|share|fund)?(?:id|index)$/i.test(String(param.name||'')))
+        return /^uint/.test(abi)?'1':null;
+      return pickFlexibleArg(abi,String(param.name||''),{ownerAccount:'$account0',amount:'1000'});
+    });
+    return values.every((value:any)=>value!==null)?values as string[]:null;
+  };
 
   let mode: SourceInvariantTransitionPlan['mode'] | null = null;
   let inflowArgs: string[] = [];
   let inflowValueWei: string | undefined;
-  let outflowArgs: string[] = [];
+  let outflowArgs: Array<string|boolean> = [];
+  let dynamicPositionObservation:SourceInvariantTransitionPlan['dynamicPositionObservation'];
+  let dynamicPositionCompanionGetters:string[]=[];
+  let dynamicPositionWitnesses:SourceWitness[]=[];
+  const mappedArgs=(fn:any,key:{sourceKey:string;parameterName?:string}|null,
+    amount:string,keyValue:string|undefined):string[]|null=>{
+    if(!key||!keyValue)return null;
+    const params=fn.parameters||[];
+    // A direct caller-keyed ledger operation has no key ABI argument. It can
+    // pair with an explicit-key companion when the getter key is address and
+    // the scenario uses the same actor for both operations.
+    if(key.sourceKey==='msg.sender'&&!key.parameterName&&params.length===1){
+      const [only]=params;
+      return isUintType(canonicalAbiType(only.typeName)||'')&&
+        /^(?:amount|amt|value|wad|qty|quantity|principal|shares|tokens?)$/i.test(String(only.name||''))
+        ?[amount]:null;
+    }
+    if(!key.parameterName||params.length!==2)return null;
+    const namedAmount=params.filter((p:any)=>
+      /^(?:amount|amt|value|wad|qty|quantity|principal|shares|tokens?)$/i.test(String(p.name||'')));
+    const amountParam=namedAmount.length===1?namedAmount[0]:
+      params.find((p:any)=>p.name!==key.parameterName&&isUintType(canonicalAbiType(p.typeName)||''));
+    const keyParam=params.find((p:any)=>p.name===key.parameterName);
+    if(!amountParam||!keyParam||amountParam.name===keyParam.name||
+      !isUintType(canonicalAbiType(amountParam.typeName)||'')||
+      canonicalAbiType(keyParam.typeName)!==publicBalanceKeyAbi)return null;
+    return params.map((p:any)=>p.name===amountParam.name?amount:
+      p.name===key.parameterName?keyValue:null)
+      .every((arg:string|null)=>arg!==null)?
+      params.map((p:any)=>p.name===amountParam.name?amount:keyValue):null;
+  };
 
   // Mode A: Payable ETH deposit() + withdraw(uint256)
   if (
@@ -2370,6 +3301,59 @@ export function extractSourceInvariantDescriptor(
     }
     mode = 'mint_burn_supply';
   }
+  // Source-indexed public mapping plus an amount. Both operations must use a
+  // single key parameter whose ABI type matches the public getter.
+  else if(!usesErc20Transfer&&inflowMappingKey&&outflowMappingKey&&commonMappingKeyArg){
+    const inArgs=mappedArgs(inflowFn,inflowMappingKey,inflowAmount,commonMappingKeyArg);
+    const outArgs=mappedArgs(outflowFn,outflowMappingKey,outflowAmount,commonMappingKeyArg);
+    if(!inArgs||!outArgs){
+      return {ok:false,category:'missing_fixture',
+        reason:'Mapped accounting operations require one source-matched key and one unsigned amount parameter',
+        witnesses:pairWitnesses};
+    }
+    mode='internal_deposit_withdraw';inflowArgs=inArgs;outflowArgs=outArgs;
+  }
+  // Dynamic full-position withdrawal is admitted only when the acquired
+  // getter, position field, capped amount, ledger debit and token burn all
+  // have direct source witnesses. The observed position amount becomes the
+  // withdrawal ABI argument in the local-EVM sequence.
+  else if(totalReferenced&&!balanceReferenced&&(!usesErc20Transfer||!!mockToken)){
+    const dynamic=sourceDynamicFullPositionWithdrawal(snapshot,contract,declarations,
+      outflowFn,inflowEffects,outflowEffects,totalVarName);
+    if(dynamic){
+      const dynamicInflowAmount=scalarAmountParameter(inflowFn,totalVarName,
+        inflowEffects,'increase');
+      const inArgs=dynamicInflowAmount?(inflowFn.parameters||[]).map((param:any)=>{
+        if(param===dynamicInflowAmount)return inflowAmount;
+        if(/^(?:maturationTimestamp|maturityTimestamp)$/i.test(String(param.name||''))&&
+          canonicalAbiType(param.typeName)==='uint64')return '2000000000';
+        return null;
+      }):null;
+      const dynamicValues=(outflowFn.parameters||[]).map((param:any,index:number)=>{
+        if(index===dynamic.depositIdIndex)return '1';
+        if(index===dynamic.amountIndex)return '$lastObservation:0';
+        if(index===dynamic.earlyIndex)return true;
+        return null;
+      });
+      if(inArgs&&inArgs.length===2&&inArgs.every((value:any)=>value!==null)&&
+        dynamicValues.every((value:any)=>value!==null)){
+          mode='dynamic_full_position_withdraw';inflowArgs=inArgs;
+          outflowArgs=dynamicValues as Array<string|boolean>;
+          outflowAmount='1';expectedRemainder='0';
+          dynamicPositionObservation={getter:dynamic.getter,args:dynamic.args,
+            argumentPath:dynamic.argumentPath};
+          dynamicPositionCompanionGetters=dynamic.companionGetters;
+          dynamicPositionWitnesses=dynamic.witnesses;
+      }
+    }
+    if(!mode){
+      const inArgs=scalarAccountingArgs(inflowFn,inflowDecl,inflowAmount,totalVarName,inflowEffects,'increase');
+      const outArgs=scalarAccountingArgs(outflowFn,outflowDecl,outflowAmount,totalVarName,outflowEffects,'decrease');
+      if(inArgs&&outArgs){
+        mode='internal_deposit_withdraw';inflowArgs=inArgs;outflowArgs=outArgs;
+      }
+    }
+  }
   // Mode C/D: Internal or acquired-ERC20 deposit(uint256)/stake(uint256) + withdraw(uint256)/unstake(uint256)
   else if (
     inflowDecl.inputs.length === 1 &&
@@ -2389,35 +3373,46 @@ export function extractSourceInvariantDescriptor(
     };
   }
 
+  if(mode===null){
+    return {ok:false,category:'missing_fixture',
+      reason:'No unambiguous ABI argument plan for the source-proven accounting pair '+
+        contract.name+'.'+inflowFn.name+'/'+outflowFn.name,
+      witnesses:pairWitnesses};
+  }
+
   // Numeric 1000/400/600 assertions apply only when the acquired source
   // proves direct matching updates without fees, exchange rates or accrual.
   // Contracts with dynamic economics require a separate measured property.
   const accountingTarget=totalReferenced?totalVarName:balanceReferenced?balanceVarName:'';
-  const amountParameter=(fn:any)=>String((fn.parameters||[]).find((param:any)=>
-    /^uint(?:[0-9]+)?$/.test(String(param.typeName?.name||'')))?.name||'');
-  const inflowParameter=amountParameter(inflowFn);
-  const outflowParameter=amountParameter(outflowFn);
-  const inflowEffects=reachableAccountingSource(snapshot,contract,inflowFn);
-  const outflowEffects=reachableAccountingSource(snapshot,contract,outflowFn);
+  const inflowParameter=inflowAmountParameter;
+  const sourceOutflowAmounts=totalReferenced?
+    matchingAmountParameters(outflowFn,totalVarName,outflowEffects,'decrease'):[];
+  const outflowParameter=sourceOutflowAmounts.length===1?
+    String(sourceOutflowAmounts[0]?.name||''):amountParameter(outflowFn);
   const directlyProven=accountingTarget&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(accountingTarget)&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(inflowParameter)&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(outflowParameter)&&
-    new RegExp("\\b"+accountingTarget+"\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
-    new RegExp("\\b"+accountingTarget+"\\s*-="+ "\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
-    !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
+    sourceAccountingWriteCount(inflowEffects,accountingTarget)===1&&
+    sourceAccountingWriteCount(outflowEffects,accountingTarget)===1&&
+    sourceExactAccountingDelta(inflowEffects,accountingTarget,inflowParameter,"increase")&&
+    sourceExactAccountingDelta(outflowEffects,accountingTarget,outflowParameter,"decrease")&&
+    totalReferenced;
+  const dynamicFullPositionProven=mode==='dynamic_full_position_withdraw'&&
+    !!dynamicPositionObservation&&totalReferenced&&expectedRemainder==='0'&&
+    outflowArgs.includes('$lastObservation:0');
   // A payable deposit and ETH withdrawal can independently establish
   // conservation from the caller balance and the actual transferred value.
   // This detects a missing aggregate-ledger decrement (the BuggyVault case)
   // instead of demanding the correct decrement already exist in the source.
   const matchingBalance=balanceReferenced&&
     /^[A-Za-z_][A-Za-z0-9_]*$/.test(balanceVarName)&&
-    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*\\+=\\s*msg\\.value").test(inflowEffects)&&
-    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*-=\\s*"+outflowParameter+"\\b").test(outflowEffects);
+    sourceExactAccountingDelta(inflowEffects,balanceVarName,"msg.value","increase","msg.sender")&&
+    sourceExactAccountingDelta(outflowEffects,balanceVarName,outflowParameter,"decrease","msg.sender");
   const coupledPayableConservation=totalReferenced&&
     inflowFn.stateMutability==='payable'&&inflowFn.parameters.length===0&&
     outflowFn.parameters.length===1&&/^uint/.test(String(outflowFn.parameters[0]?.typeName?.name||''))&&
-    new RegExp("\\b"+totalVarName+"\\s*\\+=\\s*msg\\.value").test(inflowEffects)&&
+    sourceExactAccountingDelta(inflowEffects,totalVarName,"msg.value","increase")&&
     matchingBalance&&
     new RegExp("\\bvalue\\s*:\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
     !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
@@ -2429,13 +3424,22 @@ export function extractSourceInvariantDescriptor(
     inflowFn.parameters.length===1&&outflowFn.parameters.length===1&&
     /^uint/.test(String(inflowFn.parameters[0]?.typeName?.name||''))&&
     /^uint/.test(String(outflowFn.parameters[0]?.typeName?.name||''))&&
-    new RegExp("\\b"+totalVarName+"\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
-    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*\\+=\\s*"+inflowParameter+"\\b").test(inflowEffects)&&
-    new RegExp("\\b"+balanceVarName+"\\s*\\[\\s*msg\\.sender\\s*\\]\\s*-=\\s*"+outflowParameter+"\\b").test(outflowEffects)&&
+    sourceExactAccountingDelta(inflowEffects,totalVarName,inflowParameter,"increase")&&
+    sourceExactAccountingDelta(inflowEffects,balanceVarName,inflowParameter,"increase","msg.sender")&&
+    sourceExactAccountingDelta(outflowEffects,balanceVarName,outflowParameter,"decrease","msg.sender")&&
     /\.\s*(?:safeTransferFrom|transferFrom)\s*\(/.test(inflowEffects)&&
     /\.\s*(?:safeTransfer|transfer)\s*\(/.test(outflowEffects)&&
     !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
-  if(!directlyProven&&!coupledPayableConservation&&!matchedTokenPrincipal){
+  // A source-proven per-user debit must reduce the shared aggregate when
+  // both ledgers were increased together. Its omission remains falsifiable.
+  const matchedInternalPrincipal=totalReferenced&&balanceReferenced&&!usesErc20Transfer&&
+    !!inflowParameter&&!!outflowParameter&&
+    sourceExactAccountingDelta(inflowEffects,totalVarName,inflowParameter,"increase")&&
+    sourceExactAccountingDelta(inflowEffects,balanceVarName,inflowParameter,"increase","msg.sender")&&
+    sourceExactAccountingDelta(outflowEffects,balanceVarName,outflowParameter,"decrease","msg.sender")&&
+    !/\b(?:fee|interest|incomeIndex|rewardUnlock|exchangeRate)\b/i.test(inflowEffects+outflowEffects);
+  if(!directlyProven&&!dynamicFullPositionProven&&!coupledPayableConservation&&!matchedTokenPrincipal&&
+    !matchedInternalPrincipal&&!collectionLifecycleProven){
     return {ok:false,category:'no_supported_property',
       reason:'Fixed-value conservation was not source-proven for '+contract.name+'.'+
         inflowFn.name+'/'+outflowFn.name+'; requires a property-specific measured scenario.',
@@ -2443,8 +3447,8 @@ export function extractSourceInvariantDescriptor(
   }
 
   const totalGetterSig = totalReferenced ? `${totalVarName}()` : undefined;
-  const balanceGetterSig = balanceReferenced ? `${balanceVarName}(address)` : undefined;
-  const propertyKind: InvariantPropertyKind =
+  const balanceGetterSig = balanceReferenced ? balanceVarName+'('+(publicBalanceKeyAbi||'address')+')' : undefined;
+  const propertyKind: InvariantPropertyKind = collectionLifecycleProven?'other':
     mode === 'mint_burn_supply' || /supply/i.test(totalVarName)
       ? 'supply-accounting'
       : /share/i.test(totalVarName) || /share/i.test(balanceVarName)
@@ -2458,17 +3462,28 @@ export function extractSourceInvariantDescriptor(
     postState.push({ expression: `${contract.name}.${totalVarName} == ${expectedRemainder}`, readback: totalGetterSig });
   }
   if (balanceGetterSig) {
-    preState.push({ expression: `${contract.name}.${balanceVarName}[$account0] == 0`, readback: balanceGetterSig });
-    postState.push({ expression: `${contract.name}.${balanceVarName}[$account0] == ${expectedRemainder}`, readback: balanceGetterSig });
+    const mappingKeyExpression=balanceMappingGetterArgs?.[0]||'$account0';
+    preState.push({ expression: contract.name+'.'+balanceVarName+'['+mappingKeyExpression+'] == 0', readback: balanceGetterSig });
+    postState.push({ expression: contract.name+'.'+balanceVarName+'['+mappingKeyExpression+'] == '+expectedRemainder, readback: balanceGetterSig });
   }
 
   const inflowSig = `${inflowFn.name}(${inflowDecl.inputs.join(',')})`;
   const outflowSig = `${outflowFn.name}(${outflowDecl.inputs.join(',')})`;
-  const obsList = [totalGetterSig, balanceGetterSig, typedObservation?.getter].filter(Boolean).join(' and ');
+  const obsList = [totalGetterSig,balanceGetterSig,typedObservation?.getter,
+    ...dynamicPositionCompanionGetters].filter(Boolean).join(' and ');
+  const dynamicPositionReadback=dynamicPositionObservation?
+    dynamicPositionObservation.getter+"(1).virtualTokenTotalSupply":undefined;
+  for(const getter of dynamicPositionCompanionGetters){
+    preState.push({expression:`${contract.name}.${getter} == 0`,readback:getter});
+    postState.push({expression:`${contract.name}.${getter} == 0`,readback:getter});
+  }
+  const observedExpected=collectionLifecycleProven?typedObservation!.afterOutflow:expectedRemainder;
   if(typedObservation){
     preState.push({expression:`${contract.name}.${typedObservation.getter} == ${typedObservation.baseline}`,readback:typedObservation.getter});
     postState.push({expression:`${contract.name}.${typedObservation.getter} == ${typedObservation.afterOutflow}`,readback:typedObservation.getter});
   }
+  if(dynamicPositionReadback)
+    postState.push({expression:dynamicPositionReadback+' == 0',readback:dynamicPositionObservation!.getter});
 
   return {
     ok: true,
@@ -2477,14 +3492,19 @@ export function extractSourceInvariantDescriptor(
       target: `${contract.name}.${method}`,
       companionTarget: `${contract.name}.${method === inflowFn.name ? outflowFn.name : inflowFn.name}`,
       propertyKind,
-      predictedRelation: `After ${inflowSig} (${inflowAmount}) followed by ${outflowSig} (${outflowAmount}) by $account0, ${obsList} must equal ${expectedRemainder}.`,
-      falsifier: `Execute ${inflowSig} (+${inflowAmount}) then ${outflowSig} (-${outflowAmount}) on a fresh local EVM; violation observed if ${obsList} diverges from ${expectedRemainder}.`,
+      predictedRelation: mode==='dynamic_full_position_withdraw'?
+        `After ${inflowSig} (${inflowAmount}) creates deposit 1, observe ${dynamicPositionObservation!.getter} field 0 and withdraw exactly that recorded virtual-token supply using ${outflowSig}; ${obsList} must return to ${observedExpected} and the position supply must be zero.`:
+        `After ${inflowSig} (${inflowAmount}) followed by ${outflowSig} (${outflowAmount}) by $account0, ${obsList} must equal ${observedExpected}.`,
+      falsifier: mode==='dynamic_full_position_withdraw'?
+        `Execute ${inflowSig}, read the acquired deposit position getter, feed its field 0 into ${outflowSig}, then read ${obsList} and the position supply; a nonzero ledger or remaining position supply falsifies the source-derived relation.`:
+        `Execute ${inflowSig} (+${inflowAmount}) then ${outflowSig} (-${outflowAmount}) on a fresh local EVM; violation observed if ${obsList} diverges from ${observedExpected}.`,
       preState,
       postState,
-      witnesses: pairWitnesses,
+      witnesses: [...pairWitnesses,...dynamicPositionWitnesses],
       transitionPlan: {
         mode,
-        ...(mode === 'erc20_deposit_withdraw' ? { usesMockToken: true } : {}),
+        ...(usesErc20Transfer&&mockToken?{usesMockToken:true}:{}),
+        ...(dependencyMockToken?{mockTokenDeploymentId:dependencyMockToken.id}:{}),
         inflowMethod: inflowFn.name,
         inflowSig,
         inflowArgs,
@@ -2496,8 +3516,11 @@ export function extractSourceInvariantDescriptor(
         outflowAmount,
         expectedRemainder,
         balanceMappingGetter: balanceGetterSig,
+        ...(balanceMappingGetterArgs?{balanceMappingGetterArgs}:{}),
         totalScalarGetter: totalGetterSig,
         typedObservation,
+        dynamicPositionObservation,
+        ...(dynamicPositionCompanionGetters.length?{dynamicPositionCompanionGetters}:{}),
         ...(dependencyPlan.status==='resolved'&&dependencyPlan.deployments.length?{
           dependencyDeployments:dependencyPlan.deployments,
           dependencyInitializerOperations:dependencyPlan.initializerOperations,
@@ -2529,13 +3552,28 @@ export function admitSourceInvariantDescriptor(
     return null;
   }
   const tp = invariant.transitionPlan;
-  if (!tp.totalScalarGetter && !tp.balanceMappingGetter && !tp.typedObservation) return null;
+  if (!tp.totalScalarGetter && !tp.balanceMappingGetter && !tp.typedObservation&&
+    !tp.dynamicPositionObservation) return null;
   if(tp.typedObservation && (!tp.typedObservation.getter||
     ![tp.typedObservation.baseline,tp.typedObservation.afterInflow,tp.typedObservation.afterOutflow].every(v=>/^(?:0|[1-9][0-9]*)$/.test(v))))return null;
+  if(tp.mode==='dynamic_full_position_withdraw'&&(!tp.dynamicPositionObservation?.getter||
+    tp.dynamicPositionObservation.getter!=='getDeposit(uint64)'||
+    JSON.stringify(tp.dynamicPositionObservation.args)!=='["1"]'||
+    JSON.stringify(tp.dynamicPositionObservation.argumentPath)!=='[0]'||
+    JSON.stringify(tp.outflowArgs)!=='["1","$lastObservation:0",true]'||
+    (tp.dynamicPositionCompanionGetters||[]).some(g=>!/^[_A-Za-z][_A-Za-z0-9]*\(\)$/.test(g)||
+      !invariant.witnesses?.some(w=>w.symbol.endsWith('.'+g.slice(0,-2))&&
+        w.sourceSha256===invariant.sourceSha256))||
+    new Set(tp.dynamicPositionCompanionGetters||[]).size!==(tp.dynamicPositionCompanionGetters||[]).length||
+    !invariant.witnesses?.some(w=>w.symbol.endsWith('.getDeposit(uint64)')&&
+      w.sourceSha256===invariant.sourceSha256)||
+    !invariant.witnesses?.some(w=>w.symbol.endsWith('.Deposit.virtualTokenTotalSupply')&&
+      w.sourceSha256===invariant.sourceSha256)||tp.expectedRemainder!=='0'))return null;
   if (!/^[1-9][0-9]*$/.test(tp.inflowAmount) || !/^[1-9][0-9]*$/.test(tp.outflowAmount) || !/^(?:0|[1-9][0-9]*)$/.test(tp.expectedRemainder)) {
     return null;
   }
-  if (BigInt(tp.inflowAmount) - BigInt(tp.outflowAmount) !== BigInt(tp.expectedRemainder)) {
+  if (tp.mode!=='dynamic_full_position_withdraw'&&
+    BigInt(tp.inflowAmount) - BigInt(tp.outflowAmount) !== BigInt(tp.expectedRemainder)) {
     return null;
   }
   return invariant;
@@ -2554,23 +3592,27 @@ export function constructCoreInvariantExperiment(
 ): { hypothesis: string; property: string; sequence: SoliditySequence; witnesses: SourceWitness[] } | null {
   const admitted = admitSourceInvariantDescriptor(invariant);
   if (!admitted || admitted.sourceSha256 !== snapshot.sha256) return null;
+  const canonicalContract=(parseAstCached(snapshot).children||[]).find((node:any)=>
+    node.type==='ContractDefinition'&&node.name===contract.name);
+  if(canonicalContract)contract=canonicalContract;
   const tp = admitted.transitionPlan!;
   const { chain } = resolveInheritance(snapshot, contract, sources);
   const mockToken = tp.usesMockToken || tp.mode === 'erc20_deposit_withdraw' ? findRepositoryMockToken(sources) : null;
   const setup = resolveFlexibleSetup(snapshot, contract, chain, sources, declarations, mockToken, '$account0',tp.dependencyBindings||{});
   if (!setup) return null;
   if(tp.typedObservation){
-    const observed=extractAccountingObservations(snapshot,contract.name,declarations);
+    const observed=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
     const supported=observed.some(obs=>obs.getter===tp.typedObservation!.getter &&
       (tp.typedObservation!.expectPath===undefined ||
        (obs.kind==='struct_field'&&tp.typedObservation!.expectPath.length===1&&
         tp.typedObservation!.expectPath[0]===obs.fieldIndex)));
     if(!supported)return null;
   }
-  if (tp.mode === 'erc20_deposit_withdraw' && (!mockToken || !setup.usesToken)) return null;
+  if (tp.mode === 'erc20_deposit_withdraw' &&
+    (!mockToken || (!setup.usesToken&&!tp.mockTokenDeploymentId))) return null;
 
   const deployments=[
-    ...(setup.usesToken&&mockToken?[{
+    ...(setup.usesToken&&mockToken&&!tp.mockTokenDeploymentId?[{
       id:'token',file:mockToken.snapshot.path,contract:mockToken.contractName,
       constructorArgs:mockToken.constructorArgs,
     }]:[]),
@@ -2590,12 +3632,61 @@ export function constructCoreInvariantExperiment(
       requiredSetup: true,
     });
   }
-  if (tp.mode === 'erc20_deposit_withdraw' && mockToken) {
+  // Some source families require the target to own a separately deployed
+  // token/NFT before its first operation (DInterest calls depositNFT.mint,
+  // whose acquired implementation is onlyOwner). When both sides of that
+  // relationship are source-bound, establish it as fixture setup and verify
+  // the ownership change. Do not infer or transfer roles from receiver names.
+  const selectedFns=[tp.inflowSig,tp.outflowSig].map(signature=>{
+    const name=signature.slice(0,signature.indexOf('('));
+    return (contract.subNodes||[]).find((node:any)=>node.type==='FunctionDefinition'&&
+      node.name===name&&canonicalFunctionIdentity(node)===signature);
+  }).filter(Boolean);
+  const selectedSourceClosure=selectedFns.map((fn:any)=>
+    reachableAccountingSource(snapshot,contract,fn,sources)).join('\n')
+      .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
+  const ownershipTransfers=new Set<string>();
+  for(const [receiver,reference] of Object.entries(tp.dependencyBindings||{})){
+    const deploymentId=typeof reference==='string'&&reference.startsWith('$deployment:')?
+      reference.slice('$deployment:'.length):'';
+    const dependency=(tp.dependencyDeployments||[]).find(item=>item.id===deploymentId);
+    if(!dependency||!identifier.test(receiver))continue;
+    const source=sources.get(dependency.file);
+    if(!source)continue;
+    const depAst=parseAstCached(source);
+    const depContract=(depAst.children||[]).find((node:any)=>
+      node.type==='ContractDefinition'&&node.name===dependency.contract);
+    if(!depContract)continue;
+    const dependencyMethods=[...selectedSourceClosure.matchAll(
+      new RegExp('\\b'+receiver+'\\s*\\.\\s*([A-Za-z_]\\w*)\\s*\\(','g'))]
+      .map(match=>String(match[1]));
+    for(const method of dependencyMethods){
+      const guarded=(depContract.subNodes||[]).some((node:any)=>
+        node.type==='FunctionDefinition'&&node.name===method&&
+        ((node.modifiers||[]).some((modifier:any)=>modifier.name==='onlyOwner')||
+          /\bowner\s*\(\s*\)/.test(body(source.content,node))&&
+          /\bmsg\s*\.\s*sender\b/.test(body(source.content,node))));
+      if(!guarded)continue;
+      const ownerAbi=verifyAcquiredReceiverMethods(dependency.contract,
+        ['owner','transferOwnership'],dependency.file,dependency.contract,[...sources.values()]);
+      if(!ownerAbi.ok)continue;
+      const key=deploymentId+':'+receiver;
+      if(ownershipTransfers.has(key))continue;
+      ownershipTransfers.add(key);
+      steps.push({operation:'call',deploymentId,function:'owner()',args:[],expect:'$account0'});
+      steps.push({operation:'send',deploymentId,function:'transferOwnership(address)',
+        args:['$contract'],sender:0,requiredSetup:true});
+      steps.push({operation:'call',deploymentId,function:'owner()',args:[],expect:'$contract'});
+      break;
+    }
+  }
+  if (tp.usesMockToken && mockToken) {
+    const tokenDeploymentId=tp.mockTokenDeploymentId||'token';
     const mintAmount = '10000';
     if (mockToken.mintHasRecipient) {
       steps.push({
         operation: 'send',
-        deploymentId: 'token',
+        deploymentId: tokenDeploymentId,
         function: mockToken.mintSig,
         args: ['$account0', mintAmount],
         sender: 0,
@@ -2604,7 +3695,7 @@ export function constructCoreInvariantExperiment(
     } else {
       steps.push({
         operation: 'send',
-        deploymentId: 'token',
+        deploymentId: tokenDeploymentId,
         function: mockToken.mintSig,
         args: [mintAmount],
         sender: 0,
@@ -2613,7 +3704,7 @@ export function constructCoreInvariantExperiment(
     }
     steps.push({
       operation: 'send',
-      deploymentId: 'token',
+      deploymentId: tokenDeploymentId,
       function: 'approve(address,uint256)',
       args: ['$contract', mintAmount],
       sender: 0,
@@ -2627,11 +3718,13 @@ export function constructCoreInvariantExperiment(
   // 1. Pre-state baseline readbacks
   const preTyped=typedReadback(tp.typedObservation?.baseline||'');
   if(preTyped)steps.push(preTyped);
+  for(const getter of tp.dynamicPositionCompanionGetters||[])
+    steps.push({operation:'call',function:getter,args:[],expect:'0'});
   if (tp.totalScalarGetter) {
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: '0' });
   }
   if (tp.balanceMappingGetter) {
-    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: '0' });
+    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: tp.balanceMappingGetterArgs||['$account0'], expect: '0' });
   }
   // 2. Inflow operation (+inflowAmount)
   steps.push({
@@ -2646,10 +3739,14 @@ export function constructCoreInvariantExperiment(
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: tp.inflowAmount });
   }
   if (tp.balanceMappingGetter) {
-    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: tp.inflowAmount });
+    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: tp.balanceMappingGetterArgs||['$account0'], expect: tp.inflowAmount });
   }
   const midTyped=typedReadback(tp.typedObservation?.afterInflow||'');
   if(midTyped)steps.push(midTyped);
+  if(tp.dynamicPositionObservation){
+    steps.push({operation:'observe',function:tp.dynamicPositionObservation.getter,
+      args:tp.dynamicPositionObservation.args});
+  }
   // 4. Outflow operation (-outflowAmount)
   steps.push({
     operation: 'send',
@@ -2657,14 +3754,21 @@ export function constructCoreInvariantExperiment(
     args: tp.outflowArgs,
     sender: 0,
   });
+  if(tp.dynamicPositionObservation){
+    steps.push({operation:'call',function:tp.dynamicPositionObservation.getter,
+      args:tp.dynamicPositionObservation.args,expect:'0',
+      expectPath:tp.dynamicPositionObservation.argumentPath});
+  }
   const postTyped=typedReadback(tp.typedObservation?.afterOutflow||'');
   if(postTyped)steps.push(postTyped);
+  for(const getter of tp.dynamicPositionCompanionGetters||[])
+    steps.push({operation:'call',function:getter,args:[],expect:'0'});
   // 5. Post-state conservation / supply-accounting assertions (== expectedRemainder)
   if (tp.totalScalarGetter) {
     steps.push({ operation: 'call', function: tp.totalScalarGetter, args: [], expect: tp.expectedRemainder });
   }
   if (tp.balanceMappingGetter) {
-    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: ['$account0'], expect: tp.expectedRemainder });
+    steps.push({ operation: 'call', function: tp.balanceMappingGetter, args: tp.balanceMappingGetterArgs||['$account0'], expect: tp.expectedRemainder });
   }
 
   return {
@@ -2693,73 +3797,1426 @@ function sourceScalarDeltaExperiments(
 ):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
   if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
     resolveInheritance(snapshot,contract,sources).chain))return [];
-  const nodes:any[]=contract.subNodes||[];
-  const publicCounters=nodes.filter(n=>n.type==='StateVariableDeclaration')
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=inheritance.chain;
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(owner:any,node:any):boolean=>
+    (owner.contract.subNodes||[]).includes(node)||
+    (owner.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const counters=allNodes.filter(n=>n.type==='StateVariableDeclaration')
     .flatMap(n=>n.variables||[]).filter((v:any)=>
-      v.visibility==='public'&&identifier.test(v.name||'')&&
+      identifier.test(v.name||'')&&
       v.typeName?.type==='ElementaryTypeName'&&
       /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||'')&&!v.expression);
-  if(!publicCounters.length)return [];
+  if(!counters.length)return [];
+  // A private/internal scalar can be measured only when the acquired source
+  // explicitly declares an independent view/pure return of that same state.
+  // Arbitrary functions with related names are not accepted as readbacks.
+  const observations=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
   const setup=resolveFlexibleSetup(snapshot,contract,
-    resolveInheritance(snapshot,contract,sources).chain,
+    inheritance.chain,
     sources,declarations,null);
   if(!setup||setup.usesToken)return [];
-  const constructor=nodes.find(n=>n.type==='FunctionDefinition'&&n.isConstructor);
-  const bodySource=snapshot.content;
+  const initializingFunctions=allNodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&
+    (n.isConstructor||n.name==='initialize'||n.name==='init'));
   const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
-  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name===method&&
+  for(const fn of allNodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name===method&&
     ['public','external'].includes(n.visibility))){
     const inputs=(fn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
-    if(inputs.length!==1||!inputs[0]||!/^uint(?:[0-9]{1,3})?$/.test(inputs[0]))continue;
-    const param=fn.parameters[0];
-    if(!identifier.test(param.name||''))continue;
-    const signature=fn.name+'('+inputs[0]+')';
+    const amountParameters=(fn.parameters||[]).filter((p:any)=>
+      /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p.typeName)||''));
+    const actorParameters=(fn.parameters||[]).filter((p:any)=>(
+      canonicalAbiType(p.typeName)==='address'));
+    if(!amountParameters.length||actorParameters.length>1||
+      inputs.some((type:string|null)=>!type))continue;
+    const signature=fn.name+'('+inputs.join(',')+')';
     if(!declarations.some(d=>d.operation==='send'&&
       d.selector===contract.name+'.'+method&&
       JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
     const modifiers=(fn.modifiers||[]).map((m:any)=>String(m.name||''));
     if(modifiers.some((m:string)=>/(?:only|owner|admin|auth|role|minter|permission)/i.test(m)))continue;
-    const fnText=body(bodySource,fn)
+    const fnSource=sourceForNode(fn);
+    const fnText=body(fnSource.content,fn)
       .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
     // Other contract calls create additional fixture prerequisites. Refuse until
     // their actual implementations and preconditions have been connected.
     if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText)||
       /\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(fnText))continue;
-    for(const state of publicCounters){
-      if(constructor&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,constructor)))continue;
-      if(setup.initSignature){
-        const init=nodes.find(n=>n.type==='FunctionDefinition'&&
-          (n.name==='initialize'||n.name==='init')&&n.body);
-        if(init&&new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)').test(body(bodySource,init)))continue;
-      }
-      const statement=new RegExp('\\b'+state.name+'\\s*\\+=\\s*'+param.name+'\\s*;');
-      if(!statement.test(fnText))continue;
-      const getter=state.name+'()';
-      const width=Number(inputs[0].replace(/\D/g,''))||256;
-      const amount=width<=8?'100':'1000';
+    for(const state of counters){
+      if(initializingFunctions.some(initializer=>new RegExp('\\b'+state.name+
+        '\\s*(?:\\+?=|-=)').test(body(sourceForNode(initializer).content,initializer))))continue;
+      // The source lvalue, not parameter order or name, identifies which
+      // unsigned argument is the state delta. Multiple candidate amounts
+      // remain ambiguous and are refused.
+      const matchedAmounts=amountParameters.map((candidate:any)=>{
+        if(!identifier.test(candidate.name||''))return null;
+        if(sourceAccountingWriteCount(fnText,state.name)!==1)return null;
+        const formula=sourceExactScalarFormula(fnText,state.name,candidate.name);
+        const direct=!formula&&sourceExactAccountingDelta(fnText,state.name,candidate.name,'increase');
+        return direct!==Boolean(formula)?{param:candidate,formula}:null;
+      }).filter((value:any)=>value!==null);
+      if(matchedAmounts.length!==1)continue;
+      const {param,formula}=matchedAmounts[0];
+      // Reuse exact-lvalue source accounting proof for assignment and SafeMath
+      // forms. Never equate a different storage key or symbol with this state.
+      const observed=observations.find(o=>o.kind==='scalar'&&
+        o.stateVariable===state.name);
+      const getter=state.visibility==='public'?state.name+'()':observed?.getter;
+      if(!getter)continue;
+      const stateSource=sourceForNode(state);
+      const amountWidth=Number(String(canonicalAbiType(param.typeName)||'').replace(/\D/g,''))||256;
+      const stateWidth=Number(String(canonicalAbiType(state.typeName)||'').replace(/\D/g,''))||256;
+      const amountMaximum=(1n<<BigInt(amountWidth))-1n;
+      const formulaDivisor=formula?BigInt(formula.divisor):0n;
+      const amount=formula?
+        (formulaDivisor<amountMaximum?(formulaDivisor+1n):formulaDivisor).toString():
+        (amountWidth<=8?'100':'1000');
+      const expectedDelta=formula?
+        (BigInt(amount)*BigInt(formula.multiplier)/BigInt(formula.divisor)).toString():amount;
+      if(BigInt(amount)>(1n<<BigInt(amountWidth))-1n||
+        BigInt(expectedDelta)>(1n<<BigInt(stateWidth))-1n||expectedDelta==='0')continue;
+      const boolGate=sourceBooleanGateForScalarWrite(fnText,state.name,param.name,
+        (fn.parameters||[]).filter((p:any)=>canonicalAbiType(p.typeName)==='bool')
+          .map((p:any)=>String(p.name||'')).filter(identifier.test.bind(identifier)));
+      if(boolGate===null)continue;
+      const args=(fn.parameters||[]).map((p:any,index:number)=>{
+        if(p===param)return amount;
+        const type=inputs[index]||'';
+        if(type==='address')return '$account0';
+        if(type==='bool'&&boolGate?.parameter===String(p.name||''))return boolGate.value;
+        if(/(?:deposit|funding|position|record|token|share|fund)?(?:id|index)$/i.test(String(p.name||''))&&
+          /^uint/.test(type))return '1';
+        return pickFlexibleArg(type,String(p.name||''),{ownerAccount:'$account0',amount});
+      });
+      if(args.some((value:any)=>value===null))continue;
       const steps:SoliditySequence['steps']=[];
       if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
         args:setup.initArgs,sender:0,requiredSetup:true});
       steps.push({operation:'call',function:getter,args:[],expect:'0'});
-      steps.push({operation:'send',function:signature,args:[amount],sender:0});
-      steps.push({operation:'call',function:getter,args:[],expect:amount});
+      steps.push({operation:'send',function:signature,args,sender:0});
+      steps.push({operation:'call',function:getter,args:[],expect:expectedDelta});
       out.push({
         hypothesis:'Source-declared increment of '+state.name+' by '+param.name+
-          ' must produce '+amount+' from an initial zero state for '+contract.name+'.'+signature,
-        property:'source-defined bounded scalar conservation '+contract.name+'.'+signature+':'+state.name,
+          (formula?' × '+formula.multiplier+' ÷ '+formula.divisor:'')+
+          ' must produce '+expectedDelta+' from an initial zero state for '+contract.name+'.'+signature,
+        property:(formula?'source-defined proportional scalar transition ':'source-defined bounded scalar transition ')+contract.name+'.'+signature+':'+state.name,
         sequence:{constructorArgs:setup.constructorArgs,
           ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
           sourceProperty:{kind:'scalar_delta',state:state.name,method:signature,
-            parameter:param.name,amount,direction:'increase',sourceSha256:snapshot.sha256},
+            parameter:param.name,amount,...(formula?{formula,expectedDelta}:{}),
+            direction:'increase',sourceSha256:snapshot.sha256},
           steps},
-        witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
-          witness(snapshot,state,contract.name+'.'+state.name)],
+        witnesses:[witness(fnSource,fn,contract.name+'.'+signature),
+          witness(stateSource,state,contract.name+'.'+state.name),
+          ...(state.visibility==='public'?[]:(allNodes.filter((n:any)=>
+            n.type==='FunctionDefinition'&&n.name===getter.split('(')[0]&&n.body)
+            .map((n:any)=>witness(sourceForNode(n),n,contract.name+'.'+getter))))],
       });
     }
   }
   return out;
 }
 
+
+/** Construct falsifiable source-grounded mapping/account state transitions.
+ * Exact storage-key identity prevents claiming a credit to Alice from an
+ * update to Bob's entry. EVM receipts and readbacks remain mandatory. */
+function sourceMappingDeltaExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=inheritance.chain;
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(owner:any,node:any):boolean=>
+    (owner.contract.subNodes||[]).includes(node)||
+    (owner.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const maps=allNodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      v.visibility==='public'&&identifier.test(v.name||'')&&
+      v.typeName?.type==='Mapping'&&
+      ['address',...(canonicalAbiType(v.typeName.keyType)&&
+        /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(v.typeName.keyType)!)?
+          [canonicalAbiType(v.typeName.keyType)!]:[])].includes(
+            canonicalAbiType(v.typeName.keyType)||'')&&
+      v.typeName.valueType?.type==='ElementaryTypeName'&&
+      /^uint(?:[0-9]{1,3})?$/.test(String(v.typeName.valueType.name||'')));
+  if(!maps.length)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    inheritance.chain,sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+  for(const fn of allNodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&
+    n.name===method&&['public','external'].includes(n.visibility)&&
+    !['view','pure'].includes(n.stateMutability||''))){
+    if((fn.modifiers||[]).length)continue;
+    const params:any[]=fn.parameters||[];
+    if(!params.length||params.length>5)continue;
+    const types=params.map(p=>canonicalAbiType(p.typeName));
+    if(types.some(x=>!x)||!declarations.some(d=>
+      d.selector===contract.name+'.'+fn.name&&d.operation==='send'&&
+      JSON.stringify(d.inputs)===JSON.stringify(types)))continue;
+    const fnSource=sourceForNode(fn);
+    const methodSource=body(fnSource.content,fn);
+    // Calls into an external protocol need a separately proven receiver and
+    // preparation. Pure SafeMath operations on the same lvalue are allowed.
+    if(/\b(?!msg\b|block\b|abi\b|SafeMath\b)[A-Za-z_]\w*\s*\.\s*(?!add\b|sub\b)[A-Za-z_]\w*\s*\(/.test(methodSource)||
+      /\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(methodSource))continue;
+    const numeric=params.filter((p,i)=>
+      identifier.test(p.name||'')&&/^uint(?:[0-9]{1,3})?$/.test(types[i]||''));
+    const accountKeys=params.filter((p,i)=>
+      identifier.test(p.name||'')&&types[i]==='address').map(p=>p.name);
+    for(const variable of maps){
+      const mappingKeyType=canonicalAbiType(variable.typeName.keyType);
+      if(!mappingKeyType)continue;
+      const candidateKeys=mappingKeyType==='address'?['msg.sender',...accountKeys]:
+        params.filter((p:any,i:number)=>types[i]===mappingKeyType&&
+          identifier.test(p.name||'')).map((p:any)=>String(p.name));
+      for(const key of candidateKeys){
+      for(const amountParam of numeric){
+        if(key===amountParam.name)continue;
+        const keyParameter=key==='msg.sender'?null:
+          params.find((p:any)=>p.name===key);
+        const enumCardinality=keyParameter?enumAbiCardinality(keyParameter.typeName):null;
+        const keyConstraints=keyParameter?
+          collectParamConstraints(fn.body,new Set([key])).get(key)||new Set():new Set();
+        if(enumCardinality!==null&&(enumCardinality<1||
+          (enumCardinality===1&&(keyConstraints.has('gt_zero')||keyConstraints.has('nonzero')))))continue;
+        const numericKeyValue=enumCardinality!==null?
+          String(Math.min(1,enumCardinality-1)):'1';
+        if(!sourceExactAccountingDelta(methodSource,variable.name,
+          amountParam.name,'increase',key))continue;
+        const args:SolidityArgValue[]=[];
+        let supported=true;
+        for(let i=0;i<params.length;i++){
+          const p=params[i];
+          const value:SolidityArgValue|null=
+            p.name===amountParam.name?'1':p.name===key?
+              (mappingKeyType==='address'?'$account2':numericKeyValue):
+              pickFlexibleArg(types[i]||'',p.name||'',
+                {ownerAccount:'$account0',amount:'1'});
+          if(value===null){supported=false;break;}
+          args.push(value);
+        }
+        if(!supported)continue;
+        const targetKey=key==='msg.sender'?'$account0':
+          args[params.findIndex((p:any)=>p.name===key)];
+        if(targetKey===undefined)continue;
+        const signature=canonicalFunctionIdentity(fn);
+        // A checked increase with an acquired supply precondition must be
+        // funded before testing. Executing it against zero supply yields a
+        // revert observation, not an experiment on its source-defined branch.
+        // Admit a funding pathway only when both independent storage writes
+        // and the guard are visible in the same acquired contract.
+        const totals=allNodes.filter(n=>n.type==='StateVariableDeclaration')
+          .flatMap(n=>n.variables||[]).filter((v:any)=>
+            v.visibility==='public'&&identifier.test(v.name||'')&&
+            v.typeName?.type==='ElementaryTypeName'&&
+            /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||''));
+        const constrained=totals.find(total=>{
+          const amount=String(amountParam.name);
+          const state=String(total.name);
+          return new RegExp(String.raw`\b`+amount+
+            String.raw`\s*>\s*0\s*&&\s*`+amount+
+            String.raw`\s*<=\s*`+state).test(methodSource)&&
+            sourceExactAccountingDelta(methodSource,total.name,amountParam.name,'decrease');
+        });
+        if(constrained){
+          // The paired funding constructor below is source-proven only for
+          // address-keyed liabilities; numeric-key ledgers use the direct
+          // exact-key path unless a separate funding strategy is constructed.
+          if(mappingKeyType!=='address')continue;
+          const candidate=allNodes.filter(n=>n.type==='FunctionDefinition'&&
+            n.name!==method&&n.body&&['external','public'].includes(n.visibility)&&
+            !(n.modifiers||[]).length&&(n.parameters||[]).length===2);
+          const acquiredFunding=candidate.flatMap((fund:any)=>{
+            const p:any[]=fund.parameters||[];
+            if(canonicalAbiType(p[0].typeName)!=='address'||
+              !/^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p[1].typeName)||'')||
+              !identifier.test(p[0].name||'')||!identifier.test(p[1].name||''))
+              return [];
+            const sig=canonicalFunctionIdentity(fund);
+            if(!declarations.some(d=>d.selector===contract.name+'.'+fund.name&&
+              d.operation==='send'&&JSON.stringify(d.inputs)===
+                JSON.stringify([canonicalAbiType(p[0].typeName),canonicalAbiType(p[1].typeName)])))
+              return [];
+            const fundSource=sourceForNode(fund);
+            const text=body(fundSource.content,fund);
+            const bound=text.match(new RegExp(
+              String.raw`\buint(?:256)?\s+([A-Za-z_]\w*)\s*=\s*`+
+              p[1].name+String.raw`\s*\.\s*bounded\s*\(`));
+            const amountValue=bound?.[1]||p[1].name;
+            if(!sourceExactAccountingDelta(text,variable.name,amountValue,'increase',p[0].name)||
+              !sourceExactAccountingDelta(text,constrained.name,amountValue,'increase'))
+              return [];
+            return [{fund,signature:sig}];
+          });
+          if(acquiredFunding.length!==1)continue;
+          if(key==='msg.sender')continue;
+          const evidence=acquiredFunding[0];
+          const prepared:SoliditySequence['steps']=[];
+          if(setup.initSignature)prepared.push({
+            operation:'send',function:setup.initSignature,args:setup.initArgs,
+            sender:0,requiredSetup:true});
+          // The EVM itself establishes role eligibility: no guessed
+          // administrator identity substitutes for the actual operator getter.
+          if(/require\s*\(\s*msg\s*\.\s*sender\s*==\s*operator\b/.test(methodSource)&&
+            declarations.some(d=>d.selector===contract.name+'.operator'&&d.operation==='call'))
+            prepared.push({operation:'call',function:'operator()',args:[],expect:'$account0'});
+          prepared.push({operation:'call',function:constrained.name+'()',args:[],expect:'0'});
+          prepared.push({operation:'call',function:variable.name+'(address)',
+            args:[targetKey],expect:'0'});
+          prepared.push({operation:'send',function:evidence.signature,
+            args:[targetKey,'5'],sender:0,requiredSetup:true});
+          prepared.push({operation:'call',function:variable.name+'(address)',
+            args:[targetKey],expect:'5'});
+          prepared.push({operation:'call',function:constrained.name+'()',args:[],expect:'5'});
+          prepared.push({operation:'send',function:signature,args,sender:0});
+          prepared.push({operation:'call',function:variable.name+'(address)',
+            args:[targetKey],expect:'6'});
+          prepared.push({operation:'call',function:constrained.name+'()',args:[],expect:'4'});
+          out.push({
+            hypothesis:'Acquired funding satisfies source total precondition; the selected bounded settlement changes the exact mapping by +1 and total by -1',
+            property:'source-funded mapping balance '+contract.name+'.'+signature+':'+variable.name,
+            sequence:{constructorArgs:setup.constructorArgs,
+              ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+              steps:prepared},
+            witnesses:[witness(fnSource,fn,contract.name+'.'+signature),
+              witness(sourceForNode(variable),variable,contract.name+'.'+variable.name),
+              witness(sourceForNode(constrained),constrained,contract.name+'.'+constrained.name),
+              witness(sourceForNode(evidence.fund),evidence.fund,
+                contract.name+'.'+evidence.signature)],
+          });
+          continue;
+        }
+        const steps:SoliditySequence['steps']=[];
+        if(setup.initSignature)steps.push({
+          operation:'send',function:setup.initSignature,args:setup.initArgs,
+          sender:0,requiredSetup:true});
+        const getter=variable.name+'('+mappingKeyType+')';
+        steps.push({operation:'call',function:getter,
+          args:[targetKey],expect:'0'});
+        steps.push({operation:'send',function:signature,args,sender:0});
+        steps.push({operation:'call',function:getter,
+          args:[targetKey],expect:'1'});
+        out.push({
+          hypothesis:'Source-declared update must add 1 to the exact '+
+            variable.name+'['+key+'] storage entry',
+          property:'source-backed mapping conservation '+contract.name+'.'+
+            signature+':'+variable.name+':'+key,
+          sequence:{
+            constructorArgs:setup.constructorArgs,
+            ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+            steps},
+          witnesses:[
+            witness(fnSource,fn,contract.name+'.'+signature),
+            witness(sourceForNode(variable),variable,contract.name+'.'+variable.name)],
+        });
+      }
+    }
+    }
+  }
+  return out;
+}
+
+/** Source-exact interprocedural scalar state update. The external entrypoint
+ * passes its only ABI parameter to a unique acquired internal helper that
+ * assigns that parameter directly to a concrete storage variable. Readback
+ * must be compiler-public or an exact source-returning view, never guessed.
+ */
+function sourceInternalScalarSetterExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>{
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=inheritance.chain;
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(owner:any,node:any):boolean=>
+    (owner.contract.subNodes||[]).includes(node)||
+    (owner.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const states=allNodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      identifier.test(v.name||'')&&v.typeName?.type==='ElementaryTypeName'&&
+      /^(?:address|bool|uint(?:[0-9]{1,3})?)$/.test(v.typeName.name||''));
+  if(!states.length)return [];
+  const views=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    inheritance.chain,sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const functions=allNodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&n.name);
+  const results:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const entry of functions.filter(n=>n.name===method&&
+    ['public','external'].includes(n.visibility)&&!(n.modifiers||[]).length&&
+    !['pure','view'].includes(n.stateMutability||''))){
+    const params:any[]=entry.parameters||[];
+    if(params.length!==1||!identifier.test(params[0].name||''))continue;
+    const type=canonicalAbiType(params[0].typeName);
+    if(!type||!['bool','address'].includes(type)&&!
+      /^uint(?:[0-9]{1,3})?$/.test(type))continue;
+    if(!declarations.some(d=>d.selector===contract.name+'.'+method&&
+      d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify([type])))
+      continue;
+    const entrySource=sourceForNode(entry);
+    const statements:any[]=entry.body.statements||[];
+    const callStmt=statements[0];
+    if(statements.length<1||statements.length>2||
+      callStmt?.type!=='ExpressionStatement'||
+      callStmt.expression?.type!=='FunctionCall'||
+      callStmt.expression.expression?.type!=='Identifier')continue;
+    if(statements.length===2&&(statements[1].type!=='ReturnStatement'||
+      statements[1].expression?.type!=='BooleanLiteral'||
+      statements[1].expression.value!==true))continue;
+    const invoke=callStmt.expression;
+    if(invoke.arguments?.length!==1||invoke.arguments[0]?.type!=='Identifier'||
+      invoke.arguments[0]?.name!==params[0].name)continue;
+    const helperName=String(invoke.expression.name||'');
+    const helpers=functions.filter(n=>n.name===helperName&&
+      ['internal','private'].includes(n.visibility)&&
+      !(n.modifiers||[]).length&&(n.parameters||[]).length===1&&
+      canonicalAbiType(n.parameters[0].typeName)===type);
+    if(helpers.length!==1)continue;
+    const helper=helpers[0],hp=helper.parameters[0];
+    const helperSource=sourceForNode(helper);
+    if(!identifier.test(hp.name||''))continue;
+    const writes:any[]=helper.body.statements||[];
+    if(writes.length!==1||writes[0]?.type!=='ExpressionStatement'||
+      writes[0].expression?.type!=='BinaryOperation'||
+      writes[0].expression.operator!=='='||
+      writes[0].expression.left?.type!=='Identifier'||
+      writes[0].expression.right?.type!=='Identifier'||
+      writes[0].expression.right.name!==hp.name)continue;
+    const state=states.find((v:any)=>v.name===writes[0].expression.left.name&&
+      canonicalAbiType(v.typeName)===type);
+    if(!state)continue;
+    const stateSource=sourceForNode(state);
+    const readback=state.visibility==='public'?state.name+'()':
+      views.find(o=>o.kind==='scalar'&&o.stateVariable===state.name)?.getter;
+    if(!readback)continue;
+    const readFn=functions.find(n=>n.name===readback.split('(')[0]&&n.body&&
+      canonicalFunctionIdentity(n)===readback);
+    const value:SolidityArgValue=type==='bool'?true:
+      type==='address'?'$account2':'7';
+    const steps:SoliditySequence['steps']=[];
+    if(setup.initSignature)steps.push({
+      operation:'send',function:setup.initSignature,
+      args:setup.initArgs,sender:0,requiredSetup:true});
+    steps.push({operation:'observe',function:readback,args:[]});
+    steps.push({operation:'send',function:canonicalFunctionIdentity(entry),
+      args:[value],sender:0});
+    steps.push({operation:'call',function:readback,args:[],expect:value});
+    results.push({
+      hypothesis:'Exact source helper '+helperName+' writes the input to '+
+        state.name+' and its independently source-proven getter must return it',
+      property:'source internal state assignment '+contract.name+'.'+
+        canonicalFunctionIdentity(entry)+':'+state.name,
+      sequence:{constructorArgs:setup.constructorArgs,
+        ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+        steps},
+      witnesses:[
+        witness(entrySource,entry,contract.name+'.'+canonicalFunctionIdentity(entry)),
+        witness(helperSource,helper,contract.name+'.'+helperName),
+        witness(helperSource,writes[0],contract.name+'.'+helperName+'.assignment'),
+        witness(stateSource,state,contract.name+'.'+state.name),
+        ...(readFn?[witness(sourceForNode(readFn),readFn,contract.name+'.'+readback)]:[])
+      ]
+    });
+  }
+  return results;
+}
+
+/** Generalized externally observable source-state assignment. Exact AST
+ * lvalue=parameter identity provides an independent postcondition; the
+ * pre-state is observed, not assumed to be zero. This deliberately excludes
+ * guarded branches, modifiers and unproven external effects. */
+function sourceDirectAssignmentExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=inheritance.chain;
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(owner:any,node:any):boolean=>
+    (owner.contract.subNodes||[]).includes(node)||
+    (owner.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const stateVariables=allNodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>{
+      const type=canonicalAbiType(v.typeName);
+      return v.visibility==='public'&&identifier.test(v.name||'')&&!!type&&
+        !type.includes('[')&&
+        (/^(?:bool|address|u?int(?:[0-9]{1,3})?)$/.test(type)||type.startsWith('('));
+    });
+  if(!stateVariables.length)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    inheritance.chain,
+    sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+  for(const fn of allNodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+    ['public','external'].includes(n.visibility)&&
+    !['view','pure'].includes(n.stateMutability||''))){
+    if((fn.modifiers||[]).length)continue;
+    const args:SolidityArgValue[]=[];
+    const inputs:string[]=[];
+    const selected=new Map<string,SolidityArgValue>();
+    const parameters:any[]=fn.parameters||[];
+    if(!parameters.length||parameters.length>5)continue;
+    let valid=true;
+    for(const param of parameters){
+      const type=canonicalAbiType(param.typeName);
+      const name=String(param.name||'');
+      if(!type||!identifier.test(name)){valid=false;break;}
+      const value=pickFlexibleArg(type,name);
+
+      if(value===null){valid=false;break;}
+      inputs.push(type);args.push(value);selected.set(name,value);
+    }
+    if(!valid||!declarations.some(d=>
+      d.selector.startsWith(contract.name+'.')&&
+      d.selector.slice(contract.name.length+1).split('(')[0]===method&&
+      d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
+    const fnSource=sourceForNode(fn);
+    const fnText=body(fnSource.content,fn);
+    if(hasAnySourceAuthGuard(fn,fnText))continue;
+    const statements:any[]=fn.body.statements||[];
+    // Only a top-level direct assignment is considered unconditional. A
+    // branch-sensitive store or helper call requires deeper symbolic analysis.
+    const writes=statements.filter((n:any)=>n.type==='ExpressionStatement'&&
+      n.expression?.type==='BinaryOperation'&&n.expression.operator==='='&&
+      n.expression.left?.type==='Identifier'&&n.expression.right?.type==='Identifier');
+    for(const stmt of writes){
+      const lhs=String(stmt.expression.left.name||'');
+      const rhs=String(stmt.expression.right.name||'');
+      if(!selected.has(rhs))continue;
+      const state=stateVariables.find((v:any)=>v.name===lhs);
+      if(!state)continue;
+      const stateType=canonicalAbiType(state.typeName);
+      const param=parameters.find((p:any)=>p.name===rhs);
+      if(!param||stateType!==canonicalAbiType(param.typeName))continue;
+      // A later write to the same state invalidates this exact postcondition.
+      const position=statements.indexOf(stmt);
+      const remaining=statements.slice(position+1);
+      const overwritten=remaining.some((n:any)=>
+        n.type==='ExpressionStatement'&&n.expression?.type==='BinaryOperation'&&
+        n.expression.left?.type==='Identifier'&&n.expression.left.name===lhs);
+      if(overwritten)continue;
+      const text=body(fnSource.content,fn);
+      if(/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(text))continue;
+      const signature=canonicalFunctionIdentity(fn);
+      const getter=lhs+'()';
+      const expected=selected.get(rhs)!;
+      const steps:SoliditySequence['steps']=[];
+      if(setup.initSignature)steps.push({
+        operation:'send',function:setup.initSignature,
+        args:setup.initArgs,sender:0,requiredSetup:true});
+      steps.push({operation:'observe',function:getter,args:[]});
+      steps.push({operation:'send',function:signature,args,sender:0});
+      steps.push({operation:'call',function:getter,args:[],expect:expected});
+
+      // A public role is a security property only when acquired source proves
+      // both deployer initialization and a privileged consumer. Exercise the
+      // setter from a distinct account and require the role getter to expose
+      // that outsider, rather than treating any state assignment as a flaw.
+      if(fnSource.path===snapshot.path&&stateType==='address'&&canonicalAbiType(param.typeName)==='address'&&
+        expected==='$account2'&&!hasAnySourceAuthGuard(fn,body(snapshot.content,fn))&&
+        declarations.some(d=>d.operation==='call'&&d.selector.startsWith(contract.name+'.')&&
+          d.selector.slice(contract.name.length+1).split('(')[0]===lhs&&d.inputs.length===0)){
+        const constructor=allNodes.find((n:any)=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body&&
+          new RegExp('\\b'+lhs+'\\s*=\\s*msg\\s*\\.\\s*sender\\b')
+            .test(body(sourceForNode(n).content,n)));
+        const consumer=(()=>{for(const peer of sources.values()){
+          if(peer.path===snapshot.path)continue;
+          let peerAst:any;try{peerAst=parseAstCached(peer);}catch{continue;}
+          for(const peerContract of peerAst.children||[]){
+            if(peerContract.type!=='ContractDefinition')continue;
+            for(const peerFn of peerContract.subNodes||[]){
+              if(peerFn.type!=='FunctionDefinition'||!peerFn.body)continue;
+              if(new RegExp('\\brequire\\s*\\(\\s*msg\\s*\\.\\s*sender\\s*==\\s*'+lhs+'\\b')
+                .test(body(peer.content,peerFn)))
+                return {source:peer,contract:peerContract,node:peerFn};
+            }
+          }
+        }return null;})();
+        if(constructor&&consumer){
+          const impactSequence=inheritedRoleConsumerImpactSequence(
+            snapshot.content,consumer.source.content,lhs,method,
+            snapshot.path.replace(/^source-[0-9]+\//,''),
+            consumer.source.path.replace(/^source-[0-9]+\//,''),
+            consumer.contract.name);
+          const impactSupported=impactSequence!==null;
+          const outsiderSteps:SoliditySequence['steps']=impactSequence?.steps||[
+            {operation:'observe',function:getter,args:[]},
+            {operation:'send',function:signature,args,sender:2},
+            {operation:'call',function:getter,args:[],expect:'$account2'},
+          ];
+          const impactWitnesses:SourceWitness[]=[];
+          out.unshift({
+            hypothesis:impactSupported?
+              'A non-administrator can rotate the inherited operator role to itself and execute the acquired operator-only settlement, moving funded credit while reducing totalCredit':
+              'An outsider can replace deployer-initialized '+lhs+
+                ', which acquired source uses to authorize '+consumer.contract.name+'.'+
+                canonicalFunctionIdentity(consumer.node),
+            property:impactSupported?
+              'unauthorized privileged settlement through source-proven role mutation '+
+                contract.name+'.'+signature+':'+lhs:
+              'unauthorized source-proven privileged role mutation '+
+                contract.name+'.'+signature+':'+lhs,
+            sequence:impactSequence?{
+              ...impactSequence,constructorArgs:setup.constructorArgs,
+              ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{})
+            }:{
+              constructorArgs:setup.constructorArgs,
+              ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+              steps:outsiderSteps
+            },
+            witnesses:[
+              witness(sourceForNode(constructor),constructor,contract.name+'.constructor.'+lhs),
+              witness(fnSource,fn,contract.name+'.'+signature),
+              witness(fnSource,stmt,contract.name+'.'+signature+'.assignment'),
+              witness(sourceForNode(state),state,contract.name+'.'+lhs),
+              witness(consumer.source,consumer.node,
+                consumer.contract.name+'.'+canonicalFunctionIdentity(consumer.node)+'.role-guard'),
+              ...impactWitnesses
+            ]
+          });
+          // Do not enqueue the weaker getter-only mutation after constructing
+          // the complete inherited-consumer impact experiment for this setter.
+          if(impactSupported)continue;
+        }
+      }
+      out.push({
+        hypothesis:'Acquired direct assignment '+lhs+' = '+rhs+
+          ' must produce the exact public getter value after a successful call',
+        property:'source-defined direct state assignment '+contract.name+'.'+
+          signature+':'+lhs,
+        sequence:{constructorArgs:setup.constructorArgs,
+          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+          steps},
+        witnesses:[witness(fnSource,fn,contract.name+'.'+signature),
+          witness(fnSource,stmt,contract.name+'.'+signature+'.assignment'),
+          witness(sourceForNode(state),state,contract.name+'.'+lhs)],
+      });
+    }
+  }
+  return out;
+}
+
+/** General owner-equality guard over an actual state assignment. The
+ * security property is unauthorized non-mutation AND authorized write;
+ * arbitrary similarly named methods, comments, or unproven guards do not
+ * justify an authorization conclusion. */
+function sourceOwnerGuardedAssignmentExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=inheritance.chain;
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(entry:any,node:any):boolean=>
+    (entry.contract.subNodes||[]).includes(node)||
+    (entry.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const states=allNodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>{
+      const type=canonicalAbiType(v.typeName);
+      return v.visibility==='public'&&identifier.test(v.name||'')&&!!type&&
+        !type.includes('[')&&
+        (/^(?:address|bool|u?int(?:[0-9]{1,3})?)$/.test(type)||type.startsWith('('));
+    });
+  if(states.length<2)return [];
+  const constructors=allNodes.filter(n=>n.type==='FunctionDefinition'&&n.isConstructor&&n.body);
+  if(!constructors.length)return [];
+  const initializedBySender=new Set<string>();
+  const ownerInitializer=new Map<string,any>();
+  for(const ctor of constructors)for(const statement of ctor.body.statements||[]){
+    const expr=statement.type==='ExpressionStatement'?statement.expression:null;
+    if(expr?.type==='BinaryOperation'&&expr.operator==='='&&
+      expr.left?.type==='Identifier'&&isMsgSender(expr.right)){
+      const name=String(expr.left.name);
+      initializedBySender.add(name);ownerInitializer.set(name,ctor);
+    }
+  }
+  const ownerVars=states.filter(v=>canonicalAbiType(v.typeName)==='address'&&
+    initializedBySender.has(v.name)&&!v.expression);
+  if(!ownerVars.length)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    inheritance.chain,sources,declarations,null);
+  let constructorArgs:SoliditySequence['constructorArgs'];
+  let constructorValueWei:string|undefined;
+  if(setup&&!setup.usesToken&&!setup.initSignature){
+    constructorArgs=setup.constructorArgs;
+    constructorValueWei=setup.constructorValueWei;
+  }else{
+    // A custom public administrator (rather than a variable literally named
+    // owner) is still source-verifiable when a zero-argument constructor sets
+    // it directly from msg.sender. The generic flexible setup resolver only
+    // recognizes conventional owner names, so admit this narrower fixture
+    // after checking every constructor statement and rejecting opaque effects.
+    const ctor=constructors.find(candidate=>candidate===contract.subNodes?.find((n:any)=>
+      n.type==='FunctionDefinition'&&n.isConstructor&&n.body));
+    if(!ctor)return [];
+    const ctorParams:any[]=ctor.parameters||[];
+    const ctorStatements:any[]=ctor.body.statements||[];
+    const hasInitializer=allNodes.some(n=>n.type==='FunctionDefinition'&&
+      (n.modifiers||[]).some((m:any)=>m.name==='initializer'));
+    const safeConstructor=ctorParams.length===0&&!hasInitializer&&
+      (ctor.modifiers||[]).length===0&&ctorStatements.every((n:any)=>{
+        if(n.type!=='ExpressionStatement')return false;
+        const expr=n.expression;
+        if(expr?.type!=='BinaryOperation'||expr.operator!=='=')return false;
+        if(expr.left?.type!=='Identifier')return false;
+        return isMsgSender(expr.right)||
+          ['NumberLiteral','BooleanLiteral','StringLiteral','HexLiteral'].includes(expr.right?.type);
+      });
+    if(!safeConstructor)return [];
+    constructorArgs=[];
+  }
+  const results:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const fn of allNodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+    ['external','public'].includes(n.visibility)&&
+    !['view','pure'].includes(n.stateMutability||''))){
+    if((fn.modifiers||[]).length)continue;
+    const parameters:any[]=fn.parameters||[];
+    if(!parameters.length||parameters.length>5)continue;
+    const abi=parameters.map(p=>canonicalAbiType(p.typeName));
+    if(abi.some(x=>!x)||!declarations.some(d=>
+      d.selector===contract.name+'.'+fn.name&&d.operation==='send'&&
+      JSON.stringify(d.inputs)===JSON.stringify(abi)))continue;
+    const args:SolidityArgValue[]=[],selected=new Map<string,SolidityArgValue>();
+    let supported=true;
+    for(let i=0;i<abi.length;i++){
+      const name=String(parameters[i].name||'');
+      const type=abi[i]||'';
+      if(!identifier.test(name)){supported=false;break;}
+      const value=pickFlexibleArg(type,name);
+      if(value===null){supported=false;break;}
+      args.push(value);selected.set(name,value);
+    }
+    if(!supported)continue;
+    const statements:any[]=fn.body.statements||[];
+    const first=statements[0]?.type==='ExpressionStatement'?
+      statements[0].expression:null;
+    if(first?.type!=='FunctionCall'||first.expression?.type!=='Identifier'||
+      first.expression.name!=='require'||first.arguments?.length<1)continue;
+    const condition=first.arguments[0];
+    if(condition?.type!=='BinaryOperation'||condition.operator!=='==')continue;
+    const ownerRef=isMsgSender(condition.left)?condition.right:
+      isMsgSender(condition.right)?condition.left:null;
+    if(ownerRef?.type!=='Identifier'||!
+      ownerVars.some(owner=>owner.name===ownerRef.name))continue;
+    const owner=ownerVars.find(v=>v.name===ownerRef.name)!;
+    const fnSource=sourceForNode(fn);
+    const constructor=ownerInitializer.get(owner.name);
+    if(!constructor)continue;
+    // A second guard or an opaque helper can invalidate the authorized path.
+    // Neither source-inferred call effects nor arbitrary aliases are accepted.
+    if(statements.slice(1).some((n:any)=>
+      n.type!=='ExpressionStatement'||n.expression?.type!=='BinaryOperation'||
+      n.expression.operator!=='='))continue;
+    const writes=statements.slice(1).filter((n:any)=>
+      n.expression?.left?.type==='Identifier'&&
+      n.expression?.right?.type==='Identifier');
+    for(const statement of writes){
+      const destination=String(statement.expression.left.name||'');
+      const sourceParam=String(statement.expression.right.name||'');
+      const state=states.find(v=>v.name===destination&&v!==owner&&
+        !v.expression&&!initializedBySender.has(v.name));
+      const parameter=parameters.find(p=>p.name===sourceParam);
+      if(!state||!parameter||!selected.has(sourceParam)||
+        canonicalAbiType(state.typeName)!==canonicalAbiType(parameter.typeName))continue;
+      if(writes.filter(n=>n.expression.left.name===destination).length!==1)continue;
+      const stateCtorWrites=constructors.some((constructor:any)=>(constructor.body.statements||[]).some((n:any)=>
+        n.type==='ExpressionStatement'&&n.expression?.type==='BinaryOperation'&&
+        n.expression.left?.type==='Identifier'&&
+        n.expression.left.name===destination));
+      if(stateCtorWrites)continue;
+      const expected=selected.get(sourceParam)!;
+      const baseline:SolidityArgValue=abi[parameters.indexOf(parameter)]==='bool'?false:
+        abi[parameters.indexOf(parameter)]==='address'?
+          '0x0000000000000000000000000000000000000000':'0';
+      const signature=canonicalFunctionIdentity(fn);
+      const getter=destination+'()';
+      const steps:SoliditySequence['steps']=[
+        {operation:'call',function:owner.name+'()',args:[],expect:'$account0'},
+        {operation:'call',function:getter,args:[],expect:baseline},
+        {operation:'send',function:signature,args,sender:1,expectRevert:true},
+        {operation:'call',function:getter,args:[],expect:baseline},
+        {operation:'send',function:signature,args,sender:0},
+        {operation:'call',function:getter,args:[],expect:expected},
+      ];
+      results.push({
+        hypothesis:'Source-owned msg.sender equality rejects nonowner storage mutation and admits the owner exact state assignment',
+        property:'source-proof generic owner guard '+contract.name+'.'+signature+':'+destination,
+        sequence:{constructorArgs,
+          ...(constructorValueWei?{constructorValueWei}:{}),
+          steps},
+        witnesses:[witness(sourceForNode(constructor),constructor,contract.name+'.constructor'),
+          witness(sourceForNode(owner),owner,contract.name+'.'+owner.name),
+          witness(fnSource,fn,contract.name+'.'+signature),
+          witness(fnSource,statement,contract.name+'.'+signature+'.assignment'),
+          witness(sourceForNode(state),state,contract.name+'.'+destination)],
+      });
+    }
+  }
+  return results;
+}
+
+/** Prove a cross-function mapping write from an acquired exact internal helper
+ * and its independently declared public getter. This is a small source-level
+ * def/use proof, NOT a heuristic inference from function or variable names.
+ * Reads and write keys must be the same mapping lvalue under proven parameter
+ * substitution; EVM executes the actual helper bytecode and return assertions. */
+function sourceInternalMappingSetterExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const owner=resolveInheritance(snapshot,contract,sources);
+  const owners=owner.chain;
+  const allNodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(entry:any,node:any):boolean=>
+    (entry.contract.subNodes||[]).includes(node)||
+    (entry.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const mappingNodes=allNodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      identifier.test(v.name||'')&&v.typeName?.type==='Mapping'&&
+      v.typeName?.keyType?.name==='address'&&
+      v.typeName?.valueType?.type==='Mapping'&&
+      v.typeName?.valueType?.keyType?.name==='address'&&
+      /^uint(?:[0-9]{1,3})?$/.test(String(v.typeName?.valueType?.valueType?.name||'')));
+  if(!mappingNodes.length)return [];
+  const indexPath=(n:any):{name:string;keys:string[]}|null=>{
+    if(n?.type==='Identifier'&&identifier.test(n.name||''))
+      return {name:n.name,keys:[]};
+    if(n?.type!=='IndexAccess')return null;
+    const name=n.index?.type==='Identifier'?String(n.index.name||''):
+      isMsgSender(n.index)?'msg.sender':'';
+    const parent=indexPath(n.base);
+    return parent&&(identifier.test(name)||name==='msg.sender')?
+      {name:parent.name,keys:[...parent.keys,name]}:null;
+  };
+  const functions=allNodes.filter(n=>n.type==='FunctionDefinition'&&n.name&&n.body);
+  const getterCandidates=functions.filter(fn=>
+    ['public','external'].includes(fn.visibility)&&
+    fn.stateMutability==='view'&&(fn.parameters||[]).length===2&&
+    (fn.returnParameters||[]).length===1&&
+    (fn.body?.statements||[]).length===1&&
+    fn.body.statements[0].type==='ReturnStatement');
+
+  const setup=resolveFlexibleSetup(snapshot,contract,owner.chain,
+    sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+  const targets=functions.filter(fn=>fn.name===method&&
+    ['public','external'].includes(fn.visibility)&&
+    !['pure','view'].includes(fn.stateMutability||''));
+  for(const fn of targets){
+    if((fn.modifiers||[]).length)continue;
+    const params:any[]=fn.parameters||[];
+    const inputs=params.map(p=>canonicalAbiType(p.typeName));
+    if(inputs.length!==2||inputs[0]!=='address'||
+      !/^uint(?:[0-9]{1,3})?$/.test(inputs[1]||'')||
+      !declarations.some(d=>d.selector===contract.name+'.'+method&&
+        d.operation==='send'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
+    if(!params.every((p:any)=>identifier.test(p.name||'')))continue;
+    const statements:any[]=fn.body.statements||[];
+    if(statements.length!==2||
+      statements[0]?.type!=='ExpressionStatement'||
+      statements[0].expression?.type!=='FunctionCall'||
+      statements[0].expression.expression?.type!=='Identifier'||
+      statements[1]?.type!=='ReturnStatement'||
+      statements[1]?.expression?.type!=='BooleanLiteral'||
+      statements[1].expression.value!==true)continue;
+    const call=statements[0].expression;
+    const helperName=String(call.expression.name||'');
+    const helperCandidates=functions.filter(h=>h.name===helperName&&
+      ['internal','private'].includes(h.visibility)&&
+      (h.parameters||[]).length===(call.arguments||[]).length);
+    if(helperCandidates.length!==1)continue;
+    const helper=helperCandidates[0];
+    const helperParams:any[]=helper.parameters||[];
+    const bindings=new Map<string,string>();
+    let valid=true;
+    let incrementalRead:{name:string;keys:string[]}|null=null;
+    for(let i=0;i<helperParams.length;i++){
+      const argument=call.arguments[i];
+      let sourceValue:string|null=null;
+      if(argument.type==='Identifier'&&argument.name===params[0].name)
+        sourceValue='$account2';
+      else if(argument.type==='Identifier'&&argument.name===params[1].name)
+        sourceValue='7';
+      else if(isMsgSender(argument))
+        sourceValue='$account0';
+      else if(argument.type==='BinaryOperation'&&argument.operator==='+'&&
+        argument.right?.type==='Identifier'&&
+        argument.right.name===params[1].name){
+        // Exact existing mapping read plus the supplied source amount.
+        // The EVM pre-readback must prove the zero baseline before the send.
+        incrementalRead=indexPath(argument.left);
+        if(incrementalRead)sourceValue='7';
+      }
+      if(!sourceValue||!identifier.test(helperParams[i].name||'')){
+        valid=false;break;
+      }
+      bindings.set(helperParams[i].name,sourceValue);
+    }
+    if(!valid)continue;
+    const helperStatements:any[]=helper.body.statements||[];
+    const assignment=helperStatements.find((n:any)=>n.type==='ExpressionStatement'&&
+      n.expression?.type==='BinaryOperation'&&n.expression.operator==='=');
+    if(!assignment||helperStatements.some((n:any)=>n!==assignment&&
+      n.type!=='EmitStatement'&&!(n.type==='ExpressionStatement'&&
+        n.expression?.type==='FunctionCall'&&n.expression.expression?.name==='require')))continue;
+    const left=indexPath(assignment.expression.left);
+    const rhs=assignment.expression.right;
+    if(!left||left.keys.length!==2||rhs?.type!=='Identifier'||
+      !mappingNodes.some(m=>m.name===left.name)||
+      !bindings.has(rhs.name)||bindings.get(rhs.name)!=='7')continue;
+    const resolvedKeys=left.keys.map(name=>bindings.get(name));
+    if(resolvedKeys.some(value=>value!=='$account0'&&value!=='$account2')||
+      new Set(resolvedKeys).size!==2)continue;
+    if(incrementalRead&&(
+      incrementalRead.name!==left.name||
+      incrementalRead.keys.length!==2||
+      incrementalRead.keys[0]!=='msg.sender'||
+      incrementalRead.keys[1]!==params[0].name))continue;
+    for(const getter of getterCandidates){
+      const ret=indexPath(getter.body.statements[0].expression);
+      const readerParams:any[]=getter.parameters||[];
+      if(!ret||ret.name!==left.name||ret.keys.length!==2||
+        ret.keys[0]!==readerParams[0]?.name||
+        ret.keys[1]!==readerParams[1]?.name||
+        !readerParams.every(p=>canonicalAbiType(p.typeName)==='address')||
+        canonicalAbiType(getter.returnParameters[0].typeName)!=='uint256')continue;
+      const sig=canonicalFunctionIdentity(fn);
+      const getterSig=canonicalFunctionIdentity(getter);
+      const stepArgs:SolidityArgValue[]=['$account2','7'];
+      const steps:SoliditySequence['steps']=[];
+      if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
+        args:setup.initArgs,sender:0,requiredSetup:true});
+      steps.push({operation:'call',function:getterSig,
+        args:resolvedKeys as string[],expect:'0'});
+      steps.push({operation:'send',function:sig,args:stepArgs,sender:0});
+      steps.push({operation:'call',function:getterSig,
+        args:resolvedKeys as string[],expect:'7'});
+      const mappingState=mappingNodes.find(m=>m.name===left.name);
+      if(!mappingState)continue;
+      out.push({
+        hypothesis:'Source-internal helper writes 7 to the exact private mapping keys and the independent public getter must expose that value',
+        property:'source-backed internal setter and public mapping getter '+contract.name+'.'+sig,
+        sequence:{constructorArgs:setup.constructorArgs,
+          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+          steps},
+        witnesses:[witness(sourceForNode(fn),fn,contract.name+'.'+sig),
+          witness(sourceForNode(helper),helper,contract.name+'.'+helperName),
+          witness(sourceForNode(getter),getter,contract.name+'.'+getterSig),
+          witness(sourceForNode(mappingState),mappingState,contract.name+'.'+left.name)],
+      });
+    }
+  }
+  return out;
+}
+
+/** Source-proven onlyOwner direct public mapping-of-struct override.
+ * Both ABI return fields, the owner guard and the mined revert are verified. */
+function sourceStructOverrideExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  menu:readonly SolidityProbeDeclaration[],sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const nodes:any[]=contract.subNodes||[];
+  const ast=parseAstCached(snapshot);
+  const owns=(contract.baseContracts||[]).some((b:any)=>b.baseName?.namePath==='Ownable')&&
+    (ast.children||[]).some((i:any)=>i.type==='ImportDirective'&&
+      i.path==='@openzeppelin/contracts/access/Ownable.sol');
+  if(!owns)return [];
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    resolveInheritance(snapshot,contract,sources).chain,sources,menu,null);
+  if(!setup||setup.usesToken)return [];
+  const defs=new Map<string,any>();
+  for(const n of nodes)if(n.type==='StructDefinition'&&n.name)defs.set(n.name,n);
+  const mappings=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      v.visibility==='public'&&v.typeName?.type==='Mapping'&&identifier.test(v.name||''));
+  const escaped=(v:string)=>v.replace(/[.*+?^{}$()|[\]\\]/g,'\\$&');
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const fn of nodes.filter(n=>n.type==='FunctionDefinition'&&n.name===method&&n.body&&
+    ['public','external'].includes(n.visibility)&&
+    (n.modifiers||[]).some((m:any)=>m.name==='onlyOwner'))){
+    const params:any[]=fn.parameters||[];
+    const types:string[]=params.map((p:any)=>canonicalAbiType(p.typeName)||'');
+    if(types.some(t=>!t)||!menu.some(d=>d.operation==='send'&&
+      d.selector===contract.name+'.'+method&&
+      JSON.stringify(d.inputs)===JSON.stringify(types)))continue;
+    const sourceBody=body(snapshot.content,fn);
+    for(const variable of mappings){
+      let inner:any=variable.typeName;
+      const keys:string[]=[],names:string[]=[];
+      while(inner?.type==='Mapping'){
+        const type=canonicalAbiType(inner.keyType);
+        if(!type||!['address','uint64','uint256','uint8'].includes(type))break;
+        keys.push(type);inner=inner.valueType;
+      }
+      const name=String(inner?.namePath||'').split('.').pop()||'';
+      const struct=defs.get(name),members:any[]=struct?.members||[];
+      if(!keys.length||members.length!==2||members[0].typeName?.name!=='bool'||
+        !/^uint(?:[0-9]{1,3})?$/.test(String(members[1].typeName?.name||'')))continue;
+      let valid=true;
+      for(const type of keys){
+        const param=params.find((p:any)=>canonicalAbiType(p.typeName)===type&&
+          !names.includes(p.name));
+        if(!param||!identifier.test(param.name||'')){valid=false;break;}
+        names.push(param.name);
+      }
+      if(!valid)continue;
+      const amount=params.find((p:any)=>identifier.test(p.name||'')&&
+        /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(p.typeName)||'')&&
+        !names.includes(p.name));
+      if(!amount)continue;
+      const lhs=escaped(variable.name)+names.map(n=>
+        '\\s*\\[\\s*'+escaped(n)+'\\s*\\]').join('');
+      const rhs=escaped(name)+'\\s*\\(\\s*\\{\\s*'+escaped(members[0].name)+
+        '\\s*:\\s*true\\s*,\\s*'+escaped(members[1].name)+
+        '\\s*:\\s*'+escaped(amount.name)+'\\s*\\}\\s*\\)';
+      if(!new RegExp('\\b'+lhs+'\\s*=\\s*'+rhs).test(sourceBody))continue;
+      const keyValues=keys.map(type=>type==='address'?'$account2':'1');
+      const args:SolidityArgValue[]=[];
+      for(let i=0;i<params.length;i++){
+        const keyIndex=names.indexOf(params[i].name);
+        const v:SolidityArgValue|null=keyIndex>=0?keyValues[keyIndex]:
+          params[i].name===amount.name?'7':
+          pickFlexibleArg(types[i],params[i].name||'',{ownerAccount:'$account0'});
+        if(v===null){valid=false;break;}args.push(v);
+      }
+      if(!valid)continue;
+      const signature=canonicalFunctionIdentity(fn);
+      const getter=variable.name+'('+keys.join(',')+')';
+      const steps:SoliditySequence['steps']=[];
+      if(setup.initSignature)steps.push({operation:'send',function:setup.initSignature,
+        args:setup.initArgs,sender:0,requiredSetup:true});
+      steps.push({operation:'call',function:'owner()',args:[],expect:'$account0'});
+      steps.push({operation:'call',function:getter,args:keyValues,expect:[false,'0']});
+      steps.push({operation:'send',function:signature,args,sender:1,expectRevert:true});
+      steps.push({operation:'call',function:getter,args:keyValues,expect:[false,'0']});
+      steps.push({operation:'send',function:signature,args,sender:0});
+      steps.push({operation:'call',function:getter,args:keyValues,expect:[true,'7']});
+      out.push({
+        hypothesis:'Direct source-owned struct override rejects an unauthorized caller and writes both public struct fields only for the owner',
+        property:'owner-gated source struct override '+contract.name+'.'+signature+':'+variable.name,
+        sequence:{constructorArgs:setup.constructorArgs,
+          ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),steps},
+        witnesses:[witness(snapshot,fn,contract.name+'.'+signature),
+          witness(snapshot,variable,contract.name+'.'+variable.name),
+          witness(snapshot,struct,contract.name+'.'+name)],
+      });
+    }
+  }
+  return out;
+}
+
+/** Deterministic source-expression oracle for directly executable pure entrypoints.
+ * The output is derived only from an acquired expression AST and concrete ABI
+ * arguments; arbitrary helper calls, external dependencies, unknown symbols
+ * and unreachable/ambiguous branches are never guessed.
+ */
+function sourcePureExpressionExperiment(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=inheritance.chain;
+  const nodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(entry:any,node:any):boolean=>(entry.contract.subNodes||[]).includes(node);
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const out:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const fn of nodes.filter((n:any)=>n.type==='FunctionDefinition'&&n.body&&
+    n.name===method&&n.stateMutability==='pure'&&
+    ['public','external'].includes(n.visibility)&&!(n.modifiers||[]).length)){
+    const statements:any[]=fn.body.statements||[];
+    if(statements.length!==1||statements[0].type!=='ReturnStatement')continue;
+    const inputs=(fn.parameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
+    const outputs=(fn.returnParameters||[]).map((p:any)=>canonicalAbiType(p.typeName));
+    if(inputs.some((t:string|null)=>!t)||outputs.length!==1||!outputs[0]||
+      !/^(?:u?int(?:[0-9]{1,3})?|bool)$/.test(outputs[0]))continue;
+    if(!declarations.some(d=>d.selector===contract.name+'.'+method&&
+      d.operation==='call'&&JSON.stringify(d.inputs)===JSON.stringify(inputs)))continue;
+    const params=new Map<string,bigint|boolean>();
+    const args:SolidityArgValue[]=[];
+    let compatible=true;
+    for(let i=0;i<inputs.length;i++){
+      const name=String(fn.parameters[i]?.name||'');
+      const type=inputs[i]||'';
+      if(!identifier.test(name)){compatible=false;break;}
+      if(type==='bool'){params.set(name,true);args.push(true);}
+      else if(/^u?int(?:[0-9]{1,3})?$/.test(type)){
+        params.set(name,7n+BigInt(i));args.push((7+i).toString());
+      }else{compatible=false;break;}
+    }
+    if(!compatible)continue;
+    type Scalar=bigint|boolean;
+    const evaluate=(n:any,depth=0):Scalar|null=>{
+      if(!n||depth>16)return null;
+      if(n.type==='NumberLiteral'){
+        const raw=String(n.number||'').replace(/_/g,'');
+        if(!/^(?:0x[0-9a-fA-F]+|[0-9]+)$/.test(raw))return null;
+        try{return BigInt(raw);}catch{return null;}
+      }
+      if(n.type==='BooleanLiteral')return n.value===true;
+      // Solidity parser represents redundant arithmetic parentheses as
+      // one-element TupleExpression nodes. They do not change evaluation.
+      if(n.type==='TupleExpression'&&n.components?.length===1)
+        return evaluate(n.components[0],depth+1);
+      if(n.type==='Identifier')return params.get(String(n.name||''))??null;
+      if(n.type==='UnaryOperation'){
+        const operand=evaluate(n.subExpression,depth+1);
+        if(operand===null)return null;
+        if(n.operator==='!'&&typeof operand==='boolean')return !operand;
+        if(n.operator==='-'&&typeof operand==='bigint')return -operand;
+        if(n.operator==='+'&&typeof operand==='bigint')return operand;
+        return null;
+      }
+      if(n.type==='Conditional'){
+        const condition=evaluate(n.condition,depth+1);
+        return typeof condition==='boolean'?
+          evaluate(condition?n.trueExpression:n.falseExpression,depth+1):null;
+      }
+      if(n.type!=='BinaryOperation')return null;
+      const left=evaluate(n.left,depth+1),right=evaluate(n.right,depth+1);
+      if(left===null||right===null)return null;
+      if(typeof left==='boolean'&&typeof right==='boolean'){
+        if(n.operator==='&&')return left&&right;
+        if(n.operator==='||')return left||right;
+        if(n.operator==='==')return left===right;
+        if(n.operator==='!=')return left!==right;
+        return null;
+      }
+      if(typeof left!=='bigint'||typeof right!=='bigint')return null;
+      switch(n.operator){
+        case '+':return left+right;
+        case '-':return left-right;
+        case '*':return left*right;
+        case '/':return right!==0n?left/right:null;
+        case '%':return right!==0n?left%right:null;
+        case '**':return right>=0n&&right<=64n?left**right:null;
+        case '==':return left===right;
+        case '!=':return left!==right;
+        case '>':return left>right;
+        case '>=':return left>=right;
+        case '<':return left<right;
+        case '<=':return left<=right;
+        default:return null;
+      }
+    };
+    const answer=evaluate(statements[0].expression);
+    if(answer===null)continue;
+    const output=outputs[0];
+    if(output==='bool'&&typeof answer!=='boolean')continue;
+    if(output!=='bool'){
+      if(typeof answer!=='bigint')continue;
+      const signed=output.startsWith('int');
+      const bits=Number(output.replace(/\D/g,''))||256;
+      if(bits<8||bits>256||bits%8!==0)continue;
+      const lower=signed?-(1n<<BigInt(bits-1)):0n;
+      const upper=signed?(1n<<BigInt(bits-1))-1n:(1n<<BigInt(bits))-1n;
+      if(answer<lower||answer>upper)continue;
+    }
+    const setup=resolveFlexibleSetup(snapshot,contract,
+      inheritance.chain,
+      sources,declarations,null);
+    if(!setup||setup.usesToken)continue;
+    const signature=canonicalFunctionIdentity(fn);
+    const steps:SoliditySequence['steps']=[];
+    if(setup.initSignature)steps.push({
+      operation:'send',function:setup.initSignature,
+      args:setup.initArgs,sender:0,requiredSetup:true});
+    steps.push({operation:'call',function:signature,args,
+      expect:typeof answer==='bigint'?answer.toString():answer});
+    out.push({
+      hypothesis:'The exact source pure expression of '+contract.name+'.'+signature+
+        ' evaluates to '+String(answer)+' for concrete ABI inputs',
+      property:'source-exact pure return '+contract.name+'.'+signature,
+      sequence:{constructorArgs:setup.constructorArgs,
+        ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+        steps},
+      witnesses:[witness(sourceForNode(fn),fn,contract.name+'.'+signature),
+        witness(sourceForNode(fn),statements[0],contract.name+'.'+signature+'.return')],
+    });
+  }
+  return out;
+}
+
+/** Two independently source-proven state transitions form an executable
+ * conservation property even when the state is private. Every readback must
+ * be an acquired exact-return view; do not guess economic intent by names.
+ */
+function sourcePairedScalarConservationExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  declarations:readonly SolidityProbeDeclaration[],
+  sources:ReadonlyMap<string,SourceSnapshot>
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(isTestOrMockPath(snapshot.path)||isAbstractContractNode(contract,
+    resolveInheritance(snapshot,contract,sources).chain))return [];
+  const inheritance=resolveInheritance(snapshot,contract,sources);
+  const owners=inheritance.chain;
+  const nodes:any[]=owners.flatMap(entry=>entry.contract.subNodes||[]);
+  const ownsNode=(entry:any,node:any):boolean=>
+    (entry.contract.subNodes||[]).includes(node)||
+    (entry.contract.subNodes||[]).some((member:any)=>
+      member.type==='StateVariableDeclaration'&&(member.variables||[]).includes(node));
+  const sourceForNode=(node:any):SourceSnapshot=>
+    owners.find(entry=>ownsNode(entry,node))?.snapshot||snapshot;
+  const stateVars=nodes.filter(n=>n.type==='StateVariableDeclaration')
+    .flatMap(n=>n.variables||[]).filter((v:any)=>
+      identifier.test(v.name||'')&&!v.expression&&
+      v.typeName?.type==='ElementaryTypeName'&&
+      /^uint(?:[0-9]{1,3})?$/.test(v.typeName.name||''));
+  if(!stateVars.length)return [];
+  const observations=extractAccountingObservations(snapshot,contract.name,declarations,[...sources.values()]);
+  const setup=resolveFlexibleSetup(snapshot,contract,
+    inheritance.chain,
+    sources,declarations,null);
+  if(!setup||setup.usesToken)return [];
+  const ctors=nodes.filter(n=>n.type==='FunctionDefinition'&&n.isConstructor);
+  const init=nodes.find(n=>n.type==='FunctionDefinition'&&
+    /^(?:initialize|init)$/.test(n.name||'')&&n.body);
+  const entries=nodes.filter(n=>n.type==='FunctionDefinition'&&n.body&&
+    n.name&&['public','external'].includes(n.visibility)&&
+    !['view','pure'].includes(n.stateMutability||'')&&
+    !(n.modifiers||[]).length&&
+    (n.parameters||[]).length===1&&
+    identifier.test(n.parameters[0]?.name||'')&&
+    /^uint(?:[0-9]{1,3})?$/.test(canonicalAbiType(n.parameters[0]?.typeName)||''))
+    .filter(n=>declarations.some(d=>d.selector===contract.name+'.'+n.name&&
+      d.operation==='send'&&
+      JSON.stringify(d.inputs)===JSON.stringify([canonicalAbiType(n.parameters[0].typeName)])))
+    .filter(n=>{
+      const text=body(sourceForNode(n).content,n);
+      return !hasAnySourceAuthGuard(n,text)&&
+        !/\b(?!msg\b|block\b|abi\b)[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*\s*\(/.test(text)&&
+        !/\)\s*\.\s*[A-Za-z_]\w*\s*\(/.test(text);
+    });
+  if(!entries.some(n=>n.name===method))return [];
+  const results:Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}>=[];
+
+  for(const state of stateVars){
+    const getter=state.visibility==='public'?state.name+'()':
+      observations.find(o=>o.kind==='scalar'&&o.stateVariable===state.name)?.getter;
+    if(!getter)continue;
+    const mutation=new RegExp('\\b'+state.name+'\\s*(?:\\+?=|-=)');
+    if(ctors.some(ctor=>mutation.test(body(sourceForNode(ctor).content,ctor)))||
+      (init&&mutation.test(body(sourceForNode(init).content,init))))continue;
+    const readback=nodes.find(n=>n.type==='FunctionDefinition'&&
+      n.name===getter.split('(')[0]&&n.body&&canonicalFunctionIdentity(n)===getter);
+    for(const increase of entries){
+      const inParam=increase.parameters[0].name;
+      if(!sourceExactAccountingDelta(body(sourceForNode(increase).content,increase),
+        state.name,inParam,'increase'))continue;
+      for(const decrease of entries){
+        if(increase===decrease||!
+          [increase.name,decrease.name].includes(method))continue;
+        const outParam=decrease.parameters[0].name;
+        if(!sourceExactAccountingDelta(body(sourceForNode(decrease).content,decrease),
+          state.name,outParam,'decrease'))continue;
+        const inSig=canonicalFunctionIdentity(increase),
+          outSig=canonicalFunctionIdentity(decrease);
+        const steps:SoliditySequence['steps']=[];
+        if(setup.initSignature)steps.push({operation:'send',
+          function:setup.initSignature,args:setup.initArgs,sender:0,
+          requiredSetup:true});
+        steps.push({operation:'call',function:getter,args:[],expect:'0'});
+        steps.push({operation:'send',function:inSig,args:['1'],sender:0});
+        steps.push({operation:'call',function:getter,args:[],expect:'1'});
+        steps.push({operation:'send',function:outSig,args:['1'],sender:0});
+        steps.push({operation:'call',function:getter,args:[],expect:'0'});
+        results.push({
+          hypothesis:'Acquired increase and decrease transitions of '+
+            state.name+' must restore the independently observable prestate',
+          property:'source-paired scalar conservation '+contract.name+'.'+
+            inSig+'->'+outSig+':'+state.name,
+          sequence:{constructorArgs:setup.constructorArgs,
+            ...(setup.constructorValueWei?{constructorValueWei:setup.constructorValueWei}:{}),
+            steps},
+          witnesses:[witness(sourceForNode(increase),increase,contract.name+'.'+inSig),
+            witness(sourceForNode(decrease),decrease,contract.name+'.'+outSig),
+            witness(sourceForNode(state),state,contract.name+'.'+state.name),
+            ...(readback?[witness(sourceForNode(readback),readback,
+              contract.name+'.'+getter)]:[])],
+        });
+      }
+    }
+  }
+  return results;
+}
+
+/** Source-derived CREATE2 clone replay: the acquired Factory source must
+ * prove the exact deterministic clone expression, the exact typed initializer
+ * and the public prediction helper. We only deploy a real acquired concrete
+ * template. Failure to deploy or initialize remains an actual EVM failure;
+ * source presence alone cannot certify the clone's behavior.
+ */
+function sourceFactoryDeterminismExperiments(
+  snapshot:SourceSnapshot,contract:any,method:string,
+  sources:ReadonlyMap<string,SourceSnapshot>,
+  declarations:readonly SolidityProbeDeclaration[]
+):Array<{hypothesis:string;property:string;sequence:SoliditySequence;witnesses:SourceWitness[]}> {
+  if(contract.name!=='Factory'||isTestOrMockPath(snapshot.path)||!method.startsWith('create'))
+    return [];
+  const fn=(contract.subNodes||[]).find((n:any)=>n.type==='FunctionDefinition'&&
+    n.name===method&&n.body&&['public','external'].includes(n.visibility));
+  if(!fn||!fn.parameters||fn.parameters.length<2)return [];
+  const params:any[]=fn.parameters;
+  if(canonicalAbiType(params[0].typeName)!=='address'||params[0].name!=='template'||
+    canonicalAbiType(params[1].typeName)!=='bytes32'||params[1].name!=='salt')
+    return [];
+  const maybeAbiTypes=params.map((p:any)=>canonicalAbiType(p.typeName));
+  const abiTypes=maybeAbiTypes.filter((t):t is string=>t!==null);
+  if(abiTypes.length!==params.length||abiTypes.some(t=>!t))return [];
+  if(!declarations.some(d=>d.operation==='send'&&
+    d.selector==='Factory.'+method&&
+    JSON.stringify(d.inputs)===JSON.stringify(abiTypes)))return [];
+  const predictor=(contract.subNodes||[]).find((n:any)=>
+    n.type==='FunctionDefinition'&&n.name==='predictAddress'&&n.body&&
+    ['public','external'].includes(n.visibility)&&
+    ['view','pure'].includes(n.stateMutability||''));
+  if(!predictor||!declarations.some(d=>d.operation==='call'&&
+    d.selector==='Factory.predictAddress'&&
+    JSON.stringify(d.inputs)===JSON.stringify(['address','bytes32']))||
+    !/\btemplate\s*\.\s*predictDeterministicAddress\s*\(\s*salt\s*\)/.test(
+      body(snapshot.content,predictor)))return [];
+  const text=body(snapshot.content,fn);
+  const m=text.match(/\b([A-Za-z_]\w*)\s+clone\s*=\s*\1\s*\(\s*template\s*\.\s*cloneDeterministic\s*\(\s*salt\s*\)\s*\)/);
+  if(!m)return [];
+  const templateName=m[1];
+  // A type must be imported and genuinely acquired; no guessed template
+  // deployment and no substituted mock may stand in for production bytecode.
+  const imported=(parseAstCached(snapshot).children||[]).some((n:any)=>
+    n.type==='ImportDirective'&&String(n.path||'').endsWith('/'+templateName+'.sol'));
+  if(!imported)return [];
+  const templates=[...sources.values()].filter(src=>
+    src.path.endsWith('/'+templateName+'.sol')&&!isTestOrMockPath(src.path));
+  if(templates.length!==1)return [];
+  const templateSource=templates[0];
+  const templateContract=(parseAstCached(templateSource).children||[]).find((n:any)=>
+    n.type==='ContractDefinition'&&n.name===templateName&&
+    n.kind!=='interface'&&n.kind!=='library');
+  if(!templateContract||isAbstractContractNode(templateContract,
+    resolveInheritance(templateSource,templateContract,sources).chain))return [];
+  const constructor=(templateContract.subNodes||[]).find((n:any)=>
+    n.type==='FunctionDefinition'&&n.isConstructor);
+  if(constructor&&(constructor.parameters||[]).length!==0)return [];
+  const initMatch=text.match(/\bclone\s*\.\s*initialize\s*\(([^;]*)\)\s*;/);
+  if(!initMatch)return [];
+  const initializerArgs=initMatch[1].split(',').map(x=>x.trim());
+  // The factory itself is the authority for argument forwarding. "msg.sender"
+  // is a source-declared address, not an invented extra constructor argument.
+  // Other expressions (including struct fields) are refused until separately
+  // represented by a real ABI-typed value and proven initialization path.
+  if(!initializerArgs.length)return [];
+  const initializerTypes:string[]=[];
+  for(const expression of initializerArgs){
+    if(expression==='msg.sender'){initializerTypes.push('address');continue;}
+    if(!identifier.test(expression))return [];
+    const parameterIndex=params.findIndex((p:any,i:number)=>
+      i>=2&&p.name===expression);
+    if(parameterIndex<0||!abiTypes[parameterIndex])return [];
+    initializerTypes.push(abiTypes[parameterIndex]);
+  }
+  const suppliedInit=(templateContract.subNodes||[]).find((n:any)=>
+    n.type==='FunctionDefinition'&&n.name==='initialize'&&n.body);
+  const directBase=resolveInheritance(templateSource,templateContract,sources).chain;
+  const inheritedInit=directBase.flatMap(e=>(e.contract.subNodes||[])
+    .filter((n:any)=>n.type==='FunctionDefinition'&&n.name==='initialize'&&n.body)
+    .map((node:any)=>({node,source:e.snapshot})));
+  const initChoices=suppliedInit?[{node:suppliedInit,source:templateSource}]:inheritedInit;
+  if(initChoices.length!==1||JSON.stringify((initChoices[0].node.parameters||[])
+    .map((p:any)=>canonicalAbiType(p.typeName)))!==JSON.stringify(initializerTypes))return [];
+  // A factory with additional external calls beyond initialization requires
+  // a fully resolved fixture; no arbitrary third-party protocol is inferred.
+  const rest=text.replace(/\bclone\s*\.\s*initialize\s*\([^;]*\)\s*;/,'')
+    .replace(/\bclone\s*\.\s*transferOwnership\s*\(\s*msg\.sender\s*\)\s*;/,'');
+  if(/\bclone\s*\.\s*(?:mint|fund|deposit|approve|transferFrom)\s*\(/.test(rest))
+    return [];
+  // Bind actual acquired transitive constructor and initializer dependencies.
+  // In particular, an externally cast address cannot silently become an EOA
+  // when the source requires an acquired contract receiver.
+  const fixture=resolveSourceFixtureDependencies(templateSource,templateName,
+    [...sources.values()]);
+  if(fixture.status!=='resolved')return [];
+  const tailArgs:SolidityArgValue[]=[];
+  for(let i=2;i<params.length;i++){
+    const type=abiTypes[i],name=String(params[i].name||'');
+    const literal=pickFlexibleArg(type,name);
+    if(literal===null)return [];
+    const bound=fixture.substitutions[name];
+    tailArgs.push(type==='address'&&bound?bound:literal);
+  }
+  const methodSignature=method+'('+abiTypes.join(',')+')';
+  return [ZERO_BYTES32,'0x'+'11'.repeat(32)].map((salt,index)=>{
+    const callArgs:SolidityArgValue[]=['$deployment:template',salt,...tailArgs];
+    const steps:SoliditySequence['steps']=[
+      {operation:'observe',function:'predictAddress(address,bytes32)',
+        args:['$deployment:template',salt]},
+      {operation:'send',function:methodSignature,args:callArgs,sender:0},
+      {operation:'observe',function:'predictAddress(address,bytes32)',
+        args:['$deployment:template',salt]},
+      {operation:'send',function:methodSignature,args:callArgs,sender:1,expectRevert:true},
+      {operation:'observe',function:'predictAddress(address,bytes32)',
+        args:['$deployment:template',salt]}
+    ];
+    return {hypothesis:'An acquired '+templateName+' template deployed by Factory.'+
+      method+' must initialize once; an identical deterministic CREATE2 salt cannot initialize a second clone',
+      property:'source-proven CREATE2 deterministic clone replay '+method+':'+index,
+      sequence:{constructorArgs:[],
+        preparation:{deployments:[...fixture.deployments,
+          {id:'template',file:templateSource.path,
+            contract:templateName,constructorArgs:[]}],
+          operations:[...fixture.initializerOperations],checks:[]},steps},
+      witnesses:[witness(snapshot,fn,'Factory.'+methodSignature),
+        witness(snapshot,predictor,'Factory.predictAddress(address,bytes32)'),
+        witness(templateSource,templateContract,templateName),
+        witness(initChoices[0].source,initChoices[0].node,
+          templateName+'.initialize('+initializerTypes.join(',')+')')]}
+  });
+}
 
 /** Convert a verified initializer setup into the actual source-declared
  * factory clone pathway when the acquired Factory implementation provides one.
@@ -2815,7 +5272,7 @@ function sourceFactoryCloneExperiment(
     if(JSON.stringify(specifiedArgs)!==JSON.stringify(initParams.map(p=>p.name)))
       continue;
     const preparation=sequence.preparation||{deployments:[],operations:[],checks:[]};
-    if(preparation.deployments.length>=8)continue;
+    if(preparation.deployments.length>=16)continue;
     const id='sourceFactory';
     if(preparation.deployments.some(d=>d.id===id))continue;
     const cloneMethod=create.name+'('+factoryTypes.join(',')+')';
@@ -2834,7 +5291,198 @@ function sourceFactoryCloneExperiment(
   return candidate;
 }
 
-export function constructSolidityExperiments(input:ConstructionInput):ConstructionResult {
+/** Every acquired preparation node must have a real source witness and an
+ * executable predecessor graph. Previously orderPreparation([]) validated no
+ * nodes even when the sequence contained deployments and initialization. The
+ * executor remains authoritative for actual receipts and ABI compatibility. */
+export function sourcePreparationGraph(
+  sequence:SoliditySequence,sources:ReadonlyMap<string,SourceSnapshot>,
+  target?:SourceSnapshot,contract?:any
+):{ok:true;nodes:PreparationPrerequisite[]}|{ok:false;code:string;detail:string}{
+  const preparation=sequence.preparation;
+  const nodes:PreparationPrerequisite[]=[];
+  const dependencies=(value:unknown):string[]=>{
+    if(Array.isArray(value))return value.flatMap(dependencies);
+    if(typeof value!=='string'||!value.startsWith('$deployment:'))return [];
+    return [value.slice('$deployment:'.length)];
+  };
+  const availableIds=new Set((preparation?.deployments||[]).map(x=>x.id));
+  const reject=(detail:string)=>({ok:false as const,code:'INVALID_PREREQUISITE',detail});
+  const acquiredCallable=(entry:{source:SourceSnapshot;node:any},requested:string)=>{
+    const match=/^([A-Za-z_][A-Za-z0-9_]*)(?:\((.*)\))?$/.exec(requested);
+    if(!match)return null;
+    const name=match[1],hasSignature=requested.includes('(');
+    const chain=resolveInheritance(entry.source,entry.node,sources).chain;
+    const candidates:Array<{source:SourceSnapshot;node:any;identity:string}>=[];
+    for(const owner of chain){
+      for(const node of owner.contract.subNodes||[]){
+        if(node.type==='FunctionDefinition'&&node.name===name){
+          const identity=canonicalFunctionIdentity(node);
+          if(!candidates.some(item=>item.identity===identity))
+            candidates.push({source:owner.snapshot,node,identity});
+        }else if(node.type==='StateVariableDeclaration'){
+          for(const variable of node.variables||[]){
+            if(variable.name!==name)continue;
+            for(const identity of publicGetterIdentities(variable))
+              if(!candidates.some(item=>item.identity===identity))
+                candidates.push({source:owner.snapshot,node:variable,identity});
+          }
+        }
+      }
+    }
+    const exact=hasSignature?candidates.filter(item=>item.identity===requested):
+      candidates.filter(item=>item.identity.startsWith(name+'('));
+    if(exact.length===1)return exact[0];
+    if(exact.length!==0||!hasSignature)return null;
+    // Canonical imported package methods such as ERC20.balanceOf are part of
+    // the compiler ABI even when the dependency source is not in the acquired
+    // source census. Accept only a directly imported known base and require
+    // the concrete acquired deployment to pass the shared ABI verifier; the
+    // isolated compiler and EVM still validate implementation bytecode.
+    for(const owner of chain){
+      if(verifyCanonicalInheritedPackageMethod(owner.snapshot,
+        owner.contract.name,requested,[...sources.values()]))
+        return {source:owner.snapshot,node:owner.contract,identity:requested};
+    }
+    return null;
+  };
+  // The schema validates receiver IDs, but arguments and expected readbacks
+  // may also carry deployment references. Reject dangling references before
+  // constructing source-evidence obligations or executing any transactions.
+  for(const [index,step] of sequence.steps.entries()){
+    const values=step.operation==='eth_balance'?[step.account]:
+      step.operation==='send'||step.operation==='call'||step.operation==='observe'?
+        step.operation==='call'?[...step.args,step.expect]:step.args:[];
+    for(const ref of values.flatMap(dependencies))
+      if(!availableIds.has(ref))
+        return reject('Step '+index+' references unacquired deployment: '+ref);
+  }
+  for(const ref of sequence.constructorArgs.flatMap(dependencies))
+    if(!availableIds.has(ref))
+      return reject('Target constructor references unacquired deployment: '+ref);
+  if(sequence.factoryClone)
+    for(const ref of sequence.factoryClone.args.flatMap(dependencies))
+      if(!availableIds.has(ref))
+        return reject('Source factory arguments reference unacquired deployment: '+ref);
+  for(const check of preparation?.checks||[])
+    for(const ref of dependencies(check.expect))
+      if(!availableIds.has(ref))
+        return reject('Preparation readback expects an unacquired deployment: '+ref);
+  let executionTargetSource=target;
+  let executionTargetContract=contract;
+  if(sequence.deployment){
+    const requestedPath=sequence.deployment.file;
+    const exact=sources.get(requestedPath);
+    const suffixMatches=exact?[]:[...sources.values()].filter(source=>
+      source.path.endsWith('/'+requestedPath));
+    const acquired=exact||(suffixMatches.length===1?suffixMatches[0]:undefined);
+    if(!acquired)return reject((suffixMatches.length>1?
+      'Execution target source path is ambiguous: ':
+      'Execution target source not acquired: ')+sequence.deployment.file);
+    let parsed:any;
+    try{parsed=parseAstCached(acquired);}
+    catch{return reject('Unparseable execution target source: '+sequence.deployment.file);}
+    const declared=(parsed.children||[]).find((n:any)=>
+      n.type==='ContractDefinition'&&n.name===sequence.deployment!.contract&&
+      n.kind!=='interface'&&n.kind!=='library');
+    if(!declared)return reject('Execution target contract not declared in acquired source: '+
+      sequence.deployment.file+':'+sequence.deployment.contract);
+    executionTargetSource=acquired;
+    executionTargetContract=declared;
+  }
+  if(executionTargetContract){
+    const constructor=(executionTargetContract.subNodes||[]).find((n:any)=>
+      n.type==='FunctionDefinition'&&n.isConstructor);
+    const arity=(constructor?.parameters||[]).length;
+    if(sequence.constructorArgs.length!==arity)
+      return reject('Execution target constructor expects '+arity+' ABI argument(s), received '+
+        sequence.constructorArgs.length+': '+(sequence.deployment?.contract||executionTargetContract.name));
+  }
+  const appendTarget=():void=>{
+    if(!executionTargetSource||!executionTargetContract)return;
+    // The target cannot exist before every declared prerequisite deployment,
+    // initialization and state readback has completed in the isolated EVM.
+    // A source-declared derived execution target is recorded at its actual file.
+    nodes.push({id:'target:deploy',kind:'deploy',
+      dependsOn:[...new Set([...nodes.map(step=>step.id),
+        ...sequence.constructorArgs.flatMap(dependencies).map(id=>'deploy:'+id)])],
+      sourceEvidence:[witness(executionTargetSource,executionTargetContract,
+        executionTargetContract.name+'.constructor')],
+      parameters:{file:executionTargetSource.path,
+        contract:sequence.deployment?.contract||executionTargetContract.name,
+        constructorArgs:sequence.constructorArgs}});
+  };
+  if(!preparation){appendTarget();return {ok:true,nodes};}
+  const deployments=new Map<string,{source:SourceSnapshot;node:any;position:number}>();
+  for(const [position,d] of preparation.deployments.entries()){
+    if(deployments.has(d.id))return reject('Duplicate source deployment '+d.id);
+    const acquired=sources.get(d.file);
+    if(!acquired)return reject('Preparation deployment source not acquired: '+d.file);
+    let parsed:any;
+    try{parsed=parseAstCached(acquired);}catch{return reject('Unparseable preparation source: '+d.file);}
+    const declared=(parsed.children||[]).find((n:any)=>
+      n.type==='ContractDefinition'&&n.name===d.contract&&
+      n.kind!=='interface'&&n.kind!=='library');
+    if(!declared)return reject('Preparation contract not declared in acquired file: '+d.file+':'+d.contract);
+    const constructor=(declared.subNodes||[]).find((n:any)=>
+      n.type==='FunctionDefinition'&&n.isConstructor);
+    const arity=(constructor?.parameters||[]).length;
+    if(d.constructorArgs.length!==arity)return reject('Preparation constructor for '+d.contract+
+      ' expects '+arity+' ABI argument(s), received '+d.constructorArgs.length);
+    deployments.set(d.id,{source:acquired,node:declared,position});
+  }
+  for(const [position,d] of preparation.deployments.entries()){
+    const entry=deployments.get(d.id)!;
+    const predecessors=[...new Set(d.constructorArgs.flatMap(dependencies))];
+    if(predecessors.includes(d.id))return reject('Self-referential constructor dependency '+d.id);
+    for(const prior of predecessors){
+      const dependency=deployments.get(prior);
+      if(!dependency||dependency.position>=position)return reject(
+        'Constructor dependency not deployed before '+d.id+': '+prior);
+    }
+    nodes.push({id:'deploy:'+d.id,kind:'deploy',
+      dependsOn:predecessors.map(id=>'deploy:'+id),
+      sourceEvidence:[witness(entry.source,entry.node,entry.node.name+'.constructor')],
+      parameters:{file:d.file,contract:d.contract,constructorArgs:d.constructorArgs}});
+  }
+  let previousOperation:string|null=null;
+  for(const op of preparation.operations){
+    const entry=deployments.get(op.deploymentId);
+    if(!entry)return reject('Initializer receiver has no acquired deployment: '+op.deploymentId);
+    const refs=[...new Set(op.args.flatMap(dependencies))];
+    if(refs.some(id=>!deployments.has(id)))return reject('Initializer has unacquired deployment reference: '+op.id);
+    const dependsOn=[...new Set(['deploy:'+op.deploymentId,
+      ...refs.map(id=>'deploy:'+id),
+      ...(previousOperation?[previousOperation]:[])])];
+    const callable=acquiredCallable(entry,op.function);
+    if(!callable)return reject('Initializer call does not resolve to one exact acquired ABI method: '+
+      entry.node.name+'.'+op.function);
+    nodes.push({id:'operation:'+op.id,kind:'initialize',dependsOn,
+      sourceEvidence:[witness(callable.source,callable.node,entry.node.name+'.'+callable.identity)],
+      parameters:{deploymentId:op.deploymentId,signature:op.function,args:op.args}});
+    previousOperation='operation:'+op.id;
+  }
+  for(const check of preparation.checks){
+    const entry=deployments.get(check.deploymentId);
+    if(!entry)return reject('Readback receiver has no acquired deployment: '+check.deploymentId);
+    const refs=[...new Set(check.args.flatMap(dependencies))];
+    if(refs.some(id=>!deployments.has(id)))return reject('Readback has unacquired deployment reference: '+check.id);
+    const callable=acquiredCallable(entry,check.function);
+    if(!callable)return reject('Readback call does not resolve to one exact acquired ABI method: '+
+      entry.node.name+'.'+check.function);
+    nodes.push({id:'check:'+check.id,kind:'assert_state',
+      dependsOn:[...new Set(['deploy:'+check.deploymentId,
+        ...refs.map(id=>'deploy:'+id),
+        ...preparation.operations.map(op=>'operation:'+op.id)])],
+      sourceEvidence:[witness(callable.source,callable.node,entry.node.name+'.'+callable.identity)],
+      parameters:{deploymentId:check.deploymentId,signature:check.function,
+        args:check.args,expect:check.expect}});
+  }
+  appendTarget();
+  return {ok:true,nodes};
+}
+
+function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionResult {
   if(!/^[a-f0-9]{40}$/.test(input.repositoryCommit))
     return {ok:false,code:'INVALID_COMMIT',detail:'Expected a source commit SHA'};
   const indexed=new Map<string,SourceSnapshot>();
@@ -2850,7 +5498,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
   const separator=input.targetSelector.lastIndexOf('.');
   if(separator<1)return {ok:false,code:'TARGET_INVALID',detail:input.targetSelector};
   const contractName=input.targetSelector.slice(0,separator);
-  const method=input.targetSelector.slice(separator+1);
+  const rawMethod=input.targetSelector.slice(separator+1);
+  const method=rawMethod.split('(')[0];
   let ast:any;
   try{ast=parseAstCached(target);}
   catch{return {ok:false,code:'UNPARSEABLE_SOURCE',detail:input.targetPath};}
@@ -2866,6 +5515,8 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       property:'source-proven role mutation',sequence:item.probe.sequence,
       witnesses:[witness(target,contract,input.targetSelector)]});
   }
+  const erc721Burn=guardedErc721BurnExperiment(target,contract,method,indexed,input.declarations);
+  if(erc721Burn)choices.push(erc721Burn);
   const rotation=guardedOperatorRotationExperiment(target,contract,method,input.declarations);
   if(rotation)choices.push(rotation);
   const funding=sourceBoundedFundingExperiment(target,contract,method,input.declarations);
@@ -2894,20 +5545,46 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     const reinitExp=reinitOrConstructorTakeoverExperiment(target,contract,method,indexed,input.declarations);
     if(reinitExp)choices.push(reinitExp);
   }
+  const replay=sourceInitializerReplayExperiment(target,contract,method,
+    indexed,input.declarations);
+  if(replay)choices.push(replay);
+  for(const clone of sourceFactoryDeterminismExperiments(target,contract,method,
+    indexed,input.declarations))choices.push(clone);
   if(!choices.length) {
     const drainOrMintExp=unprotectedFundDrainOrMintExperiment(target,contract,method,indexed,input.declarations);
     if(drainOrMintExp)choices.push(drainOrMintExp);
   }
   for(const scalar of sourceScalarDeltaExperiments(target,contract,method,
     input.declarations,indexed))choices.push(scalar);
+  for(const mapping of sourceMappingDeltaExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(mapping);
+  for(const scalarPure of sourcePureExpressionExperiment(target,contract,method,
+    input.declarations,indexed))choices.push(scalarPure);
+  for(const internalMapping of sourceInternalMappingSetterExperiments(
+    target,contract,method,input.declarations,indexed))choices.push(internalMapping);
+  for(const assignment of sourceDirectAssignmentExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(assignment);
+  for(const guardedWrite of sourceOwnerGuardedAssignmentExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(guardedWrite);
+  for(const internal of sourceInternalScalarSetterExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(internal);
+  for(const struct of sourceStructOverrideExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(struct);
+  for(const pair of sourcePairedScalarConservationExperiments(target,contract,method,
+    input.declarations,indexed))choices.push(pair);
   const vestingCreation=groundedVestingCreationExperiment(target,contract,method,input.declarations);
   if(vestingCreation)choices.push(vestingCreation);
   const shareAccounting=groundedShareAccountingExperiment(target,contract,method,input.declarations,indexed);
   if(shareAccounting)choices.push(shareAccounting);
+  const rewardUnlock=groundedXMphRewardUnlockExperiment(
+    target,contract,method,input.declarations,indexed);
+  if(rewardUnlock)choices.push(rewardUnlock);
   // 3-stage financial-invariant pipeline: extract -> admit -> construct.
   // Runs alongside authorization probes because accounting conservation is a
   // distinct security property; refuses to fabricate when prerequisites fail.
   let invariantUnresolved: {category: InvariantUnresolvedCategory; reason: string} | null = null;
+  let fixtureSearchIncompleteReason:string|null=null;
+  let fixtureSearchCheckpoint:FixtureSearchCheckpoint|undefined;
   const suppliedInvariant = (input.invariants || []).find(
     (inv) => inv.target === input.targetSelector && inv.sourceSha256 === target.sha256,
   );
@@ -2933,30 +5610,57 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       .map(canonicalFunctionIdentity);
     const signatures=targetVariants.length?targetVariants:[undefined];
     const issues:string[]=[];
+    // A type's multiple acquired concrete implementations are distinct
+    // candidate graphs. Never select an arbitrary first protocol: each
+    // graph retains its exact source, ABI and constructor/initializer DAG.
+    const fixtureEnumeration=enumerateSourceFixtureDependenciesDetailed(target,contract.name,
+      [...indexed.values()],{maxAlternatives:4096,
+        maxSearchNodes:input.fixtureSearchNodeBudget??8192,
+        resume:input.fixtureSearchCheckpoint});
+    fixtureSearchCheckpoint=fixtureEnumeration.checkpoint;
+    const fixtureGraphs=fixtureEnumeration.alternatives;
+    const representativeGraphs=representativeFixtureGraphs(fixtureGraphs);
+    const omittedGraphCount=fixtureGraphs.length-representativeGraphs.length;
+    const fixtureChoiceSets:Readonly<Record<string,string>|undefined>[]=
+      representativeGraphs.length?representativeGraphs.map(graph=>graph.implementationChoices):
+        fixtureEnumeration.complete?[undefined]:[];
+    if(!fixtureEnumeration.complete||omittedGraphCount>0){
+      const unresolved=fixtureEnumeration.unresolvedSelections.slice(0,8).map(item=>
+        JSON.stringify(item.selection)+":"+item.missingDependencies.join(","));
+      fixtureSearchIncompleteReason=`Source fixture alternatives are incomplete after ${fixtureEnumeration.searchNodes} search nodes; `+
+        `${fixtureEnumeration.pendingSelections} selections remain unexplored; `+
+        `${fixtureEnumeration.unresolvedSelections.length} branches lack executable fixture graphs`+
+        (omittedGraphCount?` (${omittedGraphCount} cross-graph combinations deferred after concrete-implementation coverage)`:'')+
+        (unresolved.length?` (${unresolved.join("; ")})`:"");
+      if(!invariantUnresolved)invariantUnresolved={
+        category:'missing_fixture',reason:fixtureSearchIncompleteReason};
+    }
     for(const targetSignature of signatures){
-      const extracted=extractSourceInvariantDescriptor(target,contract,method,
-        input.declarations,indexed,undefined,targetSignature);
-      const variants=extracted.ok?[extracted]:
-        extracted.companionCandidates?.length?
-          extracted.companionCandidates.map(companion=>
-            extractSourceInvariantDescriptor(target,contract,method,
-              input.declarations,indexed,companion,targetSignature)):[extracted];
-      for(const candidate of variants){
-        if(!candidate.ok){
-          issues.push((targetSignature||method)+':'+candidate.category+':'+candidate.reason);
-          if(!invariantUnresolved)invariantUnresolved={
-            category:candidate.category,reason:candidate.reason};
-          continue;
-        }
-        const built=constructCoreInvariantExperiment(candidate.invariant,target,
-          contract,input.declarations,indexed);
-        if(built)choices.push(built);
-        else{
-          const reason='Source-witnessed invariant failed typed fixture construction for '+
-            (targetSignature||method);
-          issues.push(reason);
-          if(!invariantUnresolved)invariantUnresolved={
-            category:'missing_fixture',reason};
+      for(const fixtureChoices of fixtureChoiceSets){
+        const extracted=extractSourceInvariantDescriptor(target,contract,method,
+          input.declarations,indexed,undefined,targetSignature,fixtureChoices);
+        const variants=extracted.ok?[extracted]:
+          extracted.companionCandidates?.length?
+            extracted.companionCandidates.map(companion=>
+              extractSourceInvariantDescriptor(target,contract,method,
+                input.declarations,indexed,companion,targetSignature,fixtureChoices)):[extracted];
+        for(const candidate of variants){
+          if(!candidate.ok){
+            issues.push((targetSignature||method)+':'+candidate.category+':'+candidate.reason);
+            if(!invariantUnresolved)invariantUnresolved={
+              category:candidate.category,reason:candidate.reason};
+            continue;
+          }
+          const built=constructCoreInvariantExperiment(candidate.invariant,target,
+            contract,input.declarations,indexed);
+          if(built)choices.push(built);
+          else{
+            const reason='Source-witnessed invariant failed typed fixture construction for '+
+              (targetSignature||method);
+            issues.push(reason);
+            if(!invariantUnresolved)invariantUnresolved={
+              category:'missing_fixture',reason};
+          }
         }
       }
     }
@@ -2981,11 +5685,19 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
     };
   }
   const seen=new Set<string>(),out:PreparedSecurityExperiment[]=[];
+  const failures:Array<{property:string;code:string;detail:string}>=[];
   for(const original of choices) {
     const c=sourceFactoryCloneExperiment(original,target,contract,indexed);
-    const prereqs:PreparationPrerequisite[]=[];
-    const graph=orderPreparation(prereqs);
-    if(!graph.ok)return {ok:false,code:graph.code,detail:graph.detail};
+    const planned=sourcePreparationGraph(c.sequence,indexed,target,contract);
+    if(!planned.ok){
+      failures.push({property:c.property,code:planned.code,detail:planned.detail});
+      continue;
+    }
+    const graph=orderPreparation(planned.nodes);
+    if(!graph.ok){
+      failures.push({property:c.property,code:graph.code,detail:graph.detail});
+      continue;
+    }
     const payload={sourceCommit:input.repositoryCommit,path:input.targetPath,
       selector:input.targetSelector,property:c.property,sequence:c.sequence};
     const id=hash(JSON.stringify(payload));
@@ -2995,5 +5707,58 @@ export function constructSolidityExperiments(input:ConstructionInput):Constructi
       hypothesis:c.hypothesis,securityProperty:c.property,witnesses:c.witnesses,
       prerequisites:graph.ordered,sequence:c.sequence});
   }
+  const targetIsFinancialEntry=/^(?:deposit|withdraw|borrow|repay|mint|burn|redeem|swap|stake|unstake|claim|liquidate|flash|vest|fund|rebalance|harvest|compound)/i
+    .test(input.targetSelector.split('.').pop()||'');
+  // A source-specialized xMPH property may carry its own complete, source-bound
+  // preparation graph. In that case unrelated generic fixture alternatives
+  // must not suppress the independently executable property. Keep exceptions
+  // exact to these fully checked xMPH properties; other incomplete financial
+  // fixture graphs remain blockers.
+  const hasCompleteXmphAccountingFixture=out.some(experiment=>
+    experiment.securityProperty==="source-proven zero-reward ERC20 share conservation"&&
+    Boolean(experiment.sequence.preparation?.deployments.length&&
+      experiment.sequence.preparation.operations.length&&
+      experiment.sequence.preparation.checks.length)&&
+    ["deposit(uint256)","withdraw(uint256)"].every(signature=>
+      experiment.sequence.steps.some(step=>step.operation==="send"&&
+        step.function===signature)));
+  const hasCompleteXmphRewardFixture=out.some(experiment=>
+    experiment.securityProperty==="source-proven xMPH distributor authorization and timed reward accounting"&&
+    Boolean(experiment.sequence.preparation?.deployments.length&&
+      experiment.sequence.preparation.operations.length&&
+      experiment.sequence.preparation.checks.length)&&
+    ["distributeReward(uint256)","deposit(uint256)","withdraw(uint256)"].every(signature=>
+      experiment.sequence.steps.some(step=>step.operation==="send"&&
+        step.function===signature))&&
+    experiment.sequence.steps.filter(step=>step.operation==="advance_time").length===2);
+  if(fixtureSearchIncompleteReason&&targetIsFinancialEntry&&
+    !hasCompleteXmphAccountingFixture&&!hasCompleteXmphRewardFixture){
+    return {ok:false,code:'FIXTURE_ENUMERATION_INCOMPLETE',
+      detail:fixtureSearchIncompleteReason,unresolvedCategory:'missing_fixture',
+      partialExperiments:out,
+      fixtureSearchCheckpoint};
+  }
+  if(failures.length){
+    // Preserve *all* source-derived obligations. A constructible property
+    // may yield real verifier evidence, but cannot certify an independent
+    // property whose transitive prerequisites failed construction.
+    return {ok:false,code:failures[0].code,
+      detail:failures.map(x=>x.property+":"+x.code+":"+x.detail)
+        .slice(0,16).join("; ").slice(0,3000),
+      unresolvedCategory:"missing_fixture",partialExperiments:out};
+  }
   return {ok:true,experiments:out};
+}
+
+/** Bind exact acquired user-defined ABI types for this synchronous planning call.
+ * The saved context is restored even when malformed source fails parsing. */
+export function constructSolidityExperiments(input:ConstructionInput):ConstructionResult {
+  const previous=activeAbiTypeDefinitions;
+  try{
+    const validSources=Array.isArray(input?.sources)&&input.sources.every(source=>
+      source&&typeof source.path==="string"&&typeof source.content==="string"&&
+      /^[a-f0-9]{64}$/.test(source.sha256)&&hash(source.content)===source.sha256);
+    activeAbiTypeDefinitions=validSources?buildAbiTypeDefinitions(input.sources):new Map();
+    return constructSolidityExperimentsCore(input);
+  }finally{activeAbiTypeDefinitions=previous;}
 }

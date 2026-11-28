@@ -1,8 +1,22 @@
 import { z } from "zod";
 // ABI integers are decimal strings: JSON numbers cannot faithfully carry uint256.
 const scalar = z.union([z.string().max(2048), z.boolean()]);
-const abiValue = z.union([scalar, z.array(z.union([scalar,z.array(scalar).max(32)])).max(32)]);
-const args = z.array(abiValue).max(32);
+type AbiValue=string|boolean|AbiValue[];
+function isAbiValue(value:unknown,depth=0,budget={nodes:0}):value is AbiValue {
+  if(++budget.nodes>256)return false;
+  if(typeof value==="boolean"||typeof value==="string")return typeof value!=="string"||value.length<=2048;
+  if(!Array.isArray(value)||depth>=8||value.length>32)return false;
+  return value.every(item=>isAbiValue(item,depth+1,budget));
+}
+const abiValue=z.custom<AbiValue>(value=>isAbiValue(value),
+  {message:"ABI values must be bounded strings, booleans or arrays nested at most 8 levels"});
+const args=z.array(abiValue).max(32).superRefine((values,ctx)=>{
+  const budget={nodes:0};
+  for(const value of values)if(!isAbiValue(value,0,budget)){
+    ctx.addIssue({code:z.ZodIssueCode.custom,message:"ABI argument tree exceeds 256 nodes or supported nesting"});
+    break;
+  }
+});
 const sender = z.number().int().min(0).max(2);
 const wei = z.string().regex(/^(0|[1-9][0-9]{0,29})$/);
 const deployment = z.object({
@@ -12,12 +26,18 @@ const deployment = z.object({
 }).strict();
 const signature = z.string().min(1).max(200).regex(/^[A-Za-z_][A-Za-z0-9_]*(?:\([A-Za-z0-9_,()[\]]*\))?$/);
 const prepId=z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/);
+const expectedEvent=z.object({signature:z.string().min(1).max(200)
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*\([A-Za-z0-9_,()[\]]*\)$/),args}).strict();
 const send = z.object({operation:z.literal("send"),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional(),
-  valueWei:wei.optional(),expectRevert:z.boolean().optional(),requiredSetup:z.boolean().optional()}).strict();
+  valueWei:wei.optional(),expectRevert:z.boolean().optional(),requiredSetup:z.boolean().optional(),
+  expectEvents:z.array(expectedEvent).max(16).optional()}).strict();
 const observe = z.object({operation:z.literal('observe'),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional()}).strict();
 const call = z.object({operation:z.literal("call"),deploymentId:prepId.optional(),function:signature,args,sender:sender.optional(),expect:abiValue,expectPath:z.array(z.number().int().min(0).max(31)).min(1).max(4).optional()}).strict();
 const ethBalance = z.object({operation:z.literal("eth_balance"),
   account:z.string().regex(/^(?:\$account[012]|\$contract|\$deployment:[A-Za-z][A-Za-z0-9_-]{0,63})$/)}).strict();
+const advanceTime=z.object({operation:z.literal("advance_time"),
+  seconds:z.string().regex(/^[1-9][0-9]{0,7}$/).refine(value=>Number(value)<=31536000,
+    "Local EVM time advance is limited to one year")}).strict();
 const prepDeployment=z.object({id:prepId,file:deployment.shape.file,contract:deployment.shape.contract,
   constructorArgs:args,valueWei:wei.optional()}).strict();
 const prepSend=z.object({id:prepId,deploymentId:prepId,function:signature,args,
@@ -25,7 +45,7 @@ const prepSend=z.object({id:prepId,deploymentId:prepId,function:signature,args,
 const prepCheck=z.object({id:prepId,deploymentId:prepId,function:signature,args,
   sender,expect:abiValue}).strict();
 export const solidityPreparationSchema=z.object({
-  deployments:z.array(prepDeployment).max(8),
+  deployments:z.array(prepDeployment).max(16),
   operations:z.array(prepSend).max(24),
   checks:z.array(prepCheck).max(16)
 }).strict().superRefine((plan,ctx)=>{
@@ -47,11 +67,14 @@ const scalarDeltaProperty=z.object({kind:z.literal("scalar_delta"),
   state:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),method:signature,
   parameter:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
   amount:z.string().regex(/^(0|[1-9][0-9]{0,29})$/),
+  formula:z.object({multiplier:z.string().regex(/^[1-9][0-9]{0,9}$/),
+    divisor:z.string().regex(/^[1-9][0-9]{0,9}$/)}).strict().optional(),
+  expectedDelta:z.string().regex(/^(0|[1-9][0-9]{0,29})$/).optional(),
   direction:z.literal("increase"),sourceSha256:z.string().regex(/^[a-f0-9]{64}$/)
 }).strict();
 const factoryCloneSchema=z.object({deploymentId:prepId,function:signature,args,sender}).strict();
 export const soliditySequenceSchema = z.object({constructorArgs:args,constructorValueWei:wei.optional(),deployment:deployment.optional(),preparation:solidityPreparationSchema.optional(),factoryClone:factoryCloneSchema.optional(),sourceProperty:scalarDeltaProperty.optional(),
-  steps:z.array(z.discriminatedUnion("operation",[send,call,observe,ethBalance])).min(1).max(16)}).strict()
+  steps:z.array(z.discriminatedUnion("operation",[send,call,observe,ethBalance,advanceTime])).min(1).max(16)}).strict()
   .superRefine((s,ctx)=>{
     for(const step of s.steps)
       if(step.operation==="send" && step.requiredSetup && step.expectRevert)
@@ -76,10 +99,12 @@ Set query to Contract.function for the primary function being tested. Sequence f
 {"constructorArgs":["5"],"steps":[{"operation":"send","function":"set(uint256)","args":["7"],"sender":0},{"operation":"call","function":"value()","args":[],"expect":"7"}]}.
 Use decimal strings for ABI integers and wei, booleans for bools, arrays for ABI arrays/tuples. $account0, $account1 and $account2 resolve to three local test accounts; $contract resolves to this deployment after construction.
 Optional constructorValueWei and send valueWei transfer only local test currency. send expectRevert=true tests a required revert. At most 16 steps; include at least one call with an expected result. A single return is a scalar; multiple returns are an array. Calls must be view/pure; sends must be nonpayable/payable. Optional expectPath is a bounded array of numeric tuple/array field positions, so a structured ABI return can be checked against a typed expected field without arbitrary evaluation. Use full ABI signatures for overloads.
-For a prerequisite initializer send, requiredSetup=true means its transaction must succeed before any hypothesis test executes. Use operation=observe with a source-declared view/pure method to record actual state without fabricating expect; pair observations before and after a send to establish baseline and transition. Observe records what happened, not proof of a violated invariant. Use operation=call with expect when a source-derived property justifies an assertion. Each sequence starts from a fresh deterministic local EVM. Output records actual receipts and read/assertion results. An assertion mismatch is only a test discrepancy, not evidence that the expected value or a vulnerability claim is correct. Compiler remains solc 0.8.30; external-chain state, proxies requiring external deployments, and linked libraries are not supplied.`;
+For a prerequisite initializer send, requiredSetup=true means its transaction must succeed before any hypothesis test executes. For a source-declared event observation, add expectEvents to a send step as [{"signature":"EventName(address,uint256)","args":["$account1","5"]}]. The executor validates the signature against the compiled acquired-source ABI, records the complete raw receipt including logs, and checks each expected event argument. An event mismatch is a failed assertion, never standalone vulnerability evidence. Use operation=observe with a source-declared view/pure method to record actual state without fabricating expect; pair observations before and after a send to establish baseline and transition. Observe records what happened, not proof of a violated invariant. Use operation=advance_time with a bounded positive seconds string only when the acquired source property depends on elapsed time; the executor advances and mines the isolated local EVM and records both timestamps. Use operation=call with expect when a source-derived property justifies an assertion. Each sequence starts from a fresh deterministic local EVM. Output records actual receipts and read/assertion results. An assertion mismatch is only a test discrepancy, not evidence that the expected value or a vulnerability claim is correct. Compiler versions are selected from locally installed compatible compilers using each acquired source's pragma, and compilation retains the matching EVM version and ABI. Resolve constructor, initializer, inheritance, interface, and library dependencies only from acquired source; deploy and link a library only when its source and bytecode are available. Never invent external-chain state, addresses, or deployments. Test a proxy only when its proxy, implementation, initialization, and required state dependencies are acquired and constructible; otherwise preserve an explicit unresolved-dependency result.`;
 
 const scalarJson = {anyOf:[{type:"string",maxLength:2048},{type:"boolean"}]};
-const valueJson = {anyOf:[...scalarJson.anyOf,{type:"array",maxItems:32,items:{anyOf:[...scalarJson.anyOf,{type:"array",maxItems:32,items:scalarJson}]}}]};
+const valueJsonAt=(depth:number):any=>({anyOf:[...scalarJson.anyOf,
+  ...(depth<8?[{type:"array",maxItems:32,items:valueJsonAt(depth+1)}]:[])]});
+const valueJson=valueJsonAt(0);
 const argsJson = {type:"array",maxItems:32,items:valueJson};
 const stepBase = {deploymentId:{type:"string",maxLength:64},function:{type:"string",maxLength:200},args:argsJson,sender:{type:"integer",minimum:0,maximum:2}};
 const weiJson = {type:"string",pattern:"^(0|[1-9][0-9]{0,29})$"};
@@ -92,6 +117,11 @@ export const soliditySequenceJsonSchema = {type:"object",additionalProperties:fa
       method:{type:"string",maxLength:200},
       parameter:{type:"string",pattern:"^[A-Za-z_][A-Za-z0-9_]*$"},
       amount:weiJson,direction:{const:"increase"},
+      formula:{type:"object",additionalProperties:false,properties:{
+        multiplier:{type:"string",pattern:"^[1-9][0-9]{0,9}$"},
+        divisor:{type:"string",pattern:"^[1-9][0-9]{0,9}$"}},
+        required:["multiplier","divisor"]},
+      expectedDelta:weiJson,
       sourceSha256:{type:"string",pattern:"^[a-f0-9]{64}$"}
     },required:["kind","state","method","parameter","amount","direction","sourceSha256"]},
     factoryClone:{type:"object",additionalProperties:false,properties:{
@@ -104,7 +134,11 @@ export const soliditySequenceJsonSchema = {type:"object",additionalProperties:fa
     },required:["file","contract"]},
     steps:{type:"array",minItems:1,maxItems:16,items:{anyOf:[
       {type:"object",additionalProperties:false,properties:{operation:{const:"send"},...stepBase,
-        valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"}},
+        valueWei:weiJson,expectRevert:{type:"boolean"},requiredSetup:{type:"boolean"},
+        expectEvents:{type:"array",maxItems:16,items:{type:"object",additionalProperties:false,
+          properties:{signature:{type:"string",maxLength:200,
+            pattern:"^[A-Za-z_][A-Za-z0-9_]*\\([A-Za-z0-9_,()[\\]]*\\)$"},
+            args:argsJson},required:["signature","args"]}}},
         required:["operation","function","args"]},
       {type:"object",additionalProperties:false,properties:{operation:{const:"call"},...stepBase,
         expect:valueJson,expectPath:{type:"array",minItems:1,maxItems:4,
@@ -115,5 +149,8 @@ export const soliditySequenceJsonSchema = {type:"object",additionalProperties:fa
       {type:"object",additionalProperties:false,properties:{
         operation:{const:"eth_balance"},account:{type:"string",maxLength:80}},
         required:["operation","account"]},
+      {type:"object",additionalProperties:false,properties:{
+        operation:{const:"advance_time"},seconds:{type:"string",maxLength:8,pattern:"^[1-9][0-9]{0,7}$"}},
+        required:["operation","seconds"]},
     ]}}
   },required:["constructorArgs","steps"]};

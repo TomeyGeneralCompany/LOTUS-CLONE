@@ -41,7 +41,9 @@ export async function indexedEntryRoutes(rootDir:string,eligible:string[]):Promi
       selector=path.split('/').at(-1)!.slice(0,-5)+'.responseBody';
       line=source.slice(0,call.index).split('\n').length;
     }
-    if(steps<0||steps>12||!code.has(start))continue;
+    // The acquired source inventory bounds the maximum acyclic route. A fixed
+    // hop count silently dropped longer, fully acquired caller chains.
+    if(steps<0||steps>=code.size||!code.has(start))continue;
     let p=start,complete=true;const chain=[p],seen=new Set(chain);
     for(let n=steps;n>0;n--){
       const body=code.get(p)!;

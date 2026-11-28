@@ -12,6 +12,7 @@ await import("./test-java-sequence-runtime");
 
 // Normalize formatting without allowing guessed targets to bypass validation.
 const {decodeAuditAction}=await import("../packages/security-solver/src/local-audit-protocol");
+const {huntSchema}=await import("../packages/security-solver/src/local-program-flow");
 const {javaProbeSelectorCompatible}=await import("../packages/security-solver/src/probe-target-validation");
 const javaProbeFixtureDir=await mkdtemp(join(tmpdir(),"autohack-java-probe-intent-"));
 try {
@@ -89,6 +90,9 @@ const {fixtureArguments}=await import("../packages/security-solver/src/solidity-
 assert.deepEqual(fixtureArguments(["uint256","address","bool","string","bytes4"]),["7","$account1",true,"TOMEY_LOCAL_PROBE","0x41414141"]);
 assert.deepEqual(fixtureArguments(["uint256[2]"]),[["7","7"]]);
 assert.equal(fixtureArguments(["CustomContract"]),null);
+assert.equal(fixtureArguments(["uint7"]),null,"invalid integer widths cannot receive executable fixtures");
+assert.equal(fixtureArguments(["int264"]),null,"out-of-range signed widths cannot receive executable fixtures");
+assert.equal(fixtureArguments(["bytes33"]),null,"fixed bytes widths above 32 cannot receive executable fixtures");
 const {buildBaselineSequence}=await import("../packages/security-solver/src/solidity-probe-inputs");
 const baselinePlan=buildBaselineSequence([
   {selector:"State.increment",operation:"send",inputs:["uint256"]},
@@ -110,11 +114,28 @@ const {SoliditySourceIndex}=await import("../packages/security-solver/src/solidi
 const solidityProbeDir=await mkdtemp(join(tmpdir(),"autohack-solidity-intent-"));
 try {
   const contract=join(solidityProbeDir,"State.sol");
-  await writeFile(contract,"pragma solidity ^0.8.20; contract State { uint256 private counter; function increment(uint256 value) public { counter += value; } function get() public view returns (uint256) { return counter; } }");
+  await writeFile(contract,"pragma solidity ^0.8.20; type AccountId is uint64; contract State { enum Phase { Open, Closed } uint256 private counter; mapping(uint7 => uint256) public malformed; mapping(uint8 => uint256) public valid; mapping(Phase => uint256) public phaseBalances; mapping(AccountId => uint256) public accountBalances; function increment(uint256 value) public { counter += value; } function get() public view returns (uint256) { return counter; } }");
   const index=new SoliditySourceIndex(solidityProbeDir);
   const menu=await index.probeMenu(contract);
   assert.ok(menu.some(item=>item.selector==="State.increment" && item.operation==="send" && item.inputs[0]==="uint256"));
   assert.ok(menu.some(item=>item.selector==="State.get" && item.operation==="call" && item.inputs.length===0));
+  assert.ok(menu.some(item=>item.selector==="State.valid"&&item.inputs[0]==="uint8"));
+  assert.ok(menu.some(item=>item.selector==="State.phaseBalances"&&item.inputs[0]==="uint8"),
+    "enum mapping getters must be indexed with the compiler ABI uint8 key type");
+  assert.ok(menu.some(item=>item.selector==="State.accountBalances"&&item.inputs[0]==="uint64"),
+    "user-defined value type mapping getters must resolve to their acquired underlying ABI type");
+  assert.ok(!menu.some(item=>item.selector==="State.malformed"),
+    "source indexing must not invent a compiler ABI getter for an invalid key width");
+  const types=join(solidityProbeDir,"Types.sol");
+  await writeFile(types,"pragma solidity ^0.8.20; type AccountKey is uint48; interface IAsset {}");
+  const imported=join(solidityProbeDir,"ImportedState.sol");
+  await writeFile(imported,"pragma solidity ^0.8.20; import {AccountKey as UserKey, IAsset} from './Types.sol'; contract ImportedState { enum Phase { Open, Closed } struct Config { uint16 amount; bool active; } mapping(UserKey => uint256) public balances; function typed(UserKey key, Phase phase, uint256[] calldata ids, Config calldata config, IAsset asset) external {} }");
+  const importedMenu=await index.probeMenu(imported);
+  assert.ok(importedMenu.some(item=>item.selector==="ImportedState.balances"&&item.inputs[0]==="uint48"),
+    "aliased imported value type mapping getters must use the acquired underlying ABI type");
+  assert.deepEqual(importedMenu.find(item=>item.selector==="ImportedState.typed")?.inputs,
+    ["uint48","uint8","uint256[]","(uint16,bool)","address"],
+    "function probe inputs must be canonical ABI types for imported values, contracts, enums, arrays, and structs");
 } finally { await rm(solidityProbeDir,{recursive:true,force:true}); }
 
 // Shared controller choice menu must cover Python, JS, and Java source.
@@ -250,6 +271,19 @@ assert.deepEqual(await sourceDeclarationHints(join(probeFixtures,"target.js")),[
 await writeFile(join(probeFixtures,"modern.js"),"export function actual(value) { return value; }");
 assert.deepEqual(await sourceDeclarationHints(join(probeFixtures,"modern.js")),["actual"],"JS exported function hints");
 assert.ok(recoveryRegexSource.includes("sourceDeclarationHints(target)"),"rejected probes must expose grounded source declarations");
+const manyVerifiedCandidates=Array.from({length:12},(_,index)=>({
+  caseId:(index+1).toString(16).padStart(64,"0"),severity:"low" as const,
+  confidence:0.8,ratingReason:"Source-backed execution and independent review evidence.",
+  title:`Verified source case ${index+1}`,
+  impact:"The isolated execution recorded the source-grounded expected behavior.",
+  callerFile:"source-1/Contract.sol",callerLine:index+1,
+  falsification:"Replay the recorded source-bound case and reject if any asserted state is absent.",
+}));
+assert.equal(huntSchema.parse({findings:manyVerifiedCandidates,outcome:"inspected"})
+  .findings.length,12,"report schema must preserve more than eight independently verified findings");
+const localFlowSource=await readFile(join(process.cwd(),"packages/security-solver/src/local-program-flow.ts"),"utf8");
+assert.ok(!localFlowSource.includes("routes.slice(0,16)"),"controller must attempt every indexed source route");
+assert.ok(!localFlowSource.includes("indexedVerifiedCandidates.length>=8"),"controller must not stop verified source collection at eight");
 const controllerText=await readFile(join(process.cwd(),"packages/security-solver/src/local-ollama-runner.ts"),"utf8");
 assert.ok(controllerText.includes("[CONTEXT_RECOVERY]"),"repeated completed source pages must recover rather than end a production hunt");
 assert.ok(controllerText.includes("maxItems:0"),"without recorded case IDs, typed final schema must prohibit invented findings");

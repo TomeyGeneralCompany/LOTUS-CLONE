@@ -6,7 +6,7 @@ import {z} from "zod";
 import {javaSequenceSchema, type JavaSequence} from "./java-sequence";
 import {polyglotSequenceSchema,type PolyglotSequence} from "./polyglot-sequence";
 import {sourceGroundedSolidityProbe,sourceGroundedSolidityProbes,traceProjectErc1155Callers,type GroundedSolidityProbe} from './controller-solidity-security-probes';
-import {constructSolidityExperiments,type SourceSnapshot,type StaticLeadHint} from './controller-solidity-experiment-planner';
+import {constructSolidityExperiments,type ConstructionResult,type PreparedSecurityExperiment,type SourceSnapshot,type StaticLeadHint} from './controller-solidity-experiment-planner';
 import type {SolidityProbeDeclaration} from './solidity-probe-inputs';
 import {privilegedRoleMutationCandidate} from './solidity-security-candidates';
 import {rankTracedSourceCandidates} from './controller-source-candidates';
@@ -23,13 +23,22 @@ import { soliditySequenceSchema, soliditySequenceJsonSchema, type SoliditySequen
 import { readSourcePage, searchSourcePage, listSourcePage, pageOffset, type ReadSpan } from "./source-inspection";
 import { buildAnalysisCandidateQueue, reconcileStagedLeadSelectors, buildProgramFactsGraph, createHostFactsAdapters, detectAvailableAdapters, driveDeterministicAuditTurn, generateRelationalHypotheses, isTestOrMockContractPath, resolveLocalModelAdapter, type ClosedLoopLeadResult, type DeterministicAnalysisResult, type EscalationCache, type ProgramFactsGraph } from "./deterministic";
 import { auditActionSchema, auditProtocolPrompt, decodeAuditAction } from "./local-audit-protocol";
-import { appendFile, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
-import { resolve, relative, sep, join, dirname } from "node:path";
+import { appendFileSync } from "node:fs";
+import { appendFile, mkdtemp, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { resolve, relative, sep, join, dirname, posix } from "node:path";
 import { createHash } from "node:crypto";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
+import {fileURLToPath} from "node:url";
+import {parse as parseSolidity} from '@solidity-parser/parser';
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
-import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers} from "./deterministic/fixture-dependency-planner";
+import type {FixtureSearchCheckpoint} from "./deterministic/fixture-dependency-planner";
+import {sourceRepairRoutes} from "./deterministic/typed-repair-routes";
+import {repairAttemptIdentity} from "./deterministic/repair-attempt-identity";
+import {unfittedVerifierTranscript} from "./deterministic/verifier-transcript";
+import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from
+  "./deterministic/source-unavailability-verifier";
+import {resolveAcquiredConcreteImplementations,resolveAcquiredInterfaceCallers,enumerateAcquiredInheritedAbi} from "./deterministic/fixture-dependency-planner";
 
 type Message = { role: string; content: string; tool_name?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
 async function recordToolActivity(logFile:string,event:Record<string,unknown>):Promise<void> {
@@ -93,6 +102,22 @@ export interface LocalAuditLimits {
     Promise<{callers:string[];promoted?:{caseId:string;path:string;selector:string;kind:string}}|null>;
   staticLeads?: readonly StaticLeadHint[];
   verifyPython?: (path:string,functionName:string,kind:string,sequence?:SoliditySequence | JavaSequence | PolyglotSequence) => Promise<string>;
+}
+
+/** Progress made while the source-grounded lead inventory is being assessed.
+ * The no-progress guard must include this state: valid assess/defer actions are
+ * deliberately refunded from the bounded retry budget and do not change the
+ * generic probe counters below. */
+export function analysisProgressFingerprint(state:{
+  selected:number;assessed:number;deferred:number;blocked:number;
+  pendingIds:readonly string[];inventoryResolved:number;inventoryRemaining:number;
+  candidateAssessed:number;candidateRemaining:number;processedBatches:number;
+}):string {
+  return JSON.stringify([
+    state.selected,state.assessed,state.deferred,state.blocked,[...state.pendingIds].sort(),
+    state.inventoryResolved,state.inventoryRemaining,state.candidateAssessed,
+    state.candidateRemaining,state.processedBatches,
+  ]);
 }
 
 /**
@@ -166,11 +191,23 @@ export function controllerGroundedSolidityOptions(
   const legacy=sourceGroundedSolidityProbes(source,menu,{path,peers});
   if(!repositoryCommit)return legacy;
   const eligible=new Map(legacy.map(item=>[item.selector,item]));
+  const roleCandidate=privilegedRoleMutationCandidate(
+    path,source,snapshots.map(snapshot=>snapshot.content));
   const seen=new Set<string>();
   for(const entry of menu) {
     if(entry.operation!=='send'||seen.has(entry.selector))continue;
     seen.add(entry.selector);
-    if(eligible.has(entry.selector))continue;
+    const separator=entry.selector.lastIndexOf('.');
+    const entryContract=separator>0?entry.selector.slice(0,separator):'';
+    const entryMethod=separator>0?
+      entry.selector.slice(separator+1).split('(')[0]:'';
+    const isSourceProvenRoleMutation=Boolean(roleCandidate&&
+      roleCandidate.selector.slice(0,roleCandidate.selector.lastIndexOf('.'))===entryContract&&
+      roleCandidate.method===entryMethod);
+    // A legacy probe may observe only the role getter. Prefer the exact
+    // source-derived consumer-impact plan so the scheduled plan is the same
+    // property that ANALYZE records in its obligations ledger.
+    if(eligible.has(entry.selector)&&!isSourceProvenRoleMutation)continue;
     const candidate=constructSolidityExperiments({
       repositoryCommit,targetPath:path,targetSelector:entry.selector,
       sources:snapshots,declarations:menu,skipLegacy:true,
@@ -346,6 +383,384 @@ export async function runLocalAudit(
     })+"\n");
     return batch.length;
   };
+  // Reusable source-bound repair pass: never closes a lead without verifier evidence.
+  const repairOutstandingLeadExperiments=async(phase:"initial"|"post-experiment"):Promise<number>=>{
+    if(!analysisProgressStore||!stageLock||
+      (stageLock.currentStage!=="ANALYZE"&&stageLock.currentStage!=="EXPERIMENT"))
+      throw new Error("EXPERIMENT_REPAIR_STAGE_INVALID");
+    const sourceRepairBatch=analysisProgressStore.nextRepairBatch(analysisProgressStore.records.size);
+    // A completed repair attempt belongs to both the acquired source SHA and
+    // the controller implementation revision. After a code repair, the laptop
+    // must not skip 241 previously failed source-construction attempts merely
+    // because the old checkpoint recorded an identical source hash.
+    let implementationRevision=String(process.env.GITHUB_SHA||"").trim();
+    if(!/^[a-f0-9]{40}$/.test(implementationRevision)){
+      try{implementationRevision=execFileSync("git",["rev-parse","HEAD"],
+        {cwd:process.cwd(),encoding:"utf8",timeout:5000}).trim();}
+      catch{implementationRevision="unversioned";}
+    }
+    const strategyBase="source-fixture-property-engine-v3:"+implementationRevision+":"+phase;
+    const relationalUnresolvedBySelector=new Map<string,Set<string>>();
+    if(deterministicProgramGraph){
+      for(const rel of generateRelationalHypotheses(deterministicProgramGraph)){
+        for(const ep of rel.entrypoints){
+          const bucket=relationalUnresolvedBySelector.get(ep)||new Set<string>();
+          for(const prereq of rel.unresolvedPrerequisites)bucket.add(prereq);
+          relationalUnresolvedBySelector.set(ep,bucket);
+        }
+      }
+    }
+    let repairAdded=0,repairBlocked=0;
+    for(const [repairIndex,lead] of sourceRepairBatch.entries()){
+      const record=analysisProgressStore.records.get(lead.id)!;
+      const leadRepairStartedAt=Date.now();
+      await appendFile(logFile,"[EXPERIMENT_REPAIR_LEAD_STARTED] "+JSON.stringify({
+        phase,index:repairIndex+1,total:sourceRepairBatch.length,
+        leadId:lead.id,path:lead.path,selector:lead.selector,
+        sourceSha256:lead.sourceSha256})+"\n");
+      // Re-enter repair when independently observed EVM evidence, an actual
+      // inconclusive attempt or a newly identified source obligation changes
+      // the state. A repeated no-op with identical source/obligations remains
+      // suppressed; controller responses cannot manufacture the fingerprint.
+      const strategy=strategyBase+":"+repairAttemptIdentity(record);
+      if(deterministicProgramGraph){
+        const freshRel=relationalUnresolvedBySelector.get(lead.selector)||new Set<string>();
+        if(analysisProgressStore.reconcileRelationalPrerequisites(lead.id,freshRel)&&
+          analysisProgressStore.records.get(lead.id)?.lifecycle==="experiment_completed"){
+          continue;
+        }
+      }
+      if(record.repairAttempts?.some(x=>x.strategy===strategy&&
+          x.sourceSha256===record.sourceSha256))continue;
+      const declarations=deterministicDeclarationsCache.get(lead.path)||[];
+      if(!declarations.length){
+        const reason="missing_source_declarations";
+        analysisProgressStore.noteRepairAttempt(lead.id,strategy,reason);
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_LEAD_DONE] "+JSON.stringify({
+          phase,index:repairIndex+1,total:sourceRepairBatch.length,
+          leadId:lead.id,status:"blocked",reason,
+          elapsedMs:Date.now()-leadRepairStartedAt})+"\n");
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
+          leadId:lead.id,path:lead.path,selector:lead.selector,reason,
+          sourceSha256:lead.sourceSha256})+"\n");
+        repairBlocked++;
+        continue;
+      }
+      const constructFixtureSlice=(checkpoint?:FixtureSearchCheckpoint)=>constructSolidityExperiments({
+          repositoryCommit:lead.sourceCommit,targetPath:lead.path,
+          targetSelector:lead.selector,sources:deterministicSourceSnapshots,
+          declarations,staticLeads:limits.staticLeads||[],
+          fixtureSearchCheckpoint:checkpoint,fixtureSearchNodeBudget:512,
+        });
+      let constructed:ConstructionResult;
+      try{constructed=constructFixtureSlice(record.fixtureSearchCheckpoint);}
+      catch(error){
+        const message=String((error as Error)?.message||error);
+        if(!record.fixtureSearchCheckpoint||!/^FIXTURE_SEARCH_CHECKPOINT_/.test(message))throw error;
+        await appendFile(logFile,"[FIXTURE_SEARCH_CHECKPOINT_RESET] "+JSON.stringify({
+          leadId:lead.id,selector:lead.selector,reason:message,
+          previousDigest:record.fixtureSearchCheckpoint.inventoryDigest})+"\n");
+        analysisProgressStore.setFixtureSearchCheckpoint(lead.id,undefined);
+        await analysisProgressStore.save();
+        constructed=constructFixtureSlice();
+      }
+      const resumedFixtureExperiments:PreparedSecurityExperiment[]=[];
+      let priorFixtureCheckpoint=record.fixtureSearchCheckpoint?.checksum;
+      while(!constructed.ok&&constructed.code==="FIXTURE_ENUMERATION_INCOMPLETE"&&
+        constructed.fixtureSearchCheckpoint){
+        if(constructed.partialExperiments?.length)
+          resumedFixtureExperiments.push(...constructed.partialExperiments);
+        const checkpoint=constructed.fixtureSearchCheckpoint;
+        if(checkpoint.checksum===priorFixtureCheckpoint){
+          await appendFile(logFile,"[FIXTURE_SEARCH_RESUME_STALLED] "+JSON.stringify({
+            leadId:lead.id,selector:lead.selector,checksum:checkpoint.checksum,
+            exploredNodes:checkpoint.exploredNodes,frontier:checkpoint.pending.length})+"\n");
+          break;
+        }
+        analysisProgressStore.setFixtureSearchCheckpoint(lead.id,checkpoint);
+        await analysisProgressStore.save();
+        priorFixtureCheckpoint=checkpoint.checksum;
+        constructed=constructFixtureSlice(checkpoint);
+      }
+      if(resumedFixtureExperiments.length){
+        if(constructed.ok)constructed={...constructed,
+          experiments:[...new Map([...resumedFixtureExperiments,
+            ...constructed.experiments].map(experiment=>[experiment.id,experiment])).values()]};
+        else constructed={...constructed,partialExperiments:[...new Map([
+          ...resumedFixtureExperiments,...(constructed.partialExperiments||[])]
+          .map(experiment=>[experiment.id,experiment])).values()]};
+      }
+      analysisProgressStore.setFixtureSearchCheckpoint(lead.id,
+        !constructed.ok&&constructed.code==="FIXTURE_ENUMERATION_INCOMPLETE"?
+          constructed.fixtureSearchCheckpoint:undefined);
+      await analysisProgressStore.save();
+      await appendFile(logFile,"[EXPERIMENT_REPAIR_LEAD_DONE] "+JSON.stringify({
+        phase,index:repairIndex+1,total:sourceRepairBatch.length,
+        leadId:lead.id,status:constructed.ok?"constructed":"blocked",
+        code:constructed.ok?undefined:constructed.code,
+        experiments:constructed.ok?constructed.experiments.length:
+          constructed.partialExperiments?.length||0,
+        elapsedMs:Date.now()-leadRepairStartedAt})+"\n");
+      const partialIds=new Set<string>();
+      const successful=constructed.ok?[constructed]:[];
+      if(!constructed.ok&&constructed.partialExperiments?.length){
+        successful.push({ok:true as const,experiments:constructed.partialExperiments});
+        for(const exp of constructed.partialExperiments)partialIds.add(exp.id);
+        await appendFile(logFile,"[EXPERIMENT_PARTIAL_CONSTRUCTION] "+
+          JSON.stringify({leadId:lead.id,path:lead.path,selector:lead.selector,
+            executable:constructed.partialExperiments.length,
+            blocked:constructed.code,detail:constructed.detail.slice(0,420)})+"\n");
+      }
+      const callerOnly=new Set<string>();
+      const altFailures:string[]=[];
+      // A lead may have one completed source-grounded property while another
+      // independent property remains blocked. Do not stop exploring inherited
+      // or caller implementations merely because one constructor succeeded.
+      // Exactly typed outstanding prerequisites, not model text or a generic
+      // name heuristic, determine the remaining deterministic repair routes.
+      const persisted=record.properties.filter(p=>
+        p.state==="prerequisites_pending"||p.unresolvedPrerequisites.length>0)
+        .flatMap(p=>p.unresolvedPrerequisites);
+      const initialCategory=!constructed.ok&&
+        constructed.unresolvedCategory!=="unavailable_replay_capability"?
+        constructed.unresolvedCategory:null;
+      const routes=sourceRepairRoutes(initialCategory,persisted,constructed.ok);
+      const categories=routes.categories;
+      const needsAdditionalResolution=routes.hasUnresolved;
+      const recoverConcrete=routes.concrete;
+      const recoverCaller=routes.callers;
+      const rootSource=deterministicSourceSnapshots.find(source=>
+        source.path===lead.path&&source.sha256===lead.sourceSha256);
+      if(needsAdditionalResolution&&rootSource){
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_ROUTES] "+JSON.stringify({
+          leadId:lead.id,categories,
+          previouslyVerifiedProperties:record.properties.filter(p=>p.state==="test_completed").length,
+          routes:[...(recoverConcrete?["concrete_source"]:[]),
+            ...(recoverCaller?["acquired_interface_callers"]:[])],
+          sourceSha256:lead.sourceSha256})+"\n");
+      }
+      if(rootSource&&recoverConcrete){
+        if(rootSource){
+          const method=lead.selector.split(".").pop()||"";
+          const abstractContract=lead.selector.slice(0,lead.selector.lastIndexOf("."));
+          const concrete=resolveAcquiredConcreteImplementations(rootSource,
+            abstractContract,method,deterministicSourceSnapshots);
+          // Exhaust the full acquired implementation inventory. This is the
+          // deterministic recovery path for unresolved interface/abstract
+          // leads; a fixed prefix here silently leaves later concrete source
+          // families unexamined on every run.
+          for(const target of concrete){
+            // SoliditySourceIndex may omit inherited public methods because
+            // they aren't declared in the subclass file. The verified base's
+            // AST signature is still in the compiled subclass ABI.
+            const discovered=deterministicDeclarationsCache.get(target.path)||[];
+            // Every inherited method supplied to the subclass menu comes
+            // from an authenticated actual acquired base declaration. This
+            // includes source-proven ownership getters and prerequisite
+            // transfer methods, not only the single abstract target method.
+            const acquiredBaseAbi=enumerateAcquiredInheritedAbi(rootSource,
+              abstractContract,target.contract,deterministicSourceSnapshots);
+            const implMenu=[...discovered];
+            for(const method of acquiredBaseAbi){
+              if(!implMenu.some(d=>d.selector===method.selector&&
+                d.operation===method.operation&&
+                JSON.stringify(d.inputs)===JSON.stringify(method.inputs)))
+                implMenu.push({selector:method.selector,
+                  operation:method.operation,inputs:method.inputs});
+            }
+            if(!implMenu.some(d=>d.selector===target.selector&&
+              d.operation===target.operation&&
+              JSON.stringify(d.inputs)===JSON.stringify(target.inputs)))
+              implMenu.push({selector:target.selector,operation:target.operation,
+                inputs:target.inputs});
+            const candidate=constructSolidityExperiments({
+              repositoryCommit:lead.sourceCommit,targetPath:target.path,
+              targetSelector:target.selector,sources:deterministicSourceSnapshots,
+              declarations:implMenu,staticLeads:limits.staticLeads||[],
+            });
+            if(candidate.ok)successful.push(candidate);
+            else {
+              if(candidate.partialExperiments?.length){
+                successful.push({ok:true as const,experiments:candidate.partialExperiments});
+                for(const exp of candidate.partialExperiments)partialIds.add(exp.id);
+              }
+              altFailures.push(target.selector+":"+candidate.code+":"+candidate.detail.slice(0,180));
+            }
+          }
+          await appendFile(logFile,"[EXPERIMENT_CONCRETE_RESOLUTION] "+JSON.stringify({
+            leadId:lead.id,abstractSelector:lead.selector,
+            candidates:concrete.map(x=>({selector:x.selector,path:x.path,sourceSha256:x.sourceSha256})),
+            executable:successful.length,failures:altFailures})+"\n");
+        }
+      }
+      // Interface declarations carry no executable body. Follow an exact
+      // acquired import and source callsite into a concrete consumer, then
+      // test the consumer's own source-derived obligation. This is caller-side
+      // evidence, not an assertion about an unavailable external protocol.
+      if(rootSource&&recoverCaller){
+        const source=rootSource;
+        if(source){
+          const cut=lead.selector.lastIndexOf(".");
+          const contractName=lead.selector.slice(0,cut);
+          const method=lead.selector.slice(cut+1);
+          const callers=resolveAcquiredInterfaceCallers(source,
+            contractName,method,deterministicSourceSnapshots);
+          // Caller recovery is source-bounded by the acquired inventory, so
+          // process every proven caller instead of treating the first 32 as
+          // the complete set.
+          for(const caller of callers){
+            const menu=deterministicDeclarationsCache.get(caller.path)||[];
+            if(!menu.some(d=>d.selector===caller.selector&&d.operation==="send")){
+              altFailures.push(caller.selector+":caller_send_declaration_missing");
+              continue;
+            }
+            const candidate=constructSolidityExperiments({
+              repositoryCommit:lead.sourceCommit,targetPath:caller.path,
+              targetSelector:caller.selector,sources:deterministicSourceSnapshots,
+              declarations:menu,staticLeads:limits.staticLeads||[],
+            });
+            if(candidate.ok||candidate.partialExperiments?.length){
+              if(candidate.ok)successful.push(candidate);
+              else {
+                successful.push({ok:true as const,experiments:candidate.partialExperiments!});
+                for(const exp of candidate.partialExperiments!)partialIds.add(exp.id);
+              }
+              callerOnly.add(caller.path+":"+caller.selector);
+            }else altFailures.push(caller.selector+":"+candidate.code+":"+candidate.detail.slice(0,160));
+          }
+          if(callers.length)await appendFile(logFile,
+            "[EXPERIMENT_INTERFACE_CALLERS] "+JSON.stringify({
+              leadId:lead.id,interfaceSelector:lead.selector,
+              callers:callers.map(x=>({path:x.path,selector:x.selector,
+                receiver:x.receiver,sourceSha256:x.sourceSha256,
+                witness:x.witness})),
+              executable:successful.length})+"\n");
+        }
+      }
+      if(!successful.length){
+        const reason=constructed.ok?"no_constructed_experiment":
+          constructed.code+":"+constructed.detail.slice(0,420)+
+            (altFailures.length?"; concrete: "+altFailures.join("; ").slice(0,350):"");
+        const completedStrategy=strategyBase+":"+repairAttemptIdentity(
+          analysisProgressStore.records.get(lead.id)!);
+        analysisProgressStore.noteRepairAttempt(lead.id,completedStrategy,reason);
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
+          leadId:lead.id,path:lead.path,selector:lead.selector,reason,
+          sourceSha256:lead.sourceSha256})+"\n");
+        repairBlocked++;
+        continue;
+      }
+      let added=0;
+      for(const built of successful)for(const exp of built.experiments){
+        const plan={action:"plan_probe" as const,path:exp.path,query:exp.selector,
+          answer:"solidity_sequence",hypothesis:exp.hypothesis,sequence:exp.sequence};
+        const preexisting=stagedPlans.find(x=>x.plan.path===plan.path &&
+          x.plan.query===plan.query && x.plan.hypothesis===plan.hypothesis &&
+          JSON.stringify(x.plan.sequence)===JSON.stringify(plan.sequence));
+        const witnesses=[lead.sourceEvidence,
+          ...exp.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(":"))];
+        const id=preexisting?.id||JSON.stringify([exp.path,exp.selector,plan.answer,"repair",exp.id]);
+        const limitedToCaller=callerOnly.has(exp.path+":"+exp.selector);
+        const propertyId=createHash("sha256").update(JSON.stringify([
+          lead.id,limitedToCaller?"caller_scope:"+exp.securityProperty:exp.securityProperty,witnesses])).digest("hex");
+        const alreadyLinked=analysisProgressStore.records.get(lead.id)?.properties
+          .some(p=>p.id===propertyId&&p.experimentIds.includes(id));
+        if(alreadyLinked)continue;
+        if(!preexisting){
+          if(phase==="post-experiment")stageLock.registerRepairedExperiment(id,lead.id,lead.sourceSha256,witnesses);
+          else stageLock.discover(id);
+          stagedPlans.push({id,plan});
+        }
+        // Caller integration does not discharge the interface's missing
+        // production implementation. Only source-proven concrete inheritance
+        // may replace that missing-fixture obligation.
+        analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses,
+          exp.path!==lead.path&&!limitedToCaller,!partialIds.has(exp.id));
+        added++;
+        if(!preexisting)repairAdded++;
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
+          leadId:lead.id,experimentId:id,property:exp.securityProperty,
+          reused:!!preexisting,scope:limitedToCaller?"caller_integration":"concrete_source",
+          sourceSha256:lead.sourceSha256,witnesses:witnesses.length})+"\n");
+      }
+      const completedStrategy=strategyBase+":"+repairAttemptIdentity(
+        analysisProgressStore.records.get(lead.id)!);
+      analysisProgressStore.noteRepairAttempt(lead.id,completedStrategy,
+        added?("new_experiments:"+added):"no_distinct_sourced_experiment");
+      if(!added){
+        await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
+          leadId:lead.id,path:lead.path,selector:lead.selector,
+          reason:"no_distinct_sourced_experiment",
+          sourceSha256:lead.sourceSha256})+"\n");
+        repairBlocked++;
+      }
+    }
+    await analysisProgressStore.save();
+    await appendFile(logFile,"[EXPERIMENT_REPAIR_RECONCILIATION] "+JSON.stringify({
+      strategy:strategyBase,phase,examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
+      unresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
+    return repairAdded;
+  };
+  /** After exhausting distinct source-backed recovery routes, inspect the
+   * complete READ-verified acquired inventory for exact nondeployable
+   * interface entrypoints. This NEVER manufactures an experiment result.
+   * Only independent checked source evidence can create the separate
+   * source_unavailable disposition; every other lead remains unresolved.
+   */
+  const certifyUnavailableInterfaces=async():Promise<number>=>{
+    if(!analysisProgressStore||!stageLock||
+      stageLock.currentStage!=="EXPERIMENT"||!stageLock.coverage.allComplete)
+      return 0;
+    const expected=(limits.initialSourcePaths||[])
+      .filter(p=>p.endsWith(".sol")).sort();
+    const actual=deterministicSourceSnapshots.map(s=>s.path).sort();
+    // The acquired inventory must be complete, not the subset that happened
+    // to parse or was convenient to inspect in a given repair turn.
+    if(new Set(expected).size!==expected.length||
+      JSON.stringify(expected)!==JSON.stringify(actual)){
+      await appendFile(logFile,"[SOURCE_UNAVAILABLE_REVIEW_SKIPPED] "+
+        JSON.stringify({reason:"acquired_source_inventory_incomplete",
+          expected:expected.length,available:actual.length})+"\n");
+      return 0;
+    }
+    let verified=0,rejected=0;
+    for(const lead of analysisProgressStore.candidates){
+      const record=analysisProgressStore.records.get(lead.id);
+      if(!record||record.lifecycle==="source_unavailable"||
+        record.lifecycle==="queued"||record.lifecycle==="admitted"||
+        record.lifecycle==="analyzing"||record.lifecycle==="experiment_completed"||
+        record.properties.some(p=>p.state==="test_completed"))continue;
+      const proposed=proposeInterfaceUnavailability(
+        lead,deterministicSourceSnapshots,expected);
+      if(!proposed)continue;
+      const reviewed=independentlyReviewInterfaceUnavailability(
+        proposed,deterministicSourceSnapshots,expected);
+      if(!reviewed){rejected++;continue;}
+      try{
+        analysisProgressStore.recordSourceUnavailable(lead.id,reviewed,
+          deterministicSourceSnapshots,expected);
+      }catch(e){
+        rejected++;
+        await appendFile(logFile,"[SOURCE_UNAVAILABLE_REVIEW_REJECTED] "+
+          JSON.stringify({leadId:lead.id,error:String(e)})+"\n");
+        continue;
+      }
+      verified++;
+      await appendFile(logFile,"[SOURCE_UNAVAILABLE_INDEPENDENTLY_VERIFIED] "+
+        JSON.stringify({leadId:lead.id,selector:lead.selector,
+          sourceSha256:lead.sourceSha256,
+          acquiredInventoryDigest:reviewed.acquiredInventoryDigest,
+          verifierDigest:reviewed.verifierDigest,
+          independentReviewDigest:reviewed.independentReviewDigest,
+          evidenceId:reviewed.evidenceId})+"\n");
+    }
+    if(verified)await analysisProgressStore.save();
+    await appendFile(logFile,"[SOURCE_UNAVAILABLE_RECONCILIATION] "+
+      JSON.stringify({verified,rejected,experimentConclusive:
+        analysisProgressStore.experimentCertificate.conclusive,
+        stillUnresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
+    return verified;
+  };
   const closeAnalysis=async(status:'complete'|'partial',reason='')=>{
     if(!stageLock||stageLock.currentStage!=='ANALYZE')return;
     if(!analysisProgressStore)throw new Error("ANALYSIS_PROGRESS_STORE_MISSING");
@@ -404,9 +819,10 @@ export async function runLocalAudit(
           const witnesses=candidate
             ?candidate.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(':'))
             :(inventoryEntry?[inventoryEntry.sourceEvidence]:[]);
-          // Source evidence for this selector, not evidence for an unrelated
-          // function, is required for pre-ANALYZE staged experiments.
-          if(!witnesses.length||witnesses.some(x=>!x.includes(lead.sourceSha256)))return [];
+          // The target lead's own acquired source SHA must be witnessed; valid
+          // inherited/imported dependency witnesses retain their own 64-hex SHA.
+          if(!witnesses.length||!witnesses.some(x=>x.includes(lead.sourceSha256))||
+            witnesses.some(x=>!/\b[a-f0-9]{64}\b/.test(x)))return [];
           const property=candidate?.securityProperty||entry.plan.hypothesis;
           return [{id:createHash('sha256').update(JSON.stringify([
               lead.id,property,witnesses])).digest('hex'),
@@ -449,168 +865,7 @@ export async function runLocalAudit(
     // A completed analytical inventory does not mean construction has been
     // exhausted. Give every pending property a source-only full-graph repair
     // attempt, without repeating an identical failed strategy across resumes.
-    const sourceRepairBatch=analysisProgressStore.nextRepairBatch(analysisProgressStore.records.size);
-    // A completed repair attempt belongs to both the acquired source SHA and
-    // the controller implementation revision. After a code repair, the laptop
-    // must not skip 241 previously failed source-construction attempts merely
-    // because the old checkpoint recorded an identical source hash.
-    let implementationRevision=String(process.env.GITHUB_SHA||"").trim();
-    if(!/^[a-f0-9]{40}$/.test(implementationRevision)){
-      try{implementationRevision=execFileSync("git",["rev-parse","HEAD"],
-        {cwd:process.cwd(),encoding:"utf8",timeout:5000}).trim();}
-      catch{implementationRevision="unversioned";}
-    }
-    const strategy="source-fixture-property-engine-v2:"+implementationRevision;
-    let repairAdded=0,repairBlocked=0;
-    for(const lead of sourceRepairBatch){
-      const record=analysisProgressStore.records.get(lead.id)!;
-      if(record.repairAttempts?.some(x=>x.strategy===strategy&&
-          x.sourceSha256===record.sourceSha256))continue;
-      const declarations=deterministicDeclarationsCache.get(lead.path)||[];
-      if(!declarations.length){
-        const reason="missing_source_declarations";
-        analysisProgressStore.noteRepairAttempt(lead.id,strategy,reason);
-        await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
-          leadId:lead.id,path:lead.path,selector:lead.selector,reason,
-          sourceSha256:lead.sourceSha256})+"\n");
-        repairBlocked++;
-        continue;
-      }
-      const constructed=constructSolidityExperiments({
-        repositoryCommit:lead.sourceCommit,targetPath:lead.path,
-        targetSelector:lead.selector,sources:deterministicSourceSnapshots,
-        declarations,staticLeads:limits.staticLeads||[],
-      });
-      const successful=constructed.ok?[constructed]:[];
-      const callerOnly=new Set<string>();
-      const altFailures:string[]=[];
-      if(!constructed.ok&&constructed.unresolvedCategory==="missing_fixture"&&
-        /abstract and cannot be instantiated/.test(constructed.detail)){
-        const rootSource=deterministicSourceSnapshots.find(source=>source.path===lead.path &&
-          source.sha256===lead.sourceSha256);
-        if(rootSource){
-          const method=lead.selector.split(".").pop()||"";
-          const abstractContract=lead.selector.slice(0,lead.selector.lastIndexOf("."));
-          const concrete=resolveAcquiredConcreteImplementations(rootSource,
-            abstractContract,method,deterministicSourceSnapshots);
-          for(const target of concrete.slice(0,8)){
-            // SoliditySourceIndex may omit inherited public methods because
-            // they aren't declared in the subclass file. The verified base's
-            // AST signature is still in the compiled subclass ABI.
-            const discovered=deterministicDeclarationsCache.get(target.path)||[];
-            const implMenu=discovered.some(d=>d.selector===target.selector&&d.operation==="send")
-              ?discovered:[...discovered,{selector:target.selector,operation:"send" as const,
-                inputs:target.inputs}];
-            const candidate=constructSolidityExperiments({
-              repositoryCommit:lead.sourceCommit,targetPath:target.path,
-              targetSelector:target.selector,sources:deterministicSourceSnapshots,
-              declarations:implMenu,staticLeads:limits.staticLeads||[],
-            });
-            if(candidate.ok)successful.push(candidate);
-            else altFailures.push(target.selector+":"+candidate.code+":"+candidate.detail.slice(0,180));
-          }
-          await appendFile(logFile,"[EXPERIMENT_CONCRETE_RESOLUTION] "+JSON.stringify({
-            leadId:lead.id,abstractSelector:lead.selector,
-            candidates:concrete.map(x=>({selector:x.selector,path:x.path,sourceSha256:x.sourceSha256})),
-            executable:successful.length,failures:altFailures})+"\n");
-        }
-      }
-      // Interface declarations carry no executable body. Follow an exact
-      // acquired import and source callsite into a concrete consumer, then
-      // test the consumer's own source-derived obligation. This is caller-side
-      // evidence, not an assertion about an unavailable external protocol.
-      if(!constructed.ok&&constructed.unresolvedCategory==="missing_fixture"&&
-        /abstract and cannot be instantiated/.test(constructed.detail)){
-        const source=deterministicSourceSnapshots.find(x=>
-          x.path===lead.path&&x.sha256===lead.sourceSha256);
-        if(source){
-          const cut=lead.selector.lastIndexOf(".");
-          const contractName=lead.selector.slice(0,cut);
-          const method=lead.selector.slice(cut+1);
-          const callers=resolveAcquiredInterfaceCallers(source,
-            contractName,method,deterministicSourceSnapshots);
-          for(const caller of callers.slice(0,16)){
-            const menu=deterministicDeclarationsCache.get(caller.path)||[];
-            if(!menu.some(d=>d.selector===caller.selector&&d.operation==="send")){
-              altFailures.push(caller.selector+":caller_send_declaration_missing");
-              continue;
-            }
-            const candidate=constructSolidityExperiments({
-              repositoryCommit:lead.sourceCommit,targetPath:caller.path,
-              targetSelector:caller.selector,sources:deterministicSourceSnapshots,
-              declarations:menu,staticLeads:limits.staticLeads||[],
-            });
-            if(candidate.ok){
-              successful.push(candidate);
-              callerOnly.add(caller.path+":"+caller.selector);
-            }else altFailures.push(caller.selector+":"+candidate.code+":"+candidate.detail.slice(0,160));
-          }
-          if(callers.length)await appendFile(logFile,
-            "[EXPERIMENT_INTERFACE_CALLERS] "+JSON.stringify({
-              leadId:lead.id,interfaceSelector:lead.selector,
-              callers:callers.map(x=>({path:x.path,selector:x.selector,
-                receiver:x.receiver,sourceSha256:x.sourceSha256,
-                witness:x.witness})),
-              executable:successful.length})+"\n");
-        }
-      }
-      if(!successful.length){
-        const reason=constructed.ok?"no_constructed_experiment":
-          constructed.code+":"+constructed.detail.slice(0,420)+
-            (altFailures.length?"; concrete: "+altFailures.join("; ").slice(0,350):"");
-        analysisProgressStore.noteRepairAttempt(lead.id,strategy,reason);
-        await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
-          leadId:lead.id,path:lead.path,selector:lead.selector,reason,
-          sourceSha256:lead.sourceSha256})+"\n");
-        repairBlocked++;
-        continue;
-      }
-      let added=0;
-      for(const built of successful)for(const exp of built.experiments){
-        const plan={action:"plan_probe" as const,path:exp.path,query:exp.selector,
-          answer:"solidity_sequence",hypothesis:exp.hypothesis,sequence:exp.sequence};
-        const preexisting=stagedPlans.find(x=>x.plan.path===plan.path &&
-          x.plan.query===plan.query && x.plan.hypothesis===plan.hypothesis &&
-          JSON.stringify(x.plan.sequence)===JSON.stringify(plan.sequence));
-        const witnesses=[lead.sourceEvidence,
-          ...exp.witnesses.map(w=>[w.path,w.sourceSha256,w.start,w.end,w.symbol].join(":"))];
-        const id=preexisting?.id||JSON.stringify([exp.path,exp.selector,plan.answer,"repair",exp.id]);
-        const limitedToCaller=callerOnly.has(exp.path+":"+exp.selector);
-        const propertyId=createHash("sha256").update(JSON.stringify([
-          lead.id,limitedToCaller?"caller_scope:"+exp.securityProperty:exp.securityProperty,witnesses])).digest("hex");
-        const alreadyLinked=analysisProgressStore.records.get(lead.id)?.properties
-          .some(p=>p.id===propertyId&&p.experimentIds.includes(id));
-        if(alreadyLinked)continue;
-        if(!preexisting){
-          stageLock.discover(id);
-          stagedPlans.push({id,plan});
-        }
-        // Caller integration does not discharge the interface's missing
-        // production implementation. Only source-proven concrete inheritance
-        // may replace that missing-fixture obligation.
-        analysisProgressStore.addRepairExperiment(lead.id,propertyId,id,witnesses,
-          exp.path!==lead.path&&!limitedToCaller);
-        added++;
-        if(!preexisting)repairAdded++;
-        await appendFile(logFile,"[EXPERIMENT_REPAIR_PLANNED] "+JSON.stringify({
-          leadId:lead.id,experimentId:id,property:exp.securityProperty,
-          reused:!!preexisting,scope:limitedToCaller?"caller_integration":"concrete_source",
-          sourceSha256:lead.sourceSha256,witnesses:witnesses.length})+"\n");
-      }
-      analysisProgressStore.noteRepairAttempt(lead.id,strategy,
-        added?("new_experiments:"+added):"no_distinct_sourced_experiment");
-      if(!added){
-        await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
-          leadId:lead.id,path:lead.path,selector:lead.selector,
-          reason:"no_distinct_sourced_experiment",
-          sourceSha256:lead.sourceSha256})+"\n");
-        repairBlocked++;
-      }
-    }
-    await analysisProgressStore.save();
-    await appendFile(logFile,"[EXPERIMENT_REPAIR_RECONCILIATION] "+JSON.stringify({
-      strategy,examined:sourceRepairBatch.length,added:repairAdded,blocked:repairBlocked,
-      unresolved:analysisProgressStore.experimentCertificate.unresolvedIds.length})+"\n");
+    await repairOutstandingLeadExperiments("initial");
     stageLock.assertAnalysisInventoryExhausted();
     limits.onCandidateCoverage?.(analysisProgressStore.counts);
     await appendFile(logFile,"[ANALYSIS_PROPERTY_PENDING] "+JSON.stringify(analysisProgressStore.counts)+"\n");
@@ -811,20 +1066,157 @@ export async function runLocalAudit(
       sourceRepositoryCommits.set(dir,revision);
       return revision;
     };
+    const dependencySnapshotsByRepository=new Map<string,Promise<SourceSnapshot[]>>();
+    const lockedSolidityDependencySnapshots=(repositoryRoot:string,
+      sourceEntries:ReadonlyMap<string,string>):Promise<SourceSnapshot[]>=>{
+      const cached=dependencySnapshotsByRepository.get(repositoryRoot);
+      if(cached)return cached;
+      const loading=(async()=>{
+        const imports=new Set<string>();
+        for(const content of sourceEntries.values()){
+          try{
+            const ast=parseSolidity(content);
+            for(const node of ast.children||[])
+              if(node.type==='ImportDirective'&&typeof node.path==='string'&&
+                !node.path.startsWith('.')&&node.path.endsWith('.sol'))imports.add(node.path);
+          }catch{/* The acquired source's parse failure is handled by its normal audit path. */}
+        }
+        const moduleDirectory=dirname(fileURLToPath(import.meta.url));
+        const materializerCandidates=[
+          resolve(moduleDirectory,'../../..','scripts/source_dependencies.py'),
+          resolve(moduleDirectory,'../../../..','scripts/source_dependencies.py'),
+        ];
+        let materializer:string|undefined;
+        for(const candidate of materializerCandidates){
+          try{if((await stat(candidate)).isFile()){materializer=candidate;break;}}catch{}
+        }
+        if(!materializer){
+          await appendFile(logFile,'[LOCKED_SOLIDITY_DEPENDENCY_UNAVAILABLE] '+JSON.stringify({
+            reason:'LOTUS lockfile dependency materializer is not installed beside the controller'})+'\n');
+          return [];
+        }
+        const snapshots=new Map<string,SourceSnapshot>();
+        const pending=[...imports];
+        const visited=new Set<string>();
+        while(pending.length){
+          const batch=pending.splice(0,128).filter(specifier=>!visited.has(specifier));
+          if(!batch.length)continue;
+          for(const specifier of batch)visited.add(specifier);
+          try{
+            // The repository helper validates lockfile integrity and registry
+            // redirects, extracts only requested locked packages, and never
+            // runs package lifecycle scripts. This occurs only after complete
+            // target-source reading has unlocked experiment planning.
+            const python="import importlib.util,json,sys;from pathlib import Path;"+
+              "s=importlib.util.spec_from_file_location('lotus_source_dependencies',sys.argv[1]);"+
+              "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"+
+              "m.prepare_dependencies(Path(sys.argv[2]),json.loads(sys.argv[3]))";
+            execFileSync('python3',['-c',python,materializer,repositoryRoot,JSON.stringify(batch)],
+              {encoding:'utf8',timeout:45000,stdio:['ignore','pipe','pipe']});
+          }catch(error){
+            await appendFile(logFile,'[LOCKED_SOLIDITY_DEPENDENCY_UNAVAILABLE] '+JSON.stringify({
+              repository:relative(root,repositoryRoot),imports:batch,
+              reason:String((error as Error)?.message||error).slice(0,500)})+'\n');
+            continue;
+          }
+          let modulesRoot:string;
+          try{modulesRoot=await realpath(resolve(repositoryRoot,'node_modules'));}
+          catch{continue;}
+          for(const specifier of batch){
+            if(specifier.split('/').some(part=>!part||part==='.'||part==='..'||part.includes('\\')))continue;
+            const physical=resolve(modulesRoot,...specifier.split('/'));
+            try{
+              const actual=await realpath(physical);
+              if(actual!==modulesRoot&&!actual.startsWith(modulesRoot+sep))continue;
+              const info=await stat(actual);
+              if(!info.isFile())continue;
+              const content=await readFile(actual,'utf8');
+              snapshots.set(specifier,{path:specifier,content,
+                sha256:createHash('sha256').update(content).digest('hex')});
+              try{
+                const ast=parseSolidity(content);
+                for(const node of ast.children||[]){
+                  if(node.type!=='ImportDirective'||typeof node.path!=='string'||!node.path.endsWith('.sol'))continue;
+                  const dependencyPath=node.path.startsWith('.')
+                    ?posix.normalize(posix.join(posix.dirname(specifier),node.path)):node.path;
+                  if(!dependencyPath.startsWith('/')&&
+                    !dependencyPath.split('/').some(part=>!part||part==='.'||part==='..')&&
+                    !visited.has(dependencyPath))pending.push(dependencyPath);
+                }
+              }catch{/* A malformed dependency cannot be used as source evidence. */}
+            }catch{/* Unavailable imports remain explicit planner blockers. */}
+          }
+        }
+        return [...snapshots.values()];
+      })();
+      dependencySnapshotsByRepository.set(repositoryRoot,loading);
+      return loading;
+    };
     const groundedControllerOptions=async(path:string,source:string,menu:SolidityProbeDeclaration[],options?:{skipFinancialInvariants?:boolean})=>{
       const sourceEntries=new Map(accessibleSoliditySources);
       sourceEntries.set(path,source);
       const repoPrefix=path.split('/')[0]+'/';
-      const snapshots:SourceSnapshot[]=[...sourceEntries.entries()]
+      const acquiredSnapshots:SourceSnapshot[]=[...sourceEntries.entries()]
         .filter(([candidate])=>candidate.startsWith(repoPrefix))
         .map(([candidate,content])=>({
           path:candidate,content,sha256:createHash('sha256').update(content).digest('hex')
         }));
+      const targetRoot=resolve(root,path.split('/')[0]);
+      let dependencySnapshots:SourceSnapshot[]=[];
+      try{
+        const realTargetRoot=await realpath(targetRoot);
+        if(realTargetRoot===root||!realTargetRoot.startsWith(root+sep))
+          throw new Error('Acquired repository root resolves outside the authorized workspace');
+        dependencySnapshots=await lockedSolidityDependencySnapshots(realTargetRoot,
+          new Map(acquiredSnapshots.map(snapshot=>[snapshot.path,snapshot.content])));
+      }catch(error){
+        await appendFile(logFile,'[LOCKED_SOLIDITY_DEPENDENCY_UNAVAILABLE] '+JSON.stringify({
+          repository:relative(root,targetRoot),reason:String((error as Error)?.message||error).slice(0,500)})+'\n');
+      }
+      // Package sources are dependency evidence only: planner entry points
+      // remain bound to the acquired bounty target path and indexed selector.
+      const snapshots=[...acquiredSnapshots,...dependencySnapshots];
       const revision=sourceRevision(path);
       if(!revision)await appendFile(logFile,'[CONTROLLER_SCENARIO_REVISION_UNAVAILABLE] '+
         JSON.stringify({path})+'\n');
       const pathLeads=(limits.staticLeads||[]).filter(l=>l.path===path);
-      return controllerGroundedSolidityOptions(path,source,menu,snapshots,revision,pathLeads,options);
+      const grounded=controllerGroundedSolidityOptions(path,source,menu,snapshots,revision,pathLeads,options);
+      const roleCandidate=privilegedSolidityCandidates.get(path);
+      if(roleCandidate){
+        const separator=roleCandidate.selector.lastIndexOf('.');
+        const contractName=roleCandidate.selector.slice(0,separator);
+        const target=menu.find(entry=>entry.operation==='send'&&
+          entry.selector.startsWith(contractName+'.')&&
+          entry.selector.slice(contractName.length+1).split('(')[0]===roleCandidate.method);
+        let outcome:{status:string;code?:string;detail?:string;experiments?:number}=
+          {status:revision&&target?'construction_failed':'missing_revision_or_abi'};
+        if(revision&&target){
+          const built=constructSolidityExperiments({
+            repositoryCommit:revision,targetPath:path,targetSelector:target.selector,
+            sources:snapshots,declarations:menu,skipLegacy:true,
+            skipFinancialInvariants:options?.skipFinancialInvariants,staticLeads:pathLeads
+          });
+          if(built.ok&&built.experiments.length){
+            const experiment=built.experiments[0];
+            const selectedIndex=grounded.findIndex(item=>item.selector===target.selector);
+            const sourceImpactPlan={selector:target.selector,probe:{
+              hypothesis:experiment.hypothesis,sequence:experiment.sequence,
+              guardedConsumer:''}};
+            // This controller-owned source property is authoritative for the
+            // detected setter. Replace a legacy getter-only plan for the same
+            // selector so ANALYZE and EXPERIMENT share the exact impact test.
+            if(selectedIndex>=0)grounded.splice(selectedIndex,1,sourceImpactPlan);
+            else grounded.push(sourceImpactPlan);
+            outcome={status:'planned',experiments:built.experiments.length};
+          }else outcome={status:built.ok?'no_constructed_experiments':built.code,
+            detail:built.ok?'':built.detail};
+        }
+        await appendFile(logFile,'[CONTROLLER_ROLE_EXPERIMENT] '+JSON.stringify({
+          path,selector:target?.selector||roleCandidate.selector,role:roleCandidate.role,
+          outcome,options:grounded.filter(item=>item.selector===target?.selector).length
+        })+'\n');
+      }
+      return grounded;
     };
     // Production controller: freeze the entire authorized source inventory
     // before the first paginated source read. Indexing can inspect bytes to
@@ -847,11 +1239,11 @@ export async function runLocalAudit(
       await appendFile(logFile,'[INDEX_COMPLETE] '+JSON.stringify({files:inventory.length})+'\n');
       await appendFile(logFile,'[STAGE_UNLOCK] INDEX -> READ\n');
     }
-    for(const path of [...new Set(limits.initialSourcePaths||[])].slice(0,200)){
+    for(const path of new Set(limits.initialSourcePaths||[])){
       if(!path.startsWith('source-')||!path.endsWith('.sol'))continue;
       try{
         const content=await readFile(await safePath(path),'utf8');
-        if(content.length<=256000)accessibleSoliditySources.set(path,content);
+        accessibleSoliditySources.set(path,content);
       }catch{}
     }
     // Trace project-owned ERC1155 call sites BEFORE considering inherited
@@ -1081,6 +1473,14 @@ export async function runLocalAudit(
         controllerLoopProgressCount,
         stagedPlans.length,
         analyzeTurnsRemaining,
+        stageLock?.currentStage==='ANALYZE' ? analysisProgressFingerprint({
+          ...stageLock.analysisProgress,
+          inventoryResolved:stageLock.analysisInventoryProgress.resolved,
+          inventoryRemaining:stageLock.analysisInventoryProgress.remaining,
+          candidateAssessed:analysisProgressStore?.assessed ?? 0,
+          candidateRemaining:analysisProgressStore?.remaining ?? 0,
+          processedBatches:analysisProgressStore?.processedBatches ?? 0,
+        }) : '',
       ]);
       if(turn>0 && currentFingerprint===prevTurnFingerprint) {
         consecutiveNoProgressTurns++;
@@ -1285,13 +1685,103 @@ export async function runLocalAudit(
             unqueuedSelectors,
           });
         }
+        const candidateQueueStartedAt=Date.now();
+        await appendFile(logFile,'[ANALYSIS_CANDIDATE_QUEUE_STARTED] '+JSON.stringify({
+          sourceItems:candidateSourceItems.length,
+          sourceSelectors:candidateSourceItems.reduce((sum,item)=>sum+item.unqueuedSelectors.length,0),
+          graphEdges:deterministicProgramGraph?.edges.length||0,
+        })+'\n');
         const candidateQueue=buildAnalysisCandidateQueue({
           items:candidateSourceItems,
           staticLeads:solLeads,
           graph:deterministicProgramGraph||undefined,
           maxAdmitted:analysisBatchSize,
           maxPerFile:analysisPerFileCap,
+          onProgress:progress=>appendFileSync(logFile,
+            '[ANALYSIS_CANDIDATE_QUEUE_PROGRESS] '+JSON.stringify(progress)+'\n'),
         });
+        await appendFile(logFile,'[ANALYSIS_CANDIDATE_QUEUE_COMPLETE] '+JSON.stringify({
+          total:candidateQueue.inventory.length,blocked:candidateQueue.blocked.length,
+          admitted:candidateQueue.admitted.length,queued:candidateQueue.queued.length,
+          elapsedMs:Date.now()-candidateQueueStartedAt,
+        })+'\n');
+        // Diagnose actual source-family applicability over the ORIGINAL
+        // immutable lead inventory, not over whichever 78 names happen to
+        // look easy. These are only CONSTRUCTED hypotheses, not EVM results.
+        // Empty/failed construction is recorded without fabricating a hit.
+        const propertyFamilies=new Map<string,Set<string>>();
+        const constructedLeadIds=new Set<string>();
+        const propertyConstructionFailures:Record<string,number>={};
+        const propertyConstructionStartedAt=Date.now();
+        let propertyConstructionCompleted=0;
+        await appendFile(logFile,"[ANALYSIS_SOURCE_PROPERTY_PASS_STARTED] "+JSON.stringify({
+          total:candidateQueue.inventory.length,
+          sourceFiles:deterministicSourceSnapshots.length,
+        })+"\n");
+        for(const lead of candidateQueue.inventory){
+          const menu=deterministicDeclarationsCache.get(lead.path)||[];
+          try{
+            const built=constructSolidityExperiments({
+              repositoryCommit:lead.sourceCommit,
+              targetPath:lead.path,targetSelector:lead.selector,
+              sources:deterministicSourceSnapshots,declarations:menu,
+              skipLegacy:true,
+            });
+            if(!built.ok){
+              const key=String(built.unresolvedCategory||built.code||"unknown");
+              propertyConstructionFailures[key]=(propertyConstructionFailures[key]||0)+1;
+              continue;
+            }
+            constructedLeadIds.add(lead.id);
+            for(const exp of built.experiments){
+              const name=exp.securityProperty.replace(/[:].*$/,"")
+                .replace(/\b[A-Za-z_]\w*\.[A-Za-z_]\w*(?:\([^)]*\))?.*$/,"")
+                .trim()||"other_source_witnessed_property";
+              const members=propertyFamilies.get(name)||new Set<string>();
+              members.add(lead.id);propertyFamilies.set(name,members);
+            }
+          }catch(error){
+            const key="source_construction_exception";
+            propertyConstructionFailures[key]=(propertyConstructionFailures[key]||0)+1;
+            await appendFile(logFile,"[SOURCE_PROPERTY_FAMILY_ERROR] "+
+              JSON.stringify({leadId:lead.id,selector:lead.selector,
+                sourceSha256:lead.sourceSha256,error:String(error).slice(0,240)})+"\n");
+          }
+          propertyConstructionCompleted++;
+          // The controller performs this deterministic CPU pass before opening
+          // the ANALYZE model window. Emit bounded progress so the supervisor
+          // can distinguish productive source construction from a real stall.
+          if(propertyConstructionCompleted===1 ||
+             propertyConstructionCompleted%4===0 ||
+             propertyConstructionCompleted===candidateQueue.inventory.length){
+            await appendFile(logFile,"[ANALYSIS_SOURCE_PROPERTY_PROGRESS] "+JSON.stringify({
+              completed:propertyConstructionCompleted,
+              total:candidateQueue.inventory.length,
+              sourceConstructed:constructedLeadIds.size,
+              unresolvedConstruction:propertyConstructionFailures,
+              elapsedMs:Date.now()-propertyConstructionStartedAt,
+              currentLeadId:lead.id,
+              currentSelector:lead.selector,
+            })+"\n");
+          }
+        }
+        const familyCoverage={
+          totalOriginalLeads:candidateQueue.inventory.length,
+          sourceConstructedLeads:constructedLeadIds.size,
+          unresolvedConstruction:candidateQueue.inventory.length-constructedLeadIds.size,
+          families:Object.fromEntries([...propertyFamilies].sort(([a],[b])=>a.localeCompare(b))
+            .map(([name,ids])=>[name,{count:ids.size,leadIds:[...ids].sort()}])),
+          failures:propertyConstructionFailures,
+          sourceBoundExperimentVerified:0,
+          note:"Static family construction only; no experiment or source-unavailability evidence is inferred",
+        };
+        await writeFile(logFile+".property-family-coverage.json",
+          JSON.stringify(familyCoverage,null,2),{mode:0o600});
+        await appendFile(logFile,"[SOURCE_PROPERTY_FAMILY_COVERAGE] "+
+          JSON.stringify({originalLeads:familyCoverage.totalOriginalLeads,
+            sourceConstructedLeads:familyCoverage.sourceConstructedLeads,
+            families:Object.fromEntries([...propertyFamilies].map(([name,ids])=>[name,ids.size])),
+            failures:propertyConstructionFailures})+"\n");
         analysisInventoryMeta={
           inventoryTotal:candidateQueue.inventory.length,
           admittedCount:0,
@@ -1306,7 +1796,42 @@ export async function runLocalAudit(
         const progressRoot=process.env.LOTUS_ANALYSIS_CHECKPOINT_ROOT||
           join(homedir(),".lotus-clone-analysis");
         const progressFile=join(progressRoot,inventoryFingerprint+".json");
-        analysisProgressStore=await AnalysisProgressStore.open(progressFile,candidateQueue.inventory);
+        // Checkpoint assessment validity depends on the code that interprets
+        // source, builds ABI/fixtures/properties, selects repairs and verifies
+        // evidence. The acquired Solidity source SHA alone cannot detect a
+        // changed controller implementation. Hash exact installed source
+        // bytes so future repairs trigger analysis of still-unresolved leads.
+        const enginePaths=[
+          "packages/security-solver/src/local-ollama-runner.ts",
+          "packages/security-solver/src/controller-solidity-experiment-planner.ts",
+          "packages/security-solver/src/controller-stage-lock.ts",
+          "packages/security-solver/src/deterministic/analysis-progress-store.ts",
+          "packages/security-solver/src/deterministic/fixture-dependency-planner.ts",
+          "packages/security-solver/src/deterministic/typed-repair-routes.ts",
+          "packages/security-solver/src/deterministic/hypothesis-engine.ts",
+          "packages/security-solver/src/deterministic/repair-attempt-identity.ts",
+          "packages/security-solver/src/deterministic/source-unavailability-verifier.ts",
+          "packages/security-solver/src/solidity-source-index.ts",
+          "packages/security-solver/src/solidity-sequence.ts",
+          "packages/security-solver/src/source-reproduction.ts",
+          "scripts/solidity_security_evidence.py",
+          "scripts/reproduction-runtime/solidity-sequence.cjs",
+        ];
+        // 'root' is the audited SOURCE workspace, which in tests and
+        // production acquisitions may be a temporary directory containing
+        // only target code. Resolve engine inputs relative to this module,
+        // never against the audited target's cwd.
+        const engineRoot=resolve(dirname(fileURLToPath(import.meta.url)),"../../..");
+        const engineDigest=createHash("sha256");
+        for(const enginePath of enginePaths){
+          const content=await readFile(join(engineRoot,enginePath));
+          engineDigest.update(enginePath).update("\u0000").update(content).update("\u0000");
+        }
+        const analysisEngineRevision=engineDigest.digest("hex");
+        analysisProgressStore=await AnalysisProgressStore.open(
+          progressFile,candidateQueue.inventory,analysisEngineRevision);
+        await appendFile(logFile,"[ANALYSIS_ENGINE_REVISION] "+
+          JSON.stringify({revision:analysisEngineRevision,files:enginePaths.length})+"\n");
         stageLock.registerAnalysisInventory(candidateQueue.inventory.map(c=>c.id));
         for(const record of analysisProgressStore.records.values()){
           if(record.lifecycle!=="queued")stageLock.restoreResolvedAnalysisCandidate(record.id);
@@ -1373,20 +1898,61 @@ export async function runLocalAudit(
         const inconclusive=stageLock.outcomeCounts;
         if(certificate.unresolvedIds.length || inconclusive.observation_only ||
           inconclusive.incomplete || inconclusive.unsupported || inconclusive.rejected){
+          // A finished selected queue is not a completed investigation. Attempt
+          // a distinct source-grounded repair pass before suspending. A repair
+          // must introduce a genuinely new queued experiment; zero progress
+          // retains the same strict failure and checkpoint semantics.
+          if(certificate.unresolvedIds.length){
+            const added=await repairOutstandingLeadExperiments("post-experiment");
+            if(added>0){
+              await appendFile(logFile,'[EXPERIMENT_REPAIR_REQUEUED] '+
+                JSON.stringify({added,unresolved:certificate.unresolvedIds.length})+'\n');
+              continue;
+            }
+          }
+          // Exhaustion of additional property families is not automatically
+          // evidence of missing source. Only the independent acquired-code
+          // verifier may issue a terminal unavailability disposition.
+          await certifyUnavailableInterfaces();
+          analysisProgressStore.markExplicitlyUnresolved();
+          await analysisProgressStore.save();
+          const disposition=analysisProgressStore.experimentCertificate;
+          const unresolvedHaveReasons=disposition.unresolvedIds.every(id=>
+            (disposition.pendingReasons[id]||[]).length>0);
+          const allUnresolvedExplicitlyDispositioned=
+            disposition.explicitlyUnresolvedIds.length===disposition.unresolvedIds.length;
+          if(allUnresolvedExplicitlyDispositioned&&unresolvedHaveReasons&&
+            !inconclusive.observation_only&&!inconclusive.incomplete&&
+            !inconclusive.unsupported&&!inconclusive.rejected){
+            stageLock.completeExperiments(disposition);
+            await appendFile(logFile,'[EXPERIMENT_DISPOSITIONS_COMPLETE] '+
+              JSON.stringify({experimentVerified:disposition.conclusive,
+                sourceUnavailable:disposition.sourceUnavailable,
+                explicitlyUnresolved:disposition.unresolvedIds.length,
+                pendingReasons:disposition.pendingReasons,
+                total:disposition.total})+'\n');
+            await appendFile(logFile,'[STAGE_UNLOCK] EXPERIMENT -> REVIEW\n');
+            continue;
+          }
           await analysisProgressStore.save();
           await appendFile(logFile,'[EXPERIMENT_GATE_BLOCKED] '+JSON.stringify({
-            required:certificate.total,conclusive:certificate.conclusive,
-            unresolved:certificate.unresolvedIds.length,
-            pendingLeadIds:certificate.unresolvedIds,
-            reasons:certificate.pendingReasons,
+            required:disposition.total,conclusive:disposition.conclusive,
+            sourceUnavailable:disposition.sourceUnavailable,
+            unresolved:disposition.unresolvedIds.length,
+            pendingLeadIds:disposition.unresolvedIds,
+            reasons:disposition.pendingReasons,
             outcomes:inconclusive,
             manifestDigest:certificate.manifestDigest,
             evidenceDigest:certificate.evidenceDigest,
             checkpoint:analysisProgressStore.path,
           })+'\n');
+          const unresolvedSummary=JSON.stringify(disposition.unresolvedIds.map(id=>({
+            id,reasons:disposition.pendingReasons[id]||[]}))).slice(0,1400);
           throw new Error('EXPERIMENT_INCOMPLETE_SUSPENDED: '+
-            certificate.conclusive+'/'+certificate.total+' leads conclusively tested, '+
-            certificate.unresolvedIds.length+' unresolved; checkpoint '+analysisProgressStore.path);
+            disposition.conclusive+' experimentally verified, '+
+            disposition.sourceUnavailable+' source-unavailable, '+
+            disposition.unresolvedIds.length+' explicitly unresolved; pending='+unresolvedSummary+
+            '; checkpoint '+analysisProgressStore.path);
         }
         stageLock.completeExperiments(certificate);
         limits.onExperimentLedger?.({selected:stageLock.candidateCount,
@@ -1428,8 +1994,20 @@ export async function runLocalAudit(
         stageLock.completeReviews();
         await appendFile(logFile,'[REVIEW_COMPLETE] '+JSON.stringify({eligible:0})+'\n');
         await appendFile(logFile,'[STAGE_UNLOCK] REVIEW -> REPORT\n');
+        const coverage=analysisProgressStore?.counts;
+        const unresolved=coverage?.unresolvedIds.length||0;
+        const explicit=coverage?.explicitlyUnresolvedIds.length||0;
+        const unavailable=coverage?.sourceUnavailable||0;
+        const blockerSummary=Object.entries(coverage?.unresolvedReasons||{})
+          .flatMap(([id,reasons])=>reasons.map(reason=>id+': '+reason))
+          .slice(0,4).join('; ');
         const disposition=JSON.stringify({findings:[],outcome:'no_testable_candidate',
-          reason:'No source-grounded executable security scenario qualified after complete indexed source reading and analysis.'});
+          reason:(unresolved?
+            'No source-grounded executable security scenario qualified after complete indexed source reading and analysis. '+
+              unavailable+' independently verified source-unavailable; '+
+              unresolved+' candidate properties unresolved ('+explicit+' explicitly dispositioned)'+
+              (blockerSummary?'; blockers: '+blockerSummary:'')+'.':
+            'No source-grounded executable security scenario qualified after complete indexed source reading and analysis.').slice(0,980)});
         const rejected=await limits.validateFinal?.(disposition);
         if(rejected)throw new Error('CONTROLLER_EMPTY_EXPERIMENT_REPORT_REJECTED: '+String(rejected));
         stageLock.completeReport(true);
@@ -2658,6 +3236,9 @@ export async function runLocalAudit(
                 hypothesis:action.action==='defer_lead'?'No supported executable property':action.hypothesis!,
                 disposition:action.action==='defer_lead'?'defer':'test',
                 reason:action.answer.trim().slice(0,700)},'model');
+              // A verified disposition is real forward progress: refund the
+              // action's turn so the batch window limits retries, not work.
+              analyzeTurnsRemaining++;
               await appendFile(logFile,'['+(action.action==='defer_lead'?'ANALYSIS_LEAD_DEFERRED':'ANALYSIS_LEAD_ASSESSED')+'] '+
                 JSON.stringify({leadId:packet!.id,path:packet!.path,selector:packet!.selector,
                   reason:action.answer.trim().slice(0,300),
@@ -2689,7 +3270,7 @@ export async function runLocalAudit(
               const parsedSeq=soliditySequenceSchema.safeParse(action.sequence);
               if(!declared)acceptError='Undeclared Solidity Contract.function selector: '+action.query;
               else if(!parsedSeq.success)acceptError='Invalid solidity_sequence: '+parsedSeq.error.issues.map(i=>i.path.join('.')+': '+i.message).slice(0,4).join('; ');
-              else if(!parsedSeq.data.steps.some(s=>s.operation!=='eth_balance'&&s.function.split('(')[0]===fnName))acceptError='Sequence steps must invoke '+fnName;
+              else if(!parsedSeq.data.steps.some(s=>(s.operation==='send'||s.operation==='call'||s.operation==='observe')&&s.function.split('(')[0]===fnName))acceptError='Sequence steps must invoke '+fnName;
               else if(!parsedSeq.data.steps.some(step=>step.operation==='call'||(step.operation==='send'&&step.expectRevert===true)))
                 acceptError='Security experiment requires a source-derived call assertion or expected revert, not only exploratory observations.';
               else {
@@ -2717,6 +3298,9 @@ export async function runLocalAudit(
                     sourceEvidence:[proposedLead!.sourceEvidence],
                     hypothesis:plan.hypothesis,disposition:'test',
                     reason:'Accepted distinct source-derived assertion and schema-valid local experiment'},'model');
+                  // Accepted source-bound experiments replenish the batch
+                  // window; only malformed or rejected work consumes it.
+                  analyzeTurnsRemaining++;
                   await appendFile(logFile,'[ANALYSIS_MODEL_EXPERIMENT_ADDED] '+JSON.stringify({
                     leadId:proposedLead!.id,experimentId:acceptedId,path:action.path,
                      selector:action.query,remainingTurns:analyzeTurnsRemaining})+'\n');
@@ -3064,8 +3648,11 @@ export async function runLocalAudit(
                 (limits.initialSourcePaths||[]).includes(caller)) {
               try {
                 const full=await safePath(caller);
-                let offset=0, pages=0, seenLines=0, reached=false;
-                while(pages++<32) {
+                let offset=0, seenLines=0, reached=false;
+                // Keep reading until the claimed line is covered or source
+                // pagination reaches a verified terminal/stalled condition.
+                // A fixed page count rejected valid late-file evidence.
+                while(true) {
                   const page=await readSourcePage(full,offset,pageSize);
                   if(!page.text || page.end<=page.start)break;
                   const action={action:'read_file',path:caller,query:'',answer:'',offset};
@@ -3346,6 +3933,9 @@ export async function runLocalAudit(
         controller.signal.throwIfAborted();
         await appendFile(logFile, "[TOOL] " + call.function.name + "\n");
         let output: string;
+        // The model sees a context-fitted summary; acceptance uses the exact
+        // independent verifier bytes from before fitAuditToolOutput.
+        let executedVerifierOutput:string|undefined;
         let fatalToolError:string|undefined;
         let activityCount:number|undefined;
         let completedActionKey:string|undefined;
@@ -3583,6 +4173,7 @@ export async function runLocalAudit(
               if(["behavior_observed","behavior_not_observed"].includes(result.status))
                 allowance.probe(JSON.stringify([relative(root,full),call.function.arguments?.query,kind,sequence]),turn+1);
             }catch{}
+            executedVerifierOutput=output;
           } else if (name === "list_files") {
             output = JSON.stringify(await listSourcePage(full,offset));
           } else if (name === "search_files") {
@@ -3703,11 +4294,12 @@ export async function runLocalAudit(
             if(count>=3)fatalToolError="AUDIT_STALLED: repeated missing source path after corrective feedback; inspection incomplete";
           }
         }
+        const fullVerifierOutput=unfittedVerifierTranscript(executedVerifierOutput,output);
         if(stageLock && activeStageCandidate &&
           ['verify_source','verify_python'].includes(call.function.name)){
           let outcome:Outcome='incomplete';
           try{
-            const status=String(JSON.parse(output).status||'');
+            const status=String(JSON.parse(fullVerifierOutput).status||'');
             outcome=status==='behavior_observed'?'observed':
               status==='observation_only'?'observation_only':
               status==='behavior_not_observed'?'not_observed':
@@ -3725,7 +4317,7 @@ export async function runLocalAudit(
               src.path===activeEntry.plan.path);
             let reported="";
             try{
-              const value=JSON.parse(output) as {source_sha256?:unknown};
+              const value=JSON.parse(fullVerifierOutput) as {source_sha256?:unknown};
               if(typeof value.source_sha256==="string")reported=value.source_sha256;
             }catch{}
             if(!expected||reported!==expected.sha256){
@@ -3741,21 +4333,26 @@ export async function runLocalAudit(
           stageLock.finishExperiment(activeStageCandidate,outcome);
           if(analysisProgressStore &&
             [...analysisProgressStore.records.values()].some(r=>r.experimentIds.includes(activeStageCandidate!))){
-            const verifierDigest=createHash('sha256').update(output).digest('hex');
+            const verifierDigest=createHash('sha256').update(fullVerifierOutput).digest('hex');
             let caseId='';
             let detail='';
             try{
-              const parsed=JSON.parse(output) as {caseId?:string|null;detail?:string;reason?:string};
+              const parsed=JSON.parse(fullVerifierOutput) as {caseId?:string|null;detail?:string;reason?:string};
               caseId=typeof parsed.caseId==='string'?parsed.caseId:'';
               detail=String(parsed.detail||parsed.reason||'');
-            }catch{detail='unparseable_verifier_evidence';}
+            }catch{detail='unparseable_verifier_evidence:'+fullVerifierOutput.slice(0,400).replace(/[\\r\\n]+/g,' ');}
             const evidenceId=createHash('sha256').update(JSON.stringify([
               activeStageCandidate,caseId,verifierDigest])).digest('hex');
-            if(outcome==='observed'||outcome==='not_observed')
+            if(outcome==='observed'||outcome==='not_observed'){
               analysisProgressStore.markExperimentCompleted(activeStageCandidate,{
                 result:outcome,verifierDigest,evidenceId,
               });
-            else analysisProgressStore.recordInconclusive(activeStageCandidate,
+              // Do not erase an inconclusive queue outcome until the progress
+              // store proves its new, source-identified verifier replacement.
+              for(const previous of analysisProgressStore
+                .retirableInconclusiveExperiments(activeStageCandidate))
+                stageLock.retireVerifiedInconclusive(previous,activeStageCandidate);
+            }else analysisProgressStore.recordInconclusive(activeStageCandidate,
               outcome,evidenceId,sourceMismatch||detail||'no_conclusive_falsifier');
             await analysisProgressStore.save();
             limits.onCandidateCoverage?.(analysisProgressStore.counts);
@@ -3765,7 +4362,9 @@ export async function runLocalAudit(
           activeStageCandidate=null;
         }
         if(['verify_source','verify_python'].includes(call.function.name) && !output.startsWith('Tool error:')) {
-          const result=JSON.parse(output);
+          // Archive the canonical verifier transcript, not an excerpted
+          // context envelope that omits the executed source identity.
+          const result=JSON.parse(fullVerifierOutput);
           const sourcePath=String(call.function.arguments?.path||'');
           const id=await controllerArchive?.append('probe',{
             path:sourcePath,function:call.function.arguments?.query,

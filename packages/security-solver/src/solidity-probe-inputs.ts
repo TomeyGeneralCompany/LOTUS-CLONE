@@ -1,3 +1,5 @@
+import {canonicalElementaryAbiType} from './solidity-abi-types';
+
 /** Deterministic local-EVM test values, never external account data.
  * Return null when the declaration needs semantic setup rather than guesswork. */
 export function fixtureArguments(types:string[]):unknown[]|null {
@@ -11,12 +13,13 @@ export function fixtureArguments(types:string[]):unknown[]|null {
       values.push(Array.from({length:count},()=>one[0]));continue;
     }
     if(/\[\]$/.test(type)){values.push([]);continue;}
-    if(/^u?int(?:[0-9]{1,3})?$/.test(type)){values.push('7');continue;}
+    const elementary=canonicalElementaryAbiType(type);
+    if(elementary&&/^u?int/.test(elementary)){values.push('7');continue;}
     if(type==='bool'){values.push(true);continue;}
     if(type==='address'||type==='address payable'){values.push('$account1');continue;}
     if(type==='string'){values.push('TOMEY_LOCAL_PROBE');continue;}
     if(type==='bytes'){values.push('0x4142');continue;}
-    const sized=type.match(/^bytes([1-9]|[12][0-9]|3[012])$/);
+    const sized=elementary?.match(/^bytes([1-9]|[12][0-9]|3[012])$/);
     if(sized){values.push('0x'+'41'.repeat(Number(sized[1])));continue;}
     return null; // structs, contracts, mappings and custom types need a setup plan
   }
@@ -29,9 +32,21 @@ export interface SolidityProbeDeclaration {
 /** Construct a local baseline/transition test from declarations, not imagined
  * state expectations. Unresolved ABI setup returns null. */
 export function buildBaselineSequence(menu:SolidityProbeDeclaration[],selectedSelector:string,adversarialRoleTest=false) {
-  const selected=menu.find(entry=>entry.selector===selectedSelector && entry.operation==='send');
+  const dot=selectedSelector.lastIndexOf('.');
+  if(dot<1)return null;
+  const contract=selectedSelector.slice(0,dot);
+  const requested=selectedSelector.slice(dot+1);
+  const requestedMatch=/^([A-Za-z_][A-Za-z0-9_]*)(?:\((.*)\))?$/.exec(requested);
+  if(!requestedMatch)return null;
+  const selectedMethod=requestedMatch[1];
+  const signature=(entry:SolidityProbeDeclaration)=>
+    entry.selector.split('.').at(-1)+'('+entry.inputs.join(',')+')';
+  const overloads=menu.filter(entry=>entry.selector===contract+'.'+selectedMethod &&
+    entry.operation==='send');
+  const selected=requestedMatch[2]!==undefined?
+    overloads.find(entry=>contract+'.'+signature(entry)===selectedSelector):
+    overloads.length===1?overloads[0]:undefined;
   if(!selected)return null;
-  const contract=selectedSelector.split('.')[0];
   const declarations=menu.filter(entry=>entry.selector.startsWith(contract+'.'));
   const constructors=declarations.filter(entry=>entry.operation==='constructor');
   if(constructors.length>1)return null;
@@ -42,15 +57,14 @@ export function buildBaselineSequence(menu:SolidityProbeDeclaration[],selectedSe
   // deterministic positive transfer scenario. Empty batches and transfers
   // back to the same account cannot establish a useful state transition.
   const erc1155=contract==='ERC1155Upgradeable';
-  const erc1155Single=erc1155 && selectedSelector.endsWith('.safeTransferFrom') &&
+  const erc1155Single=erc1155 && selectedMethod==='safeTransferFrom' &&
     JSON.stringify(selected.inputs)===JSON.stringify(['address','address','uint256','uint256','bytes']);
-  const erc1155Batch=erc1155 && selectedSelector.endsWith('.safeBatchTransferFrom') &&
+  const erc1155Batch=erc1155 && selectedMethod==='safeBatchTransferFrom' &&
     JSON.stringify(selected.inputs)===JSON.stringify(['address','address','uint256[]','uint256[]','bytes']);
   if(erc1155Single)sendArgs=['$account1','$account2','7','7','0x4142'];
   if(erc1155Batch)sendArgs=['$account1','$account2',['7'],['7'],'0x4142'];
   // A zero-input getter is preferable to an unrelated parameterized read;
   // these are observations, not invented assertions about correctness.
-  const selectedMethod=selectedSelector.split('.').at(-1)||'';
   const roleName=/^(?:rotate|change|set|update|transfer|assign)([A-Z][A-Za-z0-9_]*)$/.exec(selectedMethod)?.[1];
   const expectedGetter=roleName?roleName[0].toLowerCase()+roleName.slice(1):'';
   reads.sort((a,b)=>{
@@ -68,13 +82,12 @@ export function buildBaselineSequence(menu:SolidityProbeDeclaration[],selectedSe
       JSON.stringify(entry.inputs)===JSON.stringify(['address','uint256']));
     if(!balance)return null;
     read=balance;readArgs=['$account2','7'];
-  } else if(erc1155 && selectedSelector.endsWith('.setApprovalForAll')) {
+  } else if(erc1155 && selectedMethod==='setApprovalForAll') {
     const approved=reads.find(entry=>entry.selector===contract+'.isApprovedForAll' &&
       JSON.stringify(entry.inputs)===JSON.stringify(['address','address']));
     if(approved){read=approved;readArgs=['$account0','$account1'];}
   }
   if(!read || !constructorArgs || !sendArgs || !readArgs)return null;
-  const signature=(entry:SolidityProbeDeclaration)=>entry.selector.split('.').at(-1)+'('+entry.inputs.join(',')+')';
   // This is only an authorization *observation* when the caller has source
   // evidence of a protected role consumer. A nonadmin sender and a distinct
   // target role make the before/after state interpretable.

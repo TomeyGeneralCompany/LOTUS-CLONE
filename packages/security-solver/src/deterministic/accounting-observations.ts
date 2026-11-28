@@ -2,11 +2,13 @@
 import {parse} from "@solidity-parser/parser";
 import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
 import type {SolidityProbeDeclaration} from "../solidity-probe-inputs";
+import {canonicalElementaryAbiType} from "../solidity-abi-types";
+import {posix} from "node:path";
 
 export type AccountingObservation =
   | {kind:"scalar";getter:string;sourceWitness:string;stateVariable:string}
   | {kind:"mapping";getter:string;keyType:string;stateVariable:string;sourceWitness:string}
-  | {kind:"struct_field";getter:string;keyType:string;fieldName:string;fieldType:string;fieldIndex:number;stateVariable:string;sourceWitness:string}
+  | {kind:"struct_field";getter:string;keyType:string;fieldName:string;fieldType:string;fieldIndex:number;stateVariable:string;sourceWitness:string;getterArgs?:string[]}
   | {kind:"collection_length";getter:string;stateVariable:string;sourceWitness:string}
   | {kind:"external_balance";getter:string;keyType:"address";stateVariable:string;sourceWitness:string};
 
@@ -18,76 +20,258 @@ const typeName=(node:any):string=>{
   if(node.type==="Mapping")return "mapping";
   return "";
 };
-const simple=(type:string)=>/^(?:u?int(?:[0-9]+)?|bool|address|bytes(?:[0-9]+)?)$/.test(type);
+const simple=(type:string)=>canonicalElementaryAbiType(type)!==null;
 const regexEscape=(v:string)=>v.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
 
 export function extractAccountingObservations(
   snapshot:SourceSnapshot,contractName:string,declarations:readonly SolidityProbeDeclaration[],
+  acquiredSources:readonly SourceSnapshot[]=[snapshot],
 ):AccountingObservation[]{
   let ast:any;
   try{ast=parse(snapshot.content,{loc:true,tolerant:true}) as any;}catch{return [];}
   const contract=(ast.children||[]).find((node:any)=>node.type==="ContractDefinition"&&node.name===contractName);
   if(!contract)return [];
-  const nodes=contract.subNodes||[];
-  const states=new Map<string,any>();
-  const structs=new Map<string,any[]>();
-  for(const node of nodes){
-    if(node.type==="StateVariableDeclaration")for(const v of node.variables||[]){
-      if(v?.name)states.set(v.name,v);
-    }
-    if(node.type==="StructDefinition")structs.set(node.name,node.members||[]);
+  const sourceByPath=new Map(acquiredSources.map(source=>[source.path,source]));
+  sourceByPath.set(snapshot.path,snapshot);
+  const astByPath=new Map<string,any>([[snapshot.path,ast]]);
+  for(const source of sourceByPath.values()){
+    if(astByPath.has(source.path))continue;
+    try{astByPath.set(source.path,parse(source.content,{loc:true,tolerant:true}) as any);}catch{}
   }
+  // Include only declarations reachable through an acquired inheritance edge.
+  // Public/protected getters inherited by the target are valid observations,
+  // but similarly named declarations in unrelated acquired files are not.
+  type ContractSource={path:string;ast:any;contract:any};
+  const inheritance:ContractSource[]=[];
+  const visitedContracts=new Set<string>();
+  const resolveBase=(owner:ContractSource,baseName:string):ContractSource|null=>{
+    const shortName=baseName.split('.').pop()||'';
+    const sameFile=(owner.ast.children||[]).filter((node:any)=>
+      node.type==='ContractDefinition'&&node.name===shortName);
+    if(sameFile.length===1)return {path:owner.path,ast:owner.ast,contract:sameFile[0]};
+    if(sameFile.length>1)return null;
+    const matches:ContractSource[]=[];
+    for(const directive of (owner.ast.children||[]).filter((item:any)=>
+      item.type==='ImportDirective'&&typeof item.path==='string'&&item.path.startsWith('.'))){
+      const importedPath=posix.normalize(posix.join(posix.dirname(owner.path),directive.path));
+      const importedAst=astByPath.get(importedPath);
+      if(!importedAst)continue;
+      const unitAlias=String(directive.unitAlias||'');
+      const qualifiedByUnit=!!unitAlias&&baseName.startsWith(unitAlias+'.');
+      let originalName=shortName;
+      if(Array.isArray(directive.symbolAliases)&&directive.symbolAliases.length){
+        const alias=(directive.symbolAliases as Array<[string,string|null]>).find(
+          ([original,local])=>(local||original)===shortName);
+        if(!alias)continue;
+        originalName=alias[0];
+      }else if(!qualifiedByUnit){
+        // Plain imports expose names from the file. An exact declaration match
+        // in the acquired module is required before following the edge.
+      }
+      for(const node of importedAst.children||[])if(
+        node.type==='ContractDefinition'&&node.name===originalName)
+        matches.push({path:importedPath,ast:importedAst,contract:node});
+    }
+    return matches.length===1?matches[0]:null;
+  };
+  const visit=(entry:ContractSource)=>{
+    const key=entry.path+':'+entry.contract.name;
+    if(visitedContracts.has(key))return;
+    visitedContracts.add(key);inheritance.push(entry);
+    for(const base of entry.contract.baseContracts||[]){
+      const name=String(base.baseName?.namePath||'');
+      if(!name)continue;
+      const resolved=resolveBase(entry,name);
+      if(resolved)visit(resolved);
+    }
+  };
+  visit({path:snapshot.path,ast,contract});
+  const nodes=inheritance.flatMap(entry=>(entry.contract.subNodes||[]).map((node:any)=>
+    ({node,owner:entry})));
+  const typedKinds=["StructDefinition","EnumDefinition","UserDefinedValueTypeDefinition","TypeDefinition","ContractDefinition"];
+  const states:Array<{name:string;declaration:any;owner:ContractSource}>=[];
+  const structs=new Map<string,Array<{members:any[];owner:ContractSource}>>();
+  for(const {node,owner} of nodes){
+    if(node.type==="StateVariableDeclaration")for(const v of node.variables||[]){
+      if(v?.name)states.push({name:v.name,declaration:v,owner});
+    }
+    if(node.type==="StructDefinition"){
+      const existing=structs.get(node.name)||[];
+      existing.push({members:node.members||[],owner});structs.set(node.name,existing);
+    }
+  }
+  const resolveType=(qualifiedName:string,ownerPath:string,ownerContract:any,
+    seen=new Set<string>()):{node:any;path:string}|null=>{
+    const name=qualifiedName.split('.').pop()||'';
+    const visit=ownerPath+':'+ownerContract?.name+':'+name;
+    if(seen.has(visit))return null;seen.add(visit);
+    const ownerAst=astByPath.get(ownerPath);
+    if(!ownerAst)return null;
+    const local=[...(ownerContract?.subNodes||[]),...(ownerAst.children||[])].filter((item:any)=>
+      item.name===name&&typedKinds.includes(item.type));
+    if(local.length===1)return {node:local[0],path:ownerPath};
+    if(local.length>1)return null;
+    const imported:Array<{node:any;path:string}> = [];
+    for(const directive of (ownerAst.children||[]).filter((item:any)=>item.type==="ImportDirective")){
+      if(typeof directive.path!=="string"||!directive.path.startsWith("."))continue;
+      const importedPath=posix.normalize(posix.join(posix.dirname(ownerPath),directive.path));
+      const importedAst=astByPath.get(importedPath);
+      if(!importedAst)continue;
+      const unitAlias=String(directive.unitAlias||"");
+      const aliases=Array.isArray(directive.symbolAliases)&&directive.symbolAliases.length?
+        directive.symbolAliases.map(([original,alias]:[string,string|null])=>
+          ({original,local:alias||original})):[{original:name,local:name}];
+      const match=aliases.find((item:any)=>item.local===name)||
+        (unitAlias&&qualifiedName.startsWith(unitAlias+".")?
+          {original:name,local:name}:null);
+      if(!match)continue;
+      for(const item of importedAst.children||[])if(item.name===match.original&&typedKinds.includes(item.type))
+        imported.push({node:item,path:importedPath});
+    }
+    return imported.length===1?imported[0]:null;
+  };
+  const sourceAbiType=(node:any,ownerPath=snapshot.path,ownerContract:any=contract,
+    seen=new Set<any>()):string|null=>{
+    if(!node||seen.has(node))return null;
+    seen.add(node);
+    if(node.type==="ElementaryTypeName")return canonicalElementaryAbiType(String(node.name||''));
+    if(node.type==="ArrayTypeName"){
+      const base=sourceAbiType(node.baseTypeName,ownerPath,ownerContract,new Set(seen));if(!base)return null;
+      const length=node.length?.number??node.length?.value;
+      return length===undefined||length===null?base+'[]':/^\d+$/.test(String(length))?base+'['+String(length)+']':null;
+    }
+    if(node.type!=="UserDefinedTypeName")return null;
+    const fullName=String(node.namePath||'');
+    const name=fullName.split('.').pop()||'';
+    const found=resolveType(fullName,ownerPath,ownerContract);
+    if(!found)return null;
+    if(found.node.type==="ContractDefinition")return 'address';
+    if(found.node.type==="EnumDefinition")return (found.node.members||[]).length<=256?'uint8':null;
+    if(found.node.type==="StructDefinition"){
+      const fields=(found.node.members||[]).map((field:any)=>
+        sourceAbiType(field.typeName,found.path,found.node,new Set(seen)));
+      return fields.length&&fields.every(Boolean)?'('+fields.join(',')+')':null;
+    }
+    return sourceAbiType(found.node.underlyingType||found.node.typeName||found.node.definition,
+      found.path,found.node,new Set(seen));
+  };
   const out:AccountingObservation[]=[];
   const seen=new Set<string>();
   const add=(o:AccountingObservation)=>{
     const key=JSON.stringify(o);if(!seen.has(key)){seen.add(key);out.push(o);}
   };
-  for(const fn of nodes){
+  for(const {node:fn,owner:fnOwner} of nodes){
     if(fn.type!=="FunctionDefinition"||!fn.name||!fn.body||!["view","pure"].includes(fn.stateMutability))continue;
-    const declaration=declarations.find(d=>d.selector===contractName+"."+fn.name&&d.operation==="call");
+    const inputs=(fn.parameters||[]).map((parameter:any)=>
+      sourceAbiType(parameter.typeName,fnOwner.path,fnOwner.contract));
+    if(inputs.some((input:string|null)=>input===null))continue;
+    const declaration=declarations.find(d=>d.selector===contractName+"."+fn.name&&
+      d.operation==="call"&&JSON.stringify(d.inputs)===JSON.stringify(inputs));
     if(!declaration)continue;
     const getter=fn.name+"("+declaration.inputs.join(",")+")";
-    const fnLines=snapshot.content.split("\n");
+    const fnSource=sourceByPath.get(fnOwner.path)||snapshot;
+    const fnLines=fnSource.content.split("\n");
     const line=Math.max(1,fn.loc?.start?.line||1),last=Math.max(line,fn.loc?.end?.line||line);
     const body=fnLines.slice(line-1,last).join("\n");
-    const witness=snapshot.path+":"+line+"-"+last+":"+snapshot.sha256;
+    const functionWitness=fnSource.path+":"+line+"-"+last+":"+fnSource.sha256;
+    const cleanBody=body.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,'');
     const returns=fn.returnParameters||[];
-    const resultType=returns.length===1?typeName(returns[0]?.typeName):"";
-    for(const [name,state] of states){
+    const resultSourceType=returns.length===1?typeName(returns[0]?.typeName):"";
+    const resultType=returns.length===1?
+      sourceAbiType(returns[0]?.typeName,fnOwner.path,fnOwner.contract)||resultSourceType:"";
+    for(const {name,declaration:state,owner:stateOwner} of states){
       if(!new RegExp("\\b"+regexEscape(name)+"\\b").test(body))continue;
+      const sameName=states.filter(item=>item.name===name);
+      const localState=sameName.filter(item=>item.owner.path===fnOwner.path);
+      if(localState.length===1&&localState[0]!==states.find(item=>
+        item.name===name&&item.owner.path===stateOwner.path&&item.declaration===state))continue;
+      if(localState.length===0&&sameName.length!==1)continue;
+      const stateLine=Math.max(1,state.loc?.start?.line||1);
+      const witness=functionWitness+";state="+stateOwner.path+":"+stateLine+":"+
+        (sourceByPath.get(stateOwner.path)||snapshot).sha256;
       const stateType=state.typeName;
-      if(new RegExp("\\b"+regexEscape(name)+"\\s*\\.\\s*length\\b").test(body)&&declaration.inputs.length===0&&simple(resultType)){
+      if(new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\.\\s*length\\s*;",'s').test(cleanBody)&&
+        declaration.inputs.length===0&&resultType==="uint256"){
         add({kind:"collection_length",getter,stateVariable:name,sourceWitness:witness});
       }
       // Only an exact source-level return of token.balanceOf(caller) is an
       // equivalent public readback. A fee, share-price or event-only wrapper
       // cannot be interpreted as a token balance.
       const tokenType=typeName(stateType);
+      const resolvedTokenType=stateType?.type==="UserDefinedTypeName"?
+        resolveType(String(stateType.namePath||""),stateOwner.path,stateOwner.contract):null;
+      const acquiredBalanceOf=(resolvedTokenType?.node.subNodes||[]).some((candidate:any)=>
+        candidate.type==="FunctionDefinition"&&candidate.name==="balanceOf"&&
+        ["public","external"].includes(candidate.visibility)&&
+        ["view","pure"].includes(candidate.stateMutability||"")&&
+        (candidate.parameters||[]).length===1&&
+        canonicalElementaryAbiType(typeName(candidate.parameters[0]?.typeName))==="address"&&
+        (candidate.returnParameters?.length||0)===1&&
+        /^uint(?:[0-9]{1,3})?$/.test(String(canonicalElementaryAbiType(
+          typeName(candidate.returnParameters[0]?.typeName))||"")));
       const parameter=String(fn.parameters?.[0]?.name||"");
-      if(/^(?:I?ERC20|IERC20Upgradeable|ERC20Upgradeable|MockERC20|ERC20Mock)$/.test(tokenType)&&
+      if((/^(?:I?ERC20|IERC20Upgradeable|ERC20Upgradeable|MockERC20|ERC20Mock)$/.test(tokenType)||
+          acquiredBalanceOf)&&
         declaration.inputs.length===1&&declaration.inputs[0]==="address"&&
+        canonicalElementaryAbiType(typeName(fn.parameters?.[0]?.typeName))==="address"&&
         /^[A-Za-z_][A-Za-z0-9_]*$/.test(parameter)&&
         new RegExp("\\breturn\\s+"+regexEscape(name)+
-          "\\s*\\.\\s*balanceOf\\s*\\(\\s*"+parameter+"\\s*\\)\\s*;").test(body)){
+          "\\s*\\.\\s*balanceOf\\s*\\(\\s*"+parameter+"\\s*\\)\\s*;",'s').test(cleanBody)){
         add({kind:"external_balance",getter,keyType:"address",stateVariable:name,sourceWitness:witness});
       }
       if(stateType?.type==="Mapping"&&declaration.inputs.length===1){
-        const keyType=typeName(stateType.keyType);
-        if(declaration.inputs[0]===keyType && simple(resultType))
+        const keyType=sourceAbiType(stateType.keyType,stateOwner.path,stateOwner.contract)||typeName(stateType.keyType);
+        const valueType=sourceAbiType(stateType.valueType,stateOwner.path,stateOwner.contract)||
+          canonicalElementaryAbiType(typeName(stateType.valueType))||"";
+        const matchingKey=(fn.parameters||[]).filter((parameter:any)=>
+          sourceAbiType(parameter.typeName,fnOwner.path,fnOwner.contract)===keyType);
+        const exactMappingRead=matchingKey.some((parameter:any)=>/^[A-Za-z_]\w*$/.test(String(parameter.name||''))&&
+          new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\[\\s*"+
+            regexEscape(String(parameter.name))+"\\s*\\]\\s*;",'s').test(cleanBody));
+        // A lossy cast may return a value that looks like this ledger while
+        // hiding its real amount. Treat a getter as a state observation only
+        // when its complete ABI value type matches the mapped source value.
+        if(declaration.inputs[0]===keyType&&simple(resultType)&&resultType===valueType&&exactMappingRead)
           add({kind:"mapping",getter,keyType,stateVariable:name,sourceWitness:witness});
       }
-      if(declaration.inputs.length===0&&simple(resultType)&&stateType?.type==="ElementaryTypeName"&&
-         new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*;").test(body)){
+      const exactStateAbi=sourceAbiType(stateType,stateOwner.path,stateOwner.contract);
+      if(declaration.inputs.length===0&&simple(resultType)&&resultType===exactStateAbi&&
+         stateType?.type==="ElementaryTypeName"&&
+         new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*;",'s').test(cleanBody)){
         add({kind:"scalar",getter,stateVariable:name,sourceWitness:witness});
       }
-      if(stateType?.type==="ArrayTypeName"&&declaration.inputs.length===1&&/^u?int/.test(declaration.inputs[0])){
+      if(stateType?.type==="ArrayTypeName"&&declaration.inputs.length===1&&
+        /^u?int/.test(canonicalElementaryAbiType(declaration.inputs[0])||'')){
         const structName=typeName(stateType.baseTypeName);
-        const fields=structs.get(structName)||[];
-        if(resultType===structName&&fields.length){
-          fields.forEach((field:any,index:number)=>{
-            const ft=typeName(field.typeName);
+        const indexParameter=(fn.parameters||[]).map((parameter:any)=>{
+          if(sourceAbiType(parameter.typeName,fnOwner.path,fnOwner.contract)!==declaration.inputs[0]||
+            !/^[A-Za-z_]\w*$/.test(String(parameter.name||'')))return null;
+          const exact=new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\[\\s*"+
+            regexEscape(String(parameter.name))+"\\s*\\]\\s*;",'s');
+          const oneBased=new RegExp("\\breturn\\s+"+regexEscape(name)+"\\s*\\[\\s*"+
+            regexEscape(String(parameter.name))+"\\s*-\\s*1\\s*\\]\\s*;",'s');
+          if(oneBased.test(cleanBody))return {parameter,firstRecordArg:'1'};
+          if(exact.test(cleanBody))return {parameter,firstRecordArg:'0'};
+          return null;
+        }).find(Boolean);
+        const structMatches=structs.get(structName)||[];
+        const matchingStructs=structMatches.filter(item=>
+          item.owner.path===stateOwner.path||item.owner.contract===stateOwner.contract);
+        const selectedStructs=matchingStructs.length?matchingStructs:structMatches;
+        const importedStruct=selectedStructs.length===0?
+          resolveType(structName,stateOwner.path,stateOwner.contract):null;
+        const structOwner=selectedStructs.length===1?selectedStructs[0].owner:
+          importedStruct?.node.type==="StructDefinition"?
+            {path:importedStruct.path,ast:astByPath.get(importedStruct.path),contract:importedStruct.node}:null;
+        const structFields=selectedStructs.length===1?selectedStructs[0].members:
+          importedStruct?.node.type==="StructDefinition"?(importedStruct.node.members||[]):[];
+        if(resultSourceType===structName&&structOwner&&structFields.length&&indexParameter){
+          structFields.forEach((field:any,index:number)=>{
+            const ft=sourceAbiType(field.typeName,structOwner.path,
+              structOwner.contract)||typeName(field.typeName);
             if(simple(ft))add({kind:"struct_field",getter,keyType:declaration.inputs[0],fieldName:field.name,
-              fieldType:ft,fieldIndex:index,stateVariable:name,sourceWitness:witness});
+              fieldType:ft,fieldIndex:index,stateVariable:name,sourceWitness:witness,
+              ...(indexParameter?{getterArgs:[indexParameter.firstRecordArg]}:{})});
           });
         }
       }
