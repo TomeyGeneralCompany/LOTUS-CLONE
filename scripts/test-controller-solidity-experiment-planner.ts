@@ -1605,7 +1605,7 @@ assert.ok(representativeAlternatives.length<fixtureAlternatives.length+1,
   'Redundant cross-product graphs should not all be retried');
 for(const typeName of ['IToken','IMarket']){
   const expected=new Set(fixtureAlternatives.map(graph=>graph.implementationChoices[typeName]));
-  const covered=new Set(representativeAlternatives.map(graph=>graph.implementationChoices[typeName]));
+  const covered=new Set(representativeAlternatives.flatMap(graph=>graph.implementationChoices[typeName]?[graph.implementationChoices[typeName]]:[]));
   assert.deepEqual(covered,expected,
     'Every concrete acquired implementation must remain represented');
 }
