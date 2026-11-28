@@ -1926,7 +1926,10 @@ export function enumerateSourceFixtureDependenciesDetailed(
         missingDependencies:[...attempt.missingDependencies]});
       continue;
     }
-    for(const choice of choices)if(pending.length+seen.size<maxSearchNodes)
+    // The node budget limits work performed in this slice, not candidate
+    // discovery. Dropping a sibling here made a bounded search look exhausted
+    // even though an acquired implementation had never been examined.
+    for(const choice of choices)
       pending.push({...selections,[ambiguity.typeName]:choice.path+":"+choice.contract});
   }
   const searchExhausted=pending.length===0;
