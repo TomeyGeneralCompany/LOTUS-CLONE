@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for multi-class Solidity security evidence, compile caching, and pragma selection."""
 import importlib.util
+import hashlib
 import os
 import sys
 import tempfile
@@ -455,6 +456,7 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                 "uint256 internal constant MAX_REWARD_UNLOCK_PERIOD=365 days;\n"
                 "uint256 public rewardUnlockPeriod; uint256 public currentUnlockEndTimestamp;\n"
                 "uint256 public lastRewardTimestamp; uint256 public lastRewardAmount;\n"
+                "event DistributeReward(uint256 rewardAmount);\n"
                 "function initialize(address _mph,uint256 _rewardUnlockPeriod,address _distributor) external { "
                 "_setupRole(DISTRIBUTOR_ROLE,msg.sender); _deposit(MIN_AMOUNT); }\n"
                 "function distributeReward(uint256 rewardAmount) external { require(hasRole(DISTRIBUTOR_ROLE,msg.sender)); "
@@ -479,7 +481,8 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                 {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$contract"],"expect":"1000000000"},
                 {"operation":"send","function":"distributeReward(uint256)","args":["1000000000"],"sender":2,"expectRevert":True},
                 {"operation":"call","deploymentId":"token","function":"balanceOf(address)","args":["$contract"],"expect":"1000000000"},
-                {"operation":"send","function":"distributeReward(uint256)","args":["1000000000"],"sender":0},
+                {"operation":"send","function":"distributeReward(uint256)","args":["1000000000"],"sender":0,
+                 "expectEvents":[{"signature":"DistributeReward(uint256)","args":["1000000000"]}]},
                 {"operation":"call","function":"getPricePerFullShare()","expect":"1000000000000000000"},
                 {"operation":"advance_time","seconds":"43200"},
                 {"operation":"observe","function":"getPricePerFullShare()","args":[]},
@@ -508,22 +511,31 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
                     item.update({"reverted":step.get("expectRevert",False),"args":step.get("args",[])})
                     if step["function"]=="distributeReward(uint256)" and step["sender"]==0:
                         item.update({"eventsPassed":True,"expectedEvents":[
-                            {"signature":"DistributeReward(uint256)","passed":True}]})
+                            {"signature":"DistributeReward(uint256)","expected":["1000000000"],
+                             "observed":["1000000000"],"passed":True}],"actualEvents":[
+                            {"signature":"DistributeReward(uint256)","args":["1000000000"]}]})
                 if step["operation"]=="advance_time":
                     item.update({"seconds":step["seconds"],"fromTimestamp":str(local_time),"toTimestamp":str(local_time+43201),
                                  "elapsedSeconds":"43201"})
                     local_time+=43201
                 actual.append(item)
             result=security_experiment_disposition(root,source,"xMPH.distributeReward",
-                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual},
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual,
+                 "diagnostics":{"sourceSha256":hashlib.sha256(source.read_bytes()).hexdigest()}},
                 {"sequence":{"steps":req}})
             self.assertEqual(result[0],"behavior_not_observed")
             self.assertEqual(result[1],"source_xmph_reward_unlock_negative")
             bad_time=[dict(item) for item in actual]
             bad_time[8]=dict(actual[8],actual="1500000000000000000")
             self.assertEqual(security_experiment_disposition(root,source,"xMPH.distributeReward",
-                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":bad_time},
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":bad_time,
+                 "diagnostics":{"sourceSha256":hashlib.sha256(source.read_bytes()).hexdigest()}},
                 {"sequence":{"steps":req}})[0],"observation_only")
+            self.assertEqual(security_experiment_disposition(root,source,"xMPH.distributeReward",
+                {"accounts":ACCOUNTS,"contract":CONTRACT_ADDR,"steps":actual,
+                 "diagnostics":{"sourceSha256":"0"*64}},
+                {"sequence":{"steps":req}})[0],"observation_only",
+                "A source-hash mismatch must not certify the reward-unlock property")
 
     def test_general_source_scalar_conservation_is_independently_proven(self):
         import hashlib

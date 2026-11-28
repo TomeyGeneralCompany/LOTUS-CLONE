@@ -870,7 +870,7 @@ def security_experiment_disposition(
         return "behavior_not_observed", dynamic_position[0], dynamic_position[1]
 
     reward_unlock = _asserted_xmph_reward_unlock_negative(
-        file, selector, requested_steps, actual_steps
+        file, selector, requested_steps, actual_steps, data
     )
     if reward_unlock is not None:
         return "behavior_not_observed", reward_unlock[0], reward_unlock[1]
@@ -1059,14 +1059,18 @@ def _asserted_dynamic_position_withdrawal_negative(
 
 
 def _asserted_xmph_reward_unlock_negative(
-    file: Path, selector: str, requested_steps: list, actual_steps: list,
+    file: Path, selector: str, requested_steps: list, actual_steps: list, data: dict,
 ) -> Tuple[str, str] | None:
     """Verify the exact acquired xMPH distributor/unlock sequence and readbacks."""
     if selector != "xMPH.distributeReward" or len(requested_steps) != len(actual_steps):
         return None
     try:
         source = _strip_comments(file.read_text(encoding="utf8"))
+        source_sha = hashlib.sha256(file.read_bytes()).hexdigest()
     except (OSError, UnicodeError):
+        return None
+    diagnostics=data.get("diagnostics")
+    if not isinstance(diagnostics,dict) or diagnostics.get("sourceSha256")!=source_sha:
         return None
     required = (
         r"contract\s+xMPH\s+is\s+ERC20Upgradeable\s*,\s*AccessControlUpgradeable",
@@ -1079,6 +1083,7 @@ def _asserted_xmph_reward_unlock_negative(
         r"function\s+withdraw\s*\(\s*uint256\s+_shareAmount\s*\)",
         r"function\s+distributeReward\s*\(\s*uint256\s+rewardAmount\s*\)",
         r"require\(hasRole\(DISTRIBUTOR_ROLE\s*,\s*msg\.sender\)",
+        r"event\s+DistributeReward\s*\(\s*uint256\s+\w+\s*\)",
         r"mph\.safeTransferFrom\(msg\.sender\s*,\s*address\(this\)\s*,\s*rewardAmount\)",
         r"currentUnlockEndTimestamp\s*=\s*block\.timestamp\s*\+\s*rewardUnlockPeriod",
         r"lastRewardTimestamp\s*=\s*block\.timestamp",
@@ -1135,11 +1140,42 @@ def _asserted_xmph_reward_unlock_negative(
                 if req.get("operation") == "send" and
                 req.get("function") == "distributeReward(uint256)" and
                 req.get("sender") == 0 and req.get("expectRevert") is not True]
+    if len(rejects) != 1 or len(succeeds) != 1:
+        return None
+    expected_reward_events=succeeds[0][1].get("expectedEvents")
+    if not isinstance(expected_reward_events,list) or any(not isinstance(event,dict)
+        for event in expected_reward_events):
+        return None
     if (len(rejects) != 1 or rejects[0][1].get("reverted") is not True or
             len(succeeds) != 1 or succeeds[0][1].get("reverted") is not False or
             succeeds[0][1].get("eventsPassed") is not True or
             not any(event.get("signature") == "DistributeReward(uint256)" and event.get("passed") is True
-                    for event in succeeds[0][1].get("expectedEvents", []))):
+                    for event in expected_reward_events)):
+        return None
+    reward_args=succeeds[0][0].get("args", [])
+    if len(reward_args)!=1 or not str(reward_args[0]).isdecimal():
+        return None
+    reward_event_args=[str(reward_args[0])]
+    requested_reward_events=succeeds[0][0].get("expectEvents",[])
+    actual_reward_events=succeeds[0][1].get("actualEvents",[])
+    if (not isinstance(requested_reward_events,list) or
+            not isinstance(actual_reward_events,list) or
+            any(not isinstance(event,dict) for event in requested_reward_events+actual_reward_events)):
+        return None
+    if (len(requested_reward_events)!=1 or len(expected_reward_events)!=1 or
+            not isinstance(requested_reward_events[0].get("args"),list) or
+            not isinstance(expected_reward_events[0].get("expected"),list) or
+            not isinstance(expected_reward_events[0].get("observed"),list)):
+        return None
+    if (len(requested_reward_events)!=1 or
+            requested_reward_events[0].get("signature")!="DistributeReward(uint256)" or
+            [str(x) for x in requested_reward_events[0].get("args",[])]!=reward_event_args or
+            len(expected_reward_events)!=1 or
+            [str(x) for x in expected_reward_events[0].get("expected",[]) ]!=reward_event_args or
+            [str(x) for x in expected_reward_events[0].get("observed",[]) ]!=reward_event_args or
+            not any(event.get("signature")=="DistributeReward(uint256)" and
+                    [str(x) for x in event.get("args",[]) ]==reward_event_args
+                    for event in actual_reward_events)):
         return None
     rejected_at = next(i for i,(req,_) in enumerate(zip(requested_steps,actual_steps))
                        if req is rejects[0][0])
@@ -1189,7 +1225,6 @@ def _asserted_xmph_reward_unlock_negative(
         return None
     if midpoint is None:
         return None
-    reward_args=succeeds[0][0].get("args", [])
     initializers=[req for req in requested_steps if req.get("operation")=="send" and
                   req.get("function")=="initialize(address,uint256,address)"]
     if (not reward_args or not str(reward_args[0]).isdecimal() or len(initializers)!=1 or
