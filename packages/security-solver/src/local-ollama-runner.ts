@@ -1939,8 +1939,18 @@ export async function runLocalAudit(
         stageLock.completeReviews();
         await appendFile(logFile,'[REVIEW_COMPLETE] '+JSON.stringify({eligible:0})+'\n');
         await appendFile(logFile,'[STAGE_UNLOCK] REVIEW -> REPORT\n');
+        const coverage=analysisProgressStore?.counts;
+        const unresolved=coverage?.unresolvedIds.length||0;
+        const explicit=coverage?.explicitlyUnresolvedIds.length||0;
+        const blockerSummary=Object.entries(coverage?.unresolvedReasons||{})
+          .flatMap(([id,reasons])=>reasons.map(reason=>id+': '+reason))
+          .slice(0,4).join('; ');
         const disposition=JSON.stringify({findings:[],outcome:'no_testable_candidate',
-          reason:'No source-grounded executable security scenario qualified after complete indexed source reading and analysis.'});
+          reason:(unresolved?
+            'No source-grounded executable security scenario qualified after complete indexed source reading and analysis. '+
+              unresolved+' candidate properties unresolved ('+explicit+' explicitly dispositioned)'+
+              (blockerSummary?'; blockers: '+blockerSummary:'')+'.':
+            'No source-grounded executable security scenario qualified after complete indexed source reading and analysis.').slice(0,980)});
         const rejected=await limits.validateFinal?.(disposition);
         if(rejected)throw new Error('CONTROLLER_EMPTY_EXPERIMENT_REPORT_REJECTED: '+String(rejected));
         stageLock.completeReport(true);
