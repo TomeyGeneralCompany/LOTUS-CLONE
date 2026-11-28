@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {constructSolidityExperiments,pickFlexibleArg,sourcePreparationGraph} from '../packages/security-solver/src/controller-solidity-experiment-planner';
+import {constructSolidityExperiments,pickFlexibleArg,sourcePreparationGraph,representativeFixtureGraphs} from '../packages/security-solver/src/controller-solidity-experiment-planner';
 import {resolveSourceFixtureDependencies,verifyAcquiredReceiverMethods} from '../packages/security-solver/src/deterministic/fixture-dependency-planner';
 const content=`pragma solidity ^0.8.20;
 contract Vault {
@@ -1587,6 +1587,22 @@ if(dynamicPositionPlan.ok){
       &&step.expect==='0').map(step=>step.function),
     ['totalInterestOwed()','totalFeeOwed()','totalInterestOwed()','totalFeeOwed()'],
     'The fixture must prove both interest and fee ledgers start and finish at zero');
+}
+
+
+const fixtureAlternatives=[
+  {implementationChoices:{IToken:'TokenA.sol:TokenA',IMarket:'MarketA.sol:MarketA'}},
+  {implementationChoices:{IToken:'TokenB.sol:TokenB',IMarket:'MarketB.sol:MarketB'}},
+  {implementationChoices:{IToken:'TokenA.sol:TokenA',IMarket:'MarketB.sol:MarketB'}},
+];
+const representativeAlternatives=representativeFixtureGraphs(fixtureAlternatives);
+assert.ok(representativeAlternatives.length<fixtureAlternatives.length,
+  'Redundant cross-product graphs should not all be retried');
+for(const typeName of ['IToken','IMarket']){
+  const expected=new Set(fixtureAlternatives.map(graph=>graph.implementationChoices[typeName]));
+  const covered=new Set(representativeAlternatives.map(graph=>graph.implementationChoices[typeName]));
+  assert.deepEqual(covered,expected,
+    'Every concrete acquired implementation must remain represented');
 }
 
 console.log('Standalone experiment construction passed');

@@ -15,6 +15,33 @@ import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from
 import {extractAccountingObservations} from './deterministic/accounting-observations';
 import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependenciesDetailed, verifyAcquiredReceiverMethods, verifyCanonicalInheritedPackageMethod, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
 
+/** Select a compact set of complete deployment graphs that collectively
+ * exercises every acquired concrete implementation. The omitted graph
+ * combinations remain unresolved and are reported to the caller.
+ */
+export function representativeFixtureGraphs<
+  T extends {implementationChoices?:Readonly<Record<string,string>>}
+>(graphs:readonly T[]):T[] {
+  const remaining=[...graphs];
+  const uncovered=new Set(remaining.flatMap(graph=>
+    Object.values(graph.implementationChoices||{})));
+  const selected:T[]=[];
+  while(remaining.length&&uncovered.size){
+    let bestIndex=0,bestCoverage=-1;
+    for(let index=0;index<remaining.length;index++){
+      const coverage=Object.values(remaining[index].implementationChoices||{})
+        .filter(value=>uncovered.has(value)).length;
+      if(coverage>bestCoverage){bestCoverage=coverage;bestIndex=index;}
+    }
+    const [best]=remaining.splice(bestIndex,1);
+    selected.push(best);
+    for(const value of Object.values(best.implementationChoices||{}))
+      uncovered.delete(value);
+  }
+  if(!selected.length&&graphs.length)selected.push(graphs[0]);
+  return selected;
+}
+
 export interface SourceSnapshot {path:string;sha256:string;content:string}
 export interface StaticLeadHint {
   path:string;line:number;rule:string;message:string;severity?:string;engine?:string;
@@ -5490,15 +5517,18 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
     const fixtureEnumeration=enumerateSourceFixtureDependenciesDetailed(target,contract.name,
       [...indexed.values()],{maxAlternatives:4096,maxSearchNodes:8192});
     const fixtureGraphs=fixtureEnumeration.alternatives;
+    const representativeGraphs=representativeFixtureGraphs(fixtureGraphs);
+    const omittedGraphCount=fixtureGraphs.length-representativeGraphs.length;
     const fixtureChoiceSets:Readonly<Record<string,string>|undefined>[]=
-      fixtureGraphs.length?fixtureGraphs.map(graph=>graph.implementationChoices):
+      representativeGraphs.length?representativeGraphs.map(graph=>graph.implementationChoices):
         fixtureEnumeration.complete?[undefined]:[];
-    if(!fixtureEnumeration.complete){
+    if(!fixtureEnumeration.complete||omittedGraphCount>0){
       const unresolved=fixtureEnumeration.unresolvedSelections.slice(0,8).map(item=>
         JSON.stringify(item.selection)+":"+item.missingDependencies.join(","));
       fixtureSearchIncompleteReason=`Source fixture alternatives are incomplete after ${fixtureEnumeration.searchNodes} search nodes; `+
         `${fixtureEnumeration.pendingSelections} selections remain unexplored; `+
         `${fixtureEnumeration.unresolvedSelections.length} branches lack executable fixture graphs`+
+        (omittedGraphCount?` (${omittedGraphCount} cross-graph combinations deferred after concrete-implementation coverage)`:'')+
         (unresolved.length?` (${unresolved.join("; ")})`:"");
       if(!invariantUnresolved)invariantUnresolved={
         category:'missing_fixture',reason:fixtureSearchIncompleteReason};
