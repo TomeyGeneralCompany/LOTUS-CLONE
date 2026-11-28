@@ -1863,6 +1863,7 @@ export async function runLocalAudit(
           // verifier may issue a terminal unavailability disposition.
           await certifyUnavailableInterfaces();
           analysisProgressStore.markExplicitlyUnresolved();
+          await analysisProgressStore.save();
           const disposition=analysisProgressStore.experimentCertificate;
           const unresolvedHaveReasons=disposition.unresolvedIds.every(id=>
             (disposition.pendingReasons[id]||[]).length>0);
