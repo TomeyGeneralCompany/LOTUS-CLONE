@@ -276,7 +276,8 @@ export class AnalysisProgressStore {
       if(reasons.length===0)continue;
       record.lifecycle="explicitly_unresolved";
     }
-    return unresolved.map(record=>record.id).sort();
+    return unresolved.filter(record=>record.lifecycle==="explicitly_unresolved")
+      .map(record=>record.id).sort();
   }
   get experimentCertificate():LeadExperimentCertificate {
     const entries=[...this.records.values()].sort((a,b)=>a.id.localeCompare(b.id));

@@ -1945,12 +1945,14 @@ export async function runLocalAudit(
         const coverage=analysisProgressStore?.counts;
         const unresolved=coverage?.unresolvedIds.length||0;
         const explicit=coverage?.explicitlyUnresolvedIds.length||0;
+        const unavailable=coverage?.sourceUnavailable||0;
         const blockerSummary=Object.entries(coverage?.unresolvedReasons||{})
           .flatMap(([id,reasons])=>reasons.map(reason=>id+': '+reason))
           .slice(0,4).join('; ');
         const disposition=JSON.stringify({findings:[],outcome:'no_testable_candidate',
           reason:(unresolved?
             'No source-grounded executable security scenario qualified after complete indexed source reading and analysis. '+
+              unavailable+' independently verified source-unavailable; '+
               unresolved+' candidate properties unresolved ('+explicit+' explicitly dispositioned)'+
               (blockerSummary?'; blockers: '+blockerSummary:'')+'.':
             'No source-grounded executable security scenario qualified after complete indexed source reading and analysis.').slice(0,980)});

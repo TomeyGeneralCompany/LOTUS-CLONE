@@ -181,6 +181,7 @@ function buildDeterministicNegativeFinal(input: DeterministicAuditTurnInput): Re
   const indexedCount = input.sourceIndexedCount ?? Math.max(readCount, input.initialSourcePaths?.length ?? input.sources.length);
   const unresolvedCandidates=input.candidateCoverage?.unresolvedIds.length ?? 0;
   const explicitlyUnresolved=input.candidateCoverage?.explicitlyUnresolvedIds.length ?? 0;
+  const sourceUnavailable=input.candidateCoverage?.sourceUnavailable ?? 0;
   const blockerCounts=new Map<string,number>();
   for(const reasons of Object.values(input.candidateCoverage?.unresolvedReasons||{}))
     for(const reason of reasons)blockerCounts.set(reason,(blockerCounts.get(reason)||0)+1);
@@ -191,6 +192,7 @@ function buildDeterministicNegativeFinal(input: DeterministicAuditTurnInput): Re
     `${readCount}/${indexedCount} source files inspected; ${totalSelected} experiments selected: ` +
     `${o.not_observed} source-supported negative experiments, ${o.observation_only} observation-only, ` +
     `${o.incomplete} failed/incomplete fixtures, ${o.unsupported} unsupported, ${o.observed} observed behaviors; ` +
+    `${sourceUnavailable} independently verified source-unavailable; `+
     `${unresolvedCandidates} candidate properties unresolved (${explicitlyUnresolved} explicitly dispositioned`+
     (blockerSummary?`; leading blockers: ${blockerSummary}`:'')+`). ` +
     (incompleteTotal > 0
