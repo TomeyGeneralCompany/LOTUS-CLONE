@@ -253,6 +253,11 @@ contract InitialState is Initializable {
       {maxSearchNodes:8,resume:truncatedChoices.checkpoint}),
       /FIXTURE_SEARCH_CHECKPOINT_SOURCE_MISMATCH_OR_CORRUPT/,
       'A frontier from a different acquired source inventory must be rejected');
+    assert.throws(()=>enumerateSourceFixtureDependenciesDetailed(
+      consumerSource,'QuoteConsumer',acquire,{maxSearchNodes:8,
+        resume:{...truncatedChoices.checkpoint!,pending:[null as unknown as Record<string,string>]}}),
+      /FIXTURE_SEARCH_CHECKPOINT_SOURCE_MISMATCH_OR_CORRUPT/,
+      'A malformed persisted frontier must be discarded before it reaches the resolver');
     const fullChoices=enumerateSourceFixtureDependenciesDetailed(
       consumerSource,'QuoteConsumer',acquire);
     assert.equal(fullChoices.complete,true,

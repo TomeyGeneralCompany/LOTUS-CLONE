@@ -5582,6 +5582,7 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
   // distinct security property; refuses to fabricate when prerequisites fail.
   let invariantUnresolved: {category: InvariantUnresolvedCategory; reason: string} | null = null;
   let fixtureSearchIncompleteReason:string|null=null;
+  let fixtureSearchCheckpoint:FixtureSearchCheckpoint|undefined;
   const suppliedInvariant = (input.invariants || []).find(
     (inv) => inv.target === input.targetSelector && inv.sourceSha256 === target.sha256,
   );
@@ -5614,6 +5615,7 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
       [...indexed.values()],{maxAlternatives:4096,
         maxSearchNodes:input.fixtureSearchNodeBudget??8192,
         resume:input.fixtureSearchCheckpoint});
+    fixtureSearchCheckpoint=fixtureEnumeration.checkpoint;
     const fixtureGraphs=fixtureEnumeration.alternatives;
     const representativeGraphs=representativeFixtureGraphs(fixtureGraphs);
     const omittedGraphCount=fixtureGraphs.length-representativeGraphs.length;
@@ -5732,7 +5734,7 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
     return {ok:false,code:'FIXTURE_ENUMERATION_INCOMPLETE',
       detail:fixtureSearchIncompleteReason,unresolvedCategory:'missing_fixture',
       partialExperiments:out,
-      fixtureSearchCheckpoint:fixtureEnumeration.checkpoint};
+      fixtureSearchCheckpoint};
   }
   if(failures.length){
     // Preserve *all* source-derived obligations. A constructible property

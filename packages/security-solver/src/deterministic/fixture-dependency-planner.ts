@@ -1837,12 +1837,25 @@ const fixtureCheckpointPayload=(checkpoint:Omit<FixtureSearchCheckpoint,"checksu
   JSON.stringify(checkpoint);
 const validFixtureCheckpoint=(checkpoint:FixtureSearchCheckpoint,
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[]):boolean=>{
+  const validSelection=(selection:unknown):selection is Record<string,string>=>
+    !!selection&&typeof selection==="object"&&!Array.isArray(selection)&&
+    Object.entries(selection).every(([typeName,implementation])=>
+      /^[A-Za-z_][A-Za-z0-9_]*$/.test(typeName)&&typeof implementation==="string"&&
+      implementation.length>0&&implementation.length<=2048);
   if(!checkpoint||checkpoint.version!==1||checkpoint.targetPath!==target.path||
     checkpoint.targetSha256!==target.sha256||checkpoint.contractName!==contractName||
     checkpoint.inventoryDigest!==fixtureInventoryDigest(target,contractName,sources)||
     !Array.isArray(checkpoint.pending)||!Array.isArray(checkpoint.seenSelections)||
     !Array.isArray(checkpoint.resolvedChoices)||!Array.isArray(checkpoint.unresolvedSelections)||
     !Number.isSafeInteger(checkpoint.exploredNodes)||checkpoint.exploredNodes<0||
+    checkpoint.seenSelections.length!==checkpoint.exploredNodes||
+    !checkpoint.pending.every(validSelection)||
+    !checkpoint.seenSelections.every(validSelection)||
+    !checkpoint.resolvedChoices.every(validSelection)||
+    !checkpoint.unresolvedSelections.every(item=>item&&validSelection(item.selection)&&
+      Array.isArray(item.missingDependencies)&&item.missingDependencies.length>0&&
+      item.missingDependencies.every(reason=>typeof reason==="string"&&reason.length>0&&
+        reason.length<=2048))||
     !/^[a-f0-9]{64}$/.test(checkpoint.checksum))return false;
   const {checksum,...payload}=checkpoint;
   return createHash("sha256").update(fixtureCheckpointPayload(payload)).digest("hex")===checksum;
