@@ -634,7 +634,9 @@ export async function runLocalAudit(
         const reason=constructed.ok?"no_constructed_experiment":
           constructed.code+":"+constructed.detail.slice(0,420)+
             (altFailures.length?"; concrete: "+altFailures.join("; ").slice(0,350):"");
-        analysisProgressStore.noteRepairAttempt(lead.id,strategy,reason);
+        const completedStrategy=strategyBase+":"+repairAttemptIdentity(
+          analysisProgressStore.records.get(lead.id)!);
+        analysisProgressStore.noteRepairAttempt(lead.id,completedStrategy,reason);
         await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
           leadId:lead.id,path:lead.path,selector:lead.selector,reason,
           sourceSha256:lead.sourceSha256})+"\n");
@@ -674,7 +676,9 @@ export async function runLocalAudit(
           reused:!!preexisting,scope:limitedToCaller?"caller_integration":"concrete_source",
           sourceSha256:lead.sourceSha256,witnesses:witnesses.length})+"\n");
       }
-      analysisProgressStore.noteRepairAttempt(lead.id,strategy,
+      const completedStrategy=strategyBase+":"+repairAttemptIdentity(
+        analysisProgressStore.records.get(lead.id)!);
+      analysisProgressStore.noteRepairAttempt(lead.id,completedStrategy,
         added?("new_experiments:"+added):"no_distinct_sourced_experiment");
       if(!added){
         await appendFile(logFile,"[EXPERIMENT_REPAIR_BLOCKED] "+JSON.stringify({
