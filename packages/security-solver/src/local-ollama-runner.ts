@@ -1867,7 +1867,9 @@ export async function runLocalAudit(
           const disposition=analysisProgressStore.experimentCertificate;
           const unresolvedHaveReasons=disposition.unresolvedIds.every(id=>
             (disposition.pendingReasons[id]||[]).length>0);
-          if(unresolvedHaveReasons&&
+          const allUnresolvedExplicitlyDispositioned=
+            disposition.explicitlyUnresolvedIds.length===disposition.unresolvedIds.length;
+          if(allUnresolvedExplicitlyDispositioned&&unresolvedHaveReasons&&
             !inconclusive.observation_only&&!inconclusive.incomplete&&
             !inconclusive.unsupported&&!inconclusive.rejected){
             stageLock.completeExperiments(disposition);
@@ -1877,6 +1879,7 @@ export async function runLocalAudit(
                 explicitlyUnresolved:disposition.unresolvedIds.length,
                 pendingReasons:disposition.pendingReasons,
                 total:disposition.total})+'\n');
+            await appendFile(logFile,'[STAGE_UNLOCK] EXPERIMENT -> REVIEW\n');
             continue;
           }
           await analysisProgressStore.save();

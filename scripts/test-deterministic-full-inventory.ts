@@ -409,6 +409,12 @@ contract DividendGetter {
       'Exhausted assessed leads receive a durable, separately identified disposition');
     assert.equal(partialStore.nextRepairBatch(10).length,0,
       'A terminal unresolved disposition does not re-enter the same repair pass');
+    const reasonlessStore=await AnalysisProgressStore.open(
+      join(dir,'reasonless-unresolved.json'),[partialLead]);
+    reasonlessStore.records.get(partialLead.id)!.lifecycle='analysis_exhausted';
+    assert.deepEqual(reasonlessStore.markExplicitlyUnresolved(),[],
+      'A lifecycle label without a source-grounded blocker is not a terminal disposition');
+    assert.deepEqual(reasonlessStore.experimentCertificate.explicitlyUnresolvedIds,[]);
     const explicitCheckpoint=join(dir,'explicitly-unresolved-resume.json');
     await partialStore.save();
     const resumedExplicit=await AnalysisProgressStore.open(explicitCheckpoint,[partialLead]);

@@ -270,11 +270,10 @@ export class AnalysisProgressStore {
         ...(record.specialistAttempts||[]).map(attempt=>
           "specialist:"+attempt.adapter+":"+attempt.status+":"+attempt.reason),
         ...(record.lastError?["controller_error:"+record.lastError]:[]),
-        ...(!record.properties.length?[
-          "lifecycle:"+record.lifecycle+":no_source_grounded_property_recorded"]:[]),
       ];
-      if(reasons.length===0)reasons.push(
-        "lifecycle:"+record.lifecycle+":source_property_not_conclusively_verified");
+      // A lifecycle label or lack of a property is not a concrete blocker.
+      // Leave such a lead pending so the gate requires further analysis.
+      if(reasons.length===0)continue;
       record.lifecycle="explicitly_unresolved";
     }
     return unresolved.map(record=>record.id).sort();
