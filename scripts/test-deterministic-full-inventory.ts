@@ -3303,6 +3303,31 @@ contract MathLedger {
       e.sequence.steps.some(step=>step.operation==='call'&&
         step.function==='total()'&&step.expect==='600')),
       'The invariant must test total conservation even if only the balance ledger has an opposing write');
+    const deepAccountingHelpers=(prefix:string,operator:'+='|'-=')=>
+      Array.from({length:55},(_,i)=>'function _'+prefix+i+
+        '(uint256 amount) internal {'+
+        (i===54?'total '+operator+' amount;':'_'+prefix+(i+1)+'(amount);')+'}')
+        .join('\n');
+    const deepAccountingText='pragma solidity ^0.8.20; contract DeepAccounting { uint256 public total; function deposit(uint256 amount) external { _d0(amount); } function withdraw(uint256 amount) external { _w0(amount); } '+
+      deepAccountingHelpers('d','+=')+' '+deepAccountingHelpers('w','-=')+' }';
+    const deepAccountingSource={path:'source-1/contracts/DeepAccounting.sol',
+      content:deepAccountingText,sha256:hash(deepAccountingText)};
+    const deepAccountingMenu=[
+      {selector:'DeepAccounting.total',operation:'call' as const,inputs:[],outputs:['uint256']},
+      {selector:'DeepAccounting.deposit',operation:'send' as const,inputs:['uint256']},
+      {selector:'DeepAccounting.withdraw',operation:'send' as const,inputs:['uint256']},
+    ];
+    const deepAccounting=constructSolidityExperiments({
+      repositoryCommit:'c'.repeat(40),targetPath:deepAccountingSource.path,
+      targetSelector:'DeepAccounting.deposit',sources:[deepAccountingSource],
+      declarations:deepAccountingMenu as any,skipLegacy:true});
+    assert.equal(deepAccounting.ok,true,
+      'Source-derived financial analysis must traverse every unique accounting helper');
+    if(deepAccounting.ok)assert.ok(deepAccounting.experiments.some(experiment=>
+      experiment.securityProperty.startsWith('financial ')&&
+      experiment.sequence.steps.some(step=>step.operation==='send'&&
+        step.function==='withdraw(uint256)')),
+      'Deep paired deposit and withdrawal writes must produce a falsifiable financial invariant');
     // Inherited methods use their ORIGINAL file's AST offsets; applying
     // those offsets to the child file falsely erases source-backed effects.
     const parentLedgerText=`pragma solidity ^0.8.0;

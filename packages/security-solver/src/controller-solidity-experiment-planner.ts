@@ -2550,7 +2550,9 @@ function reachableAccountingSource(
     }
   }
   const pending=[seed],visited=new Set<any>(),parts:string[]=[];
-  while(pending.length&&visited.size<48){
+  // The inherited function graph is finite, and visited prevents cycles.
+  // Do not truncate source-derived accounting after a fixed number of helpers.
+  while(pending.length){
     const fn=pending.shift()!;
     if(visited.has(fn))continue;
     visited.add(fn);
