@@ -209,34 +209,36 @@ function buildDeterministicPositiveFinal(
   observedCases: readonly DeterministicObservedCase[],
   maxFindings?: number,
 ): Record<string, unknown> {
-  const findings = observedCases.slice(0, maxFindings).map((obs) => {
-    const isSolidity = obs.kind === "solidity_sequence" || obs.path.endsWith(".sol");
-    const callerFile = obs.callerFile || obs.path;
-    const callerLine = Math.max(1, obs.callerLine || 1);
-    const reachability: "caller" | "direct_transaction" =
-      obs.reachability || (isSolidity ? "direct_transaction" : "caller");
-    const kindLabel =
-      obs.kind === "html_reflection"
-        ? "unescaped HTML reflection"
-        : obs.kind === "path_construction"
-          ? "unconfined path construction"
-          : "local Solidity security invariant violation";
-    return {
-      caseId: obs.caseId,
-      severity: "low" as const,
-      confidence: 0.65,
-      ratingReason:
-        `Deterministic controller reproduction observed ${kindLabel} on ${obs.selector} (${obs.path}) with recorded differential evidence; external deployment context and impact require independent verification.`,
-      title: `Deterministic replay observed ${kindLabel} in ${obs.selector}`.slice(0, 195),
-      impact:
-        `Verified local execution of ${obs.selector} in ${obs.path} violated the expected security assertion; actual production impact depends on deployment reachability and external controls.`,
-      callerFile,
-      callerLine,
-      reachability,
-      falsification:
-        `Independently replay recorded case ${obs.caseId.slice(0, 12)} against ${obs.path} (${obs.selector}) and inspect caller/deployment guards at ${callerFile}:${callerLine}; reject if a source-backed mitigation blocks exploitation.`,
-    };
-  });
+  const findings = observedCases
+    .slice(0, maxFindings ?? observedCases.length)
+    .map((obs) => {
+      const isSolidity = obs.kind === "solidity_sequence" || obs.path.endsWith(".sol");
+      const callerFile = obs.callerFile || obs.path;
+      const callerLine = Math.max(1, obs.callerLine || 1);
+      const reachability: "caller" | "direct_transaction" =
+        obs.reachability || (isSolidity ? "direct_transaction" : "caller");
+      const kindLabel =
+        obs.kind === "html_reflection"
+          ? "unescaped HTML reflection"
+          : obs.kind === "path_construction"
+            ? "unconfined path construction"
+            : "local Solidity security invariant violation";
+      return {
+        caseId: obs.caseId,
+        severity: "low" as const,
+        confidence: 0.65,
+        ratingReason:
+          `Deterministic controller reproduction observed ${kindLabel} on ${obs.selector} (${obs.path}) with recorded differential evidence; external deployment context and impact require independent verification.`,
+        title: `Deterministic replay observed ${kindLabel} in ${obs.selector}`.slice(0, 195),
+        impact:
+          `Verified local execution of ${obs.selector} in ${obs.path} violated the expected security assertion; actual production impact depends on deployment reachability and external controls.`,
+        callerFile,
+        callerLine,
+        reachability,
+        falsification:
+          `Independently replay recorded case ${obs.caseId.slice(0, 12)} against ${obs.path} (${obs.selector}) and inspect caller/deployment guards at ${callerFile}:${callerLine}; reject if a source-backed mitigation blocks exploitation.`,
+      };
+    });
   return {
     findings,
     outcome: "inspected",
