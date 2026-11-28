@@ -1099,7 +1099,7 @@ export async function runLocalAudit(
         const pending=[...imports];
         const visited=new Set<string>();
         let totalBytes=0;
-        while(pending.length&&visited.size<1500){
+        while(pending.length){
           const batch=pending.splice(0,128).filter(specifier=>!visited.has(specifier));
           if(!batch.length)continue;
           for(const specifier of batch)visited.add(specifier);

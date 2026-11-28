@@ -248,6 +248,18 @@ contract InitialState is Initializable {
       'Resuming the persisted frontier must finish the original source graph search');
     assert.equal(resumedChoices.alternatives.length,2,
       'Resumed fixture search must retain both acquired concrete implementations');
+    const alternativeSlice=enumerateSourceFixtureDependenciesDetailed(
+      consumerSource,'QuoteConsumer',acquire,{maxAlternatives:1,maxSearchNodes:8});
+    assert.equal(alternativeSlice.alternatives.length,1);
+    assert.ok(alternativeSlice.checkpoint,
+      'The per-slice alternative budget must preserve the remaining acquired branch');
+    const resumedAlternativeSlice=enumerateSourceFixtureDependenciesDetailed(
+      consumerSource,'QuoteConsumer',acquire,{maxAlternatives:1,maxSearchNodes:8,
+        resume:alternativeSlice.checkpoint});
+    assert.equal(resumedAlternativeSlice.complete,true,
+      'A one-alternative slice must make progress after a checkpoint resume');
+    assert.equal(resumedAlternativeSlice.alternatives.length,2,
+      'Resumed alternative enumeration must preserve prior and newly resolved graphs');
     assert.throws(()=>enumerateSourceFixtureDependenciesDetailed(
       consumerSource,'QuoteConsumer',[...acquire,typedSrc('Unrelated','contract Unrelated {}')],
       {maxSearchNodes:8,resume:truncatedChoices.checkpoint}),

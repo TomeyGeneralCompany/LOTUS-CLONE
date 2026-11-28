@@ -96,7 +96,7 @@ function acquiredValueDeclaration(type:any,owner:any,source?:SourceSnapshot,
   byPath.set(source.path,source);
   const candidates:Array<{node:any;owner:any;source:SourceSnapshot}>=[];
   const paths=new Set<string>(),pending=[source.path];
-  while(pending.length&&paths.size<256){
+  while(pending.length){
     const path=pending.shift()!;
     if(paths.has(path))continue;
     paths.add(path);
@@ -317,7 +317,7 @@ function initializerStateBindings(
   byPath.set(source.path,source);
   const nonDeployable=new Set<string>();
   const visited=new Set<string>(),pending=[source.path];
-  while(pending.length&&visited.size<512){
+  while(pending.length){
     const path=pending.shift()!;
     if(visited.has(path))continue;
     visited.add(path);
@@ -364,7 +364,7 @@ function initializerStateBindings(
     const pending:Array<{fn:any;originForParameter:Map<string,string>;kind:"constructor"|"initializer"}>=
       [{fn,originForParameter:rootParameters,kind:rootKind}];
     const visited=new Set<any>();
-    while(pending.length&&visited.size<64){
+    while(pending.length){
       const current=pending.shift()!;
       if(visited.has(current.fn))continue;
       visited.add(current.fn);
@@ -1903,6 +1903,8 @@ export function enumerateSourceFixtureDependenciesDetailed(
   const unresolvedSelections:FixtureEnumerationResult["unresolvedSelections"]=
     structuredClone(options.resume?.unresolvedSelections||[]);
   const resolvedChoices=structuredClone(options.resume?.resolvedChoices||[]);
+  const resolvedChoiceKeys=new Set(resolvedChoices.map(choices=>
+    JSON.stringify(Object.entries(choices).sort(([a],[b])=>a.localeCompare(b)))));
   for(const choices of resolvedChoices){
     const resolved=resolveSourceFixtureDependencies(target,contractName,sources,{
       maxDepth:options.maxDepth,maxNodes:options.maxNodes,choiceByType:choices});
@@ -1915,8 +1917,8 @@ export function enumerateSourceFixtureDependenciesDetailed(
   // alternatives: a valid graph may sit behind several independent concrete
   // protocol, token, NFT, and minter branches. The caller can tune this bound;
   // we still fail closed and never synthesize unavailable implementations.
-  let nodesThisPass=0;
-  while(pending.length&&nodesThisPass<maxSearchNodes&&results.length<max){
+  let nodesThisPass=0,alternativesThisPass=0;
+  while(pending.length&&nodesThisPass<maxSearchNodes&&alternativesThisPass<max){
     const selections=pending.shift()!;
     const key=JSON.stringify(Object.entries(selections).sort(([a],[b])=>a.localeCompare(b)));
     if(seen.has(key))continue;
@@ -1925,9 +1927,12 @@ export function enumerateSourceFixtureDependenciesDetailed(
     const attempt=resolveSourceFixtureDependencies(target,contractName,sources,{
       maxDepth:options.maxDepth,maxNodes:options.maxNodes,choiceByType:selections});
     if(attempt.status==="resolved"){
-      if(!results.some(result=>
-        JSON.stringify(result.implementationChoices)===JSON.stringify(attempt.implementationChoices)))
-        {results.push(attempt);resolvedChoices.push({...attempt.implementationChoices});}
+      const choiceKey=JSON.stringify(Object.entries(attempt.implementationChoices||{})
+        .sort(([a],[b])=>a.localeCompare(b)));
+      if(!resolvedChoiceKeys.has(choiceKey)){
+        results.push(attempt);resolvedChoices.push({...attempt.implementationChoices});
+        resolvedChoiceKeys.add(choiceKey);alternativesThisPass++;
+      }
       continue;
     }
     const ambiguity=attempt.ambiguousImplementations?.find(item=>
