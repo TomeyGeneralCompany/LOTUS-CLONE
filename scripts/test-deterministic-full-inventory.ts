@@ -1701,6 +1701,17 @@ contract PlugConsumer {
       assert.deepEqual(extended.initializerOperations[0].args,['','0x',[]]);
       assert.equal(extended.bindings[0].receiver,'plug');
     }
+    const helperChainFunctions=Array.from({length:70},(_,i)=>
+      'function _route'+i+'(IPlug value) internal {'+
+      (i===69?'plugin=value;':'_route'+(i+1)+'(value);')+'}').join(' ');
+    const helperChainText='pragma solidity ^0.8.20; import "./IPlug.sol"; contract LongHelperConsumer { IPlug public plugin; function initialize(IPlug chosen) external { _route0(chosen); } '+helperChainFunctions+' }';
+    const helperChainSource=typedSrc('LongHelperConsumer',helperChainText);
+    const helperChain=resolveSourceFixtureDependencies(helperChainSource,
+      'LongHelperConsumer',[extendedSources[0],extendedSources[1],helperChainSource]);
+    assert.equal(helperChain.status,'resolved',
+      'Initializer dependency resolution must traverse every uniquely mapped internal helper');
+    if(helperChain.status==='resolved')
+      assert.deepEqual(helperChain.deployments.map(deployment=>deployment.contract),['Plug']);
     const arrayFixtureInterface='pragma solidity ^0.8.20; interface IArrayFixture { function ping() external view returns(uint256); }';
     const arrayFixtureImplementation='pragma solidity ^0.8.20; import "./IArrayFixture.sol"; contract ArrayFixture is IArrayFixture { bool[2] public flags; uint8[2][2] public matrix; constructor(bool[2] memory seedFlags,uint8[2][2] memory seedMatrix) { flags=seedFlags; matrix=seedMatrix; } function ping() external pure returns(uint256) { return 1; } }';
     const arrayFixtureConsumer='pragma solidity ^0.8.20; import "./IArrayFixture.sol"; contract ArrayFixtureConsumer { IArrayFixture public fixture; function initialize(IArrayFixture chosen) external { fixture=chosen; } function run() external view returns(uint256) { return fixture.ping(); } }';
