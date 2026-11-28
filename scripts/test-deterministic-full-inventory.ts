@@ -3037,6 +3037,7 @@ contract OverrideRates is Ownable {
   struct Override { bool enabled; uint256 amount; }
   mapping(address=>Override) public poolRates;
   mapping(address=>mapping(uint64=>Override)) public depositRates;
+  mapping(address=>mapping(uint64=>mapping(uint256=>mapping(uint8=>Override)))) public trancheRates;
   uint256 public cap;
   constructor(uint256 initialCap) { cap = initialCap; }
   function overridePool(address pool,uint256 fee) external onlyOwner {
@@ -3047,16 +3048,22 @@ contract OverrideRates is Ownable {
     require(fee <= cap);
     depositRates[pool][id] = Override({enabled:true,amount:fee});
   }
+  function overrideTranche(address pool,uint64 id,uint256 epoch,uint8 tier,uint256 fee) external onlyOwner {
+    require(fee <= cap);
+    trancheRates[pool][id][epoch][tier] = Override({enabled:true,amount:fee});
+  }
 }`;
     const overrideSource={path:'source-1/contracts/OverrideRates.sol',
       content:overrideText,sha256:hash(overrideText)};
     const overrideMenu=[
       {selector:'OverrideRates.overridePool',operation:'send',inputs:['address','uint256']},
-      {selector:'OverrideRates.overrideDeposit',operation:'send',inputs:['address','uint64','uint256']}
+      {selector:'OverrideRates.overrideDeposit',operation:'send',inputs:['address','uint64','uint256']},
+      {selector:'OverrideRates.overrideTranche',operation:'send',inputs:['address','uint64','uint256','uint8','uint256']}
     ];
     for(const [fn,getter,keyLength] of [
       ['overridePool','poolRates(address)',1],
-      ['overrideDeposit','depositRates(address,uint64)',2]
+      ['overrideDeposit','depositRates(address,uint64)',2],
+      ['overrideTranche','trancheRates(address,uint64,uint256,uint8)',4]
     ] as const){
       const result=constructSolidityExperiments({
         repositoryCommit:'b'.repeat(40),targetPath:overrideSource.path,

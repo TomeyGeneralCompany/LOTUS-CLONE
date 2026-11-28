@@ -2575,7 +2575,7 @@ function accountingDirections(text:string,state:string):{increase:boolean;decrea
   // A source lvalue is the declared state symbol plus at most two identical
   // mapping indices. The RHS must refer to that SAME source lvalue; unrelated
   // names or different account keys never establish an accounting transition.
-  const indexed="(?:\\s*\\[[^\\]\\n]{1,128}\\]){0,2}";
+  const indexed="(?:\\s*\\[[^\\]\\n]{1,128}\\])*";
   const lvalue="\\b"+state+"("+indexed+")\\s*";
   const simple="\\b"+state+"\\s*"+indexed+"\\s*";
   const collectionPush=new RegExp("\\b"+state+"\\s*\\.\\s*push\\s*\\(");
@@ -2682,7 +2682,7 @@ function sourceBooleanGateForScalarWrite(
 function sourceAccountingWriteCount(text:string,state:string):number {
   if(!identifier.test(state))return 0;
   const escape=state.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-  const write=new RegExp('\\b'+escape+'(?:\\s*\\[[^\\]\\n]{1,128}\\]){0,2}\\s*(?:\\+=|-=|=(?!=))','g');
+  const write=new RegExp('\\b'+escape+'(?:\\s*\\[[^\\]\\n]{1,128}\\])*\\s*(?:\\+=|-=|=(?!=))','g');
   return [...text.matchAll(write)].length;
 }
 
@@ -4786,7 +4786,7 @@ function sourceStructOverrideExperiments(
     for(const variable of mappings){
       let inner:any=variable.typeName;
       const keys:string[]=[],names:string[]=[];
-      while(inner?.type==='Mapping'&&keys.length<3){
+      while(inner?.type==='Mapping'){
         const type=canonicalAbiType(inner.keyType);
         if(!type||!['address','uint64','uint256','uint8'].includes(type))break;
         keys.push(type);inner=inner.valueType;

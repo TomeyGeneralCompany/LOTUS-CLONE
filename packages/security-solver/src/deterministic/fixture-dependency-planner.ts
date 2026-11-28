@@ -1568,11 +1568,10 @@ export function resolveSourceFixtureDependencies(
     for(const binding of initializerStateBindings(entry.node,entry.source,sources))
       recordReceiverMethods(entry.source,binding.typeName,binding.receiver,entry.node);
   }
-  // The acquired concrete inventory is the natural upper bound: a valid
-  // deployment chain cannot use more unique implementations than it contains.
-  // Keep optional smaller caller budgets, but do not silently classify a
-  // deeper acquired chain as missing merely because of a historical constant.
-  const sourceNodeLimit=Math.max(1,scanned.length);
+  // The acquired inventory is the natural bound, further limited by the
+  // isolated sequence schema's 16-deployment ceiling. Preserve that runtime
+  // resource guard while allowing every graph the executor can represent.
+  const sourceNodeLimit=Math.max(1,Math.min(16,scanned.length));
   const MAX_DEPTH=limits.maxDepth===undefined?sourceNodeLimit:limits.maxDepth;
   const MAX_NODES=limits.maxNodes===undefined?sourceNodeLimit:limits.maxNodes;
   if(!Number.isSafeInteger(MAX_DEPTH)||MAX_DEPTH<1||MAX_DEPTH>sourceNodeLimit||
