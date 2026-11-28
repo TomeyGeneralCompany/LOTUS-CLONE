@@ -190,7 +190,7 @@ export function sourceGroundedSolidityProbes(source:string,menu:SolidityProbeDec
         variable.typeName?.type==='ElementaryTypeName' &&
         variable.typeName?.name==='address' &&
         /^[A-Za-z_]\w*$/.test(variable.name||''))
-      .map(variable=>variable.name).slice(0,64);
+      .map(variable=>variable.name);
     for(const member of members) {
       if(member.type!=='FunctionDefinition'||!member.name||
          !['public','external'].includes(member.visibility) ||
@@ -216,7 +216,6 @@ export function sourceGroundedSolidityProbes(source:string,menu:SolidityProbeDec
           break;
         }
       }
-      if(results.length>=64)return results;
     }
   }
   return results;
@@ -260,5 +259,5 @@ export function traceProjectErc1155Callers(path:string,source:string):
       walk(fn.body,0);
     }
   }
-  return results.slice(0,40);
+  return results;
 }

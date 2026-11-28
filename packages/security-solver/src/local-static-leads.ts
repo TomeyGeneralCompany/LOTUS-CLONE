@@ -6,18 +6,16 @@ import {relative,resolve,sep,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const exec=promisify(execFile);
-const MAX_SLITHER_TARGETS=6;
-const COLLECT_SLITHER_LIMIT=24;
-const SLITHER_BATCH_SIZE=8;
+const SLITHER_BATCH_SIZE=1;
 const excludedSolidityPath=/(?:^|\/)(?:mocks?|tests?|__tests__|fixtures|vendor|node_modules|echidna)(?:\/|$)|(?:Mock|Tests?)\.sol$|(?:^|\/)(?:Dummy|Echidna)[A-Za-z0-9_]*\.sol$/i;
 const coreContractTerms=/(?:core|vaults?|pools?|markets?|lending|staking|bridge|router|exchange|vesting|minter|treasury|strategy|controller|settlement|liquidation|oracle|escrow|rewards?|deposit|interest|zap)/i;
 
 /**
- * Select a bounded, deterministic set of production Solidity files for Slither.
+ * Select every eligible production Solidity file for the Slither sweep.
  * Acquisition order is retained within the same rank, while obvious core
  * protocol contracts are scanned before generic libraries and helpers.
  */
-export function rankSolidityStaticTargets(paths:string[],repoPrefix:string,limit=MAX_SLITHER_TARGETS):string[] {
+export function rankSolidityStaticTargets(paths:string[],repoPrefix:string,limit=Number.MAX_SAFE_INTEGER):string[] {
   const candidates=[...new Set(paths.filter(p=>p.startsWith(repoPrefix+'/')&&p.endsWith('.sol')))]
     .map((path,index)=>({path:path.slice(repoPrefix.length+1),index}))
     .filter(({path})=>!excludedSolidityPath.test(path));
@@ -43,14 +41,14 @@ export async function collectStaticLeads(root:string,repositories:Array<{directo
   const rulesRevision=revision.digest('hex');
   try {
     const saved=JSON.parse(await readFile(cache,'utf8'));
-    if(saved.version===4&&saved.rulesRevision===rulesRevision&&Array.isArray(saved.leads)&&
+    if(saved.version===5&&saved.rulesRevision===rulesRevision&&Array.isArray(saved.leads)&&
       Array.isArray(saved.runs)&&saved.runs.length>0&&saved.runs.every((r:any)=>r.status==='completed'))return saved;
   }catch{}
 
   const runs:any[]=[],leads:any[]=[];
   for(const repo of repositories) {
     const prefix=relative(root,repo.directory).split(sep).join('/');
-    const solidityTargets=rankSolidityStaticTargets(paths,prefix,COLLECT_SLITHER_LIMIT);
+    const solidityTargets=rankSolidityStaticTargets(paths,prefix);
     const slitherBatches:Array<string[]|undefined>=[];
     for(let i=0;i<solidityTargets.length;i+=SLITHER_BATCH_SIZE)
       slitherBatches.push(solidityTargets.slice(i,i+SLITHER_BATCH_SIZE));
@@ -60,7 +58,7 @@ export async function collectStaticLeads(root:string,repositories:Array<{directo
         signal.throwIfAborted();
         try {
           const {stdout}=await exec('python3',[resolve(app,'scripts/source-static.py'),'--repository',repo.directory,'--engine',engine,
-            ...(batch?['--targets',JSON.stringify(batch)]:[])],{signal,timeout:110000,maxBuffer:256000,cwd:app});
+            ...(batch?['--targets',JSON.stringify(batch)]:[])],{signal,timeout:110000,maxBuffer:128*1024*1024,cwd:app});
           const value=JSON.parse(stdout);
           const failureDetail=value.status==='failed' ? {
             exitCode:Number.isInteger(value.exitCode)?value.exitCode:undefined,
@@ -70,7 +68,7 @@ export async function collectStaticLeads(root:string,repositories:Array<{directo
           runs.push({repository:repo.url,engine,...(batch?{targets:batch,target:batch[0]}:{}),status:value.status,reason:value.reason,
             detectedLeads:Number.isInteger(value.detectedLeads)?value.detectedLeads:rawLeads.length,
             coverage:value.coverage,...failureDetail});
-          for(const lead of rawLeads.slice(0,64)) {
+          for(const lead of rawLeads) {
             if(typeof lead.path!=='string'||!Number.isSafeInteger(lead.line)||lead.line<1)continue;
             const full=resolve(repo.directory,lead.path),local=relative(repo.directory,full);
             if(local==='..'||local.startsWith('..'+sep)||local.startsWith('/'))continue;
@@ -84,7 +82,7 @@ export async function collectStaticLeads(root:string,repositories:Array<{directo
       }
     }
   }
-  const result={version:4,rulesRevision,status:'navigation_only',leads:leads.slice(0,128),runs,
+  const result={version:5,rulesRevision,status:'navigation_only',leads,runs,
     limitation:'Detectors produce advisory candidates, not verified findings. Inspect and independently reproduce before reporting.'};
   const temporary=cache+'.'+process.pid+'.tmp';
   await writeFile(temporary,JSON.stringify(result),{mode:0o600});

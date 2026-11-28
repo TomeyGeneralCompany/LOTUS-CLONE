@@ -522,12 +522,12 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
     if(!focus && process.env.LOCAL_CONTROLLER_OWNED_ACTIONS!=='false') {
       try {
         const ranked=await rankTracedSourceCandidates(root,
-          [...new Set([...sourceHints,...eligiblePaths])],96);
+          [...new Set([...sourceHints,...eligiblePaths])]);
         await appendFile(logFile,'[CONTROLLER_SOURCE_RANKING] '+JSON.stringify({
-          inspectedBudget:96,candidates:ranked.length,
+          inspectedFiles:new Set([...sourceHints,...eligiblePaths]).size,candidates:ranked.length,
           preview:ranked.slice(0,5).map(c=>({path:c.path,selector:c.selector,score:c.score}))
         })+'\n');
-        for(const selected of ranked.slice(0,8)) {
+        for(const selected of ranked) {
           signal.throwIfAborted();
           const repo=repos.find(r=>selected.path.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
           if(!repo || missingDependencies.has(repo.url))continue;
@@ -542,12 +542,12 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
           if(!record || !record.result.behavior_observed)continue;
           const prefix=relative(root,repo.directory).split(sep).join('/')+'/';
           const chain=await controllerCallerChain(root,prefix,selected.path,
-            selected.selector,[...new Set([...sourceHints,...eligiblePaths])],8);
+            selected.selector,[...new Set([...sourceHints,...eligiblePaths])],new Set([...sourceHints,...eligiblePaths]).size+1);
           // Reproduce each import-resolved intermediate caller, rather than
           // jumping directly from a nested helper to a handler.
           const progression=await promoteControllerCallChain({
             start:{path:selected.path,selector:selected.selector,kind:selected.kind,caseId:output.caseId},
-            chain,maxSteps:8,
+            chain,maxSteps:new Set([...sourceHints,...eligiblePaths]).size+1,
             read:path=>readFile(join(root,path),'utf8'),
             references:callerLineReferences,
             supported:async(path,selector)=>path.endsWith('.java')
@@ -611,17 +611,14 @@ export async function runLocalProgramHunt(program:SecurityProgram,signal?:AbortS
     const controllerStatefulObservations:Array<{path:string;selector:string;
       kind:string;caseId:string;steps:unknown}>= [];
     if(!focus && process.env.LOCAL_CONTROLLER_OWNED_ACTIONS!=='false') {
-      let budget=2;
-      for(const path of [...new Set(sourceHints)].slice(0,96)) {
-        if(budget<=0)break;
+      for(const path of new Set([...sourceHints,...eligiblePaths])) {
         if(!/\.(?:py|js|cjs|mjs)$/.test(path))continue;
         const repo=repos.find(r=>path.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
         if(!repo || missingDependencies.has(repo.url))continue;
         let code:string;
         try{code=await readFile(join(root,path),'utf8');}catch{continue;}
         for(const plan of sourceStatefulPlans(path,code)) {
-          if(budget<=0)break;
-          signal.throwIfAborted();budget--;
+          signal.throwIfAborted();
           reads.add(path,{start:0,end:code.length});
           try {
             const out=JSON.parse(await session.probe(path,plan.selector,plan.kind,plan.sequence));
@@ -985,7 +982,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
             const repository=repos.find(r=>r.url===record.repositoryUrl);
             if(!repository || !reads.has(sourceFileInWorkspace(repository,record.spec.file,root)))continue;
             const matches:Array<{path:string,line:number,code:string,qualified:boolean}>=[];
-            for(const sourcePath of [...new Set([...sourceHints,...eligiblePaths])].slice(0,192)) {
+            for(const sourcePath of new Set([...sourceHints,...eligiblePaths])) {
               if(!sourcePath.startsWith(relative(root,repository.directory).split(sep).join('/')+'/') ||
                  !reads.has(sourcePath))continue;
               try {
@@ -1143,7 +1140,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
                 }
                 if(candidate.reachability==='direct_transaction')continue;
                 const sites:{file:string,line:number,qualified:boolean}[]=[];
-                for(const path of [...new Set([...sourceHints,...eligiblePaths])].slice(0,192)) {
+                for(const path of new Set([...sourceHints,...eligiblePaths])) {
                   const sourceRepo=repos.find(r=>path.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
                   if(!sourceRepo || sourceRepo.url!==record.repositoryUrl || !reads.has(path))continue;
                   try {
@@ -1279,8 +1276,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
               }catch{}
               if(claimedValid)continue;
               const sites:{file:string,line:number}[]=[];
-              for(const candidatePath of [...new Set([...sourceHints,...eligiblePaths])].slice(0,192)) {
-                if(sites.length>=8)break;
+              for(const candidatePath of new Set([...sourceHints,...eligiblePaths])) {
                 const candidateRepo=repos.find(r=>candidatePath.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
                 if(!candidateRepo || candidateRepo.url!==record.repositoryUrl)continue;
                 try {
@@ -1342,8 +1338,7 @@ Do not claim production testing, JavaScript execution, file access or other effe
                 const otherCallers:{file:string,line:number,code:string}[]=[];
                 // Offer exact, previously inspected call sites. Do not infer a
                 // vulnerability or forge caller evidence to fix model output.
-                for(const sourcePath of [...new Set([...sourceHints,...eligiblePaths])].slice(0,40)) {
-                  if(otherCallers.length>=5)break;
+                for(const sourcePath of [...new Set([...sourceHints,...eligiblePaths])]) {
                   const targetRepoPath=sourcePath.replace(/\\/g,'/');
                   const sourceRepo=repos.find(r=>targetRepoPath.startsWith(relative(root,r.directory).split(sep).join('/')+'/'));
                   if(!sourceRepo || sourceRepo.url!==record.repositoryUrl)continue;

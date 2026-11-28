@@ -10,7 +10,7 @@ export type TracedSourceCandidate={path:string;selector:string;kind:'html_reflec
  * in this ranking is accepted as evidence of an exploitable vulnerability.
  */
 export async function rankTracedSourceCandidates(
-  workspace:string,paths:string[],maxFiles=192
+  workspace:string,paths:string[],maxFiles=Number.MAX_SAFE_INTEGER
 ):Promise<TracedSourceCandidate[]> {
   const root=await realpath(workspace);
   const candidates:TracedSourceCandidate[]=[];
@@ -28,7 +28,7 @@ export async function rankTracedSourceCandidates(
       const rel=relative(repository,full);
       if(rel==='..'||rel.startsWith('..'+sep))continue;
       source=await readFile(full,'utf8');
-      if(source.length>128000)continue;
+      if(source.length>256000)continue;
     }catch{continue;}
     if(/(?:http.handler|http_handler|route|entry|server)/i.test(path) &&
        /(?:searchParams|urlsplit|parse_qs|URL\s*\()/i.test(source))continue;
@@ -58,11 +58,11 @@ export async function rankTracedSourceCandidates(
         }
       }
     }
-    for(const selector of [...new Set(selectors)].slice(0,12)){
+    for(const selector of [...new Set(selectors)]){
       const method=selector.split('.').at(-1)||'';
       if(/^(?:inspect|test|debug|mock)/i.test(method))continue;
       try {
-        const trace=await traceSourceCalls(repository,relativeFile,selector,5);
+        const trace=await traceSourceCalls(repository,relativeFile,selector,new Set(paths).size+1);
         const implementation=trace.facts.map(f=>f.source).join('\n');
         // Require an actual source-traced HTML result. Sanitizers in any
         // inspected hop defeat this particular unsanitized-reflection hint.
@@ -82,5 +82,5 @@ export async function rankTracedSourceCandidates(
       }catch{}
     }
   }
-  return candidates.sort((a,b)=>b.score-a.score || a.path.localeCompare(b.path)).slice(0,24);
+  return candidates.sort((a,b)=>b.score-a.score || a.path.localeCompare(b.path));
 }

@@ -8,6 +8,29 @@ export type StatefulSourcePlan={
   sequence:PolyglotSequence;factoryLine:number;methodLine:number;
 };
 const lineAt=(source:string,pos:number)=>source.slice(0,pos).split('\n').length;
+/** Return the matching brace while ignoring braces inside quoted strings/comments. */
+function matchingBrace(source:string,open:number):number {
+  let depth=0,state:'code'|'single'|'double'|'template'|'line'|'block'='code';
+  for(let i=open;i<source.length;i++) {
+    const char=source[i],next=source[i+1];
+    if(state==='line'){if(char==='\n')state='code';continue;}
+    if(state==='block'){if(char==='*'&&next==='/'){state='code';i++;}continue;}
+    if(state==='single'||state==='double'||state==='template') {
+      if(char==='\\'){i++;continue;}
+      if((state==='single'&&char==="'")||(state==='double'&&char==='"')||
+         (state==='template'&&char==='`'))state='code';
+      continue;
+    }
+    if(char==='/'&&next==='/'){state='line';i++;continue;}
+    if(char==='/'&&next==='*'){state='block';i++;continue;}
+    if(char==="'"){state='single';continue;}
+    if(char==='"'){state='double';continue;}
+    if(char==='`'){state='template';continue;}
+    if(char==='{')depth++;
+    else if(char==='}'&&--depth===0)return i;
+  }
+  return -1;
+}
 /** Fixture only declared primitive defaults/types; never evaluate source expressions. */
 function parameterFixtures(parameters:string,python:boolean,fallback:number):PolyglotSequence['constructor']|null {
   if(!parameters.trim())return [];
@@ -34,11 +57,15 @@ export function sourceStatefulPlans(file:string,source:string):StatefulSourcePla
     const factory=/\b(?:exports\.|export\s+(?:const|let)\s+)([A-Za-z][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?(?:function(?:\s+[A-Za-z]\w*)?\s*\([^)]*\)|\([^)]*\)\s*=>)\s*\{/g;
     const plans:StatefulSourcePlan[]=[];
     for(const f of source.matchAll(factory)){
-      const tail=source.slice(f.index!,f.index!+6000);
-      const returned=/\breturn\s*\{([\s\S]{0,3000})/.exec(tail);
+      const tail=source.slice(f.index!);
+      const returned=/\breturn\s*\{/.exec(tail);
       if(!returned)continue;
+      const objectStart=f.index!+returned.index!+returned[0].length-1;
+      const objectEnd=matchingBrace(source,objectStart);
+      if(objectEnd<0)continue;
+      const returnedBody=source.slice(objectStart+1,objectEnd);
       const method=/\b([A-Za-z][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*\{/g;
-      for(const m of returned[1].matchAll(method)){
+      for(const m of returnedBody.matchAll(method)){
         if(['constructor','toString','valueOf'].includes(m[1]))continue;
         const selectedArgs=parameterFixtures(m[2],false,1);
         if(!selectedArgs)continue;
@@ -46,22 +73,20 @@ export function sourceStatefulPlans(file:string,source:string):StatefulSourcePla
         const ctor=parameterFixtures(rawParams,false,0);
         if(!ctor)continue;
         plans.push({kind:'javascript_sequence',selector:m[1],factoryLine:lineAt(source,f.index!),
-          methodLine:lineAt(source,f.index!+returned.index+returned[0].indexOf(m[0])),
+          methodLine:lineAt(source,objectStart+1+m.index!),
           sequence:{factory:f[1],constructor:ctor,
             steps:[{method:m[1],args:selectedArgs},{method:m[1],args:selectedArgs}]}});
-        if(plans.length>=32)return plans;
       }
-      if(plans.length>=32)break;
     }
     return plans;
   }
   if(file.endsWith('.py')) {
     const classes=[...source.matchAll(/^class\s+([A-Za-z][A-Za-z0-9_]*)\s*(?:\([^)]*\))?\s*:/gm)];
     const plans:StatefulSourcePlan[]=[];
-    for(const cls of classes.slice(0,8)){
+    for(const cls of classes){
       const tail=source.slice(cls.index!+cls[0].length);
       const next=/^class\s+[A-Za-z]/m.exec(tail);
-      const body=tail.slice(0,Math.min(next?.index??tail.length,5000));
+      const body=tail.slice(0,next?.index??tail.length);
       const method=/^    def\s+([A-Za-z][A-Za-z0-9_]*)\s*\(\s*self\s*(?:,\s*([^)]*))?\)\s*(?:->\s*[A-Za-z]\w*)?\s*:/gm;
       const named=[...body.matchAll(method)].filter(x=>!x[1].startsWith('_'));
       const factoryRe=new RegExp('^def\\s+([A-Za-z][A-Za-z0-9_]*)\\s*\\(([^)]*)\\)\\s*(?:->\\s*[A-Za-z]\\w*\\s*)?:[ \\t]*(?:\\n(?:[ \\t]+[^\\n]*\\n){0,6}[ \\t]+)?return\\s+'+cls[1]+'\\s*\\(','gm');
@@ -75,9 +100,7 @@ export function sourceStatefulPlans(file:string,source:string):StatefulSourcePla
           methodLine:lineAt(source,cls.index!+cls[0].length+m.index!),
           sequence:{factory:make[1],constructor:ctor,
             steps:[{method:m[1],args},{method:m[1],args}]}});
-        if(plans.length>=32)return plans;
       }
-      if(plans.length>=32)break;
     }
     return plans;
   }
