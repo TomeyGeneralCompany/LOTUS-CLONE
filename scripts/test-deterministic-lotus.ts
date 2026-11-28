@@ -1763,6 +1763,13 @@ contract MixedProtocolVault {
     assert.equal(completeReport.action,"final");
     assert.equal(JSON.parse(completeReport.answer).findings.length,10,
       "The deterministic report must preserve every observed case when its requested schema has no findings limit");
+    const schemaBoundReport=driveDeterministicAuditTurn({
+      stage:"REPORT",sources:[mixedSnap],observedCases:allObservedCases,
+      requestSchema:{type:"object",properties:{findings:{type:"array",maxItems:3}}},
+      constraints:{action:["final"]},
+    });
+    assert.equal(JSON.parse(schemaBoundReport.answer).findings.length,3,
+      "The deterministic report must retain an explicit caller-provided findings bound");
 
     // When Z3 proves smt_unsat_guard on the same lead, construction MUST be skipped
     const refutedGraph = buildProgramFactsGraph({ sources: [mixedSnap] });
