@@ -409,6 +409,18 @@ contract DividendGetter {
       'Exhausted assessed leads receive a durable, separately identified disposition');
     assert.equal(partialStore.nextRepairBatch(10).length,0,
       'A terminal unresolved disposition does not re-enter the same repair pass');
+    const explicitCheckpoint=join(dir,'explicitly-unresolved-resume.json');
+    await partialStore.save();
+    const resumedExplicit=await AnalysisProgressStore.open(explicitCheckpoint,[partialLead]);
+    assert.equal(resumedExplicit.records.get(partialLead.id)?.lifecycle,'explicitly_unresolved',
+      'An explicit unresolved disposition survives restart under the same engine revision');
+    assert.deepEqual(resumedExplicit.experimentCertificate.explicitlyUnresolvedIds,[partialLead.id]);
+    const reassessedExplicit=await AnalysisProgressStore.open(explicitCheckpoint,[partialLead],
+      'new-property-engine-revision');
+    assert.equal(reassessedExplicit.records.get(partialLead.id)?.lifecycle,'queued',
+      'A new property engine reopens explicit unresolved leads for reassessment');
+    assert.deepEqual(reassessedExplicit.experimentCertificate.explicitlyUnresolvedIds,[],
+      'A prior terminal disposition cannot satisfy a revised engine');
 
     // A changed property engine must reopen unresolved checkpoints, never
     // reuse the old blocked assessment as proof that it was reevaluated.
