@@ -1098,7 +1098,6 @@ export async function runLocalAudit(
         const snapshots=new Map<string,SourceSnapshot>();
         const pending=[...imports];
         const visited=new Set<string>();
-        let totalBytes=0;
         while(pending.length){
           const batch=pending.splice(0,128).filter(specifier=>!visited.has(specifier));
           if(!batch.length)continue;
@@ -1130,10 +1129,8 @@ export async function runLocalAudit(
               const actual=await realpath(physical);
               if(actual!==modulesRoot&&!actual.startsWith(modulesRoot+sep))continue;
               const info=await stat(actual);
-              if(!info.isFile()||info.size>256000)continue;
+              if(!info.isFile())continue;
               const content=await readFile(actual,'utf8');
-              totalBytes+=Buffer.byteLength(content);
-              if(totalBytes>32*1024*1024)break;
               snapshots.set(specifier,{path:specifier,content,
                 sha256:createHash('sha256').update(content).digest('hex')});
               try{
@@ -1242,11 +1239,11 @@ export async function runLocalAudit(
       await appendFile(logFile,'[INDEX_COMPLETE] '+JSON.stringify({files:inventory.length})+'\n');
       await appendFile(logFile,'[STAGE_UNLOCK] INDEX -> READ\n');
     }
-    for(const path of [...new Set(limits.initialSourcePaths||[])].slice(0,200)){
+    for(const path of new Set(limits.initialSourcePaths||[])){
       if(!path.startsWith('source-')||!path.endsWith('.sol'))continue;
       try{
         const content=await readFile(await safePath(path),'utf8');
-        if(content.length<=256000)accessibleSoliditySources.set(path,content);
+        accessibleSoliditySources.set(path,content);
       }catch{}
     }
     // Trace project-owned ERC1155 call sites BEFORE considering inherited
