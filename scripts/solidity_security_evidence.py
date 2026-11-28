@@ -1096,6 +1096,34 @@ def _asserted_xmph_reward_unlock_negative(
         return None
     if any(req.get("operation") != got.get("operation") for req, got in zip(requested_steps, actual_steps)):
         return None
+    # Bind the executor's recorded ABI actions back to the requested plan.
+    # A matching result value from a different function or caller must never
+    # certify this source-derived property.
+    for req, got in zip(requested_steps, actual_steps):
+        operation=req.get("operation")
+        if operation in ("send", "call", "observe"):
+            try:
+                actual_sender=int(got.get("sender", 0))
+                requested_sender=int(req.get("sender", 0))
+            except (TypeError, ValueError):
+                return None
+            if got.get("function") != req.get("function") or actual_sender != requested_sender:
+                return None
+        if operation == "call" and str(got.get("expected")) != str(req.get("expect")):
+            return None
+        if operation == "send":
+            requested_args=req.get("args", [])
+            actual_args=got.get("args")
+            if not isinstance(actual_args, list) or len(actual_args) != len(requested_args):
+                return None
+            for requested_arg, actual_arg in zip(requested_args, actual_args):
+                if isinstance(requested_arg, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", requested_arg) and \
+                        str(actual_arg) != requested_arg:
+                    return None
+                if isinstance(requested_arg, bool) and actual_arg is not requested_arg:
+                    return None
+        if operation == "advance_time" and got.get("seconds") != req.get("seconds"):
+            return None
     if any(got.get("passed") is not True for req,got in zip(requested_steps,actual_steps)
            if req.get("operation") != "observe"):
         return None

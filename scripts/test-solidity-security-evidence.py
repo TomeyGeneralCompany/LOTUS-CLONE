@@ -498,15 +498,19 @@ class SoliditySecurityEvidenceTests(unittest.TestCase):
             local_time=1577836800
             for i,step in enumerate(req):
                 item={"operation":step["operation"],"passed":True}
-                if step["operation"]=="call": item["actual"]=step["expect"]
-                if step["operation"]=="observe": item["actual"]=midpoint
+                if step["operation"] in ("call","observe","send"):
+                    item.update({"function":step["function"],"sender":step.get("sender",0)})
+                if step["operation"]=="call":
+                    item.update({"actual":step["expect"],"expected":step["expect"]})
+                if step["operation"]=="observe":
+                    item.update({"actual":midpoint,"args":step.get("args",[])})
                 if step["operation"]=="send":
                     item.update({"reverted":step.get("expectRevert",False),"args":step.get("args",[])})
                     if step["function"]=="distributeReward(uint256)" and step["sender"]==0:
                         item.update({"eventsPassed":True,"expectedEvents":[
                             {"signature":"DistributeReward(uint256)","passed":True}]})
                 if step["operation"]=="advance_time":
-                    item.update({"fromTimestamp":str(local_time),"toTimestamp":str(local_time+43201),
+                    item.update({"seconds":step["seconds"],"fromTimestamp":str(local_time),"toTimestamp":str(local_time+43201),
                                  "elapsedSeconds":"43201"})
                     local_time+=43201
                 actual.append(item)
