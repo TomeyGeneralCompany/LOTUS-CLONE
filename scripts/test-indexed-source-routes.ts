@@ -28,4 +28,25 @@ try{
    assert.ok(protectedNode.startsWith('source-1/'));
    console.log(language+': complete 2000-source entry-to-service route discovery PASSED; routes='+routes.length);
  }
+
+ const deepRoot=join(root,'deep'),deepEligible:string[]=[];
+ const gateway='source-1/app/handler.py';
+ const gatewayFull=join(deepRoot,gateway);
+ await mkdir(dirname(gatewayFull),{recursive:true});
+ await writeFile(gatewayFull,
+   'from app.module0 import transform\n'+
+   'def handle(request):\n    if request.args:\n        return transform(request.args, 14)\n');
+ deepEligible.push(gateway);
+ for(let index=0;index<15;index++){
+   const path=`source-1/app/module${index}.py`,full=join(deepRoot,path);
+   await mkdir(dirname(full),{recursive:true});
+   const body=index===14
+     ? 'def transform(value, remaining):\n    return project(value)\ndef project(value):\n    return "<p>" + value + "</p>"\n'
+     : `from app.module${index+1} import transform as next_transform\ndef transform(value, remaining):\n    return next_transform(value, remaining - 1)\n`;
+   await writeFile(full,body);deepEligible.push(path);
+ }
+ const deepRoutes=await indexedEntryRoutes(deepRoot,deepEligible);
+ const deepRoute=deepRoutes.find(route=>route.entry===gateway);
+ assert.ok(deepRoute,'controller must retain a complete acquired route deeper than twelve hops');
+ assert.equal(deepRoute.chain.length,15,'deep route must include every acquired transformation module');
 }finally{await rm(root,{recursive:true,force:true});}
