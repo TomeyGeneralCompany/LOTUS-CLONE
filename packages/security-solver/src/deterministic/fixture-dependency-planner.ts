@@ -1872,6 +1872,10 @@ export function enumerateSourceFixtureDependenciesDetailed(
   const maxSearchNodes=options.maxSearchNodes??2048;
   if(!Number.isSafeInteger(maxSearchNodes)||maxSearchNodes<1||maxSearchNodes>8192)
     throw new Error("INVALID_FIXTURE_SEARCH_LIMIT");
+  // Validate before cache lookup: a caller must not be able to reuse a prior
+  // valid result by mutating the checkpoint while retaining its old checksum.
+  if(options.resume&&!validFixtureCheckpoint(options.resume,target,contractName,sources))
+    throw new Error("FIXTURE_SEARCH_CHECKPOINT_SOURCE_MISMATCH_OR_CORRUPT");
   // The fixture graph depends only on this immutable source inventory and
   // these bounds, not on the lead method being analyzed. Cache complete
   // alternatives so a contract with many indexed entrypoints does not repeat
@@ -1888,8 +1892,6 @@ export function enumerateSourceFixtureDependenciesDetailed(
     cache.delete(cacheKey);cache.set(cacheKey,cached);
     return structuredClone(cached);
   }
-  if(options.resume&&!validFixtureCheckpoint(options.resume,target,contractName,sources))
-    throw new Error("FIXTURE_SEARCH_CHECKPOINT_SOURCE_MISMATCH_OR_CORRUPT");
   const pending:Array<Record<string,string>>=options.resume?
     structuredClone(options.resume.pending):[{}];
   const seen=new Set<string>((options.resume?.seenSelections||[]).map(selections=>
