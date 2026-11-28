@@ -404,7 +404,6 @@ contract DividendGetter {
     const partialLead=candidates[1];
     const partialStore=await AnalysisProgressStore.open(
       join(dir,'partial-source-properties.json'),[partialLead]);
-    partialStore.setFixtureSearchCheckpoint(partialLead.id,truncatedChoices.checkpoint);
     partialStore.nextBatch(1,1);
     partialStore.recordAssessment(partialLead.id,[],
       ['source_grounded_falsifier_missing'],[]);
@@ -443,6 +442,11 @@ contract DividendGetter {
     assert.ok(frontierStore.experimentCertificate.pendingReasons[partialLead.id]
       .some(reason=>reason.startsWith('fixture_search_pending:')),
       'The certificate reports durable fixture search work as pending');
+    await frontierStore.save();
+    const resumedFrontier=await AnalysisProgressStore.open(frontierStore.path,[partialLead]);
+    assert.deepEqual(resumedFrontier.records.get(partialLead.id)?.fixtureSearchCheckpoint,
+      truncatedChoices.checkpoint,
+      'A bounded fixture frontier survives an analysis checkpoint restart');
     const repairDispositionStore=await AnalysisProgressStore.open(
       join(dir,'repair-attempt-blocker.json'),[partialLead]);
     repairDispositionStore.records.get(partialLead.id)!.lifecycle='analysis_exhausted';
@@ -463,9 +467,6 @@ contract DividendGetter {
     const explicitCheckpoint=partialStore.path;
     await partialStore.save();
     const resumedExplicit=await AnalysisProgressStore.open(explicitCheckpoint,[partialLead]);
-    assert.deepEqual(resumedExplicit.records.get(partialLead.id)?.fixtureSearchCheckpoint,
-      truncatedChoices.checkpoint,
-      'A bounded fixture frontier survives an analysis checkpoint restart');
     assert.equal(resumedExplicit.records.get(partialLead.id)?.lifecycle,'explicitly_unresolved',
       'An explicit unresolved disposition survives restart under the same engine revision');
     assert.deepEqual(resumedExplicit.experimentCertificate.explicitlyUnresolvedIds,[partialLead.id]);
