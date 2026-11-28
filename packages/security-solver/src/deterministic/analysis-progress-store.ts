@@ -11,7 +11,8 @@ import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailabilit
   "./source-unavailability-verifier";
 
 export type CandidateLifecycle="queued"|"admitted"|"analyzing"|"dependencies_pending"|
-  "experiment_pending"|"experiment_completed"|"source_unavailable"|"analysis_exhausted"|"blocked";
+  "experiment_pending"|"experiment_completed"|"source_unavailable"|"analysis_exhausted"|"blocked"|
+  "explicitly_unresolved";
 export type PropertyResolution="unexamined"|"analyzing"|"prerequisites_pending"|
   "test_constructed"|"test_completed"|"contradicted"|"unsupported"|"blocked";
 
@@ -33,7 +34,7 @@ export interface SourceUnavailableEvidence {
 export interface LeadExperimentCertificate {
   version:1|2; manifestDigest:string; evidenceDigest:string;
   total:number; conclusive:number; sourceUnavailable:number; sourceUnavailableIds:string[];
-  unavailabilityEvidenceDigest:string; unresolvedIds:string[];
+  unavailabilityEvidenceDigest:string; unresolvedIds:string[]; explicitlyUnresolvedIds:string[];
   pendingReasons:Record<string,string[]>; evidenceCount:number;
 }
 export interface CandidateProgress {
@@ -247,6 +248,33 @@ export class AnalysisProgressStore {
     record.sourceUnavailable={...reviewed,sourceWitnesses:[...reviewed.sourceWitnesses]};
     record.lifecycle="source_unavailable";
   }
+  /**
+   * Close only the remaining assessed leads as explicit unresolved outcomes
+   * after the caller has exhausted its source-grounded repair pass. This is a
+   * durable disposition, separate from a lead that is still pending work.
+   */
+  markExplicitlyUnresolved():string[]{
+    const unresolved=[...this.records.values()].filter(record=>
+      !this.isConclusive(record)&&!this.hasSourceUnavailableEvidence(record));
+    for(const record of unresolved){
+      if(["queued","admitted","analyzing"].includes(record.lifecycle))
+        throw new Error("UNRESOLVED_LEAD_STILL_PENDING: "+record.id+":"+record.lifecycle);
+      const reasons=[
+        ...record.properties.flatMap(property=>property.unresolvedPrerequisites),
+        ...record.properties.filter(property=>property.state!=="test_completed")
+          .map(property=>"property_state:"+property.state),
+        ...(record.specialistAttempts||[]).map(attempt=>
+          "specialist:"+attempt.adapter+":"+attempt.status+":"+attempt.reason),
+        ...(record.lastError?["controller_error:"+record.lastError]:[]),
+        ...(!record.properties.length?[
+          "lifecycle:"+record.lifecycle+":no_source_grounded_property_recorded"]:[]),
+      ];
+      if(reasons.length===0)reasons.push(
+        "lifecycle:"+record.lifecycle+":source_property_not_conclusively_verified");
+      record.lifecycle="explicitly_unresolved";
+    }
+    return unresolved.map(record=>record.id).sort();
+  }
   get experimentCertificate():LeadExperimentCertificate {
     const entries=[...this.records.values()].sort((a,b)=>a.id.localeCompare(b.id));
     const unavailable=entries.filter(e=>this.hasSourceUnavailableEvidence(e));
@@ -269,6 +297,8 @@ export class AnalysisProgressStore {
           e.sourceUnavailable?.verifierDigest,e.sourceUnavailable?.independentReviewDigest,
           e.sourceUnavailable?.acquiredInventoryDigest]))).digest("hex"),
       unresolvedIds:unresolved.map(e=>e.id),
+      explicitlyUnresolvedIds:unresolved.filter(e=>e.lifecycle==="explicitly_unresolved")
+        .map(e=>e.id),
       pendingReasons:Object.fromEntries(unresolved.map(e=>{
         const reasons=[
           ...e.properties.flatMap(p=>p.unresolvedPrerequisites),
@@ -277,6 +307,8 @@ export class AnalysisProgressStore {
           ...(e.lastError?["controller_error:"+e.lastError]:[]),
           ...(!e.properties.length?["lifecycle:"+e.lifecycle+":no_source_grounded_property_recorded"]:[]),
         ];
+        if(!reasons.length)reasons.push(
+          "lifecycle:"+e.lifecycle+":source_property_not_conclusively_verified");
         return [e.id,[...new Set(reasons)]] as const;
       })),
       evidenceCount:evidence.length,
@@ -568,6 +600,7 @@ export class AnalysisProgressStore {
       const record=this.records.get(c.id);
       return !!record && record.lifecycle!=="queued" &&
         record.lifecycle!=="admitted" && record.lifecycle!=="analyzing" &&
+        record.lifecycle!=="explicitly_unresolved"&&
         !this.isConclusive(record)&&!this.hasSourceUnavailableEvidence(record);
     });
     return eligible.slice(0,max);

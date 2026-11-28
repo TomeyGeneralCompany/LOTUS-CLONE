@@ -240,26 +240,27 @@ export class ControllerStageLock {
      const unavailableDigest=certificate?.version===2?
        certificate.unavailabilityEvidenceDigest:"";
      const unresolvedIds=certificate?.unresolvedIds||[];
+     const explicitlyUnresolvedIds=certificate?.explicitlyUnresolvedIds||[];
      const pendingReasons=certificate?.pendingReasons||{};
      if(!certificate||![1,2].includes(certificate.version)||certificate.manifestDigest!==digest||
         certificate.total!==ids.length||
-        certificate.conclusive+unavailable!==ids.length||
+        certificate.conclusive+unavailable+unresolvedIds.length!==ids.length||
         unavailableIds.length!==unavailable||
         new Set(unavailableIds).size!==unavailable||
         unavailableIds.some(id=>!this.inventoryIds!.has(id))||
         unresolvedIds.some(id=>!this.inventoryIds!.has(id)||unavailableIds.includes(id))||
         new Set(unresolvedIds).size!==unresolvedIds.length||
+        JSON.stringify([...explicitlyUnresolvedIds].sort())!==JSON.stringify([...unresolvedIds].sort())||
         unresolvedIds.some(id=>!Array.isArray(pendingReasons[id])||
           pendingReasons[id].length===0||pendingReasons[id].some(reason=>!reason.trim()))||
-        unresolvedIds.length!==0||
         (certificate.version===2&&!(/^[a-f0-9]{64}$/).test(unavailableDigest))||
         !(/^[a-f0-9]{64}$/).test(certificate.evidenceDigest)||
         certificate.evidenceCount<certificate.conclusive)
         throw new Error('EXPERIMENT_LEAD_COVERAGE_INCOMPLETE: '+
           (certificate?certificate.conclusive+' experimentally verified + '+
-            unavailable+' independently verified source-unavailable / '+
-            certificate.total+' original leads; '+
-            unresolvedIds.length+' explicitly unresolved':'missing completion certificate'));
+            unavailable+' independently verified source-unavailable + '+
+            unresolvedIds.length+' explicitly unresolved / '+
+            certificate.total+' original leads':'missing completion certificate'));
      if(this.outcomeCounts.observation_only||this.outcomeCounts.incomplete||
         this.outcomeCounts.unsupported||this.outcomeCounts.rejected||
         this.outcomeCounts.pending)
