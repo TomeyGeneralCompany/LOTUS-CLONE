@@ -274,14 +274,17 @@ contract GuardedVault is Ownable {
     }
 
     const parsed = JSON.parse(answer);
-    assert.equal(parsed.outcome, "suspended",
-      "An untested source function must not produce a completed report");
+    assert.equal(parsed.outcome, "no_testable_candidate",
+      "An exhausted source lead with a recorded blocker must produce a truthful incomplete-coverage report");
     assert.equal(parsed.findings.length, 0);
+    assert.match(parsed.reason,/candidate properties unresolved/,
+      "The report must identify that source coverage remains unresolved");
     const logText = await readFile(logFile, "utf8");
     assert.match(logText, /\[DETERMINISTIC_DRIVER_ACTION\]/, "Runner must invoke deterministic driver");
     assert.doesNotMatch(logText, /\[MODEL_REQUEST_RECOVERY\]/, "No Ollama retries may occur in deterministic mode");
-    assert.match(logText, /\[EXPERIMENT_GATE_BLOCKED\]/);
-    assert.doesNotMatch(logText, /\[STAGE_UNLOCK\] EXPERIMENT -> REVIEW/);
+    assert.match(logText, /\[EXPERIMENT_DISPOSITIONS_COMPLETE\]/,
+      "An assessed blocker is a distinct disposition after repair exhaustion");
+    assert.match(logText, /\[STAGE_UNLOCK\] EXPERIMENT -> REVIEW/);
 
     // 5b. Standalone runLocalAudit (productionWorkflow: false) must track terminalReadPages without stalling
     const standaloneLog = join(tmp, "standalone-audit.log");
