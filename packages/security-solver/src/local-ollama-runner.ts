@@ -545,7 +545,11 @@ export async function runLocalAudit(
           const abstractContract=lead.selector.slice(0,lead.selector.lastIndexOf("."));
           const concrete=resolveAcquiredConcreteImplementations(rootSource,
             abstractContract,method,deterministicSourceSnapshots);
-          for(const target of concrete.slice(0,32)){
+          // Exhaust the full acquired implementation inventory. This is the
+          // deterministic recovery path for unresolved interface/abstract
+          // leads; a fixed prefix here silently leaves later concrete source
+          // families unexamined on every run.
+          for(const target of concrete){
             // SoliditySourceIndex may omit inherited public methods because
             // they aren't declared in the subclass file. The verified base's
             // AST signature is still in the compiled subclass ABI.
@@ -601,7 +605,10 @@ export async function runLocalAudit(
           const method=lead.selector.slice(cut+1);
           const callers=resolveAcquiredInterfaceCallers(source,
             contractName,method,deterministicSourceSnapshots);
-          for(const caller of callers.slice(0,32)){
+          // Caller recovery is source-bounded by the acquired inventory, so
+          // process every proven caller instead of treating the first 32 as
+          // the complete set.
+          for(const caller of callers){
             const menu=deterministicDeclarationsCache.get(caller.path)||[];
             if(!menu.some(d=>d.selector===caller.selector&&d.operation==="send")){
               altFailures.push(caller.selector+":caller_send_declaration_missing");
