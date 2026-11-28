@@ -9,6 +9,7 @@ import type {AnalysisCandidate} from "./analysis-candidate-queue";
 import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
 import {proposeInterfaceUnavailability,independentlyReviewInterfaceUnavailability} from
   "./source-unavailability-verifier";
+import type {FixtureSearchCheckpoint} from "./fixture-dependency-planner";
 
 export type CandidateLifecycle="queued"|"admitted"|"analyzing"|"dependencies_pending"|
   "experiment_pending"|"experiment_completed"|"source_unavailable"|"analysis_exhausted"|"blocked"|
@@ -47,6 +48,9 @@ export interface CandidateProgress {
   sourceUnavailable?:SourceUnavailableEvidence;
   repairAttempts?:Array<{strategy:string;sourceSha256:string;result:string}>;
   specialistAttempts?:Array<{adapter:string;status:string;reason:string;detail?:string}>;
+  /** Unexplored fixture selection frontier, bound to the immutable acquired
+   * inventory by its own digest and checksum. */
+  fixtureSearchCheckpoint?:FixtureSearchCheckpoint;
 }
 export interface CandidateCoverage {
   total:number; queued:number; admitted:number; dependenciesPending:number;
@@ -56,7 +60,7 @@ export interface CandidateCoverage {
 }
 
 export interface AnalysisProgressSnapshot {
-  version:1|2|3|4|5; inventoryFingerprint:string;
+  version:1|2|3|4|5|6; inventoryFingerprint:string;
   /** Explicitly version the source-property interpreter, independently of the acquired program SHA. */
   analysisEngineRevision?:string;
   candidateIds:string[]; records:CandidateProgress[];
@@ -92,7 +96,7 @@ export class AnalysisProgressStore {
     const parsed=JSON.parse(raw) as AnalysisProgressSnapshot;
     // V1 snapshots contain valid source identities but lack the V2 terminality contract.
     // Preserve their candidate lifecycles and upgrade the schema on the next save.
-    if(![1,2,3,4,5].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
+    if(![1,2,3,4,5,6].includes(parsed.version)||parsed.inventoryFingerprint!==store.inventoryFingerprint||
        JSON.stringify([...parsed.candidateIds].sort())!==JSON.stringify([...store.records.keys()].sort()))
       throw new Error("ANALYSIS_CHECKPOINT_SOURCE_MISMATCH: source inventory or revision changed");
     if(!Array.isArray(parsed.records)||parsed.records.length!==candidates.length||
@@ -469,6 +473,12 @@ export class AnalysisProgressStore {
       result:result.slice(0,500)});
     return true;
   }
+  setFixtureSearchCheckpoint(leadId:string,checkpoint:FixtureSearchCheckpoint|undefined):void {
+    const record=this.records.get(leadId);
+    if(!record)throw new Error("FIXTURE_SEARCH_LEAD_NOT_FOUND: "+leadId);
+    if(checkpoint)record.fixtureSearchCheckpoint=structuredClone(checkpoint);
+    else delete record.fixtureSearchCheckpoint;
+  }
   addRepairExperiment(leadId:string,propertyId:string,experimentId:string,witnesses:string[],
     resolvedAbstractFixture=false,maySupersedePriorBlockers=true){
     const record=this.records.get(leadId);
@@ -620,7 +630,7 @@ export class AnalysisProgressStore {
     return eligible.slice(0,max);
   }
   async save():Promise<void>{
-    const state:AnalysisProgressSnapshot={version:5,analysisEngineRevision:this.analysisEngineRevision,
+    const state:AnalysisProgressSnapshot={version:6,analysisEngineRevision:this.analysisEngineRevision,
       inventoryFingerprint:this.inventoryFingerprint,
       candidateIds:[...this.records.keys()],records:[...this.records.values()],
       processedBatches:this.processedBatches,completedExperimentIds:[...this.completedExperimentIds]};

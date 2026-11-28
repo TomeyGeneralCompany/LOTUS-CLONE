@@ -234,11 +234,25 @@ contract InitialState is Initializable {
       plan.deployments.map(deployment=>deployment.contract))),
       new Set(['QuoteA','QuoteB']));
     const truncatedChoices=enumerateSourceFixtureDependenciesDetailed(
-      consumerSource,'QuoteConsumer',acquire,{maxAlternatives:1});
+      consumerSource,'QuoteConsumer',acquire,{maxSearchNodes:2});
     assert.equal(truncatedChoices.alternatives.length,1);
     assert.equal(truncatedChoices.complete,false,
       'A bounded search that leaves a valid acquired alternative pending must be marked incomplete');
     assert.ok(truncatedChoices.pendingSelections>0);
+    assert.ok(truncatedChoices.checkpoint,
+      'A truncated source fixture search must preserve its actual frontier');
+    const resumedChoices=enumerateSourceFixtureDependenciesDetailed(
+      consumerSource,'QuoteConsumer',acquire,{maxSearchNodes:8,
+        resume:truncatedChoices.checkpoint});
+    assert.equal(resumedChoices.complete,true,
+      'Resuming the persisted frontier must finish the original source graph search');
+    assert.equal(resumedChoices.alternatives.length,2,
+      'Resumed fixture search must retain both acquired concrete implementations');
+    assert.throws(()=>enumerateSourceFixtureDependenciesDetailed(
+      consumerSource,'QuoteConsumer',[...acquire,typedSrc('Unrelated','contract Unrelated {}')],
+      {maxSearchNodes:8,resume:truncatedChoices.checkpoint}),
+      /FIXTURE_SEARCH_CHECKPOINT_SOURCE_MISMATCH_OR_CORRUPT/,
+      'A frontier from a different acquired source inventory must be rejected');
     const fullChoices=enumerateSourceFixtureDependenciesDetailed(
       consumerSource,'QuoteConsumer',acquire);
     assert.equal(fullChoices.complete,true,
@@ -390,6 +404,7 @@ contract DividendGetter {
     const partialLead=candidates[1];
     const partialStore=await AnalysisProgressStore.open(
       join(dir,'partial-source-properties.json'),[partialLead]);
+    partialStore.setFixtureSearchCheckpoint(partialLead.id,truncatedChoices.checkpoint);
     partialStore.nextBatch(1,1);
     partialStore.recordAssessment(partialLead.id,[],
       ['source_grounded_falsifier_missing'],[]);
@@ -437,6 +452,9 @@ contract DividendGetter {
     const explicitCheckpoint=partialStore.path;
     await partialStore.save();
     const resumedExplicit=await AnalysisProgressStore.open(explicitCheckpoint,[partialLead]);
+    assert.deepEqual(resumedExplicit.records.get(partialLead.id)?.fixtureSearchCheckpoint,
+      truncatedChoices.checkpoint,
+      'A bounded fixture frontier survives an analysis checkpoint restart');
     assert.equal(resumedExplicit.records.get(partialLead.id)?.lifecycle,'explicitly_unresolved',
       'An explicit unresolved disposition survives restart under the same engine revision');
     assert.deepEqual(resumedExplicit.experimentCertificate.explicitlyUnresolvedIds,[partialLead.id]);

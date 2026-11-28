@@ -13,7 +13,7 @@ import {sourceGroundedSolidityProbes} from './controller-solidity-security-probe
 import {inheritedRoleConsumerImpactSequence} from './controller-solidity-consumer-impact';
 import {orderPreparation, type PreparationPrerequisite, type SourceWitness} from './controller-solidity-prerequisites';
 import {extractAccountingObservations} from './deterministic/accounting-observations';
-import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependenciesDetailed, verifyAcquiredReceiverMethods, verifyCanonicalInheritedPackageMethod, type PreparedDeployment, type PreparedInitializerOperation} from './deterministic/fixture-dependency-planner';
+import {resolveSourceFixtureDependencies, enumerateSourceFixtureDependenciesDetailed, verifyAcquiredReceiverMethods, verifyCanonicalInheritedPackageMethod, type PreparedDeployment, type PreparedInitializerOperation, type FixtureSearchCheckpoint} from './deterministic/fixture-dependency-planner';
 
 /** Select a compact set of complete deployment graphs that collectively
  * exercises every acquired concrete implementation. The omitted graph
@@ -116,6 +116,8 @@ export interface ConstructionInput {
   skipFinancialInvariants?:boolean;
   staticLeads?:readonly StaticLeadHint[];
   invariants?:readonly SourceInvariant[];
+  fixtureSearchCheckpoint?:FixtureSearchCheckpoint;
+  fixtureSearchNodeBudget?:number;
 }
 export interface PreparedSecurityExperiment {
   version:1;id:string;language:'solidity';status:'constructed';
@@ -127,7 +129,8 @@ export type ConstructionResult =
   | {ok:true;experiments:PreparedSecurityExperiment[]}
   | {ok:false;code:string;detail:string;unresolvedCategory?:InvariantUnresolvedCategory;
       /** An independently executable alternative does not discharge another blocked source obligation. */
-      partialExperiments?:PreparedSecurityExperiment[]};
+      partialExperiments?:PreparedSecurityExperiment[];
+      fixtureSearchCheckpoint?:FixtureSearchCheckpoint};
 
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
 /** Resolve an acquired import without treating package imports as paths under
@@ -5608,7 +5611,9 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
     // candidate graphs. Never select an arbitrary first protocol: each
     // graph retains its exact source, ABI and constructor/initializer DAG.
     const fixtureEnumeration=enumerateSourceFixtureDependenciesDetailed(target,contract.name,
-      [...indexed.values()],{maxAlternatives:4096,maxSearchNodes:8192});
+      [...indexed.values()],{maxAlternatives:4096,
+        maxSearchNodes:input.fixtureSearchNodeBudget??8192,
+        resume:input.fixtureSearchCheckpoint});
     const fixtureGraphs=fixtureEnumeration.alternatives;
     const representativeGraphs=representativeFixtureGraphs(fixtureGraphs);
     const omittedGraphCount=fixtureGraphs.length-representativeGraphs.length;
@@ -5726,7 +5731,8 @@ function constructSolidityExperimentsCore(input:ConstructionInput):ConstructionR
     !hasCompleteXmphAccountingFixture&&!hasCompleteXmphRewardFixture){
     return {ok:false,code:'FIXTURE_ENUMERATION_INCOMPLETE',
       detail:fixtureSearchIncompleteReason,unresolvedCategory:'missing_fixture',
-      partialExperiments:out};
+      partialExperiments:out,
+      fixtureSearchCheckpoint:fixtureEnumeration.checkpoint};
   }
   if(failures.length){
     // Preserve *all* source-derived obligations. A constructible property

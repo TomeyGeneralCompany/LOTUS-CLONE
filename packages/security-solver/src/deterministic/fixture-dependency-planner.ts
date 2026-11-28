@@ -1810,11 +1810,48 @@ export interface FixtureEnumerationResult {
   searchNodes:number;
   pendingSelections:number;
   unresolvedSelections:Array<{selection:Record<string,string>;missingDependencies:string[]}>;
+  /** Durable frontier for bounded continuation. It contains selections, not
+   * inferred deployments; every completed graph is re-resolved against the
+   * current immutable source inventory before it is returned. */
+  checkpoint?:FixtureSearchCheckpoint;
 }
+export interface FixtureSearchCheckpoint {
+  version:1;
+  inventoryDigest:string;
+  targetPath:string;
+  targetSha256:string;
+  contractName:string;
+  pending:Array<Record<string,string>>;
+  seenSelections:Array<Record<string,string>>;
+  resolvedChoices:Array<Record<string,string>>;
+  unresolvedSelections:Array<{selection:Record<string,string>;missingDependencies:string[]}>;
+  exploredNodes:number;
+  checksum:string;
+}
+const fixtureInventoryDigest=(target:SourceSnapshot,contractName:string,
+  sources:readonly SourceSnapshot[])=>createHash("sha256").update(JSON.stringify([
+    target.path,target.sha256,contractName,[...sources].map(source=>[source.path,source.sha256])
+      .sort(([a],[b])=>String(a).localeCompare(String(b))),
+  ])).digest("hex");
+const fixtureCheckpointPayload=(checkpoint:Omit<FixtureSearchCheckpoint,"checksum">)=>
+  JSON.stringify(checkpoint);
+const validFixtureCheckpoint=(checkpoint:FixtureSearchCheckpoint,
+  target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[]):boolean=>{
+  if(!checkpoint||checkpoint.version!==1||checkpoint.targetPath!==target.path||
+    checkpoint.targetSha256!==target.sha256||checkpoint.contractName!==contractName||
+    checkpoint.inventoryDigest!==fixtureInventoryDigest(target,contractName,sources)||
+    !Array.isArray(checkpoint.pending)||!Array.isArray(checkpoint.seenSelections)||
+    !Array.isArray(checkpoint.resolvedChoices)||!Array.isArray(checkpoint.unresolvedSelections)||
+    !Number.isSafeInteger(checkpoint.exploredNodes)||checkpoint.exploredNodes<0||
+    !/^[a-f0-9]{64}$/.test(checkpoint.checksum))return false;
+  const {checksum,...payload}=checkpoint;
+  return createHash("sha256").update(fixtureCheckpointPayload(payload)).digest("hex")===checksum;
+};
 
 export function enumerateSourceFixtureDependenciesDetailed(
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
-  options:Readonly<{maxAlternatives?:number;maxSearchNodes?:number;maxDepth?:number;maxNodes?:number}>={},
+  options:Readonly<{maxAlternatives?:number;maxSearchNodes?:number;maxDepth?:number;maxNodes?:number;
+    resume?:FixtureSearchCheckpoint}>={},
 ):FixtureEnumerationResult {
   const max=options.maxAlternatives??256;
   if(!Number.isSafeInteger(max)||max<1||max>4096)
@@ -1830,31 +1867,49 @@ export function enumerateSourceFixtureDependenciesDetailed(
   const cacheKey=JSON.stringify([contractName,target.path,target.sha256,
     [...sources].map(source=>[source.path,source.sha256]).sort(([a],[b])=>
       String(a).localeCompare(String(b))),max,maxSearchNodes,
-    options.maxDepth??null,options.maxNodes??null]);
+    options.maxDepth??null,options.maxNodes??null,
+    options.resume?.checksum??null]);
   const cache=fixtureEnumerationCache;
   const cached=cache.get(cacheKey);
   if(cached){
     cache.delete(cacheKey);cache.set(cacheKey,cached);
     return structuredClone(cached);
   }
-  const pending:Array<Record<string,string>>=[{}];
-  const seen=new Set<string>(),results:Extract<FixtureResolution,{status:"resolved"}>[]=[];
-  const unresolvedSelections:FixtureEnumerationResult["unresolvedSelections"]=[];
+  if(options.resume&&!validFixtureCheckpoint(options.resume,target,contractName,sources))
+    throw new Error("FIXTURE_SEARCH_CHECKPOINT_SOURCE_MISMATCH_OR_CORRUPT");
+  const pending:Array<Record<string,string>>=options.resume?
+    structuredClone(options.resume.pending):[{}];
+  const seen=new Set<string>((options.resume?.seenSelections||[]).map(selections=>
+    JSON.stringify(Object.entries(selections).sort(([a],[b])=>a.localeCompare(b)))));
+  const results:Extract<FixtureResolution,{status:"resolved"}>[]=[];
+  const unresolvedSelections:FixtureEnumerationResult["unresolvedSelections"]=
+    structuredClone(options.resume?.unresolvedSelections||[]);
+  const resolvedChoices=structuredClone(options.resume?.resolvedChoices||[]);
+  for(const choices of resolvedChoices){
+    const resolved=resolveSourceFixtureDependencies(target,contractName,sources,{
+      maxDepth:options.maxDepth,maxNodes:options.maxNodes,choiceByType:choices});
+    if(resolved.status!=="resolved")
+      throw new Error("FIXTURE_SEARCH_CHECKPOINT_GRAPH_NO_LONGER_RESOLVES");
+    results.push(resolved);
+  }
+  let exploredNodes=options.resume?.exploredNodes||0;
   // Keep a larger explicit search budget than the number of complete graph
   // alternatives: a valid graph may sit behind several independent concrete
   // protocol, token, NFT, and minter branches. The caller can tune this bound;
   // we still fail closed and never synthesize unavailable implementations.
-  while(pending.length&&seen.size<maxSearchNodes&&results.length<max){
+  let nodesThisPass=0;
+  while(pending.length&&nodesThisPass<maxSearchNodes&&results.length<max){
     const selections=pending.shift()!;
     const key=JSON.stringify(Object.entries(selections).sort(([a],[b])=>a.localeCompare(b)));
     if(seen.has(key))continue;
     seen.add(key);
+    nodesThisPass++;exploredNodes++;
     const attempt=resolveSourceFixtureDependencies(target,contractName,sources,{
       maxDepth:options.maxDepth,maxNodes:options.maxNodes,choiceByType:selections});
     if(attempt.status==="resolved"){
       if(!results.some(result=>
         JSON.stringify(result.implementationChoices)===JSON.stringify(attempt.implementationChoices)))
-        results.push(attempt);
+        {results.push(attempt);resolvedChoices.push({...attempt.implementationChoices});}
       continue;
     }
     const ambiguity=attempt.ambiguousImplementations?.find(item=>
@@ -1875,10 +1930,22 @@ export function enumerateSourceFixtureDependenciesDetailed(
       pending.push({...selections,[ambiguity.typeName]:choice.path+":"+choice.contract});
   }
   const searchExhausted=pending.length===0;
+  let checkpoint:FixtureSearchCheckpoint|undefined;
+  if(pending.length){
+    const payload:Omit<FixtureSearchCheckpoint,"checksum">={version:1,
+      inventoryDigest:fixtureInventoryDigest(target,contractName,sources),
+      targetPath:target.path,targetSha256:target.sha256,contractName,
+      pending:structuredClone(pending),
+      seenSelections:[...seen].map(key=>Object.fromEntries(JSON.parse(key))),
+      resolvedChoices:structuredClone(resolvedChoices),
+      unresolvedSelections:structuredClone(unresolvedSelections),exploredNodes};
+    checkpoint={...payload,checksum:createHash("sha256")
+      .update(fixtureCheckpointPayload(payload)).digest("hex")};
+  }
   const enumeration:FixtureEnumerationResult={alternatives:results,
     complete:searchExhausted&&unresolvedSelections.length===0,
-    searchExhausted,searchNodes:seen.size,pendingSelections:pending.length,
-    unresolvedSelections};
+    searchExhausted,searchNodes:exploredNodes,pendingSelections:pending.length,
+    unresolvedSelections,checkpoint};
   if(cache.size>=8)cache.delete(cache.keys().next().value!);
   cache.set(cacheKey,structuredClone(enumeration));
   return enumeration;
@@ -1892,7 +1959,8 @@ const fixtureEnumerationCache=new Map<string,
  * bit as a blocker when a bounded search leaves selections unexplored. */
 export function enumerateSourceFixtureDependencies(
   target:SourceSnapshot,contractName:string,sources:readonly SourceSnapshot[],
-  options:Readonly<{maxAlternatives?:number;maxSearchNodes?:number;maxDepth?:number;maxNodes?:number}>={},
+  options:Readonly<{maxAlternatives?:number;maxSearchNodes?:number;maxDepth?:number;maxNodes?:number;
+    resume?:FixtureSearchCheckpoint}>={},
 ):Extract<FixtureResolution,{status:"resolved"}>[] {
   return enumerateSourceFixtureDependenciesDetailed(target,contractName,sources,options).alternatives;
 }

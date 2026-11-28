@@ -6,7 +6,7 @@ import {z} from "zod";
 import {javaSequenceSchema, type JavaSequence} from "./java-sequence";
 import {polyglotSequenceSchema,type PolyglotSequence} from "./polyglot-sequence";
 import {sourceGroundedSolidityProbe,sourceGroundedSolidityProbes,traceProjectErc1155Callers,type GroundedSolidityProbe} from './controller-solidity-security-probes';
-import {constructSolidityExperiments,type SourceSnapshot,type StaticLeadHint} from './controller-solidity-experiment-planner';
+import {constructSolidityExperiments,type ConstructionResult,type PreparedSecurityExperiment,type SourceSnapshot,type StaticLeadHint} from './controller-solidity-experiment-planner';
 import type {SolidityProbeDeclaration} from './solidity-probe-inputs';
 import {privilegedRoleMutationCandidate} from './solidity-security-candidates';
 import {rankTracedSourceCandidates} from './controller-source-candidates';
@@ -32,6 +32,7 @@ import {homedir} from "node:os";
 import {fileURLToPath} from "node:url";
 import {parse as parseSolidity} from '@solidity-parser/parser';
 import {AnalysisProgressStore,type CandidateCoverage} from "./deterministic/analysis-progress-store";
+import type {FixtureSearchCheckpoint} from "./deterministic/fixture-dependency-planner";
 import {sourceRepairRoutes} from "./deterministic/typed-repair-routes";
 import {repairAttemptIdentity} from "./deterministic/repair-attempt-identity";
 import {unfittedVerifierTranscript} from "./deterministic/verifier-transcript";
@@ -445,11 +446,54 @@ export async function runLocalAudit(
         repairBlocked++;
         continue;
       }
-      const constructed=constructSolidityExperiments({
-        repositoryCommit:lead.sourceCommit,targetPath:lead.path,
-        targetSelector:lead.selector,sources:deterministicSourceSnapshots,
-        declarations,staticLeads:limits.staticLeads||[],
-      });
+      const constructFixtureSlice=(checkpoint?:FixtureSearchCheckpoint)=>constructSolidityExperiments({
+          repositoryCommit:lead.sourceCommit,targetPath:lead.path,
+          targetSelector:lead.selector,sources:deterministicSourceSnapshots,
+          declarations,staticLeads:limits.staticLeads||[],
+          fixtureSearchCheckpoint:checkpoint,fixtureSearchNodeBudget:512,
+        });
+      let constructed:ConstructionResult;
+      try{constructed=constructFixtureSlice(record.fixtureSearchCheckpoint);}
+      catch(error){
+        const message=String((error as Error)?.message||error);
+        if(!record.fixtureSearchCheckpoint||!/^FIXTURE_SEARCH_CHECKPOINT_/.test(message))throw error;
+        await appendFile(logFile,"[FIXTURE_SEARCH_CHECKPOINT_RESET] "+JSON.stringify({
+          leadId:lead.id,selector:lead.selector,reason:message,
+          previousDigest:record.fixtureSearchCheckpoint.inventoryDigest})+"\n");
+        analysisProgressStore.setFixtureSearchCheckpoint(lead.id,undefined);
+        await analysisProgressStore.save();
+        constructed=constructFixtureSlice();
+      }
+      const resumedFixtureExperiments:PreparedSecurityExperiment[]=[];
+      let priorFixtureCheckpoint=record.fixtureSearchCheckpoint?.checksum;
+      while(!constructed.ok&&constructed.code==="FIXTURE_ENUMERATION_INCOMPLETE"&&
+        constructed.fixtureSearchCheckpoint){
+        if(constructed.partialExperiments?.length)
+          resumedFixtureExperiments.push(...constructed.partialExperiments);
+        const checkpoint=constructed.fixtureSearchCheckpoint;
+        if(checkpoint.checksum===priorFixtureCheckpoint){
+          await appendFile(logFile,"[FIXTURE_SEARCH_RESUME_STALLED] "+JSON.stringify({
+            leadId:lead.id,selector:lead.selector,checksum:checkpoint.checksum,
+            exploredNodes:checkpoint.exploredNodes,frontier:checkpoint.pending.length})+"\n");
+          break;
+        }
+        analysisProgressStore.setFixtureSearchCheckpoint(lead.id,checkpoint);
+        await analysisProgressStore.save();
+        priorFixtureCheckpoint=checkpoint.checksum;
+        constructed=constructFixtureSlice(checkpoint);
+      }
+      if(resumedFixtureExperiments.length){
+        if(constructed.ok)constructed={...constructed,
+          experiments:[...new Map([...resumedFixtureExperiments,
+            ...constructed.experiments].map(experiment=>[experiment.id,experiment])).values()]};
+        else constructed={...constructed,partialExperiments:[...new Map([
+          ...resumedFixtureExperiments,...(constructed.partialExperiments||[])]
+          .map(experiment=>[experiment.id,experiment])).values()]};
+      }
+      analysisProgressStore.setFixtureSearchCheckpoint(lead.id,
+        !constructed.ok&&constructed.code==="FIXTURE_ENUMERATION_INCOMPLETE"?
+          constructed.fixtureSearchCheckpoint:undefined);
+      await analysisProgressStore.save();
       await appendFile(logFile,"[EXPERIMENT_REPAIR_LEAD_DONE] "+JSON.stringify({
         phase,index:repairIndex+1,total:sourceRepairBatch.length,
         leadId:lead.id,status:constructed.ok?"constructed":"blocked",
