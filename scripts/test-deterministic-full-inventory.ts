@@ -1701,24 +1701,39 @@ contract PlugConsumer {
       assert.deepEqual(extended.initializerOperations[0].args,['','0x',[]]);
       assert.equal(extended.bindings[0].receiver,'plug');
     }
+    const arrayFixtureInterface='pragma solidity ^0.8.20; interface IArrayFixture { function ping() external view returns(uint256); }';
+    const arrayFixtureImplementation='pragma solidity ^0.8.20; import "./IArrayFixture.sol"; contract ArrayFixture is IArrayFixture { bool[2] public flags; uint8[2][2] public matrix; constructor(bool[2] memory seedFlags,uint8[2][2] memory seedMatrix) { flags=seedFlags; matrix=seedMatrix; } function ping() external pure returns(uint256) { return 1; } }';
+    const arrayFixtureConsumer='pragma solidity ^0.8.20; import "./IArrayFixture.sol"; contract ArrayFixtureConsumer { IArrayFixture public fixture; function initialize(IArrayFixture chosen) external { fixture=chosen; } function run() external view returns(uint256) { return fixture.ping(); } }';
+    const arrayFixtureSources=[
+      typedSrc('IArrayFixture',arrayFixtureInterface),
+      typedSrc('ArrayFixture',arrayFixtureImplementation),
+      typedSrc('ArrayFixtureConsumer',arrayFixtureConsumer),
+    ];
+    const arrayFixtureGraph=resolveSourceFixtureDependencies(arrayFixtureSources[2],
+      'ArrayFixtureConsumer',arrayFixtureSources);
+    assert.equal(arrayFixtureGraph.status,'resolved',
+      'Boolean and nested fixed-array constructor arguments must receive ABI-typed fixtures');
+    if(arrayFixtureGraph.status==='resolved')
+      assert.deepEqual(arrayFixtureGraph.deployments[0].constructorArgs,
+        [[false,false],[["0","0"],["0","0"]]]);
     // Verified deep transitive constructor chains are no longer discarded at
     // the historical eight-contract ceiling; bounds remain configurable and
     // must fail closed before EVM execution when explicitly exceeded.
     const deepChainText='pragma solidity ^0.8.0; contract Leaf {} '+
-      Array.from({length:10},(_,i)=>'contract Node'+(i+1)+
+      Array.from({length:14},(_,i)=>'contract Node'+(i+1)+
         ' { constructor('+(i===0?'Leaf':'Node'+i)+' dependency) {} }').join(' ')+
-      ' contract DeepConsumer { Node10 public node; '+
-      'function initialize(address chosen) external { node = Node10(chosen); } }';
+      ' contract DeepConsumer { Node14 public node; '+
+      'function initialize(address chosen) external { node = Node14(chosen); } }';
     const deepChainSource={path:'source-1/contracts/DeepConsumer.sol',
       content:deepChainText,sha256:hash(deepChainText)};
     const deepGraph=resolveSourceFixtureDependencies(deepChainSource,
       'DeepConsumer',[deepChainSource]);
     assert.equal(deepGraph.status,'resolved',
-      'Eleven acquired transitive contracts must fit within the bounded graph');
+      'Fifteen acquired transitive contracts must fit within the source-bounded graph');
     if(deepGraph.status==='resolved'){
-      assert.equal(deepGraph.deployments.length,11);
+      assert.equal(deepGraph.deployments.length,15);
       assert.deepEqual(deepGraph.deployments.map(x=>x.contract),
-        ['Leaf',...Array.from({length:10},(_,i)=>'Node'+(i+1))]);
+        ['Leaf',...Array.from({length:14},(_,i)=>'Node'+(i+1))]);
     }
     const artificiallySmall=resolveSourceFixtureDependencies(deepChainSource,
       'DeepConsumer',[deepChainSource],{maxDepth:10,maxNodes:8});

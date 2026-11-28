@@ -4,7 +4,7 @@ import {createHash} from "node:crypto";
 import {posix} from "node:path";
 import type {SourceSnapshot} from "../controller-solidity-experiment-planner";
 import {canonicalElementaryAbiType} from "../solidity-abi-types";
-type PreparedArg=string|boolean|string[]|Array<string|boolean|string[]>;
+type PreparedArg=string|boolean|PreparedArg[];
 export interface PreparedDeployment {id:string;file:string;contract:string;constructorArgs:PreparedArg[];}
 export interface FixtureSourceWitness {file:string;line:number;contract:string;sourceSha256?:string;parameter?:string;stateVariable?:string;}
 export interface VerifiedDependencyBinding {parameter:string;receiver:string;typeName:string;deploymentId:string;file:string;sourceSha256:string;}
@@ -127,28 +127,31 @@ function acquiredValueDeclaration(type:any,owner:any,source?:SourceSnapshot,
  * and bounded one-dimensional array types. Solidity constructor/initializer
  * reverts remain real executor failures, never presumed successes. */
 function primitiveFixtureArg(type:any,nonzero=false,contract?:any,source?:SourceSnapshot,
-  acquired:readonly SourceSnapshot[]=[],depth=0):PreparedArg|null {
-  if(depth>8)return null;
+  acquired:readonly SourceSnapshot[]=[],resolving=new Set<string>()):PreparedArg|null {
   if(type?.type==="UserDefinedTypeName"&&contract){
     const found=acquiredValueDeclaration(type,contract,source,acquired);
     if(!found)return null;
     const declaration=found.node;
+    const identity=(found.source?.path||source?.path||"")+":"+
+      String(found.owner.name||"")+":"+String(declaration.name||"");
+    if(resolving.has(identity))return null;
+    const nextResolving=new Set(resolving);nextResolving.add(identity);
     if(declaration.type==="EnumDefinition")return (declaration.members||[]).length>0?"0":null;
     if(["UserDefinedValueTypeDefinition","TypeDefinition"].includes(declaration.type))
       return primitiveFixtureArg(declaration.underlyingType||declaration.typeName||declaration.definition,
-        nonzero,found.owner,found.source,acquired,depth+1);
+        nonzero,found.owner,found.source,acquired,nextResolving);
     const parts=(declaration.members||[]).map((field:any)=>
-      primitiveFixtureArg(field.typeName,nonzero,found.owner,found.source,acquired,depth+1));
+      primitiveFixtureArg(field.typeName,nonzero,found.owner,found.source,acquired,nextResolving));
     if(parts.some((part:any)=>part===null))return null;
     return parts as PreparedArg;
   }
   if(type?.type==="ArrayTypeName"){
-    const base=primitiveFixtureArg(type.baseTypeName,nonzero,contract,source,acquired,depth+1);
-    if(typeof base!=="string")return null;
+    const base=primitiveFixtureArg(type.baseTypeName,nonzero,contract,source,acquired,resolving);
+    if(base===null)return null;
     if(!type.length)return [];
     const len=type.length?.type==="NumberLiteral"?Number(type.length.number):NaN;
     if(!Number.isSafeInteger(len)||len<0||len>32)return null;
-    return Array(len).fill(base);
+    return Array.from({length:len},()=>structuredClone(base));
   }
   if(type?.type!=="ElementaryTypeName")return null;
   const k=String(type.name||"");
@@ -1565,13 +1568,15 @@ export function resolveSourceFixtureDependencies(
     for(const binding of initializerStateBindings(entry.node,entry.source,sources))
       recordReceiverMethods(entry.source,binding.typeName,binding.receiver,entry.node);
   }
-  // Planner resource limits are independently bounded by the execution schema
-  // and local gas/sequence limits. A deep acquired dependency chain is not a
-  // missing implementation simply because a historical fixture budget was 8.
-  const MAX_DEPTH=limits.maxDepth===undefined?10:limits.maxDepth;
-  const MAX_NODES=limits.maxNodes===undefined?16:limits.maxNodes;
-  if(!Number.isSafeInteger(MAX_DEPTH)||MAX_DEPTH<1||MAX_DEPTH>12||
-     !Number.isSafeInteger(MAX_NODES)||MAX_NODES<1||MAX_NODES>16)
+  // The acquired concrete inventory is the natural upper bound: a valid
+  // deployment chain cannot use more unique implementations than it contains.
+  // Keep optional smaller caller budgets, but do not silently classify a
+  // deeper acquired chain as missing merely because of a historical constant.
+  const sourceNodeLimit=Math.max(1,scanned.length);
+  const MAX_DEPTH=limits.maxDepth===undefined?sourceNodeLimit:limits.maxDepth;
+  const MAX_NODES=limits.maxNodes===undefined?sourceNodeLimit:limits.maxNodes;
+  if(!Number.isSafeInteger(MAX_DEPTH)||MAX_DEPTH<1||MAX_DEPTH>sourceNodeLimit||
+     !Number.isSafeInteger(MAX_NODES)||MAX_NODES<1||MAX_NODES>sourceNodeLimit)
     return {status:"unresolved",missingDependencies:["invalid_fixture_resource_budget"],
       attemptedResolvers:[],witnesses:[]};
   const resolve=(typ:string,depth:number,ownerSource:SourceSnapshot=target):string|null=>{
