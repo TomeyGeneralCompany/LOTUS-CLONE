@@ -1752,6 +1752,18 @@ contract MixedProtocolVault {
       "Driver must propose discover_experiment for constructible property even when a companion relational hypothesis was deferred",
     );
 
+    const allObservedCases=Array.from({length:10},(_,index)=>({
+      caseId:sha(`observed-case-${index}`),path:mixedPath,
+      selector:`MixedProtocolVault.withdraw${index}`,kind:"solidity_sequence",
+    }));
+    const completeReport=driveDeterministicAuditTurn({
+      stage:"REPORT",sources:[mixedSnap],observedCases:allObservedCases,
+      constraints:{action:["final"]},
+    });
+    assert.equal(completeReport.action,"final");
+    assert.equal(JSON.parse(completeReport.answer).findings.length,10,
+      "The deterministic report must preserve every observed case when its requested schema has no findings limit");
+
     // When Z3 proves smt_unsat_guard on the same lead, construction MUST be skipped
     const refutedGraph = buildProgramFactsGraph({ sources: [mixedSnap] });
     refutedGraph.byFile.get(mixedPath)!.facts.push({

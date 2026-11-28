@@ -207,8 +207,9 @@ function buildDeterministicNegativeFinal(input: DeterministicAuditTurnInput): Re
 
 function buildDeterministicPositiveFinal(
   observedCases: readonly DeterministicObservedCase[],
+  maxFindings?: number,
 ): Record<string, unknown> {
-  const findings = observedCases.slice(0, 8).map((obs) => {
+  const findings = observedCases.slice(0, maxFindings).map((obs) => {
     const isSolidity = obs.kind === "solidity_sequence" || obs.path.endsWith(".sol");
     const callerFile = obs.callerFile || obs.path;
     const callerLine = Math.max(1, obs.callerLine || 1);
@@ -240,6 +241,13 @@ function buildDeterministicPositiveFinal(
     findings,
     outcome: "inspected",
   };
+}
+
+function requestedFindingLimit(requestSchema:Record<string,any>|undefined):number|undefined {
+  const resultSchema=requestSchema?.properties?.result;
+  const findingsSchema=resultSchema?.properties?.findings||requestSchema?.properties?.findings;
+  const limit=findingsSchema?.maxItems;
+  return Number.isSafeInteger(limit)&&limit>=0?limit:undefined;
 }
 
 function runnerExperimentId(
@@ -510,7 +518,7 @@ export function driveDeterministicAuditTurn(
       const observed = (input.observedCases || []).filter((c) => /^[a-f0-9]{64}$/.test(c.caseId));
       payload =
         observed.length > 0
-          ? buildDeterministicPositiveFinal(observed)
+          ? buildDeterministicPositiveFinal(observed,requestedFindingLimit(input.requestSchema))
           : buildDeterministicNegativeFinal(input);
     }
     if (wantsResultObject) {
